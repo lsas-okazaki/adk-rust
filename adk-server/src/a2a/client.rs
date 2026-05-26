@@ -14,16 +14,37 @@ pub struct A2aClient {
 }
 
 impl A2aClient {
-    /// Create a new A2A client from an agent card
+    /// Create a new A2A client from an agent card.
+    /// Uses a default `reqwest::Client`. For custom headers, middleware, or
+    /// TLS configuration, use [`A2aClient::with_client`] instead.
     pub fn new(agent_card: AgentCard) -> Self {
         Self { http_client: reqwest::Client::new(), agent_card }
     }
 
+    /// Create a new A2A client from an agent card with a caller-provided
+    /// `reqwest::Client`. Lets callers inject default headers, TLS settings,
+    /// timeouts, or any other reqwest configuration. For per-request auth
+    /// schemes (e.g. DPoP) where the header value must change each call,
+    /// wrap the client with a middleware library before passing it in.
+    pub fn with_client(agent_card: AgentCard, http_client: reqwest::Client) -> Self {
+        Self { http_client, agent_card }
+    }
+
     /// Resolve an agent card from a URL (fetch from /.well-known/agent.json)
     pub async fn resolve_agent_card(base_url: &str) -> Result<AgentCard> {
+        Self::resolve_agent_card_with_client(base_url, &reqwest::Client::new()).await
+    }
+
+    /// Like [`A2aClient::resolve_agent_card`] but uses a caller-provided
+    /// `reqwest::Client` for the discovery request. Use this when the
+    /// well-known endpoint requires the same authentication headers as the
+    /// agent's RPC endpoint.
+    pub async fn resolve_agent_card_with_client(
+        base_url: &str,
+        client: &reqwest::Client,
+    ) -> Result<AgentCard> {
         let url = format!("{}/.well-known/agent.json", base_url.trim_end_matches('/'));
 
-        let client = reqwest::Client::new();
         let response =
             client.get(&url).send().await.map_err(|e| {
                 adk_core::AdkError::agent(format!("Failed to fetch agent card: {e}"))
@@ -48,6 +69,17 @@ impl A2aClient {
     pub async fn from_url(base_url: &str) -> Result<Self> {
         let card = Self::resolve_agent_card(base_url).await?;
         Ok(Self::new(card))
+    }
+
+    /// Like [`A2aClient::from_url`] but uses a caller-provided
+    /// `reqwest::Client` for both the agent-card fetch and subsequent
+    /// requests. The same client is retained on the returned `A2aClient`.
+    pub async fn from_url_with_client(
+        base_url: &str,
+        http_client: reqwest::Client,
+    ) -> Result<Self> {
+        let card = Self::resolve_agent_card_with_client(base_url, &http_client).await?;
+        Ok(Self::with_client(card, http_client))
     }
 
     /// Get the agent card

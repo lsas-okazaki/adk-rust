@@ -117,6 +117,68 @@ impl McpHttpClientBuilder {
         &self.auth
     }
 
+    /// Build the rmcp transport config from `self`. Resolves the auth token
+    /// (extracting it from `McpAuth` / running the OAuth2 flow as needed)
+    /// and applies any custom headers configured via [`Self::header`].
+    ///
+    /// Factored out of `connect` / `connect_with_elicitation` so both paths
+    /// stay in sync. Previously the headers were stored on the builder but
+    /// never reached the transport — calling `.header(...)` silently did
+    /// nothing.
+    #[cfg(feature = "http-transport")]
+    async fn build_transport_config(
+        &self,
+    ) -> Result<rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig> {
+        use adk_core::{ErrorCategory, ErrorComponent};
+        use reqwest::header::{HeaderName, HeaderValue};
+        use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+        use std::collections::HashMap;
+
+        // Resolve auth token (rmcp's bearer_auth adds the "Bearer " prefix).
+        let token = match &self.auth {
+            McpAuth::Bearer(token) => Some(token.clone()),
+            McpAuth::OAuth2(config) => {
+                let token = config.get_or_refresh_token().await.map_err(|e| {
+                    AdkError::new(
+                        ErrorComponent::Tool,
+                        ErrorCategory::Unauthorized,
+                        "mcp.oauth.token_fetch",
+                        format!("OAuth2 authentication failed: {e}"),
+                    )
+                })?;
+                Some(token)
+            }
+            // API-key auth uses a non-standard header that rmcp's auth_header
+            // doesn't model. Callers who need that can pass the key via
+            // .header(...) instead.
+            McpAuth::ApiKey { .. } => None,
+            McpAuth::None => None,
+        };
+
+        // Convert the builder's stored string-keyed headers into the typed
+        // map rmcp wants. Surface conversion errors with the offending name
+        // so misconfigurations are obvious.
+        let mut custom_headers: HashMap<HeaderName, HeaderValue> = HashMap::new();
+        for (name, value) in &self.headers {
+            let header_name = HeaderName::try_from(name.as_str()).map_err(|e| {
+                AdkError::tool(format!("invalid MCP header name {name:?}: {e}"))
+            })?;
+            let header_value = HeaderValue::try_from(value.as_str()).map_err(|e| {
+                AdkError::tool(format!("invalid MCP header value for {name:?}: {e}"))
+            })?;
+            custom_headers.insert(header_name, header_value);
+        }
+
+        let mut config = StreamableHttpClientTransportConfig::with_uri(self.endpoint.as_str());
+        if let Some(token) = token {
+            config = config.auth_header(token);
+        }
+        if !custom_headers.is_empty() {
+            config = config.custom_headers(custom_headers);
+        }
+        Ok(config)
+    }
+
     /// Connect to the MCP server and create a toolset.
     ///
     /// This method establishes a connection to the remote MCP server
@@ -132,45 +194,10 @@ impl McpHttpClientBuilder {
     pub async fn connect(
         self,
     ) -> Result<super::McpToolset<impl rmcp::service::Service<rmcp::RoleClient>>> {
-        use adk_core::{ErrorCategory, ErrorComponent};
         use rmcp::ServiceExt;
-        use rmcp::transport::streamable_http_client::{
-            StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
-        };
+        use rmcp::transport::streamable_http_client::StreamableHttpClientTransport;
 
-        // Extract the raw token from auth config
-        // rmcp's bearer_auth() adds "Bearer " prefix automatically
-        let token = match &self.auth {
-            McpAuth::Bearer(token) => Some(token.clone()),
-            McpAuth::OAuth2(config) => {
-                // Get token from OAuth2 flow
-                let token = config.get_or_refresh_token().await.map_err(|e| {
-                    AdkError::new(
-                        ErrorComponent::Tool,
-                        ErrorCategory::Unauthorized,
-                        "mcp.oauth.token_fetch",
-                        format!("OAuth2 authentication failed: {e}"),
-                    )
-                })?;
-                Some(token)
-            }
-            McpAuth::ApiKey { .. } => {
-                // API key auth not supported via rmcp's auth_header (uses different header)
-                // Would need custom client implementation
-                None
-            }
-            McpAuth::None => None,
-        };
-
-        // Build transport config with authentication
-        let mut config = StreamableHttpClientTransportConfig::with_uri(self.endpoint.as_str());
-
-        // Set auth header if we have a token (rmcp adds "Bearer " prefix via bearer_auth)
-        if let Some(token) = token {
-            config = config.auth_header(token);
-        }
-
-        // Create transport with config
+        let config = self.build_transport_config().await?;
         let transport = StreamableHttpClientTransport::from_config(config);
 
         // Connect using the service extension
@@ -215,41 +242,16 @@ impl McpHttpClientBuilder {
     pub async fn connect_with_elicitation(
         self,
     ) -> Result<super::McpToolset<impl rmcp::service::Service<rmcp::RoleClient>>> {
-        use adk_core::{ErrorCategory, ErrorComponent};
         use rmcp::ServiceExt;
-        use rmcp::transport::streamable_http_client::{
-            StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
-        };
+        use rmcp::transport::streamable_http_client::StreamableHttpClientTransport;
 
-        let handler = self.elicitation_handler.ok_or_else(|| {
+        let handler = self.elicitation_handler.clone().ok_or_else(|| {
             AdkError::tool(
                 "connect_with_elicitation requires with_elicitation_handler to be called first",
             )
         })?;
 
-        // Extract the raw token from auth config
-        let token = match &self.auth {
-            McpAuth::Bearer(token) => Some(token.clone()),
-            McpAuth::OAuth2(config) => {
-                let token = config.get_or_refresh_token().await.map_err(|e| {
-                    AdkError::new(
-                        ErrorComponent::Tool,
-                        ErrorCategory::Unauthorized,
-                        "mcp.oauth.token_fetch",
-                        format!("OAuth2 authentication failed: {e}"),
-                    )
-                })?;
-                Some(token)
-            }
-            McpAuth::ApiKey { .. } => None,
-            McpAuth::None => None,
-        };
-
-        let mut config = StreamableHttpClientTransportConfig::with_uri(self.endpoint.as_str());
-        if let Some(token) = token {
-            config = config.auth_header(token);
-        }
-
+        let config = self.build_transport_config().await?;
         let transport = StreamableHttpClientTransport::from_config(config);
         let adk_handler = super::elicitation::AdkClientHandler::new(handler);
         let client = adk_handler
@@ -311,5 +313,33 @@ mod tests {
         let builder =
             McpHttpClientBuilder::new("https://mcp.example.com").header("X-Custom", "value");
         assert!(builder.headers.contains_key("X-Custom"));
+    }
+
+    /// Regression test: previously `.header()` stored entries on the builder
+    /// but `connect()` never applied them to the transport config. Now they
+    /// flow through, and invalid names/values produce a clear error instead
+    /// of silently disappearing.
+    #[cfg(feature = "http-transport")]
+    #[tokio::test]
+    async fn test_build_transport_config_applies_headers() {
+        let builder = McpHttpClientBuilder::new("https://mcp.example.com")
+            .header("X-Custom", "value")
+            .header("Authorization", "License abc.def.ghi");
+        let config = builder.build_transport_config().await.unwrap();
+        assert_eq!(config.custom_headers.len(), 2);
+        assert!(
+            config
+                .custom_headers
+                .contains_key(&reqwest::header::HeaderName::from_static("x-custom"))
+        );
+    }
+
+    #[cfg(feature = "http-transport")]
+    #[tokio::test]
+    async fn test_build_transport_config_rejects_invalid_header_name() {
+        let builder =
+            McpHttpClientBuilder::new("https://mcp.example.com").header("bad header", "value");
+        let err = builder.build_transport_config().await.unwrap_err();
+        assert!(err.to_string().contains("invalid MCP header name"));
     }
 }
