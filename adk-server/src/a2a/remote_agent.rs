@@ -18,6 +18,11 @@ pub struct RemoteA2aConfig {
     /// Whether to use streaming for communication.
     /// If `None`, the agent uses streaming if the remote agent supports it.
     pub streaming: Option<bool>,
+    /// Optional caller-provided `reqwest::Client` used for both the
+    /// agent-card fetch and subsequent RPC requests. When `None`, a default
+    /// client is constructed per call. Use this to inject default headers
+    /// (e.g. a license JWT), TLS settings, or proxy configuration.
+    pub http_client: Option<reqwest::Client>,
 }
 
 /// An agent that communicates with a remote A2A agent
@@ -54,13 +59,19 @@ impl Agent for RemoteA2aAgent {
         let invocation_id = ctx.invocation_id().to_string();
         let agent_name = self.config.name.clone();
         let config_streaming = self.config.streaming;
+        let http_client = self.config.http_client.clone();
 
         // Get user content from context
         let user_content = get_user_content_from_context(ctx.as_ref());
 
         let stream = async_stream::stream! {
-            // Create A2A client
-            let client = match A2aClient::from_url(&url).await {
+            // Create A2A client. Use the caller-provided reqwest::Client if
+            // one was set on the config; otherwise fall back to the default.
+            let client_result = match http_client {
+                Some(c) => A2aClient::from_url_with_client(&url, c).await,
+                None => A2aClient::from_url(&url).await,
+            };
+            let client = match client_result {
                 Ok(c) => c,
                 Err(e) => {
                     yield Ok(create_error_event(&invocation_id, &agent_name, &e.to_string()));
@@ -133,11 +144,18 @@ pub struct RemoteA2aAgentBuilder {
     description: String,
     agent_url: Option<String>,
     streaming: Option<bool>,
+    http_client: Option<reqwest::Client>,
 }
 
 impl RemoteA2aAgentBuilder {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), description: String::new(), agent_url: None, streaming: None }
+        Self {
+            name: name.into(),
+            description: String::new(),
+            agent_url: None,
+            streaming: None,
+            http_client: None,
+        }
     }
 
     pub fn description(mut self, description: impl Into<String>) -> Self {
@@ -156,6 +174,16 @@ impl RemoteA2aAgentBuilder {
         self
     }
 
+    /// Use a caller-provided `reqwest::Client` for both agent-card discovery
+    /// and RPC requests. Configure default headers, TLS, timeouts, or
+    /// proxies on the client before passing it in. For per-request header
+    /// values (e.g. DPoP tokens that change every call) wrap the client
+    /// with a middleware library and use the resulting client.
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
     pub fn build(self) -> Result<RemoteA2aAgent> {
         let agent_url = self
             .agent_url
@@ -166,6 +194,7 @@ impl RemoteA2aAgentBuilder {
             description: self.description,
             agent_url,
             streaming: self.streaming,
+            http_client: self.http_client,
         }))
     }
 }
@@ -349,9 +378,28 @@ mod tests {
     }
 
     #[test]
+    fn test_builder_with_client() {
+        let custom = reqwest::Client::new();
+        let agent = RemoteA2aAgent::builder("test")
+            .agent_url("http://localhost:8080")
+            .with_client(custom)
+            .build()
+            .unwrap();
+
+        assert!(agent.config.http_client.is_some());
+    }
+
+    #[test]
+    fn test_builder_no_client_by_default() {
+        let agent =
+            RemoteA2aAgent::builder("test").agent_url("http://localhost:8080").build().unwrap();
+
+        assert!(agent.config.http_client.is_none());
+    }
+
+    #[test]
     fn test_convert_task_to_events_with_artifacts_and_history() {
         use crate::a2a::{Artifact, Message, Task, TaskState, TaskStatus};
-
         let task = Task {
             id: "task-123".to_string(),
             context_id: Some("ctx-456".to_string()),
