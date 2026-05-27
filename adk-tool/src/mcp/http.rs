@@ -160,9 +160,8 @@ impl McpHttpClientBuilder {
         // so misconfigurations are obvious.
         let mut custom_headers: HashMap<HeaderName, HeaderValue> = HashMap::new();
         for (name, value) in &self.headers {
-            let header_name = HeaderName::try_from(name.as_str()).map_err(|e| {
-                AdkError::tool(format!("invalid MCP header name {name:?}: {e}"))
-            })?;
+            let header_name = HeaderName::try_from(name.as_str())
+                .map_err(|e| AdkError::tool(format!("invalid MCP header name {name:?}: {e}")))?;
             let header_value = HeaderValue::try_from(value.as_str()).map_err(|e| {
                 AdkError::tool(format!("invalid MCP header value for {name:?}: {e}"))
             })?;
