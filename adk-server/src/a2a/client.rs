@@ -4,44 +4,54 @@ use crate::a2a::{
 };
 use adk_core::Result;
 use futures::stream::Stream;
+use reqwest_middleware::ClientWithMiddleware;
 use serde_json::Value;
 use std::pin::Pin;
 
+/// Wrap a bare `reqwest::Client` in a no-op middleware client. Used by the
+/// constructors that don't take a caller-provided client, so the field type
+/// is uniform.
+fn plain_client() -> ClientWithMiddleware {
+    reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build()
+}
+
 /// A2A client for communicating with remote A2A agents
 pub struct A2aClient {
-    http_client: reqwest::Client,
+    http_client: ClientWithMiddleware,
     agent_card: AgentCard,
 }
 
 impl A2aClient {
     /// Create a new A2A client from an agent card.
-    /// Uses a default `reqwest::Client`. For custom headers, middleware, or
-    /// TLS configuration, use [`A2aClient::with_client`] instead.
+    /// Uses a default client with no middleware. For custom headers,
+    /// per-request auth middleware, or TLS configuration, use
+    /// [`A2aClient::with_client`] instead.
     pub fn new(agent_card: AgentCard) -> Self {
-        Self { http_client: reqwest::Client::new(), agent_card }
+        Self { http_client: plain_client(), agent_card }
     }
 
     /// Create a new A2A client from an agent card with a caller-provided
-    /// `reqwest::Client`. Lets callers inject default headers, TLS settings,
-    /// timeouts, or any other reqwest configuration. For per-request auth
-    /// schemes (e.g. DPoP) where the header value must change each call,
-    /// wrap the client with a middleware library before passing it in.
-    pub fn with_client(agent_card: AgentCard, http_client: reqwest::Client) -> Self {
+    /// [`ClientWithMiddleware`]. Lets callers inject default headers, TLS
+    /// settings, timeouts, or per-request auth middleware. For per-request
+    /// auth schemes (e.g. DPoP) where the header value must change each call,
+    /// attach a [`reqwest_middleware::Middleware`] to the client before
+    /// passing it in.
+    pub fn with_client(agent_card: AgentCard, http_client: ClientWithMiddleware) -> Self {
         Self { http_client, agent_card }
     }
 
     /// Resolve an agent card from a URL (fetch from /.well-known/agent.json)
     pub async fn resolve_agent_card(base_url: &str) -> Result<AgentCard> {
-        Self::resolve_agent_card_with_client(base_url, &reqwest::Client::new()).await
+        Self::resolve_agent_card_with_client(base_url, &plain_client()).await
     }
 
     /// Like [`A2aClient::resolve_agent_card`] but uses a caller-provided
-    /// `reqwest::Client` for the discovery request. Use this when the
-    /// well-known endpoint requires the same authentication headers as the
-    /// agent's RPC endpoint.
+    /// client for the discovery request. Use this when the well-known
+    /// endpoint requires the same authentication headers as the agent's RPC
+    /// endpoint (the sidecar gates both).
     pub async fn resolve_agent_card_with_client(
         base_url: &str,
-        client: &reqwest::Client,
+        client: &ClientWithMiddleware,
     ) -> Result<AgentCard> {
         let url = format!("{}/.well-known/agent.json", base_url.trim_end_matches('/'));
 
@@ -72,11 +82,11 @@ impl A2aClient {
     }
 
     /// Like [`A2aClient::from_url`] but uses a caller-provided
-    /// `reqwest::Client` for both the agent-card fetch and subsequent
+    /// [`ClientWithMiddleware`] for both the agent-card fetch and subsequent
     /// requests. The same client is retained on the returned `A2aClient`.
     pub async fn from_url_with_client(
         base_url: &str,
-        http_client: reqwest::Client,
+        http_client: ClientWithMiddleware,
     ) -> Result<Self> {
         let card = Self::resolve_agent_card_with_client(base_url, &http_client).await?;
         Ok(Self::with_client(card, http_client))
