@@ -399,6 +399,7 @@ mod tests {
     #[test]
     fn test_convert_task_to_events_with_artifacts_and_history() {
         use crate::a2a::{Artifact, Message, Task, TaskState, TaskStatus};
+
         let task = Task {
             id: "task-123".to_string(),
             context_id: Some("ctx-456".to_string()),
