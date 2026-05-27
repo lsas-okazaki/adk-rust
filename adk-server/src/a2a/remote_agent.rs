@@ -140,7 +140,11 @@ impl Agent for RemoteA2aAgent {
 }
 
 /// Helper to convert a non-streaming A2A Task response into a sequence of ADK Events
-fn convert_task_to_events(invocation_id: &str, agent_name: &str, task: crate::a2a::Task) -> Vec<Event> {
+fn convert_task_to_events(
+    invocation_id: &str,
+    agent_name: &str,
+    task: crate::a2a::Task,
+) -> Vec<Event> {
     let mut events = Vec::new();
 
     // 1. Yield events for artifacts first
@@ -373,17 +377,15 @@ mod tests {
 
     #[test]
     fn test_builder_no_client_by_default() {
-        let agent = RemoteA2aAgent::builder("test")
-            .agent_url("http://localhost:8080")
-            .build()
-            .unwrap();
+        let agent =
+            RemoteA2aAgent::builder("test").agent_url("http://localhost:8080").build().unwrap();
 
         assert!(agent.config.http_client.is_none());
     }
 
     #[test]
     fn test_convert_task_to_events() {
-        use crate::a2a::{Artifact, Message, Task, TaskStatus, TaskState};
+        use crate::a2a::{Artifact, Message, Task, TaskState, TaskStatus};
 
         let task = Task {
             id: "task-123".to_string(),
@@ -400,10 +402,12 @@ mod tests {
                 metadata: None,
                 extensions: None,
             }]),
-            history: Some(vec![Message::builder()
-                .role(Role::Agent)
-                .parts(vec![A2aPart::text("Hello from history".to_string())])
-                .build()]),
+            history: Some(vec![
+                Message::builder()
+                    .role(Role::Agent)
+                    .parts(vec![A2aPart::text("Hello from history".to_string())])
+                    .build(),
+            ]),
         };
 
         let events = convert_task_to_events("inv-1", "agent-1", task);
