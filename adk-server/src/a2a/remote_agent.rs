@@ -3,6 +3,7 @@ use crate::a2a::{
 };
 use adk_core::{Agent, Content, Event, EventStream, InvocationContext, Part, Result};
 use async_trait::async_trait;
+use reqwest_middleware::ClientWithMiddleware;
 use std::sync::Arc;
 
 /// Configuration for a remote A2A agent
@@ -18,11 +19,12 @@ pub struct RemoteA2aConfig {
     /// Whether to use streaming for communication.
     /// If None, the agent will use streaming if the remote agent supports it.
     pub streaming: Option<bool>,
-    /// Optional caller-provided `reqwest::Client` used for both the
-    /// agent-card fetch and subsequent RPC requests. When `None`, a default
-    /// client is constructed per call. Use this to inject default headers
-    /// (e.g. a license JWT), TLS settings, or proxy configuration.
-    pub http_client: Option<reqwest::Client>,
+    /// Optional caller-provided client used for both the agent-card fetch and
+    /// subsequent RPC requests. When `None`, a default client is constructed
+    /// per call. Use this to inject default headers (e.g. a license JWT), TLS
+    /// settings, proxy configuration, or per-request auth middleware (e.g.
+    /// DPoP proofs).
+    pub http_client: Option<ClientWithMiddleware>,
 }
 
 /// An agent that communicates with a remote A2A agent
@@ -207,7 +209,7 @@ pub struct RemoteA2aAgentBuilder {
     description: String,
     agent_url: Option<String>,
     streaming: Option<bool>,
-    http_client: Option<reqwest::Client>,
+    http_client: Option<ClientWithMiddleware>,
 }
 
 impl RemoteA2aAgentBuilder {
@@ -236,12 +238,12 @@ impl RemoteA2aAgentBuilder {
         self
     }
 
-    /// Use a caller-provided `reqwest::Client` for both agent-card discovery
-    /// and RPC requests. Configure default headers, TLS, timeouts, or
-    /// proxies on the client before passing it in. For per-request header
-    /// values (e.g. DPoP tokens that change every call) wrap the client
-    /// with a middleware library and use the resulting client.
-    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+    /// Use a caller-provided [`ClientWithMiddleware`] for both agent-card
+    /// discovery and RPC requests. Configure default headers, TLS, timeouts,
+    /// or proxies on the client before passing it in. For per-request header
+    /// values (e.g. DPoP proofs that change every call) attach a
+    /// [`reqwest_middleware::Middleware`] to the client.
+    pub fn with_client(mut self, client: ClientWithMiddleware) -> Self {
         self.http_client = Some(client);
         self
     }
@@ -365,7 +367,7 @@ mod tests {
 
     #[test]
     fn test_builder_with_client() {
-        let custom = reqwest::Client::new();
+        let custom = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
         let agent = RemoteA2aAgent::builder("test")
             .agent_url("http://localhost:8080")
             .with_client(custom)
