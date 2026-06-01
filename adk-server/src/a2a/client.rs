@@ -84,6 +84,21 @@ impl A2aClient {
     /// Like [`A2aClient::from_url`] but uses a caller-provided
     /// [`ClientWithMiddleware`] for both the agent-card fetch and subsequent
     /// requests. The same client is retained on the returned `A2aClient`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_server::a2a::A2aClient;
+    /// use reqwest::header::{HeaderMap, HeaderValue};
+    ///
+    /// // Send a license JWT as a default header on every request.
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert("X-License", HeaderValue::from_static("jwt-token"));
+    /// let inner = reqwest::Client::builder().default_headers(headers).build()?;
+    /// let http = reqwest_middleware::ClientBuilder::new(inner).build();
+    ///
+    /// let client = A2aClient::from_url_with_client("https://agent.example.com", http).await?;
+    /// ```
     pub async fn from_url_with_client(
         base_url: &str,
         http_client: ClientWithMiddleware,
