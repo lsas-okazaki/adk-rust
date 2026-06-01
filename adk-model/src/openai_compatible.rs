@@ -288,6 +288,28 @@ impl OpenAICompatible {
     /// The client's default headers and TLS configuration still apply: a
     /// `reqwest::Client` attaches them when it executes a request, not when
     /// the request is built.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_model::openai_compatible::{OpenAICompatible, OpenAICompatibleConfig};
+    ///
+    /// // A reqwest client preconfigured with default headers and a timeout
+    /// // can be passed as-is ...
+    /// let http = reqwest::Client::builder()
+    ///     .timeout(std::time::Duration::from_secs(30))
+    ///     .build()?;
+    ///
+    /// // ... or wrapped in tower layers that rewrite each request first.
+    /// let http = tower::ServiceBuilder::new()
+    ///     .layer(my_per_request_auth_layer)
+    ///     .service(http);
+    ///
+    /// let model = OpenAICompatible::with_client(
+    ///     OpenAICompatibleConfig::new("my-api-key", "my-model"),
+    ///     http,
+    /// )?;
+    /// ```
     pub fn with_client<S>(config: OpenAICompatibleConfig, http: S) -> Result<Self, AdkError>
     where
         S: Service<reqwest::Request, Response = reqwest::Response> + Clone + Send + Sync + 'static,

@@ -1,10 +1,11 @@
+use crate::a2a::transport::{HttpTransport, box_transport};
 use crate::a2a::{
     A2aClient, Part as A2aPart, Role, TaskArtifactUpdateEvent, TaskStatusUpdateEvent, UpdateEvent,
 };
 use adk_core::{Agent, Content, Event, EventStream, InvocationContext, Part, Result};
 use async_trait::async_trait;
-use reqwest_middleware::ClientWithMiddleware;
 use std::sync::Arc;
+use tower::{BoxError, Service};
 
 /// Configuration for a remote A2A agent
 #[derive(Clone)]
@@ -19,12 +20,13 @@ pub struct RemoteA2aConfig {
     /// Whether to use streaming for communication.
     /// If `None`, the agent uses streaming if the remote agent supports it.
     pub streaming: Option<bool>,
-    /// Optional caller-provided client used for both the agent-card fetch and
-    /// subsequent RPC requests. When `None`, a default client is constructed
-    /// per call. Use this to inject default headers (e.g. a license JWT), TLS
-    /// settings, proxy configuration, or per-request auth middleware (e.g.
-    /// DPoP proofs).
-    pub http_client: Option<ClientWithMiddleware>,
+    /// Optional caller-provided HTTP transport used for both the agent-card
+    /// fetch and subsequent RPC requests. When `None`, a default client is
+    /// constructed per call. Use this to inject default headers (e.g. a
+    /// license JWT), TLS settings, proxy configuration, or per-request auth
+    /// (e.g. DPoP proofs) via `tower` layers; see
+    /// [`RemoteA2aAgentBuilder::with_client`].
+    pub http_client: Option<HttpTransport>,
 }
 
 /// An agent that communicates with a remote A2A agent
@@ -67,7 +69,7 @@ impl Agent for RemoteA2aAgent {
         let user_content = get_user_content_from_context(ctx.as_ref());
 
         let stream = async_stream::stream! {
-            // Create A2A client. Use the caller-provided reqwest::Client if
+            // Create A2A client. Use the caller-provided transport if
             // one was set on the config; otherwise fall back to the default.
             let client_result = match http_client {
                 Some(c) => A2aClient::from_url_with_client(&url, c).await,
@@ -146,7 +148,7 @@ pub struct RemoteA2aAgentBuilder {
     description: String,
     agent_url: Option<String>,
     streaming: Option<bool>,
-    http_client: Option<ClientWithMiddleware>,
+    http_client: Option<HttpTransport>,
 }
 
 impl RemoteA2aAgentBuilder {
@@ -176,13 +178,34 @@ impl RemoteA2aAgentBuilder {
         self
     }
 
-    /// Use a caller-provided [`ClientWithMiddleware`] for both agent-card
-    /// discovery and RPC requests. Configure default headers, TLS, timeouts,
-    /// or proxies on the client before passing it in. For per-request header
-    /// values (e.g. DPoP proofs that change every call) attach a
-    /// [`reqwest_middleware::Middleware`] to the client.
-    pub fn with_client(mut self, client: ClientWithMiddleware) -> Self {
-        self.http_client = Some(client);
+    /// Use a caller-provided HTTP client or `tower` service stack for both
+    /// agent-card discovery and RPC requests. Configure default headers, TLS,
+    /// timeouts, or proxies on the [`reqwest::Client`] before passing it in.
+    /// For per-request header values (e.g. DPoP proofs that change every
+    /// call) wrap the client in a [`tower::Layer`] that rewrites each
+    /// [`reqwest::Request`] before handing it on.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_server::a2a::RemoteA2aAgent;
+    ///
+    /// let http = reqwest::Client::builder()
+    ///     .timeout(std::time::Duration::from_secs(60))
+    ///     .build()?;
+    ///
+    /// let agent = RemoteA2aAgent::builder("remote")
+    ///     .agent_url("https://agent.example.com")
+    ///     .with_client(http)
+    ///     .build()?;
+    /// ```
+    pub fn with_client<S>(mut self, client: S) -> Self
+    where
+        S: Service<reqwest::Request, Response = reqwest::Response> + Clone + Send + Sync + 'static,
+        S::Error: Into<BoxError>,
+        S::Future: Send + 'static,
+    {
+        self.http_client = Some(box_transport(client));
         self
     }
 
@@ -381,7 +404,7 @@ mod tests {
 
     #[test]
     fn test_builder_with_client() {
-        let custom = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let custom = reqwest::Client::new();
         let agent = RemoteA2aAgent::builder("test")
             .agent_url("http://localhost:8080")
             .with_client(custom)

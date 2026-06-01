@@ -1,48 +1,46 @@
+use crate::a2a::transport::{self, HttpTransport, box_transport};
 use crate::a2a::{
     AgentCard, JsonRpcRequest, JsonRpcResponse, Message, MessageSendParams,
     TaskArtifactUpdateEvent, TaskStatusUpdateEvent, UpdateEvent,
 };
 use adk_core::Result;
 use futures::stream::Stream;
-use reqwest_middleware::ClientWithMiddleware;
 use serde_json::Value;
 use std::pin::Pin;
-
-/// Wrap a bare `reqwest::Client` in a no-op middleware client. Used by the
-/// constructors that don't take a caller-provided client, so the field type
-/// is uniform.
-fn plain_client() -> ClientWithMiddleware {
-    reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build()
-}
+use tower::{BoxError, Service};
 
 /// A2A client for communicating with remote A2A agents
 pub struct A2aClient {
-    http_client: ClientWithMiddleware,
+    http_client: HttpTransport,
     agent_card: AgentCard,
 }
 
 impl A2aClient {
     /// Create a new A2A client from an agent card.
-    /// Uses a default client with no middleware. For custom headers,
-    /// per-request auth middleware, or TLS configuration, use
-    /// [`A2aClient::with_client`] instead.
+    /// Uses a default client with no layers. For custom headers, per-request
+    /// auth, or TLS configuration, use [`A2aClient::with_client`] instead.
     pub fn new(agent_card: AgentCard) -> Self {
-        Self { http_client: plain_client(), agent_card }
+        Self { http_client: transport::plain_transport(), agent_card }
     }
 
-    /// Create a new A2A client from an agent card with a caller-provided
-    /// [`ClientWithMiddleware`]. Lets callers inject default headers, TLS
-    /// settings, timeouts, or per-request auth middleware. For per-request
-    /// auth schemes (e.g. DPoP) where the header value must change each call,
-    /// attach a [`reqwest_middleware::Middleware`] to the client before
-    /// passing it in.
-    pub fn with_client(agent_card: AgentCard, http_client: ClientWithMiddleware) -> Self {
-        Self { http_client, agent_card }
+    /// Create a new A2A client from an agent card with a caller-provided HTTP
+    /// client or `tower` service stack. Lets callers inject default headers,
+    /// TLS settings, timeouts, or per-request auth. A preconfigured
+    /// [`reqwest::Client`] can be passed directly; for per-request auth
+    /// schemes (e.g. DPoP) where the header value must change each call, wrap
+    /// it in a [`tower::Layer`] that rewrites the [`reqwest::Request`] first.
+    pub fn with_client<S>(agent_card: AgentCard, http_client: S) -> Self
+    where
+        S: Service<reqwest::Request, Response = reqwest::Response> + Clone + Send + Sync + 'static,
+        S::Error: Into<BoxError>,
+        S::Future: Send + 'static,
+    {
+        Self { http_client: box_transport(http_client), agent_card }
     }
 
     /// Resolve an agent card from a URL (fetch from /.well-known/agent.json)
     pub async fn resolve_agent_card(base_url: &str) -> Result<AgentCard> {
-        Self::resolve_agent_card_with_client(base_url, &plain_client()).await
+        Self::resolve_agent_card_with_client(base_url, &transport::plain_transport()).await
     }
 
     /// Like [`A2aClient::resolve_agent_card`] but uses a caller-provided
@@ -51,14 +49,13 @@ impl A2aClient {
     /// endpoint (the sidecar gates both).
     pub async fn resolve_agent_card_with_client(
         base_url: &str,
-        client: &ClientWithMiddleware,
+        client: &HttpTransport,
     ) -> Result<AgentCard> {
         let url = format!("{}/.well-known/agent.json", base_url.trim_end_matches('/'));
 
-        let response =
-            client.get(&url).send().await.map_err(|e| {
-                adk_core::AdkError::agent(format!("Failed to fetch agent card: {e}"))
-            })?;
+        let response = transport::get(client, &url)
+            .await
+            .map_err(|e| adk_core::AdkError::agent(format!("Failed to fetch agent card: {e}")))?;
 
         if !response.status().is_success() {
             return Err(adk_core::AdkError::agent(format!(
@@ -81,15 +78,32 @@ impl A2aClient {
         Ok(Self::new(card))
     }
 
-    /// Like [`A2aClient::from_url`] but uses a caller-provided
-    /// [`ClientWithMiddleware`] for both the agent-card fetch and subsequent
+    /// Like [`A2aClient::from_url`] but uses a caller-provided HTTP client or
+    /// `tower` service stack for both the agent-card fetch and subsequent
     /// requests. The same client is retained on the returned `A2aClient`.
-    pub async fn from_url_with_client(
-        base_url: &str,
-        http_client: ClientWithMiddleware,
-    ) -> Result<Self> {
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_server::a2a::A2aClient;
+    /// use reqwest::header::{HeaderMap, HeaderValue};
+    ///
+    /// // Send a license JWT as a default header on every request.
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert("X-License", HeaderValue::from_static("jwt-token"));
+    /// let http = reqwest::Client::builder().default_headers(headers).build()?;
+    ///
+    /// let client = A2aClient::from_url_with_client("https://agent.example.com", http).await?;
+    /// ```
+    pub async fn from_url_with_client<S>(base_url: &str, http_client: S) -> Result<Self>
+    where
+        S: Service<reqwest::Request, Response = reqwest::Response> + Clone + Send + Sync + 'static,
+        S::Error: Into<BoxError>,
+        S::Future: Send + 'static,
+    {
+        let http_client = box_transport(http_client);
         let card = Self::resolve_agent_card_with_client(base_url, &http_client).await?;
-        Ok(Self::with_client(card, http_client))
+        Ok(Self { http_client, agent_card: card })
     }
 
     /// Get the agent card
@@ -109,11 +123,7 @@ impl A2aClient {
             id: Some(Value::String(uuid::Uuid::new_v4().to_string())),
         };
 
-        let response = self
-            .http_client
-            .post(&self.agent_card.url)
-            .json(&request)
-            .send()
+        let response = transport::post_json(&self.http_client, &self.agent_card.url, &request)
             .await
             .map_err(|e| adk_core::AdkError::agent(format!("Request failed: {e}")))?;
 
@@ -149,11 +159,7 @@ impl A2aClient {
             id: Some(Value::String(uuid::Uuid::new_v4().to_string())),
         };
 
-        let response = self
-            .http_client
-            .post(&stream_url)
-            .json(&request)
-            .send()
+        let response = transport::post_json(&self.http_client, &stream_url, &request)
             .await
             .map_err(|e| adk_core::AdkError::agent(format!("Request failed: {e}")))?;
 

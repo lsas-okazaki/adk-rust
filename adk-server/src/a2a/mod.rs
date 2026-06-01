@@ -7,6 +7,7 @@ pub mod metadata;
 pub mod parts;
 pub mod processor;
 pub mod remote_agent;
+pub mod transport;
 pub mod types;
 
 pub use agent_card::{agent_skills_from_index, build_agent_card, build_agent_skills};
@@ -20,6 +21,7 @@ pub use jsonrpc::{
 pub use metadata::{InvocationMeta, to_invocation_meta};
 pub use parts::{a2a_parts_to_adk, adk_parts_to_a2a};
 pub use remote_agent::{RemoteA2aAgent, RemoteA2aAgentBuilder, RemoteA2aConfig};
+pub use transport::{HttpTransport, box_transport};
 pub use types::*;
 
 #[cfg(feature = "a2a-interceptors")]
