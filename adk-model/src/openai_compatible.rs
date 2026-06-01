@@ -217,7 +217,7 @@ impl OpenAICompatibleConfig {
 
 /// Shared OpenAI-compatible client implementation.
 pub struct OpenAICompatible {
-    http: reqwest::Client,
+    http: reqwest_middleware::ClientWithMiddleware,
     api_key: String,
     base_url: String,
     model: String,
@@ -230,10 +230,24 @@ pub struct OpenAICompatible {
 impl OpenAICompatible {
     /// Create a new OpenAI-compatible client.
     pub fn new(config: OpenAICompatibleConfig) -> Result<Self, AdkError> {
+        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        Self::with_client(config, http)
+    }
+
+    /// Build from a caller-provided [`reqwest_middleware::ClientWithMiddleware`].
+    ///
+    /// Lets callers inject default headers, TLS settings, timeouts, or
+    /// per-request auth middleware. For per-request auth schemes (e.g. DPoP)
+    /// where the header value must change each call, attach a
+    /// [`reqwest_middleware::Middleware`] to the client before passing it in.
+    pub fn with_client(
+        config: OpenAICompatibleConfig,
+        http: reqwest_middleware::ClientWithMiddleware,
+    ) -> Result<Self, AdkError> {
         let base_url = config.base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
         Ok(Self {
-            http: reqwest::Client::new(),
+            http,
             api_key: config.api_key,
             base_url,
             model: config.model,
@@ -349,7 +363,7 @@ pub(crate) fn build_request_json(
 /// whether to parse it as JSON (non-streaming) or consume it as an SSE byte
 /// stream (streaming).
 async fn send_request(
-    http: &reqwest::Client,
+    http: &reqwest_middleware::ClientWithMiddleware,
     url: &str,
     api_key: &str,
     organization_id: &Option<String>,
