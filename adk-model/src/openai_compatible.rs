@@ -250,6 +250,23 @@ impl OpenAICompatible {
     /// per-request auth middleware. For per-request auth schemes (e.g. DPoP)
     /// where the header value must change each call, attach a
     /// [`reqwest_middleware::Middleware`] to the client before passing it in.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_model::openai_compatible::{OpenAICompatible, OpenAICompatibleConfig};
+    ///
+    /// // A reqwest client preconfigured with default headers and a timeout.
+    /// let inner = reqwest::Client::builder()
+    ///     .timeout(std::time::Duration::from_secs(30))
+    ///     .build()?;
+    /// let http = reqwest_middleware::ClientBuilder::new(inner).build();
+    ///
+    /// let model = OpenAICompatible::with_client(
+    ///     OpenAICompatibleConfig::new("my-api-key", "my-model"),
+    ///     http,
+    /// )?;
+    /// ```
     pub fn with_client(
         config: OpenAICompatibleConfig,
         http: reqwest_middleware::ClientWithMiddleware,

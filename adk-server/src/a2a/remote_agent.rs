@@ -181,6 +181,22 @@ impl RemoteA2aAgentBuilder {
     /// or proxies on the client before passing it in. For per-request header
     /// values (e.g. DPoP proofs that change every call) attach a
     /// [`reqwest_middleware::Middleware`] to the client.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_server::a2a::RemoteA2aAgent;
+    ///
+    /// let inner = reqwest::Client::builder()
+    ///     .timeout(std::time::Duration::from_secs(60))
+    ///     .build()?;
+    /// let http = reqwest_middleware::ClientBuilder::new(inner).build();
+    ///
+    /// let agent = RemoteA2aAgent::builder("remote")
+    ///     .agent_url("https://agent.example.com")
+    ///     .with_client(http)
+    ///     .build()?;
+    /// ```
     pub fn with_client(mut self, client: ClientWithMiddleware) -> Self {
         self.http_client = Some(client);
         self
@@ -379,6 +395,7 @@ mod tests {
         assert_eq!(agent.config.streaming, None);
     }
 
+    #[test]
     fn test_builder_with_client() {
         let custom = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
         let agent = RemoteA2aAgent::builder("test")
