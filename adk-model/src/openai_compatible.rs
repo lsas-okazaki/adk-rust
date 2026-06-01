@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tower::{BoxError, Service, ServiceExt};
 
 /// Configuration for OpenAI-compatible providers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,9 +226,28 @@ impl OpenAICompatibleConfig {
     }
 }
 
+/// Boxed HTTP transport used to send requests to the provider.
+///
+/// Anything that implements `tower::Service<reqwest::Request>` and yields a
+/// `reqwest::Response` fits — a bare [`reqwest::Client`] does, and so does
+/// one wrapped in `tower` layers that rewrite each request (per-request
+/// auth headers, logging, ...). See [`OpenAICompatible::with_client`].
+pub type HttpTransport =
+    tower::util::BoxCloneSyncService<reqwest::Request, reqwest::Response, BoxError>;
+
+/// Box any compatible service into an [`HttpTransport`].
+pub fn box_transport<S>(service: S) -> HttpTransport
+where
+    S: Service<reqwest::Request, Response = reqwest::Response> + Clone + Send + Sync + 'static,
+    S::Error: Into<BoxError>,
+    S::Future: Send + 'static,
+{
+    tower::util::BoxCloneSyncService::new(service.map_err(Into::into))
+}
+
 /// Shared OpenAI-compatible client implementation.
 pub struct OpenAICompatible {
-    http: reqwest::Client,
+    http: HttpTransport,
     api_key: String,
     base_url: String,
     model: String,
@@ -241,14 +261,7 @@ pub struct OpenAICompatible {
 impl OpenAICompatible {
     /// Create a new OpenAI-compatible client.
     pub fn new(config: OpenAICompatibleConfig) -> Result<Self, AdkError> {
-        let reasoning_effort = config.reasoning_effort.clone().map(|effort| match effort {
-            OaiReasoningEffort::None => OpenAIReasoningEffort::None,
-            OaiReasoningEffort::Minimal => OpenAIReasoningEffort::Minimal,
-            OaiReasoningEffort::Low => OpenAIReasoningEffort::Low,
-            OaiReasoningEffort::Medium => OpenAIReasoningEffort::Medium,
-            OaiReasoningEffort::High => OpenAIReasoningEffort::High,
-            OaiReasoningEffort::Xhigh => OpenAIReasoningEffort::XHigh,
-        });
+        let reasoning_effort = map_reasoning_effort(&config);
         Self::new_with_reasoning_effort(config, reasoning_effort)
     }
 
@@ -260,11 +273,48 @@ impl OpenAICompatible {
         config: OpenAICompatibleConfig,
         reasoning_effort: Option<OpenAIReasoningEffort>,
     ) -> Result<Self, AdkError> {
+        Self::with_client_and_reasoning_effort(config, reqwest::Client::new(), reasoning_effort)
+    }
+
+    /// Build from a caller-provided HTTP client or `tower` service stack.
+    ///
+    /// Lets callers inject default headers, TLS settings, timeouts, or
+    /// per-request auth. A preconfigured [`reqwest::Client`] can be passed
+    /// directly. For per-request auth schemes (e.g. DPoP) where the header
+    /// value must change each call, wrap the client in a [`tower::Layer`]
+    /// that rewrites the [`reqwest::Request`] before handing it on; the stack
+    /// only has to yield a [`reqwest::Response`].
+    ///
+    /// The client's default headers and TLS configuration still apply: a
+    /// `reqwest::Client` attaches them when it executes a request, not when
+    /// the request is built.
+    pub fn with_client<S>(config: OpenAICompatibleConfig, http: S) -> Result<Self, AdkError>
+    where
+        S: Service<reqwest::Request, Response = reqwest::Response> + Clone + Send + Sync + 'static,
+        S::Error: Into<BoxError>,
+        S::Future: Send + 'static,
+    {
+        let reasoning_effort = map_reasoning_effort(&config);
+        Self::with_client_and_reasoning_effort(config, http, reasoning_effort)
+    }
+
+    /// [`OpenAICompatible::with_client`] with the complete reasoning vocabulary
+    /// of [`OpenAICompatible::new_with_reasoning_effort`].
+    pub fn with_client_and_reasoning_effort<S>(
+        config: OpenAICompatibleConfig,
+        http: S,
+        reasoning_effort: Option<OpenAIReasoningEffort>,
+    ) -> Result<Self, AdkError>
+    where
+        S: Service<reqwest::Request, Response = reqwest::Response> + Clone + Send + Sync + 'static,
+        S::Error: Into<BoxError>,
+        S::Future: Send + 'static,
+    {
         crate::catalog::warn_if_obsolete(&config.provider_name, &config.model);
         let base_url = config.base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: box_transport(http),
             api_key: config.api_key,
             base_url,
             model: config.model,
@@ -292,6 +342,18 @@ impl OpenAICompatible {
     pub fn retry_config(&self) -> &RetryConfig {
         &self.retry_config
     }
+}
+
+/// Map the config's public reasoning-effort field onto the internal vocabulary.
+fn map_reasoning_effort(config: &OpenAICompatibleConfig) -> Option<OpenAIReasoningEffort> {
+    config.reasoning_effort.clone().map(|effort| match effort {
+        OaiReasoningEffort::None => OpenAIReasoningEffort::None,
+        OaiReasoningEffort::Minimal => OpenAIReasoningEffort::Minimal,
+        OaiReasoningEffort::Low => OpenAIReasoningEffort::Low,
+        OaiReasoningEffort::Medium => OpenAIReasoningEffort::Medium,
+        OaiReasoningEffort::High => OpenAIReasoningEffort::High,
+        OaiReasoningEffort::Xhigh => OpenAIReasoningEffort::XHigh,
+    })
 }
 
 /// Build the serialized JSON request body from an `LlmRequest`.
@@ -412,34 +474,69 @@ fn to_oai_reasoning_effort(effort: OpenAIReasoningEffort) -> Option<OaiReasoning
     }
 }
 
+/// Build the `POST` request `send_request` hands to the transport.
+///
+/// Built by hand rather than through `reqwest::RequestBuilder` so the request
+/// does not depend on which `reqwest::Client` ends up executing it: default
+/// headers and TLS come from the client inside the transport stack.
+fn build_post_json(
+    url: &str,
+    api_key: &str,
+    organization_id: Option<&str>,
+    body: &serde_json::Value,
+) -> Result<reqwest::Request, BoxError> {
+    use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+
+    let url = reqwest::Url::parse(url).map_err(|e| format!("invalid url {url}: {e}"))?;
+    let mut request = reqwest::Request::new(reqwest::Method::POST, url);
+    let headers = request.headers_mut();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|e| format!("api key is not a valid header value: {e}"))?,
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Some(org_id) = organization_id {
+        headers.insert(
+            "OpenAI-Organization",
+            HeaderValue::from_str(org_id)
+                .map_err(|e| format!("organization id is not a valid header value: {e}"))?,
+        );
+    }
+    let payload =
+        serde_json::to_vec(body).map_err(|e| format!("failed to serialize request: {e}"))?;
+    *request.body_mut() = Some(payload.into());
+    Ok(request)
+}
+
 /// Send an HTTP POST and handle error status codes.
 ///
 /// Returns the raw `reqwest::Response` on success so the caller can decide
 /// whether to parse it as JSON (non-streaming) or consume it as an SSE byte
 /// stream (streaming).
 async fn send_request(
-    http: &reqwest::Client,
+    http: &HttpTransport,
     url: &str,
     api_key: &str,
     organization_id: &Option<String>,
     body: &serde_json::Value,
     provider_name: &str,
 ) -> Result<reqwest::Response, AdkError> {
-    let mut http_req = http.post(url).bearer_auth(api_key).json(body);
-
-    if let Some(org_id) = organization_id {
-        http_req = http_req.header("OpenAI-Organization", org_id);
-    }
-
-    let http_resp = http_req.send().await.map_err(|e| {
+    let request_error = |message: String| {
         AdkError::new(
             ErrorComponent::Model,
             ErrorCategory::Unavailable,
             "model.openai_compat.request",
-            format!("{provider_name} request error: {e}"),
+            format!("{provider_name} request error: {message}"),
         )
         .with_provider(provider_name)
-    })?;
+    };
+
+    let http_req = build_post_json(url, api_key, organization_id.as_deref(), body)
+        .map_err(|e| request_error(e.to_string()))?;
+
+    let http_resp =
+        http.clone().oneshot(http_req).await.map_err(|e| request_error(e.to_string()))?;
 
     if !http_resp.status().is_success() {
         let status = http_resp.status();
