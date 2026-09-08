@@ -7,8 +7,9 @@ use adk_core::{
     LlmRequest, LlmResponse, LlmResponseStream, Part, SchemaAdapter, SchemaCache, UsageMetadata,
 };
 use async_openai::types::chat::{
-    CreateChatCompletionRequestArgs, ReasoningEffort as OaiReasoningEffort, ResponseFormat,
-    ResponseFormatJsonSchema,
+    ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
+    ChatCompletionRequestUserMessageContent, CreateChatCompletionRequestArgs,
+    ReasoningEffort as OaiReasoningEffort, ResponseFormat, ResponseFormatJsonSchema,
 };
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -378,6 +379,82 @@ fn map_reasoning_effort(config: &OpenAICompatibleConfig) -> Option<OpenAIReasoni
     })
 }
 
+/// Render an error together with its whole `source` chain.
+///
+/// `reqwest`'s own `Display` for a send failure is just `error sending request
+/// for url (...)`; whether it was DNS, a refused connection, or a certificate
+/// the client would not trust sits one or more levels down. Formatting with
+/// `{e}` alone therefore logs the one part that carries no information.
+///
+/// A cause already contained in its parent's message is skipped, and the
+/// comparison is against the parent alone — matching against the accumulated
+/// output lets a short message collide with the separator and truncate the
+/// rest of the chain.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = err.to_string();
+    let mut parent = rendered.clone();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !text.is_empty() && !parent.contains(&text) {
+            rendered.push_str(" | caused by: ");
+            rendered.push_str(&text);
+        }
+        parent = text;
+        source = cause.source();
+    }
+    rendered
+}
+
+/// Text of the turn appended to close an assistant-terminated conversation.
+///
+/// Deliberately contentless: it exists to satisfy the "must end with a user
+/// message" rule, and any wording carrying task semantics would silently steer
+/// the model.
+const CONTINUATION_TURN: &str = "Continue.";
+
+/// Ensure the request does not end on an assistant turn.
+///
+/// A conversation whose last message is from the assistant is an *assistant
+/// message prefill*. The Chat Completions wire format allows it, but the model
+/// behind an OpenAI-compatible gateway may not: a Bedrock-backed gateway
+/// forwards it to the Converse API, and Claude 4.6 and later reject the whole
+/// request with `This model does not support assistant message prefill. The
+/// conversation must end with a user message.`
+///
+/// ADK hands the next agent in a sequence or loop the previous agent's answer
+/// as the last entry in `contents`, so every multi-agent handoff produces that
+/// shape — the second agent in a pipeline fails on its first call while a
+/// single-agent run succeeds. ADK exposes no way to ask for a prefill, so a
+/// trailing assistant turn is always this artefact rather than an intent.
+///
+/// A trailing assistant turn carrying `tool_calls` is left alone: its `tool`
+/// messages are required next, and a user turn wedged in between trades this
+/// rejection for another.
+fn close_assistant_prefill(messages: &mut Vec<ChatCompletionRequestMessage>) {
+    let ends_on_prefill = match messages.last() {
+        Some(ChatCompletionRequestMessage::Assistant(last)) => {
+            last.tool_calls.as_ref().is_none_or(|calls| calls.is_empty())
+        }
+        _ => false,
+    };
+    if !ends_on_prefill {
+        return;
+    }
+
+    tracing::warn!(
+        "conversation ended on an assistant turn; appending a user turn because \
+         a Bedrock-backed gateway rejects assistant message prefill"
+    );
+
+    if let Ok(closing) = ChatCompletionRequestUserMessageArgs::default()
+        .content(ChatCompletionRequestUserMessageContent::Text(CONTINUATION_TURN.to_string()))
+        .build()
+    {
+        messages.push(closing.into());
+    }
+}
+
 /// Build the serialized JSON request body from an `LlmRequest`.
 ///
 /// This is shared between the streaming and non-streaming paths so that
@@ -407,7 +484,8 @@ pub(crate) fn build_request_json(
         )
         .with_provider("gemini"));
     }
-    let messages: Vec<_> = request.contents.iter().map(convert::content_to_message).collect();
+    let mut messages: Vec<_> = request.contents.iter().map(convert::content_to_message).collect();
+    close_assistant_prefill(&mut messages);
 
     let mut request_builder = CreateChatCompletionRequestArgs::default();
     request_builder.model(model).messages(messages);
@@ -558,7 +636,7 @@ async fn send_request(
         .map_err(|e| request_error(e.to_string()))?;
 
     let http_resp =
-        http.clone().oneshot(http_req).await.map_err(|e| request_error(e.to_string()))?;
+        http.clone().oneshot(http_req).await.map_err(|e| request_error(error_chain(e.as_ref())))?;
 
     if !http_resp.status().is_success() {
         let status = http_resp.status();
@@ -1185,5 +1263,121 @@ mod tests {
         let config = OpenAICompatibleConfig::gemini("k", "gemini-3.5-flash");
         let client = OpenAICompatible::new(config).expect("client builds");
         assert_eq!(client.name(), "gemini-3.5-flash");
+    }
+}
+
+#[cfg(test)]
+mod prefill_tests {
+    use super::*;
+    use adk_core::{Content, Part};
+    use async_openai::types::chat::ChatCompletionRequestAssistantMessageArgs;
+
+    fn user(text: &str) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestUserMessageArgs::default()
+            .content(ChatCompletionRequestUserMessageContent::Text(text.to_string()))
+            .build()
+            .unwrap()
+            .into()
+    }
+
+    fn assistant(text: &str) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestAssistantMessageArgs::default()
+            .content(text.to_string())
+            .build()
+            .unwrap()
+            .into()
+    }
+
+    fn last_user_text(messages: &[ChatCompletionRequestMessage]) -> Option<String> {
+        match messages.last() {
+            Some(ChatCompletionRequestMessage::User(last)) => match &last.content {
+                ChatCompletionRequestUserMessageContent::Text(text) => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The shape every ADK multi-agent handoff produces: the next agent is
+    /// handed the previous agent's answer as the last entry.
+    #[test]
+    fn a_conversation_ending_on_an_assistant_turn_gets_a_closing_user_turn() {
+        let mut messages = vec![user("Create Probe1."), assistant("Probe1 created.")];
+
+        close_assistant_prefill(&mut messages);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(last_user_text(&messages).as_deref(), Some(CONTINUATION_TURN));
+    }
+
+    #[test]
+    fn a_conversation_already_ending_on_a_user_turn_is_left_alone() {
+        let mut messages = vec![user("Create Probe1."), assistant("Done."), user("Verify it.")];
+
+        close_assistant_prefill(&mut messages);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(last_user_text(&messages).as_deref(), Some("Verify it."));
+    }
+
+    /// A pending tool call must stay last so its `tool` messages can follow;
+    /// closing it off trades one rejection for another.
+    #[test]
+    fn a_trailing_assistant_turn_with_tool_calls_is_left_alone() {
+        let contents = [Content {
+            role: "model".to_string(),
+            parts: vec![Part::FunctionCall {
+                name: "create_satellite".to_string(),
+                args: serde_json::json!({}),
+                id: Some("call_abc".to_string()),
+                thought_signature: None,
+            }],
+        }];
+        let mut messages: Vec<_> = contents.iter().map(convert::content_to_message).collect();
+        assert_eq!(messages.len(), 1);
+
+        close_assistant_prefill(&mut messages);
+
+        assert_eq!(messages.len(), 1, "a pending tool call must stay last");
+    }
+
+    #[test]
+    fn an_empty_conversation_gets_no_closing_turn() {
+        let mut messages: Vec<ChatCompletionRequestMessage> = Vec::new();
+
+        close_assistant_prefill(&mut messages);
+
+        assert!(messages.is_empty());
+    }
+
+    /// `reqwest`'s outermost message names no cause, so the chain is the only
+    /// place a TLS or DNS failure is stated.
+    #[test]
+    fn error_chain_appends_causes_and_skips_ones_already_shown() {
+        #[derive(Debug)]
+        struct Layer(String, Option<Box<Layer>>);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_ref().map(|s| s.as_ref() as &(dyn std::error::Error + 'static))
+            }
+        }
+
+        let deep = Layer(
+            "error sending request for url (https://gw/v1/chat/completions)".into(),
+            Some(Box::new(Layer(
+                "invalid peer certificate: UnknownIssuer".into(),
+                Some(Box::new(Layer("UnknownIssuer".into(), None))),
+            ))),
+        );
+        let rendered = error_chain(&deep);
+        assert!(rendered.starts_with("error sending request for url"));
+        assert!(rendered.contains("invalid peer certificate: UnknownIssuer"));
+        // The leaf repeats its parent's wording, so it is not appended twice.
+        assert_eq!(rendered.matches(" | caused by: ").count(), 1);
     }
 }
