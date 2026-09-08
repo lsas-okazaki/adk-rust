@@ -34,7 +34,49 @@ fn fallback_tool_call_id(name: &str) -> String {
     format!("call_{name}")
 }
 
+/// Convert one ADK `Content` into every OpenAI message it becomes.
+///
+/// Each role maps to exactly one message except `function`/`tool`: a
+/// tool-result `Content` can carry **several** `FunctionResponse` parts, one
+/// per call in a parallel tool turn, and Chat Completions has nowhere to put
+/// more than one result in a message — each needs its own `tool` message with
+/// its own `tool_call_id`. [`content_to_message`] returns only the first, which
+/// silently drops the rest; the model then rejects the whole request naming the
+/// ids it never received (`Expected toolResult blocks at messages.N.content for
+/// the following Ids: ...`). Prefer this function when building a request.
+pub fn content_to_messages(content: &Content) -> Vec<ChatCompletionRequestMessage> {
+    if !matches!(content.role.as_str(), "function" | "tool") {
+        return vec![content_to_message(content)];
+    }
+
+    let messages: Vec<ChatCompletionRequestMessage> = content
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::FunctionResponse { function_response, id, .. } => {
+                let tool_call_id =
+                    id.clone().unwrap_or_else(|| fallback_tool_call_id(&function_response.name));
+                ChatCompletionRequestToolMessageArgs::default()
+                    .tool_call_id(tool_call_id)
+                    .content(crate::tool_result::serialize_tool_result(&function_response.response))
+                    .build()
+                    .ok()
+                    .map(Into::into)
+            }
+            _ => None,
+        })
+        .collect();
+
+    // A tool-role Content with no usable response part still has to become
+    // something, or the turn it answers loses its reply entirely.
+    if messages.is_empty() { vec![content_to_message(content)] } else { messages }
+}
+
 /// Convert ADK Content to OpenAI ChatCompletionRequestMessage.
+///
+/// Returns a single message, so a tool-result `Content` carrying more than one
+/// `FunctionResponse` keeps only the first — see [`content_to_messages`], which
+/// is what a request builder should use.
 pub fn content_to_message(content: &Content) -> ChatCompletionRequestMessage {
     match content.role.as_str() {
         "user" => {
@@ -154,9 +196,14 @@ pub fn content_to_message(content: &Content) -> ChatCompletionRequestMessage {
                     .unwrap()
                     .into()
             } else {
-                // Fallback to user message
+                // Fallback to a user message. Never empty: a blank text block
+                // is itself rejected by some backends ("text content blocks
+                // must be non-empty"), so send whatever text the parts hold and
+                // a single space when there is none.
+                let text = extract_text(&content.parts);
+                let text = if text.trim().is_empty() { " ".to_string() } else { text };
                 ChatCompletionRequestUserMessageArgs::default()
-                    .content(ChatCompletionRequestUserMessageContent::Text(String::new()))
+                    .content(ChatCompletionRequestUserMessageContent::Text(text))
                     .build()
                     .unwrap()
                     .into()
@@ -855,6 +902,103 @@ mod tests {
                 json.contains("\"detail\":\"auto\""),
                 "serialized request should carry `\"detail\":\"auto\"`: {json}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod parallel_tool_result_tests {
+    use super::*;
+    use adk_core::FunctionResponseData;
+
+    fn response(name: &str, id: &str) -> Part {
+        Part::FunctionResponse {
+            function_response: FunctionResponseData::new(name, serde_json::json!({"ok": true})),
+            id: Some(id.to_string()),
+            annotations: None,
+        }
+    }
+
+    fn tool_call_ids(messages: &[ChatCompletionRequestMessage]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                ChatCompletionRequestMessage::Tool(t) => Some(t.tool_call_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A parallel tool turn answers several calls in one `Content`. Chat
+    /// Completions needs one `tool` message per id; keeping only the first
+    /// makes the model reject the request for the ids it never received.
+    #[test]
+    fn every_function_response_in_one_content_becomes_its_own_tool_message() {
+        let content = Content {
+            role: "tool".to_string(),
+            parts: vec![
+                response("load_mcp_resource", "tooluse_first"),
+                response("load_mcp_resource", "tooluse_second"),
+            ],
+        };
+
+        let messages = content_to_messages(&content);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(tool_call_ids(&messages), vec!["tooluse_first", "tooluse_second"]);
+    }
+
+    /// The single-message helper is what dropped them — pinned so the
+    /// difference between the two functions stays visible.
+    #[test]
+    fn the_single_message_helper_keeps_only_the_first_response() {
+        let content = Content {
+            role: "tool".to_string(),
+            parts: vec![response("a", "tooluse_first"), response("b", "tooluse_second")],
+        };
+
+        assert_eq!(tool_call_ids(&[content_to_message(&content)]), vec!["tooluse_first"]);
+    }
+
+    #[test]
+    fn a_single_response_still_becomes_exactly_one_tool_message() {
+        let content = Content {
+            role: "tool".to_string(),
+            parts: vec![response("get_weather", "tooluse_only")],
+        };
+
+        let messages = content_to_messages(&content);
+
+        assert_eq!(tool_call_ids(&messages), vec!["tooluse_only"]);
+    }
+
+    #[test]
+    fn a_non_tool_content_still_becomes_exactly_one_message() {
+        let content = Content {
+            role: "user".to_string(),
+            parts: vec![Part::Text { text: "Create Probe1.".to_string() }],
+        };
+
+        assert_eq!(content_to_messages(&content).len(), 1);
+    }
+
+    /// A tool-role Content with nothing usable must not vanish, and must not
+    /// become a blank message either — an empty text block is itself rejected.
+    #[test]
+    fn a_tool_content_with_no_response_part_falls_back_to_non_empty_text() {
+        let content = Content { role: "tool".to_string(), parts: vec![] };
+
+        let messages = content_to_messages(&content);
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0] {
+            ChatCompletionRequestMessage::User(m) => match &m.content {
+                ChatCompletionRequestUserMessageContent::Text(text) => {
+                    assert!(!text.is_empty(), "a blank text block is rejected by some backends");
+                }
+                other => panic!("expected text content, got {other:?}"),
+            },
+            other => panic!("expected a user message, got {other:?}"),
         }
     }
 }

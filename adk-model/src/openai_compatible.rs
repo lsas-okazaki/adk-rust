@@ -7,9 +7,9 @@ use adk_core::{
     LlmRequest, LlmResponse, LlmResponseStream, Part, SchemaAdapter, SchemaCache, UsageMetadata,
 };
 use async_openai::types::chat::{
-    ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
-    ChatCompletionRequestUserMessageContent, CreateChatCompletionRequestArgs, ReasoningEffort,
-    ResponseFormat, ResponseFormatJsonSchema,
+    ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContent,
+    CreateChatCompletionRequestArgs, ReasoningEffort, ResponseFormat, ResponseFormatJsonSchema,
 };
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -333,6 +333,53 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     rendered
 }
 
+/// One-line summary of an assembled message list: role, and the ids that pair
+/// an assistant `tool_call` with its `tool` reply.
+///
+/// A gateway rejects a request on the *shape* of `messages` and names an index
+/// (`messages.6`) that means nothing without the shape to index into — an
+/// unpaired tool id and an assistant-terminated conversation both arrive that
+/// way. Logging roles, ids and text lengths rather than content keeps prompts
+/// and tool payloads out of the log.
+fn describe_messages(messages: &[ChatCompletionRequestMessage]) -> String {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, message)| {
+            let described = match message {
+                ChatCompletionRequestMessage::System(_) => "system".to_string(),
+                ChatCompletionRequestMessage::User(_) => "user".to_string(),
+                ChatCompletionRequestMessage::Assistant(m) => {
+                    let calls: Vec<&str> = m
+                        .tool_calls
+                        .as_ref()
+                        .map(|calls| {
+                            calls
+                                .iter()
+                                .map(|call| match call {
+                                    ChatCompletionMessageToolCalls::Function(f) => f.id.as_str(),
+                                    _ => "?",
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if calls.is_empty() {
+                        "assistant{text}".to_string()
+                    } else {
+                        format!("assistant{{tool_calls #{}}}", calls.join(",#"))
+                    }
+                }
+                ChatCompletionRequestMessage::Tool(m) => {
+                    format!("tool{{#{}}}", m.tool_call_id)
+                }
+                _ => "other".to_string(),
+            };
+            format!("[{i}]{described}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Text of the turn appended to close an assistant-terminated conversation.
 ///
 /// Deliberately contentless: it exists to satisfy the "must end with a user
@@ -395,8 +442,20 @@ pub(crate) fn build_request_json(
     adapter: &dyn SchemaAdapter,
     cache: &SchemaCache,
 ) -> Result<serde_json::Value, AdkError> {
-    let mut messages: Vec<_> = request.contents.iter().map(convert::content_to_message).collect();
+    // `content_to_messages`, not `content_to_message`: a tool-result `Content`
+    // can hold one response per call in a parallel tool turn, and each of those
+    // needs its own `tool` message.
+    let mut messages: Vec<_> =
+        request.contents.iter().flat_map(convert::content_to_messages).collect();
     close_assistant_prefill(&mut messages);
+
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!(
+            model,
+            messages = %describe_messages(&messages),
+            "openai-compatible chat completion request"
+        );
+    }
 
     let mut request_builder = CreateChatCompletionRequestArgs::default();
     request_builder.model(model).messages(messages);
