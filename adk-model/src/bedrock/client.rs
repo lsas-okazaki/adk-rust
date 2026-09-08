@@ -14,7 +14,69 @@ use adk_core::{AdkError, Llm, LlmRequest, LlmResponse, LlmResponseStream};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::types::ConverseStreamOutput;
+use aws_smithy_types::error::display::DisplayErrorContext;
 use tracing::{debug, info, instrument};
+
+/// Render an `SdkError` with its whole source chain.
+///
+/// `SdkError`'s own `Display` is only a category — a rejected request prints
+/// the bare string `service error`, and the sentence that says what is wrong
+/// (`ValidationException: ...`) lives one or more levels down in `source()`.
+/// Formatting the error with `{e}` therefore throws away the only part worth
+/// logging. [`DisplayErrorContext`] is the AWS SDK's own wrapper for walking
+/// that chain.
+fn describe<E>(err: &E) -> String
+where
+    E: std::error::Error + 'static,
+{
+    DisplayErrorContext(err).to_string()
+}
+
+/// One-line summary of an assembled Converse message list: role, block kinds,
+/// and the ids that pair `toolUse` with `toolResult`.
+///
+/// Converse rejects a request on the *shape* of `messages` — an unpaired
+/// `toolUse` id, a blank text block — and the rejection names a message index
+/// (`messages.2: ...`) that means nothing without the shape to index into.
+/// Logging kinds and ids rather than content keeps prompts and tool payloads
+/// out of the log while still making those errors readable.
+fn describe_messages(messages: &[aws_sdk_bedrockruntime::types::Message]) -> String {
+    use aws_sdk_bedrockruntime::types::ContentBlock;
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, message)| {
+            let blocks = message
+                .content
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::Text(text) => {
+                        if text.trim().is_empty() {
+                            "text(BLANK)".to_string()
+                        } else {
+                            format!("text({})", text.len())
+                        }
+                    }
+                    ContentBlock::ToolUse(tool_use) => {
+                        format!("toolUse({}#{})", tool_use.name, tool_use.tool_use_id)
+                    }
+                    ContentBlock::ToolResult(result) => {
+                        format!("toolResult(#{})", result.tool_use_id)
+                    }
+                    ContentBlock::Image(_) => "image".to_string(),
+                    ContentBlock::Document(_) => "document".to_string(),
+                    ContentBlock::ReasoningContent(_) => "reasoning".to_string(),
+                    ContentBlock::CachePoint(_) => "cachePoint".to_string(),
+                    _ => "other".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{i}]{:?}{{{blocks}}}", message.role)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Amazon Bedrock client backed by the AWS SDK Converse API.
 ///
@@ -131,7 +193,14 @@ impl BedrockClient {
         &self,
         input: super::convert::BedrockConverseInput,
     ) -> Result<LlmResponseStream, AdkError> {
-        debug!("bedrock non-streaming converse for model={}", self.model_id);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                model = %self.model_id,
+                messages = %describe_messages(&input.messages),
+                system_blocks = input.system.len(),
+                "bedrock non-streaming converse"
+            );
+        }
 
         let response = self
             .client
@@ -145,8 +214,10 @@ impl BedrockClient {
             .await
             .map_err(|e| {
                 AdkError::model(format!(
-                    "Bedrock API error for region={}, model={}: {e}",
-                    self.region, self.model_id
+                    "Bedrock API error for region={}, model={}: {}",
+                    self.region,
+                    self.model_id,
+                    describe(&e)
                 ))
             })?;
 
@@ -169,7 +240,14 @@ impl BedrockClient {
         &self,
         input: super::convert::BedrockConverseInput,
     ) -> Result<LlmResponseStream, AdkError> {
-        debug!("bedrock streaming converse for model={}", self.model_id);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                model = %self.model_id,
+                messages = %describe_messages(&input.messages),
+                system_blocks = input.system.len(),
+                "bedrock streaming converse"
+            );
+        }
 
         let mut stream_output = self
             .client
@@ -183,8 +261,10 @@ impl BedrockClient {
             .await
             .map_err(|e| {
                 AdkError::model(format!(
-                    "Bedrock API error for region={}, model={}: {e}",
-                    self.region, self.model_id
+                    "Bedrock API error for region={}, model={}: {}",
+                    self.region,
+                    self.model_id,
+                    describe(&e)
                 ))
             })?;
 
@@ -206,7 +286,8 @@ impl BedrockClient {
 
             while let Some(event) = stream_output.stream.recv().await.map_err(|e| {
                 AdkError::model(format!(
-                    "Bedrock stream error for region={region}, model={model_id}: {e}"
+                    "Bedrock stream error for region={region}, model={model_id}: {}",
+                    describe(&e)
                 ))
             })? {
                 match event {
