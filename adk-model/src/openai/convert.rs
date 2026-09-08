@@ -17,6 +17,23 @@ use async_openai::types::chat::{
 };
 use std::collections::HashMap;
 
+/// Fallback tool-call id for a `Part` that carries none.
+///
+/// A `tool` message is matched to the assistant's `tool_call` by id, and a
+/// mismatch fails the request — a Bedrock-backed gateway reports it as
+/// ``messages.N: `tool_use` ids were found without `tool_result` blocks
+/// immediately after``. Call and response must therefore derive the SAME
+/// fallback, so it comes from the only field both sides carry: the function
+/// name. (The response side used to fall back to the constant `"unknown"`,
+/// which never matched the call's `call_<name>`.)
+///
+/// Deriving from the name means two id-less calls to the same tool in one turn
+/// still collide; the caller has to supply ids for parallel calls, which the
+/// current ADK paths do.
+fn fallback_tool_call_id(name: &str) -> String {
+    format!("call_{name}")
+}
+
 /// Convert ADK Content to OpenAI ChatCompletionRequestMessage.
 pub fn content_to_message(content: &Content) -> ChatCompletionRequestMessage {
     match content.role.as_str() {
@@ -128,7 +145,8 @@ pub fn content_to_message(content: &Content) -> ChatCompletionRequestMessage {
             if let Some(Part::FunctionResponse { function_response, id, .. }) =
                 content.parts.first()
             {
-                let tool_call_id = id.clone().unwrap_or_else(|| "unknown".to_string());
+                let tool_call_id =
+                    id.clone().unwrap_or_else(|| fallback_tool_call_id(&function_response.name));
                 ChatCompletionRequestToolMessageArgs::default()
                     .tool_call_id(tool_call_id)
                     .content(crate::tool_result::serialize_tool_result(&function_response.response))
@@ -220,7 +238,7 @@ fn extract_tool_calls(parts: &[Part]) -> Vec<ChatCompletionMessageToolCalls> {
         .filter_map(|part| {
             if let Part::FunctionCall { name, args, id, .. } = part {
                 Some(ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
-                    id: id.clone().unwrap_or_else(|| format!("call_{}", name)),
+                    id: id.clone().unwrap_or_else(|| fallback_tool_call_id(name)),
                     function: FunctionCall {
                         name: name.clone(),
                         arguments: serde_json::to_string(args).unwrap_or_default(),
