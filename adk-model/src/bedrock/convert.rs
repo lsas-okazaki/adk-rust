@@ -100,6 +100,8 @@ pub(crate) fn adk_request_to_bedrock(
         }
     }
 
+    close_assistant_prefill(&mut messages)?;
+
     // Inject CachePoint after system content when prompt caching is enabled.
     if let Some(cache_config) = prompt_caching
         && !system.is_empty()
@@ -112,6 +114,59 @@ pub(crate) fn adk_request_to_bedrock(
         if tools.is_empty() { None } else { Some(adk_tools_to_bedrock(tools, prompt_caching)) };
 
     Ok(BedrockConverseInput { messages, system, inference_config, tool_config })
+}
+
+/// Text of the turn appended to close an assistant-terminated conversation.
+///
+/// Deliberately contentless: it exists to satisfy Converse's "must end with a
+/// user message" rule, and any wording carrying task semantics would silently
+/// steer the model.
+const CONTINUATION_TURN: &str = "Continue.";
+
+/// Ensure the conversation does not end on an assistant turn.
+///
+/// A request whose last message is from the assistant is an *assistant message
+/// prefill* — asking the model to continue its own half-written turn. Claude
+/// 4.6 and later dropped support for it, and Bedrock rejects the whole request:
+/// `ValidationException: This model does not support assistant message
+/// prefill. The conversation must end with a user message.` Older models
+/// (including the non-Claude ones) accept it, which is why this only surfaces
+/// on a model upgrade.
+///
+/// ADK hands the next agent in a sequence or loop the previous agent's answer
+/// as the last thing in `contents`, so *every* multi-agent handoff ends on an
+/// assistant turn. Appending a contentless user turn is what lets those
+/// pipelines run on a current Claude model at all; it is the same class of
+/// adaptation this module already performs (dropping blank text, merging tool
+/// results, rendering thinking as text).
+/// A trailing assistant turn that holds a `toolUse` is left alone: Converse
+/// requires its `toolResult` in the very next message, so wedging a text turn
+/// in between trades this rejection for `messages.N: `tool_use` ids were found
+/// without `tool_result` blocks immediately after`. Such a request is
+/// mid-tool-call and the runner is expected to supply the result.
+fn close_assistant_prefill(messages: &mut Vec<Message>) -> Result<(), String> {
+    let Some(last) = messages.last() else {
+        return Ok(());
+    };
+    if last.role != ConversationRole::Assistant {
+        return Ok(());
+    }
+    if last.content.iter().any(|block| matches!(block, ContentBlock::ToolUse(_))) {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        "conversation ended on an assistant turn; appending a user turn because \
+         Claude 4.6+ rejects assistant message prefill"
+    );
+
+    let closing = Message::builder()
+        .role(ConversationRole::User)
+        .content(ContentBlock::Text(CONTINUATION_TURN.to_string()))
+        .build()
+        .map_err(|e| format!("Failed to build the closing Bedrock message: {e}"))?;
+    messages.push(closing);
+    Ok(())
 }
 
 /// Build a `CachePointBlock` from the given cache configuration.
@@ -222,6 +277,24 @@ fn part_mime_type(part: &Part) -> Option<&str> {
     }
 }
 
+/// Fallback tool-call id for a `Part` that carries none.
+///
+/// Bedrock pairs `toolUse` and `toolResult` by id, and rejects any request in
+/// which a `toolUse` has no `toolResult` carrying the same id in the message
+/// immediately after — `messages.N: `tool_use` ids were found without
+/// `tool_result` blocks immediately after`. Call and response must therefore
+/// derive the *same* fallback, so it is derived from the only field both sides
+/// carry: the function name. (The response side previously fell back to the
+/// constant `"unknown"`, which never matched the call's `call_<name>` and made
+/// every id-less pair fail the request.)
+///
+/// Deriving from the name means two id-less calls to the *same* tool in one
+/// turn still collide. Nothing here can separate them — the caller has to
+/// supply ids for parallel calls, which the current ADK paths do.
+fn fallback_tool_id(name: &str) -> String {
+    format!("call_{name}")
+}
+
 fn convert_one_part(
     part: &Part,
     contains_function_call: bool,
@@ -237,7 +310,7 @@ fn convert_one_part(
         }
         Part::FunctionCall { name, args, id, .. } => {
             let tool_use = ToolUseBlock::builder()
-                .tool_use_id(id.clone().unwrap_or_else(|| format!("call_{name}")))
+                .tool_use_id(id.clone().unwrap_or_else(|| fallback_tool_id(name)))
                 .name(name.clone())
                 .input(json_value_to_document(args))
                 .build()
@@ -246,7 +319,9 @@ fn convert_one_part(
         }
         Part::FunctionResponse { function_response, id, .. } => {
             let tool_result = ToolResultBlock::builder()
-                .tool_use_id(id.clone().unwrap_or_else(|| "unknown".to_string()))
+                .tool_use_id(
+                    id.clone().unwrap_or_else(|| fallback_tool_id(&function_response.name)),
+                )
                 .content(ToolResultContentBlock::Text(crate::tool_result::serialize_tool_result(
                     &function_response.response,
                 )))
@@ -812,7 +887,11 @@ mod tests {
         ];
 
         let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
-        assert_eq!(result.messages.len(), 3);
+        // Both "model" and "assistant" map to the Assistant role. The fourth
+        // message is the closing user turn `close_assistant_prefill` adds
+        // because this conversation ends on an assistant turn — covered by
+        // `a_conversation_ending_on_an_assistant_turn_gets_a_closing_user_turn`.
+        assert_eq!(result.messages.len(), 4);
         assert_eq!(result.messages[0].role, ConversationRole::User);
         assert_eq!(result.messages[1].role, ConversationRole::Assistant);
         assert_eq!(result.messages[2].role, ConversationRole::Assistant);
@@ -859,6 +938,214 @@ mod tests {
         let blocks = &result.messages[0].content;
         assert_eq!(blocks.len(), 1);
         assert!(matches!(&blocks[0], ContentBlock::ToolUse(_)));
+    }
+
+    /// The shape every ADK multi-agent handoff produces: the next agent gets
+    /// the previous agent's answer as the last entry, so the conversation ends
+    /// on an assistant turn. Claude 4.6+ rejects that as an assistant message
+    /// prefill, so a closing user turn has to be appended.
+    #[test]
+    fn a_conversation_ending_on_an_assistant_turn_gets_a_closing_user_turn() {
+        let contents = vec![
+            Content {
+                role: "user".to_string(),
+                parts: vec![Part::Text { text: "Create Probe1.".to_string() }],
+            },
+            Content {
+                role: "model".to_string(),
+                parts: vec![Part::Text { text: "Probe1 created.".to_string() }],
+            },
+        ];
+
+        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+
+        assert_eq!(result.messages.len(), 3);
+        assert_eq!(result.messages[2].role, ConversationRole::User);
+        match &result.messages[2].content[0] {
+            ContentBlock::Text(text) => assert_eq!(text, CONTINUATION_TURN),
+            other => panic!("expected a text block, got {other:?}"),
+        }
+    }
+
+    /// A tool-result turn is a user turn, so the common operator shape needs no
+    /// closing turn — appending one there would add a message to every request.
+    #[test]
+    fn a_conversation_ending_on_a_tool_result_is_left_alone() {
+        let contents = vec![
+            Content {
+                role: "model".to_string(),
+                parts: vec![Part::FunctionCall {
+                    name: "get_weather".to_string(),
+                    args: serde_json::json!({}),
+                    id: Some("tooluse_abc".to_string()),
+                    thought_signature: None,
+                }],
+            },
+            Content {
+                role: "user".to_string(),
+                parts: vec![Part::FunctionResponse {
+                    function_response: FunctionResponseData::new(
+                        "get_weather",
+                        serde_json::json!({"temp": 72}),
+                    ),
+                    id: Some("tooluse_abc".to_string()),
+                    annotations: None,
+                }],
+            },
+        ];
+
+        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.messages[1].role, ConversationRole::User);
+    }
+
+    /// An assistant turn holding only a `toolUse` must NOT be closed off: its
+    /// `toolResult` is required in the very next message, and a text turn
+    /// wedged in between fails the request a different way.
+    #[test]
+    fn a_trailing_tool_use_turn_is_left_alone() {
+        let contents = vec![Content {
+            role: "model".to_string(),
+            parts: vec![Part::FunctionCall {
+                name: "get_weather".to_string(),
+                args: serde_json::json!({}),
+                id: Some("tooluse_abc".to_string()),
+                thought_signature: None,
+            }],
+        }];
+
+        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+
+        assert_eq!(
+            result.messages.len(),
+            1,
+            "a pending tool call must stay last so its result can follow"
+        );
+    }
+
+    #[test]
+    fn an_empty_conversation_gets_no_closing_turn() {
+        let result = adk_request_to_bedrock(&[], &HashMap::new(), None, None).unwrap();
+        assert!(result.messages.is_empty());
+    }
+
+    /// Converse pairs `toolUse` with `toolResult` by id and rejects the whole
+    /// request when a call has no result carrying the same id in the next
+    /// message: ``messages.N: `tool_use` ids were found without `tool_result`
+    /// blocks immediately after``. When neither `Part` carries an id the two
+    /// sides must still derive the same fallback.
+    #[test]
+    fn id_less_call_and_response_derive_the_same_tool_use_id() {
+        let contents = vec![
+            Content {
+                role: "model".to_string(),
+                parts: vec![Part::FunctionCall {
+                    name: "get_weather".to_string(),
+                    args: serde_json::json!({"city": "Seattle"}),
+                    id: None,
+                    thought_signature: None,
+                }],
+            },
+            Content {
+                role: "user".to_string(),
+                parts: vec![Part::FunctionResponse {
+                    function_response: FunctionResponseData::new(
+                        "get_weather",
+                        serde_json::json!({"temp": 72}),
+                    ),
+                    id: None,
+                    annotations: None,
+                }],
+            },
+        ];
+
+        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+        assert_eq!(result.messages.len(), 2);
+
+        let call_id = match &result.messages[0].content[0] {
+            ContentBlock::ToolUse(tool_use) => tool_use.tool_use_id.clone(),
+            other => panic!("expected a toolUse block, got {other:?}"),
+        };
+        let result_id = match &result.messages[1].content[0] {
+            ContentBlock::ToolResult(tool_result) => tool_result.tool_use_id.clone(),
+            other => panic!("expected a toolResult block, got {other:?}"),
+        };
+
+        assert_eq!(call_id, result_id, "an unpaired id makes Bedrock reject the whole request");
+    }
+
+    /// An explicit id always wins; the fallback is only for a missing one.
+    #[test]
+    fn an_explicit_id_is_preserved_on_both_sides() {
+        let contents = vec![
+            Content {
+                role: "model".to_string(),
+                parts: vec![Part::FunctionCall {
+                    name: "get_weather".to_string(),
+                    args: serde_json::json!({}),
+                    id: Some("tooluse_abc".to_string()),
+                    thought_signature: None,
+                }],
+            },
+            Content {
+                role: "user".to_string(),
+                parts: vec![Part::FunctionResponse {
+                    function_response: FunctionResponseData::new(
+                        "get_weather",
+                        serde_json::json!({}),
+                    ),
+                    id: Some("tooluse_abc".to_string()),
+                    annotations: None,
+                }],
+            },
+        ];
+
+        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+
+        match (&result.messages[0].content[0], &result.messages[1].content[0]) {
+            (ContentBlock::ToolUse(call), ContentBlock::ToolResult(response)) => {
+                assert_eq!(call.tool_use_id, "tooluse_abc");
+                assert_eq!(response.tool_use_id, "tooluse_abc");
+            }
+            other => panic!("expected a toolUse/toolResult pair, got {other:?}"),
+        }
+    }
+
+    /// Two id-less calls to *different* tools must not collide onto one id —
+    /// that would pair both results with the same call.
+    #[test]
+    fn id_less_calls_to_different_tools_get_distinct_ids() {
+        let contents = vec![Content {
+            role: "model".to_string(),
+            parts: vec![
+                Part::FunctionCall {
+                    name: "get_weather".to_string(),
+                    args: serde_json::json!({}),
+                    id: None,
+                    thought_signature: None,
+                },
+                Part::FunctionCall {
+                    name: "get_time".to_string(),
+                    args: serde_json::json!({}),
+                    id: None,
+                    thought_signature: None,
+                },
+            ],
+        }];
+
+        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+        let ids: Vec<String> = result.messages[0]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse(tool_use) => Some(tool_use.tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
     }
 
     #[test]
