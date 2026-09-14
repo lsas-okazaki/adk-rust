@@ -509,30 +509,24 @@ pub async fn apply_compaction_with_retry(
     Err(ContextOverflowError { token_count: final_tokens, limit: config.context_budget }.into())
 }
 
+/// Characters per token, the heuristic shared with
+/// [`adk_core::intra_compaction::estimate_tokens`].
+const CHARS_PER_TOKEN: u32 = 4;
+
 /// Estimates the total token count for a slice of events.
 ///
-/// Uses a simple heuristic of ~4 characters per token, consistent with
-/// `adk_core::intra_compaction::estimate_tokens`.
+/// Delegates to [`adk_core::intra_compaction::estimate_tokens`], which sizes
+/// function calls and function responses by their serialized JSON.
+///
+/// This used to count every non-text part as a flat 20 characters while
+/// documenting itself as consistent with that estimator. For a chat-only
+/// conversation the two agree; for a tool-using agent they do not, and the gap
+/// is unbounded — a 200 KB tool result scored about 5 tokens, so an agent whose
+/// context is mostly tool output never reached `context_budget` and compaction
+/// only ever ran reactively, after the provider had already rejected the
+/// request.
 pub fn estimate_event_tokens(events: &[Event]) -> usize {
-    let total_chars: usize = events
-        .iter()
-        .map(|e| {
-            e.content()
-                .map(|c| {
-                    c.parts
-                        .iter()
-                        .map(|p| match p {
-                            adk_core::Part::Text { text } => text.len(),
-                            _ => 20, // rough estimate for non-text parts
-                        })
-                        .sum::<usize>()
-                })
-                .unwrap_or(0)
-        })
-        .sum();
-
-    // ~4 chars per token
-    total_chars / 4
+    adk_core::intra_compaction::estimate_tokens(events, CHARS_PER_TOKEN) as usize
 }
 
 #[cfg(test)]
@@ -731,6 +725,46 @@ mod tests {
         event.set_content(Content::new("user").with_text("Hello world"));
         let events = vec![event];
         assert_eq!(estimate_event_tokens(&events), 11 / 4); // 2
+    }
+
+    #[test]
+    fn test_estimate_event_tokens_counts_tool_payloads() {
+        // The case the flat 20-chars-per-part heuristic got wrong: a tool
+        // result is the bulk of a tool-using agent's context, and scoring it as
+        // a constant kept `context_budget` out of reach however long the
+        // conversation grew.
+        let mut event = Event::new("inv");
+        let mut content = Content::new("user");
+        content.parts.push(adk_core::Part::FunctionResponse {
+            function_response: adk_core::FunctionResponseData::new(
+                "compute_access",
+                serde_json::json!({ "rows": "x".repeat(40_000) }),
+            ),
+            id: None,
+            annotations: None,
+        });
+        event.set_content(content);
+
+        let tokens = estimate_event_tokens(&[event]);
+        assert!(
+            tokens > 9_000,
+            "a 40 KB tool payload must not score like a short string (got {tokens})"
+        );
+    }
+
+    #[test]
+    fn test_estimate_event_tokens_counts_call_arguments() {
+        let mut event = Event::new("inv");
+        let mut content = Content::new("model");
+        content.parts.push(adk_core::Part::FunctionCall {
+            name: "sweep_orbit_access".to_string(),
+            args: serde_json::json!({ "values": vec![1.5_f64; 2_000] }),
+            id: None,
+            thought_signature: None,
+        });
+        event.set_content(content);
+
+        assert!(estimate_event_tokens(&[event]) > 1_000);
     }
 
     #[tokio::test]
