@@ -470,6 +470,34 @@ pub async fn apply_compaction_with_retry(
     config: &CompactionConfig,
     events: Vec<Event>,
 ) -> Result<Vec<Event>, AdkError> {
+    compact_to_budget(config, events, config.context_budget).await
+}
+
+/// Share of the rejected history's estimate that reactive compaction aims for.
+const REACTIVE_TARGET_PERCENT: usize = 75;
+
+/// Compacts a history the model has just rejected as too long.
+///
+/// Unlike [`apply_compaction_with_retry`], the target is not `context_budget`
+/// alone: a rejection means the estimate undercounts this provider's tokens,
+/// and a history whose estimate is already under budget would come back
+/// unchanged and be resent as the same oversized request. The target is the
+/// smaller of the budget and [`REACTIVE_TARGET_PERCENT`] of the rejected
+/// history's estimate, so every reactive pass removes something.
+pub async fn apply_reactive_compaction(
+    config: &CompactionConfig,
+    events: Vec<Event>,
+) -> Result<Vec<Event>, AdkError> {
+    let estimated = estimate_event_tokens(&events);
+    let target = config.context_budget.min(estimated * REACTIVE_TARGET_PERCENT / 100);
+    compact_to_budget(config, events, target).await
+}
+
+async fn compact_to_budget(
+    config: &CompactionConfig,
+    events: Vec<Event>,
+    budget: usize,
+) -> Result<Vec<Event>, AdkError> {
     let mut current_events = events;
 
     for attempt in 0..config.max_retries {
@@ -477,28 +505,24 @@ pub async fn apply_compaction_with_retry(
             attempt = attempt + 1,
             max_retries = config.max_retries,
             event_count = current_events.len(),
-            budget = config.context_budget,
+            budget,
             "applying context compaction"
         );
 
-        current_events = config.strategy.compact(current_events, config.context_budget).await?;
+        current_events = config.strategy.compact(current_events, budget).await?;
 
         // Estimate token count after compaction using a simple heuristic:
         // ~4 chars per token (same as adk-core's estimate_tokens).
         let estimated_tokens = estimate_event_tokens(&current_events);
 
-        if estimated_tokens <= config.context_budget {
-            tracing::info!(
-                estimated_tokens,
-                budget = config.context_budget,
-                "compaction succeeded, context within budget"
-            );
+        if estimated_tokens <= budget {
+            tracing::info!(estimated_tokens, budget, "compaction succeeded, context within budget");
             return Ok(current_events);
         }
 
         tracing::warn!(
             estimated_tokens,
-            budget = config.context_budget,
+            budget,
             attempt = attempt + 1,
             "compaction did not bring context under budget, retrying"
         );
@@ -506,7 +530,7 @@ pub async fn apply_compaction_with_retry(
 
     // All retries exhausted — return ContextOverflowError
     let final_tokens = estimate_event_tokens(&current_events);
-    Err(ContextOverflowError { token_count: final_tokens, limit: config.context_budget }.into())
+    Err(ContextOverflowError { token_count: final_tokens, limit: budget }.into())
 }
 
 /// Characters per token, the heuristic shared with
@@ -664,6 +688,20 @@ mod tests {
             adk_core::ErrorCategory::InvalidInput,
             "model.anthropic.bad_request",
             "prompt is too long: 200000 tokens > 100000 maximum",
+        );
+        assert!(is_token_limit_error(&err));
+    }
+
+    #[test]
+    fn test_is_token_limit_error_detects_bedrock_gpt_oss_overflow() {
+        // The shape the Bedrock adapter now emits for an oversized request.
+        let err = AdkError::new(
+            adk_core::ErrorComponent::Model,
+            adk_core::ErrorCategory::InvalidInput,
+            "model.bedrock.context_overflow",
+            "Bedrock API error for region=ap-northeast-1, model=openai.gpt-oss-120b-1:0: \
+             service error: ValidationException: Input length (135735) exceeds model's \
+             maximum context length (131072).",
         );
         assert!(is_token_limit_error(&err));
     }

@@ -32,6 +32,53 @@ where
     DisplayErrorContext(err).to_string()
 }
 
+/// Phrases Bedrock-hosted models use when a request exceeds the context
+/// window, matched lowercase. OpenAI-compatible models (gpt-oss) say
+/// "Input length (N) exceeds model's maximum context length (M)"; Anthropic
+/// models say "prompt is too long: N tokens > M maximum" or "Input is too long
+/// for requested model".
+const CONTEXT_OVERFLOW_PHRASES: &[&str] = &[
+    "maximum context length",
+    "context length",
+    "context window",
+    "prompt is too long",
+    "input is too long",
+    "too many tokens",
+    "input length",
+];
+
+/// True when a rendered Converse error is a `ValidationException` saying the
+/// request is larger than the model's context window.
+///
+/// Gated on `ValidationException` so a throttling or transport error that
+/// happens to mention tokens is never mistaken for an oversized request.
+fn is_context_overflow(detail: &str) -> bool {
+    let lower = detail.to_lowercase();
+    lower.contains("validationexception")
+        && CONTEXT_OVERFLOW_PHRASES.iter().any(|phrase| lower.contains(phrase))
+}
+
+/// Map a failed Converse call to an [`AdkError`].
+///
+/// A context overflow is `InvalidInput`, which is what the runner's
+/// `is_token_limit_error` requires before it compacts the history and retries.
+/// Everything else stays the legacy `Internal` model error. Without the
+/// distinction an oversized request was resent unchanged until the session
+/// died, because no Bedrock error ever qualified for reactive compaction.
+fn converse_error(region: &str, model_id: &str, detail: String) -> AdkError {
+    let message = format!("Bedrock API error for region={region}, model={model_id}: {detail}");
+    if is_context_overflow(&detail) {
+        AdkError::new(
+            adk_core::ErrorComponent::Model,
+            adk_core::ErrorCategory::InvalidInput,
+            "model.bedrock.context_overflow",
+            message,
+        )
+    } else {
+        AdkError::model(message)
+    }
+}
+
 /// One-line summary of an assembled Converse message list: role, block kinds,
 /// and the ids that pair `toolUse` with `toolResult`.
 ///
@@ -212,14 +259,7 @@ impl BedrockClient {
             .set_tool_config(input.tool_config)
             .send()
             .await
-            .map_err(|e| {
-                AdkError::model(format!(
-                    "Bedrock API error for region={}, model={}: {}",
-                    self.region,
-                    self.model_id,
-                    describe(&e)
-                ))
-            })?;
+            .map_err(|e| converse_error(&self.region, &self.model_id, describe(&e)))?;
 
         let output = response.output.ok_or_else(|| {
             AdkError::model(format!("Bedrock response missing output for model={}", self.model_id))
@@ -259,14 +299,7 @@ impl BedrockClient {
             .set_tool_config(input.tool_config)
             .send()
             .await
-            .map_err(|e| {
-                AdkError::model(format!(
-                    "Bedrock API error for region={}, model={}: {}",
-                    self.region,
-                    self.model_id,
-                    describe(&e)
-                ))
-            })?;
+            .map_err(|e| converse_error(&self.region, &self.model_id, describe(&e)))?;
 
         let model_id = self.model_id.clone();
         let region = self.region.clone();
@@ -419,5 +452,53 @@ impl BedrockClient {
         };
 
         Ok(Box::pin(response_stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adk_core::{ErrorCategory, ErrorComponent};
+
+    /// Verbatim detail of the gpt-oss-120b rejection that killed the GEO
+    /// station-keeping NL run on 2026-09-28.
+    const GPT_OSS_OVERFLOW: &str = "service error: ValidationException: The model returned the \
+        following errors: {\"error\":{\"code\":\"validation_error\",\"message\":\"ErrorEvent { \
+        error: APIError { type: \\\"BadRequestError\\\", code: Some(400), message: \\\"Input \
+        length (135735) exceeds model's maximum context length (131072).\\\", param: None } }\"}}";
+
+    #[test]
+    fn a_gpt_oss_context_overflow_is_invalid_input() {
+        let err =
+            converse_error("ap-northeast-1", "openai.gpt-oss-120b-1:0", GPT_OSS_OVERFLOW.into());
+        assert_eq!(err.component, ErrorComponent::Model);
+        assert_eq!(err.category, ErrorCategory::InvalidInput);
+        assert_eq!(err.code, "model.bedrock.context_overflow");
+        assert!(err.message.contains("Input length (135735)"));
+    }
+
+    #[test]
+    fn a_claude_prompt_too_long_is_invalid_input() {
+        for detail in [
+            "service error: ValidationException: prompt is too long: 210000 tokens > 200000 maximum",
+            "service error: ValidationException: Input is too long for requested model.",
+        ] {
+            let err = converse_error("us-east-1", "anthropic.claude", detail.into());
+            assert_eq!(err.category, ErrorCategory::InvalidInput, "{detail}");
+        }
+    }
+
+    #[test]
+    fn other_validation_errors_stay_internal() {
+        let detail = "service error: ValidationException: messages.2: toolUse ids must be paired";
+        let err = converse_error("us-east-1", "anthropic.claude", detail.into());
+        assert_eq!(err.category, ErrorCategory::Internal);
+    }
+
+    #[test]
+    fn a_non_validation_error_mentioning_tokens_stays_internal() {
+        let detail = "service error: ThrottlingException: Too many tokens, please wait";
+        let err = converse_error("us-east-1", "anthropic.claude", detail.into());
+        assert_eq!(err.category, ErrorCategory::Internal);
     }
 }
