@@ -1000,6 +1000,36 @@ mod tests {
         assert_eq!(result.messages[1].role, ConversationRole::User);
     }
 
+    /// A wrapper agent may append a user turn after the model's answer — a
+    /// nudge, a verifier's work order. That turn is what the model must
+    /// answer, so nothing is appended after it.
+    #[test]
+    fn a_conversation_ending_on_a_user_turn_keeps_it_last() {
+        let contents = vec![
+            Content {
+                role: "user".to_string(),
+                parts: vec![Part::Text { text: "Create Probe1.".to_string() }],
+            },
+            Content {
+                role: "model".to_string(),
+                parts: vec![Part::Text { text: "Probe1 created.".to_string() }],
+            },
+            Content {
+                role: "user".to_string(),
+                parts: vec![Part::Text { text: "Verify it.".to_string() }],
+            },
+        ];
+
+        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+
+        assert_eq!(result.messages.len(), 3);
+        assert_eq!(result.messages[2].role, ConversationRole::User);
+        match &result.messages[2].content[0] {
+            ContentBlock::Text(text) => assert_eq!(text, "Verify it."),
+            other => panic!("expected a text block, got {other:?}"),
+        }
+    }
+
     /// An assistant turn holding only a `toolUse` must NOT be closed off: its
     /// `toolResult` is required in the very next message, and a text turn
     /// wedged in between fails the request a different way.

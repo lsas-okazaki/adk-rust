@@ -363,11 +363,7 @@ impl PromptConfig {
                 self.max_skill_chars,
             );
         }
-        if let Some(index) = session_history.iter().rposition(|content| content.role == "user") {
-            session_history[index] = current_user_content.clone();
-        } else {
-            session_history.push(current_user_content.clone());
-        }
+        place_current_user_content(&mut session_history, ctx.user_content(), &current_user_content);
 
         Ok(match self.include_contents {
             adk_core::IncludeContents::None => {
@@ -379,6 +375,33 @@ impl PromptConfig {
                 preamble
             }
         })
+    }
+}
+
+/// The text of a content, every text part joined, for telling two user turns apart.
+fn content_text(content: &Content) -> String {
+    content.parts.iter().filter_map(Part::text).collect::<Vec<_>>().join("")
+}
+
+/// Put the invocation's user content into the history the model will see.
+///
+/// `original` is `ctx.user_content()` as the session stored it; `current` is the
+/// same content after skill injection, which is what the request must carry.
+/// The history entry that IS the original is replaced by `current`. Any other
+/// user turn is left alone: a wrapper agent may append one after the model's
+/// last turn — a nudge, a verifier's work order — and that turn must remain the
+/// last thing the model reads. Replacing "the last user turn" instead, as this
+/// used to, overwrote every such message with the original request before the
+/// model ever saw it. With no user turn in the history at all the content is
+/// appended, as before.
+fn place_current_user_content(history: &mut Vec<Content>, original: &Content, current: &Content) {
+    let original_text = content_text(original);
+    let is_original =
+        |content: &Content| content.role == "user" && content_text(content) == original_text;
+    if let Some(index) = history.iter().rposition(is_original) {
+        history[index] = current.clone();
+    } else if !history.iter().any(|content| content.role == "user") {
+        history.push(current.clone());
     }
 }
 
@@ -3395,6 +3418,70 @@ impl Agent for LlmAgent {
 #[cfg(test)]
 mod run_helper_tests {
     use super::*;
+
+    fn turn(role: &str, text: &str) -> Content {
+        Content::new(role).with_text(text)
+    }
+
+    fn texts(history: &[Content]) -> Vec<(String, String)> {
+        history.iter().map(|c| (c.role.clone(), content_text(c))).collect()
+    }
+
+    #[test]
+    fn a_user_turn_appended_after_the_model_stays_last() {
+        // A wrapper yielded a nudge after the model's turn. The old rule replaced
+        // the LAST user turn with the original request, so the model never read
+        // the nudge: it saw the request repeated instead.
+        let original = turn("user", "set the mask on ten cities");
+        let mut history = vec![
+            original.clone(),
+            turn("model", "done on five"),
+            turn("user", "VERIFIER ORDER: read every city back"),
+        ];
+        place_current_user_content(&mut history, &original, &original);
+        assert_eq!(
+            texts(&history),
+            vec![
+                ("user".into(), "set the mask on ten cities".into()),
+                ("model".into(), "done on five".into()),
+                ("user".into(), "VERIFIER ORDER: read every city back".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_original_turn_is_the_one_that_takes_the_injected_content() {
+        let original = turn("user", "plan the mission");
+        let injected = turn("user", "plan the mission\n\n[skill: mission planning]");
+        let mut history = vec![
+            original.clone(),
+            turn("model", "which orbit?"),
+            turn("user", "a nudge from a wrapper"),
+        ];
+        place_current_user_content(&mut history, &original, &injected);
+        assert_eq!(content_text(&history[0]), "plan the mission\n\n[skill: mission planning]");
+        assert_eq!(content_text(&history[2]), "a nudge from a wrapper");
+    }
+
+    #[test]
+    fn a_history_without_the_user_turn_gets_it_appended() {
+        let original = turn("user", "hello");
+        let mut history = vec![turn("model", "earlier answer")];
+        place_current_user_content(&mut history, &original, &original);
+        assert_eq!(texts(&history).last().unwrap().1, "hello");
+    }
+
+    #[test]
+    fn an_unmatched_user_turn_is_not_clobbered() {
+        // The stored request was rewritten (compaction, augmentation): nothing
+        // matches the original text. Leave the history as it is rather than
+        // overwrite whatever user turn happens to be last.
+        let original = turn("user", "hello");
+        let mut history = vec![turn("user", "[summary of an earlier hello]"), turn("model", "hi")];
+        let before = texts(&history);
+        place_current_user_content(&mut history, &original, &original);
+        assert_eq!(texts(&history), before);
+    }
 
     #[test]
     fn generation_config_layers_schema_and_cached_content() {
