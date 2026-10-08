@@ -332,9 +332,9 @@ pub fn final_chunk_parts(
 /// When `strict` is `true`, each tool definition includes `"strict": true`
 /// for the beta strict tool mode.
 pub fn convert_tools(tools: &std::collections::HashMap<String, Value>, strict: bool) -> Vec<Tool> {
-    tools
-        .values()
-        .filter_map(|tool| {
+    crate::tool_order::by_name(tools)
+        .into_iter()
+        .filter_map(|(_, tool)| {
             let name = tool.get("name")?.as_str()?;
             let description = tool.get("description").and_then(|d| d.as_str()).unwrap_or("");
             let parameters = tool.get("parameters").cloned().unwrap_or(serde_json::json!({

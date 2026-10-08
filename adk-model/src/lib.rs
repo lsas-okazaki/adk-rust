@@ -280,6 +280,8 @@ pub mod provider;
 /// Retry logic with exponential backoff for transient provider errors.
 pub mod retry;
 pub mod tool_call_parser;
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "deepseek", feature = "bedrock"))]
+pub(crate) mod tool_order;
 #[cfg(any(
     feature = "openai",
     feature = "ollama",
