@@ -482,8 +482,8 @@ fn adk_tools_to_bedrock(
     tools: &HashMap<String, Value>,
     prompt_caching: Option<&BedrockCacheConfig>,
 ) -> ToolConfiguration {
-    let mut bedrock_tools: Vec<Tool> = tools
-        .iter()
+    let mut bedrock_tools: Vec<Tool> = crate::tool_order::by_name(tools)
+        .into_iter()
         .filter_map(|(name, decl)| {
             let description = decl.get("description").and_then(|d| d.as_str()).map(String::from);
 

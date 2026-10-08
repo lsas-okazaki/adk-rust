@@ -231,8 +231,8 @@ fn content_to_input_items(content: &Content) -> Vec<InputItem> {
 /// If the type is not recognized (e.g., `tool_search`, `skill`), the tool falls back to
 /// being treated as a regular function tool.
 pub fn convert_tools(tools: &HashMap<String, serde_json::Value>) -> Result<Vec<Tool>, AdkError> {
-    tools
-        .iter()
+    crate::tool_order::by_name(tools)
+        .into_iter()
         .map(|(name, decl)| {
             if let Some(provider_tool) = decl.get("x-adk-openai-tool") {
                 convert_native_tool(name, decl, provider_tool)

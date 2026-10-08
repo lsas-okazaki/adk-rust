@@ -304,8 +304,8 @@ pub fn convert_tools(
     adapter: &dyn SchemaAdapter,
     cache: &SchemaCache,
 ) -> Vec<ChatCompletionTools> {
-    tools
-        .iter()
+    crate::tool_order::by_name(tools)
+        .into_iter()
         .map(|(name, decl)| {
             let description = decl.get("description").and_then(|d| d.as_str()).map(String::from);
 
@@ -880,6 +880,30 @@ mod tests {
         } else {
             panic!("Expected Function variant");
         }
+    }
+
+    /// The same tools must go out in the same order on every request, or the
+    /// prompt prefix changes and the server's prefix cache never hits.
+    #[test]
+    fn test_convert_tools_sorts_by_name() {
+        use super::super::schema_adapter::OpenAiSchemaAdapter;
+
+        let names: Vec<String> = (0..40).rev().map(|i| format!("tool_{i:02}")).collect();
+        let tools: HashMap<String, serde_json::Value> =
+            names.iter().map(|n| (n.clone(), serde_json::json!({ "description": n }))).collect();
+
+        let adapter = OpenAiSchemaAdapter;
+        let cache = SchemaCache::for_adapter(std::sync::Arc::new(OpenAiSchemaAdapter));
+        let sent: Vec<String> = convert_tools(&tools, &adapter, &cache)
+            .iter()
+            .map(|t| match t {
+                ChatCompletionTools::Function(tool) => tool.function.name.clone(),
+                _ => panic!("Expected Function variant"),
+            })
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(sent, sorted);
     }
 
     /// Regression test for issue #395.

@@ -210,8 +210,8 @@ pub fn convert_tools(
     adapter: &dyn SchemaAdapter,
     cache: &SchemaCache,
 ) -> Result<Vec<ToolUnionParam>, ConversionError> {
-    tools
-        .iter()
+    crate::tool_order::by_name(tools)
+        .into_iter()
         .map(|(name, decl)| {
             if let Some(provider_tool) = decl.get("x-adk-anthropic-tool") {
                 return serde_json::from_value::<ToolUnionParam>(provider_tool.clone()).map_err(
