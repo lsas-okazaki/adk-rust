@@ -35,11 +35,11 @@ This is assembled from a few focused pieces rather than a monolithic framework:
 
 ```toml
 # The harness (pulls in the dev tools) + a model provider
-adk-agent = { version = "2.2.0", features = ["coding"] }
-adk-devtools = "2.2.0"
-adk-model = { version = "2.2.0", features = ["gemini"] }
-adk-runner = "2.2.0"
-adk-session = "2.2.0"
+adk-agent = { version = "3.0.0", features = ["coding"] }
+adk-devtools = "3.0.0"
+adk-model = { version = "3.0.0", features = ["gemini"] }
+adk-runner = "3.0.0"
+adk-session = "3.0.0"
 ```
 
 The dev tools are sandbox-first and have no heavy dependencies, so the footprint
@@ -59,7 +59,7 @@ use std::sync::Arc;
 // One call builds a coding agent over a confined workspace.
 let coding = CodingAgent::builder()
     .model(model)
-    .workspace(Workspace::new("./my-repo"))
+    .workspace(Workspace::new("./my-repo").allow_bash(true)) // bash is opt-in
     .build()?;
 
 let sessions: Arc<dyn SessionService> = Arc::new(InMemorySessionService::new());

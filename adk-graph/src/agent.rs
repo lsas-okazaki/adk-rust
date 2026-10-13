@@ -45,6 +45,23 @@ pub type InputMapper = Arc<dyn Fn(&dyn InvocationContext) -> State + Send + Sync
 pub type OutputMapper = Arc<dyn Fn(&State) -> Vec<Event> + Send + Sync>;
 
 /// GraphAgent wraps a CompiledGraph as an ADK Agent
+///
+/// # Turns and checkpoints
+///
+/// Each [`Agent::run`] call is one turn on the session's thread, whose id
+/// [`session_thread_id`] derives from the app name, user id, and session id, so
+/// two users who choose the same session id never share checkpoints. With a
+/// checkpointer configured:
+///
+/// | Thread's latest checkpoint | What the turn does |
+/// |----------------------------|--------------------|
+/// | None | Runs the graph from its entry nodes. |
+/// | Paused (non-empty frontier) | Resumes the paused run, with the turn's input merged into its state. |
+/// | Finished (empty frontier) | Runs the graph again from its entry nodes, starting from the previous turn's final state with the turn's input merged on top. |
+///
+/// The recursion limit applies to each turn separately. [`GraphAgent::invoke`]
+/// keeps the direct-graph behaviour, where re-invoking a finished thread returns
+/// its final state without running anything.
 pub struct GraphAgent {
     name: String,
     description: String,
@@ -208,7 +225,8 @@ impl Agent for GraphAgent {
         // Create execution config from context, carrying the invocation so an
         // `AgentNode` inside the graph presents this run's identity, services, and
         // cancellation rather than a synthetic standalone context.
-        let config = ExecutionConfig::new(ctx.session_id()).with_parent_context(ctx.clone());
+        let thread_id = session_thread_id(ctx.app_name(), ctx.user_id(), ctx.session_id());
+        let config = ExecutionConfig::new(&thread_id).with_parent_context(ctx.clone());
 
         // Execute graph
         let graph = self.graph.clone();
@@ -217,7 +235,12 @@ impl Agent for GraphAgent {
         let ctx_clone = ctx.clone();
 
         let stream = async_stream::stream! {
-            match graph.invoke(input, config).await {
+            // Each call is one turn on the session's thread: a paused thread
+            // resumes, and a finished one runs again from its entry nodes with the
+            // previous turn's state carried over.
+            let mut executor =
+                crate::executor::PregelExecutor::new(&graph, config).restarting_completed_threads();
+            match executor.run(input).await {
                 Ok(state) => {
                     let events = output_mapper(&state);
                     for event in events {
@@ -267,6 +290,41 @@ impl Agent for GraphAgent {
 
         Ok(Box::pin(stream))
     }
+}
+
+/// Returns the checkpoint thread id for an ADK session.
+///
+/// [`GraphAgent`] and [`NodeTool`](crate::tool::NodeTool) key their checkpoints
+/// by this id. It joins the app name, user id, and session id with `:`, and
+/// percent-encodes `%` and `:` inside each part, so distinct identities never
+/// produce the same thread id. Use it to find a session's checkpoints with
+/// [`Checkpointer::load`] or [`Checkpointer::list`].
+///
+/// # Example
+///
+/// ```
+/// use adk_graph::agent::session_thread_id;
+///
+/// assert_eq!(session_thread_id("shop", "alice", "s-1"), "shop:alice:s-1");
+/// assert_eq!(session_thread_id("shop", "a:b", "c"), "shop:a%3Ab:c");
+/// assert_ne!(session_thread_id("shop", "alice", "s-1"), session_thread_id("shop", "bob", "s-1"));
+/// ```
+pub fn session_thread_id(app_name: &str, user_id: &str, session_id: &str) -> String {
+    let mut thread_id =
+        String::with_capacity(app_name.len() + user_id.len() + session_id.len() + 2);
+    for (index, part) in [app_name, user_id, session_id].into_iter().enumerate() {
+        if index > 0 {
+            thread_id.push(':');
+        }
+        for c in part.chars() {
+            match c {
+                '%' => thread_id.push_str("%25"),
+                ':' => thread_id.push_str("%3A"),
+                other => thread_id.push(other),
+            }
+        }
+    }
+    thread_id
 }
 
 /// Default input mapper - extracts content from InvocationContext
@@ -751,6 +809,13 @@ impl GraphAgentBuilder {
 
         #[cfg(feature = "node-cache")]
         {
+            compiled.node_caches = self
+                .cache_policies
+                .iter()
+                .map(|(name, policy)| {
+                    (name.clone(), Arc::new(crate::cache::NodeCache::from_policy(policy)))
+                })
+                .collect();
             compiled.cache_policies = self.cache_policies;
         }
 

@@ -5,15 +5,15 @@
 
 use crate::attachment;
 use adk_core::{
-    AdkError, Content, ErrorCategory, ErrorComponent, FinishReason, LlmRequest, LlmResponse, Part,
-    UsageMetadata,
+    AdkError, CitationMetadata, CitationSource, Content, ErrorCategory, ErrorComponent,
+    FinishReason, LlmRequest, LlmResponse, Part, UsageMetadata,
 };
 use async_openai::types::responses::{
-    ApplyPatchToolCallItemParam, ApplyPatchToolCallOutputItemParam, ConversationParam,
+    Annotation, ApplyPatchToolCallItemParam, ApplyPatchToolCallOutputItemParam, ConversationParam,
     CreateResponse, CreateResponseArgs, EasyInputContent, EasyInputMessage, FunctionCallOutput,
     FunctionCallOutputItemParam, FunctionShellCallItemParam, FunctionShellCallOutputItemParam,
-    FunctionTool, FunctionToolCall, IncludeEnum, InputContent, InputImageContent, InputItem,
-    InputParam, Item, OutputItem, OutputMessageContent, Prompt,
+    FunctionTool, FunctionToolCall, IncludeEnum, InputContent, InputFileContent, InputImageContent,
+    InputItem, InputParam, Item, MessagePhase, OutputItem, OutputMessageContent, Prompt,
     PromptCacheRetention as OaiPromptCacheRetention, Reasoning,
     ReasoningEffort as OaiReasoningEffort, ReasoningSummary as OaiReasoningSummary, Response,
     ResponseUsage, Role, ServiceTier as OaiServiceTier, Status, SummaryPart, Tool, Truncation,
@@ -25,7 +25,7 @@ use super::config::{OpenAIReasoningEffort, ReasoningSummary};
 
 /// Convert a list of ADK `Content` items to Responses API `InputItem` list.
 pub fn contents_to_input_items(contents: &[Content]) -> Vec<InputItem> {
-    contents.iter().flat_map(content_to_input_items).collect()
+    crate::tool_result::with_images(contents).iter().flat_map(content_to_input_items).collect()
 }
 
 /// Returns true when the request includes any OpenAI-native tool declarations.
@@ -118,28 +118,37 @@ fn content_to_input_items(content: &Content) -> Vec<InputItem> {
                 )));
             }
 
-            Part::InlineData { mime_type, data, .. } => {
-                if mime_type.starts_with("image/") {
-                    let data_uri =
-                        format!("data:{mime_type};base64,{}", attachment::encode_base64(data));
-                    let image_content = InputContent::InputImage(InputImageContent {
-                        image_url: Some(data_uri),
+            Part::InlineData { mime_type, data, uri, .. } => {
+                let data = if mime_type.starts_with("image/") {
+                    InputContent::InputImage(InputImageContent {
+                        image_url: Some(format!(
+                            "data:{mime_type};base64,{}",
+                            attachment::encode_base64(data)
+                        )),
                         detail: Default::default(),
                         file_id: None,
-                    });
-                    // Wrap in an EasyMessage with content list
-                    let msg_role = match role {
-                        "model" | "assistant" => Role::Assistant,
-                        _ => Role::User,
-                    };
-                    items.push(InputItem::EasyMessage(EasyInputMessage {
-                        role: msg_role,
-                        content: EasyInputContent::ContentList(vec![image_content]),
+                    })
+                } else if mime_type == "application/pdf" {
+                    InputContent::InputFile(InputFileContent {
+                        file_data: Some(format!(
+                            "data:{mime_type};base64,{}",
+                            attachment::encode_base64(data)
+                        )),
+                        filename: Some(attachment::pdf_filename(uri.as_deref())),
                         ..Default::default()
-                    }));
-                }
-                // Non-image inline data is not directly supported by Responses API;
-                // skip silently.
+                    })
+                } else {
+                    continue;
+                };
+                let msg_role = match role {
+                    "model" | "assistant" => Role::Assistant,
+                    _ => Role::User,
+                };
+                items.push(InputItem::EasyMessage(EasyInputMessage {
+                    role: msg_role,
+                    content: EasyInputContent::ContentList(vec![data]),
+                    ..Default::default()
+                }));
             }
 
             Part::Thinking { thinking, .. } => {
@@ -580,27 +589,77 @@ pub fn build_create_response(
 /// collects all parts into a single `Content`, and maps usage, finish reason,
 /// and provider metadata.
 pub fn from_response(response: &Response) -> LlmResponse {
-    let parts: Vec<Part> = response.output.iter().flat_map(output_item_to_parts).collect();
+    let parts = response.output.iter().map(output_item_to_parts).collect::<Result<Vec<_>, _>>();
+    let (parts, argument_error) = match parts {
+        Ok(parts) => (parts.into_iter().flatten().collect::<Vec<_>>(), None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
 
     let content =
         if parts.is_empty() { None } else { Some(Content { role: "model".to_string(), parts }) };
 
-    let usage_metadata = response.usage.as_ref().map(convert_usage);
+    let usage_metadata = response.usage.as_ref().map(|usage| UsageMetadata {
+        builtin_tool_uses: builtin_tool_uses(&response.output),
+        ..convert_usage(usage)
+    });
     let finish_reason = map_finish_reason(response);
     let provider_metadata = build_provider_metadata(response);
+    let mut citation_sources = Vec::new();
+    let mut offset = 0usize;
+    for item in &response.output {
+        let OutputItem::Message(message) = item else { continue };
+        if message.phase == Some(MessagePhase::Commentary) {
+            continue;
+        }
+        for content in &message.content {
+            let OutputMessageContent::OutputText(text) = content else { continue };
+            let length = text.text.chars().count();
+            for annotation in &text.annotations {
+                let Annotation::UrlCitation(citation) = annotation else { continue };
+                let Ok(value) = serde_json::to_value(citation) else { continue };
+                let index = |name: &str| {
+                    value
+                        .get(name)
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .filter(|value| *value <= length)
+                        .and_then(|value| offset.checked_add(value))
+                        .and_then(|value| i32::try_from(value).ok())
+                };
+                citation_sources.push(CitationSource {
+                    uri: value.get("url").and_then(serde_json::Value::as_str).map(str::to_owned),
+                    title: value
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    start_index: index("start_index"),
+                    end_index: index("end_index"),
+                    license: None,
+                    publication_date: None,
+                });
+            }
+            offset += length;
+        }
+    }
+    let citation_metadata =
+        (!citation_sources.is_empty()).then_some(CitationMetadata { citation_sources });
 
     LlmResponse {
         content,
         usage_metadata,
         finish_reason,
-        citation_metadata: None,
+        citation_metadata,
         partial: false,
         turn_complete: true,
         interrupted: false,
-        error_code: None,
-        error_message: None,
+        error_code: argument_error
+            .as_ref()
+            .map(|_| "model.openai_responses.invalid_tool_arguments".to_owned()),
+        error_message: argument_error,
         provider_metadata,
         interaction_id: None,
+        model: None,
+        provider: None,
     }
 }
 
@@ -610,8 +669,19 @@ pub fn from_response(response: &Response) -> LlmResponse {
 /// - `Reasoning` → `Part::Thinking` with concatenated summary text
 /// - `FunctionCall` → `Part::FunctionCall` with parsed JSON args
 /// - Other variants (WebSearchCall, FileSearchCall, etc.) → empty vec (handled in provider_metadata)
-fn output_item_to_parts(item: &OutputItem) -> Vec<Part> {
-    match item {
+fn output_item_to_parts(item: &OutputItem) -> Result<Vec<Part>, String> {
+    let parts = match item {
+        // Preserve commentary as a native message in canonical history. It is not
+        // answer text and must retain its phase when sent back to the provider.
+        OutputItem::Message(msg) if msg.phase == Some(MessagePhase::Commentary) => {
+            response_item_part(
+                Item::Message(
+                    bridge_response_item(msg)
+                        .expect("output messages have an input representation"),
+                ),
+                false,
+            )
+        }
         OutputItem::Message(msg) => msg
             .content
             .iter()
@@ -639,8 +709,9 @@ fn output_item_to_parts(item: &OutputItem) -> Vec<Part> {
             }
         }
         OutputItem::FunctionCall(fc) => {
-            let args: serde_json::Value =
-                serde_json::from_str(&fc.arguments).unwrap_or(serde_json::json!({}));
+            let encoded = serde_json::Value::String(fc.arguments.clone());
+            let args = super::convert::decode_tool_call_arguments(Some(&encoded))
+                .map_err(|error| format!("invalid arguments for tool '{}': {error}", fc.name))?;
             vec![Part::FunctionCall {
                 name: fc.name.clone(),
                 args,
@@ -693,7 +764,8 @@ fn output_item_to_parts(item: &OutputItem) -> Vec<Part> {
             response_item_part(Item::CustomToolCall(call.clone()), false)
         }
         _ => Vec::new(),
-    }
+    };
+    Ok(parts)
 }
 
 fn response_item_part(item: Item, is_output: bool) -> Vec<Part> {
@@ -729,6 +801,26 @@ fn reasoning_history_parts(response: &Response) -> Vec<serde_json::Value> {
         })
         .filter_map(|part| serde_json::to_value(part).ok())
         .collect()
+}
+
+/// Hosted tool calls the provider ran while producing `output`, one use per item.
+///
+/// Computer, shell and apply-patch calls are executed by the client, not the
+/// provider, so they are not counted here.
+fn builtin_tool_uses(output: &[OutputItem]) -> Vec<adk_core::BuiltinToolUse> {
+    let mut counts = std::collections::BTreeMap::<&str, u32>::new();
+    for item in output {
+        let kind = match item {
+            OutputItem::WebSearchCall(_) => "web_search",
+            OutputItem::FileSearchCall(_) => "file_search",
+            OutputItem::CodeInterpreterCall(_) => "code_execution",
+            OutputItem::ImageGenerationCall(_) => "image_generation",
+            OutputItem::McpCall(_) => "mcp",
+            _ => continue,
+        };
+        *counts.entry(kind).or_default() += 1;
+    }
+    counts.into_iter().map(|(kind, count)| adk_core::BuiltinToolUse::new(kind, count)).collect()
 }
 
 /// Convert Responses API usage to ADK `UsageMetadata`.
@@ -950,6 +1042,24 @@ mod tests {
     };
 
     #[test]
+    fn pdf_inline_data_uses_input_file() {
+        let content = Content {
+            role: "user".into(),
+            parts: vec![Part::inline_data("application/pdf", b"%PDF".to_vec())],
+        };
+        let items = serde_json::to_value(contents_to_input_items(&[content])).unwrap();
+        assert_eq!(items[0]["role"], "user");
+        assert_eq!(
+            items[0]["content"],
+            serde_json::json!([{
+                "type": "input_file",
+                "filename": "document.pdf",
+                "file_data": "data:application/pdf;base64,JVBERg=="
+            }])
+        );
+    }
+
+    #[test]
     fn test_convert_tools_supports_native_openai_tool_declarations() {
         let mut tools = HashMap::new();
         tools.insert(
@@ -968,6 +1078,29 @@ mod tests {
     }
 
     #[test]
+    fn convert_tools_has_deterministic_name_order() {
+        for _ in 0..32 {
+            let tools = HashMap::from([
+                ("zeta".to_string(), serde_json::json!({})),
+                ("alpha".to_string(), serde_json::json!({})),
+                ("middle".to_string(), serde_json::json!({})),
+            ]);
+            let names = convert_tools(&tools)
+                .expect("tool conversion should succeed")
+                .into_iter()
+                .map(|tool| {
+                    serde_json::to_value(tool).expect("tool should serialize")["name"]
+                        .as_str()
+                        .expect("function tool should have a name")
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(names, ["alpha", "middle", "zeta"]);
+        }
+    }
+
+    #[test]
     fn test_server_tool_parts_round_trip_as_openai_items() {
         let parts = output_item_to_parts(&OutputItem::WebSearchCall(WebSearchToolCall {
             action: Some(WebSearchToolCallAction::Search(WebSearchActionSearch {
@@ -976,7 +1109,8 @@ mod tests {
             })),
             id: "ws_123".to_string(),
             status: WebSearchToolCallStatus::Completed,
-        }));
+        }))
+        .expect("server tool output should convert");
 
         assert!(matches!(parts[0], Part::ServerToolCall { .. }));
 
@@ -990,6 +1124,34 @@ mod tests {
             }
             other => panic!("expected web_search_call item, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn function_tool_arguments_share_compatible_normalization() {
+        let empty = output_item_to_parts(&OutputItem::FunctionCall(FunctionToolCall {
+            call_id: "call_empty".to_string(),
+            name: "no_args".to_string(),
+            arguments: "null".to_string(),
+            namespace: None,
+            id: None,
+            status: None,
+        }))
+        .expect("an empty compatible payload should normalize");
+        assert!(matches!(
+            &empty[0],
+            Part::FunctionCall { args, .. } if args == &serde_json::json!({})
+        ));
+
+        let error = output_item_to_parts(&OutputItem::FunctionCall(FunctionToolCall {
+            call_id: "call_invalid".to_string(),
+            name: "bash".to_string(),
+            arguments: r#"{"command":"#.to_string(),
+            namespace: None,
+            id: None,
+            status: None,
+        }))
+        .expect_err("truncated arguments must remain invalid");
+        assert!(error.contains("bash"));
     }
 
     #[test]
@@ -1060,7 +1222,7 @@ mod tests {
             "openai_web_search".to_string(),
             serde_json::json!({
                 "x-adk-openai-tool": {
-                    "type": "web_search_2025_08_26"
+                    "type": "web_search"
                 }
             }),
         );
@@ -1360,7 +1522,7 @@ mod tests {
             "openai".to_string(),
             serde_json::json!({
                 "built_in_tools": [
-                    { "type": "web_search_2025_08_26" },
+                    { "type": "web_search" },
                     { "type": "image_generation", "size": "1024x1024", "quality": "high" }
                 ]
             }),
@@ -1414,7 +1576,7 @@ mod tests {
                 "prompt_cache_retention": "24h",
                 "service_tier": "priority",
                 "built_in_tools": [
-                    { "type": "web_search_2025_08_26" }
+                    { "type": "web_search" }
                 ]
             }),
         );
@@ -1469,6 +1631,56 @@ mod tests {
         let metadata = llm_response.provider_metadata.expect("metadata should exist");
         assert_eq!(metadata["openai"]["response_id"], "resp_status_test");
         assert_eq!(metadata["openai"]["status"], "completed");
+    }
+
+    #[test]
+    fn test_from_response_maps_url_citations() {
+        let response: Response = serde_json::from_value(serde_json::json!({
+            "id": "resp_citation_test",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5.4",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg_citation_test",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": "OpenAI",
+                    "annotations": [{
+                        "type": "url_citation",
+                        "start_index": 0,
+                        "end_index": 6,
+                        "title": "OpenAI",
+                        "url": "https://openai.com"
+                    }]
+                }]
+            }],
+            "usage": {
+                "input_tokens": 10,
+                "input_tokens_details": { "cached_tokens": 0 },
+                "output_tokens": 5,
+                "output_tokens_details": { "reasoning_tokens": 0 },
+                "total_tokens": 15
+            }
+        }))
+        .expect("response should deserialize");
+
+        let llm_response = from_response(&response);
+        let citations = llm_response.citation_metadata.expect("citation metadata should exist");
+        assert_eq!(
+            citations.citation_sources,
+            vec![adk_core::CitationSource {
+                uri: Some("https://openai.com".to_string()),
+                title: Some("OpenAI".to_string()),
+                start_index: Some(0),
+                end_index: Some(6),
+                license: None,
+                publication_date: None,
+            }]
+        );
     }
 
     #[test]

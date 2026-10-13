@@ -3,8 +3,9 @@ use crate::cache::CacheManager;
 #[cfg(feature = "artifacts")]
 use adk_artifact::ArtifactService;
 use adk_core::{
-    Agent, AppName, CacheCapable, Content, ContextCacheConfig, Event, EventStream, Memory,
-    ReadonlyContext, Result, RunConfig, SessionId, UserId,
+    Agent, AppName, CacheCapable, Content, ContextCacheConfig, Event, EventStream,
+    FunctionResponseData, InvocationId, Memory, Part, ReadonlyContext, Result, RunConfig,
+    SessionId, UserId,
 };
 #[cfg(feature = "plugins")]
 use adk_plugin::PluginManager;
@@ -43,6 +44,165 @@ fn preserve_streamed_content(accumulated: &mut HashMap<String, Content>, event: 
     }
 }
 
+/// A tool call the run has seen requested but not yet answered.
+struct InFlightCall {
+    id: Option<String>,
+    name: String,
+    args: serde_json::Value,
+    author: String,
+    branch: String,
+    invocation_id: String,
+}
+
+/// Tracks tool calls from request to response, so a cancelled run can answer
+/// the calls still in flight instead of leaving them unpaired.
+#[derive(Default)]
+struct InFlightCalls(Vec<InFlightCall>);
+
+impl InFlightCalls {
+    fn observe(&mut self, event: &Event) {
+        if event.llm_response.partial {
+            return;
+        }
+        let Some(content) = &event.llm_response.content else {
+            return;
+        };
+        for part in &content.parts {
+            match part {
+                Part::FunctionCall { name, args, id, .. } => self.0.push(InFlightCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
+                    author: event.author.clone(),
+                    branch: event.branch.clone(),
+                    invocation_id: event.invocation_id.clone(),
+                }),
+                Part::FunctionResponse { function_response, id, .. } => {
+                    let answered = match id {
+                        Some(id) => self.0.iter().position(|call| call.id.as_ref() == Some(id)),
+                        None => self.0.iter().position(|call| {
+                            call.id.is_none() && call.name == function_response.name
+                        }),
+                    };
+                    if let Some(index) = answered {
+                        self.0.remove(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Records every call still in flight with the outcome `outcome` assigns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error the trail reports, which it does only in
+    /// [`AuditFailureMode::Block`](adk_core::audit_log::AuditFailureMode::Block).
+    async fn audit_calls(
+        &self,
+        trail: &adk_core::audit_log::AuditTrail,
+        run_config: &RunConfig,
+        identity: &adk_core::AdkIdentity,
+        cause: &str,
+        outcome: impl Fn(&InFlightCall) -> adk_core::audit_log::AuditRecordOutcome,
+    ) -> Result<()> {
+        use adk_core::audit_log::{AuditActor, AuditRecordDraft, AuditRecordKind};
+        for call in &self.0 {
+            let mut draft = AuditRecordDraft::new(AuditRecordKind::ToolCall, call.name.as_str())
+                .actor(AuditActor::new(
+                    &run_config.acting_context_for(
+                        identity.app_name.as_ref(),
+                        &call.author,
+                        identity.user_id.as_ref(),
+                    ),
+                    &call.invocation_id,
+                ))
+                .args_digest(trail.digest(&call.args))
+                .outcome(outcome(call))
+                .ext("cause", serde_json::Value::String(cause.to_string()))
+                .ext("sessionId", serde_json::Value::String(identity.session_id.to_string()));
+            if let Some(id) = &call.id {
+                draft = draft.ext("functionCallId", serde_json::Value::String(id.clone()));
+            }
+            trail.record(draft).await?;
+        }
+        Ok(())
+    }
+
+    /// Answers every call still in flight with an outcome-unknown response, one
+    /// event per author, branch, and invocation, so each call keeps exactly one
+    /// response.
+    fn answer_interrupted(&mut self) -> Vec<Event> {
+        self.answer_with(|call| {
+            adk_core::outcome_unknown_response(format!(
+                "the run was cancelled while '{}' was in flight, so the call may have taken effect; check its result before calling it again",
+                call.name
+            ))
+        })
+    }
+
+    /// Answers every call still in flight with `respond(call)`, one event per author,
+    /// branch, and invocation.
+    fn answer_with(
+        &mut self,
+        mut respond: impl FnMut(&InFlightCall) -> serde_json::Value,
+    ) -> Vec<Event> {
+        let mut events: Vec<Event> = Vec::new();
+        for call in std::mem::take(&mut self.0) {
+            let response = Part::FunctionResponse {
+                function_response: FunctionResponseData::new(call.name.clone(), respond(&call)),
+                id: call.id,
+                annotations: None,
+            };
+            let existing = events.iter_mut().find(|event| {
+                event.author == call.author
+                    && event.branch == call.branch
+                    && event.invocation_id == call.invocation_id
+            });
+            match existing {
+                Some(event) => {
+                    if let Some(content) = event.llm_response.content.as_mut() {
+                        content.parts.push(response);
+                    }
+                }
+                None => {
+                    let mut event = Event::new(&call.invocation_id);
+                    event.author = call.author;
+                    event.branch = call.branch;
+                    event.llm_response.content =
+                        Some(Content { role: "function".to_string(), parts: vec![response] });
+                    events.push(event);
+                }
+            }
+        }
+        events
+    }
+}
+
+/// The function response a recovering worker gives a call that a stopped process left
+/// unanswered, from the action ledger's record of it.
+fn recovered_call_response(
+    name: &str,
+    record: Option<adk_core::ActionRecord>,
+) -> serde_json::Value {
+    match record.and_then(|record| record.outcome) {
+        Some(adk_core::ActionOutcome::Succeeded { result_digest }) => serde_json::json!({
+            "status": "already_succeeded",
+            "result_digest": result_digest,
+            "detail": format!("this call to '{name}' completed before the run was recovered; it was not executed again"),
+        }),
+        Some(adk_core::ActionOutcome::Failed { error }) => serde_json::json!({
+            "status": "already_failed",
+            "error": error,
+            "detail": format!("this call to '{name}' failed before the run was recovered; it was not executed again"),
+        }),
+        _ => adk_core::outcome_unknown_response(format!(
+            "the process running '{name}' stopped before the call recorded an outcome, so it may have taken effect; check its result before calling it again"
+        )),
+    }
+}
+
 /// Deregisters a run when its event stream is dropped.
 ///
 /// Removal is by run ID, so a finishing run can never deregister a different run
@@ -50,6 +210,36 @@ fn preserve_streamed_content(accumulated: &mut HashMap<String, Content>, event: 
 struct ActiveRunCleanup {
     active_runs: ActiveRuns,
     run_id: u64,
+}
+
+/// A newly registered runner invocation and its event stream.
+///
+/// The invocation identity is available before the stream is polled, so hosts
+/// can durably correlate failures that happen before the first agent event.
+pub struct RunnerInvocation {
+    invocation_id: InvocationId,
+    events: EventStream,
+}
+
+impl RunnerInvocation {
+    /// Returns the identity assigned to this invocation.
+    pub fn invocation_id(&self) -> &InvocationId {
+        &self.invocation_id
+    }
+
+    /// Consumes the invocation and returns its event stream.
+    pub fn into_events(self) -> EventStream {
+        self.events
+    }
+}
+
+impl std::fmt::Debug for RunnerInvocation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunnerInvocation")
+            .field("invocation_id", &self.invocation_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for ActiveRunCleanup {
@@ -102,6 +292,9 @@ pub struct RunnerConfig {
     /// `user_scopes()` and `user_id()` reflect the authenticated identity.
     pub request_context: Option<adk_core::RequestContext>,
     /// Optional cooperative cancellation token for externally managed runs.
+    ///
+    /// Each run derives a child of this token, so cancelling it stops every in-flight
+    /// run, while [`Runner::interrupt`] cancels only the targeted run's child.
     pub cancellation_token: Option<CancellationToken>,
     /// Optional intra-invocation compaction configuration.
     /// When set, the runner estimates token count before each agent run
@@ -119,6 +312,47 @@ pub struct RunnerConfig {
     /// This field is only available when the `context-compaction` feature is enabled.
     #[cfg(feature = "context-compaction")]
     pub context_compaction: Option<crate::compaction::CompactionConfig>,
+    /// Optional policy evaluated for every tool call.
+    ///
+    /// Installed on each run's [`RunConfig::tool_policy`] when the run carries none.
+    pub tool_policy: Option<Arc<dyn adk_core::ToolPolicy>>,
+    /// Optional kill switch shared with other runners. Without one the runner creates
+    /// its own; see [`Runner::governance`].
+    pub governance: Option<adk_core::GovernanceControl>,
+    /// Optional ledger of non-idempotent tool calls.
+    ///
+    /// Installed on each run's [`RunConfig::action_ledger`] when the run carries none.
+    pub action_ledger: Option<Arc<dyn adk_core::ActionLedger>>,
+    /// Optional store for calls held for approval and their decisions.
+    ///
+    /// Installed on each run's [`RunConfig::approval_store`] when the run carries none.
+    pub approval_store: Option<Arc<dyn adk_core::ApprovalStore>>,
+    /// Optional ledger that model calls and payment tools reserve budget against.
+    ///
+    /// Installed on each run's [`RunConfig::spend_ledger`] when the run carries none.
+    pub spend_ledger: Option<Arc<dyn adk_core::SpendLedger>>,
+    /// Optional durable run queue shared by every replica.
+    ///
+    /// When set, [`Runner::interrupt`] also requests cancellation of the session's
+    /// unfinished durable runs, so the worker that owns one stops it on its next
+    /// heartbeat, whichever replica it runs on.
+    pub durable_runs: Option<Arc<dyn adk_core::DurableRunStore>>,
+    /// Optional audit trail for governed actions.
+    ///
+    /// Installed on each run's [`RunConfig::audit`] when the run carries none, and
+    /// attached to the runner's kill switch so freezes and unfreezes are recorded.
+    pub audit: Option<adk_core::audit_log::AuditTrail>,
+    /// Optional source of the principals each run's agents act as.
+    ///
+    /// Read at the start of every run: the root agent acts as the source's principal for
+    /// it, and every other agent as the source's principal for it when the source maps
+    /// one. A principal the run's [`RunConfig::acting`] names for an agent takes
+    /// precedence. Without one, each agent acts as
+    /// `urn:adk:agent:{app_name}/{agent_name}`.
+    pub identity_source: Option<Arc<dyn adk_core::IdentitySource>>,
+    /// Optional policy allowing runs to act for a subject other than their session's
+    /// user. Without one, such runs are refused with `identity.subject_mismatch`.
+    pub subject_delegation: Option<Arc<dyn adk_core::SubjectDelegationPolicy>>,
 }
 
 /// Agent execution runtime.
@@ -148,10 +382,25 @@ pub struct Runner {
     /// Optional context compaction configuration for token-budget overflow handling.
     #[cfg(feature = "context-compaction")]
     context_compaction: Option<Arc<crate::compaction::CompactionConfig>>,
+    /// Hold taken before each model call when the run config carries a spend ledger.
+    llm_spend_estimate: crate::spend::LlmSpendEstimate,
     /// Per-session cancellation tokens for the interrupt API.
     /// Each `run()` call registers a token here; `interrupt()` cancels it.
     active_runs: ActiveRuns,
     next_run_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Policy installed on runs that carry none.
+    tool_policy: Option<Arc<dyn adk_core::ToolPolicy>>,
+    /// Kill switch checked at the start of every run and carried into it.
+    governance: adk_core::GovernanceControl,
+    /// Durable stores installed on runs that carry none.
+    action_ledger: Option<Arc<dyn adk_core::ActionLedger>>,
+    approval_store: Option<Arc<dyn adk_core::ApprovalStore>>,
+    spend_ledger: Option<Arc<dyn adk_core::SpendLedger>>,
+    durable_runs: Option<Arc<dyn adk_core::DurableRunStore>>,
+    /// Audit trail installed on runs that carry none.
+    audit: Option<adk_core::audit_log::AuditTrail>,
+    identity_source: Option<Arc<dyn adk_core::IdentitySource>>,
+    subject_delegation: Option<Arc<dyn adk_core::SubjectDelegationPolicy>>,
     /// Serializes externally triggered invocations per session. The weak values prevent the
     /// per-trigger session policy from retaining one lock forever for every completed event.
     pub(crate) external_session_locks: Arc<
@@ -210,6 +459,11 @@ impl Runner {
             })
         });
 
+        let governance = config.governance.unwrap_or_default();
+        if let Some(audit) = &config.audit {
+            governance.attach_audit(audit.clone());
+        }
+
         Ok(Self {
             app_name: config.app_name,
             root_agent: config.agent,
@@ -231,8 +485,18 @@ impl Runner {
             intra_compactor,
             #[cfg(feature = "context-compaction")]
             context_compaction: config.context_compaction.map(Arc::new),
+            llm_spend_estimate: crate::spend::LlmSpendEstimate::default(),
             active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             next_run_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            tool_policy: config.tool_policy,
+            governance,
+            action_ledger: config.action_ledger,
+            approval_store: config.approval_store,
+            spend_ledger: config.spend_ledger,
+            durable_runs: config.durable_runs,
+            audit: config.audit,
+            identity_source: config.identity_source,
+            subject_delegation: config.subject_delegation,
             external_session_locks: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -242,6 +506,57 @@ impl Runner {
     /// The executable root owned by this runner.
     pub(crate) fn root_agent(&self) -> Arc<dyn Agent> {
         Arc::clone(&self.root_agent)
+    }
+
+    /// The name of the runner's root agent.
+    pub fn root_agent_name(&self) -> &str {
+        self.root_agent.name()
+    }
+
+    /// The audit trail installed on runs that carry none, if any.
+    pub fn audit_trail(&self) -> Option<&adk_core::audit_log::AuditTrail> {
+        self.audit.as_ref().or(self.run_config.audit.as_ref())
+    }
+
+    /// The principal the agent named `agent_name` acts as when a run names none for it.
+    ///
+    /// The identity source's principal for the agent; for the root agent, falling back
+    /// to the source's current principal; otherwise
+    /// [`AgentPrincipal::derived`](adk_core::AgentPrincipal::derived).
+    ///
+    /// # Errors
+    ///
+    /// Returns the identity source's error.
+    pub async fn default_principal(&self, agent_name: &str) -> Result<adk_core::AgentPrincipal> {
+        if let Some(source) = &self.identity_source {
+            if let Some(principal) = source.principal_for(agent_name).await? {
+                return Ok(principal);
+            }
+            if agent_name == self.root_agent.name() {
+                return source.current().await;
+            }
+        }
+        Ok(adk_core::AgentPrincipal::derived(&self.app_name, agent_name))
+    }
+
+    fn acting_resolver(&self) -> crate::acting::ActingResolver {
+        crate::acting::ActingResolver {
+            app_name: self.app_name.clone(),
+            root: Arc::clone(&self.root_agent),
+            source: self.identity_source.clone(),
+            delegation: self.subject_delegation.clone(),
+        }
+    }
+
+    /// Sets what a call to an unpriced model commits in the run's
+    /// [`spend_ledger`](RunConfig::spend_ledger) when its response reports no cost.
+    ///
+    /// Priced calls reserve and commit their upper-bound cost instead; see
+    /// [`ModelCallScope`](adk_core::ModelCallScope). The runner writes the estimate into
+    /// [`RunConfig::llm_spend_estimate`] when the run's config has none. Defaults to [`LlmSpendEstimate::default`](crate::LlmSpendEstimate::default).
+    pub fn with_llm_spend_estimate(mut self, estimate: crate::LlmSpendEstimate) -> Self {
+        self.llm_spend_estimate = estimate;
+        self
     }
 
     /// Enable skill injection using a pre-built injector.
@@ -304,6 +619,22 @@ impl Runner {
         &self.session_service
     }
 
+    /// Returns the runner's kill switch.
+    ///
+    /// Freezing it fails new runs at their start and stops running ones before their
+    /// next model or tool call, with an error carrying the freeze reason.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// runner.governance().freeze("incident 4012");
+    /// // ... investigate ...
+    /// runner.governance().unfreeze();
+    /// ```
+    pub fn governance(&self) -> &adk_core::GovernanceControl {
+        &self.governance
+    }
+
     /// Returns the runner's configured [`RunConfig`].
     ///
     /// Useful as a base to clone and adjust for [`Self::run_with_config`].
@@ -328,6 +659,31 @@ impl Runner {
         user_content: Content,
         run_config: Option<RunConfig>,
     ) -> Result<EventStream> {
+        Ok(self
+            .start_with_config(user_id, session_id, user_content, run_config)
+            .await?
+            .into_events())
+    }
+
+    /// Registers one invocation and returns its identity with the event stream.
+    ///
+    /// Prefer this method when a host must durably associate its own turn or
+    /// operation record before the first agent event can be produced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if invocation setup fails before the stream is created.
+    /// Session lookup and agent execution failures are yielded by the returned
+    /// stream.
+    pub async fn start_with_config(
+        &self,
+        user_id: UserId,
+        session_id: SessionId,
+        user_content: Content,
+        run_config: Option<RunConfig>,
+    ) -> Result<RunnerInvocation> {
+        let invocation_id = InvocationId::try_from(format!("inv-{}", uuid::Uuid::new_v4()))?;
+        let stream_invocation_id = invocation_id.to_string();
         let app_name = self.app_name.clone();
         let typed_app_name = AppName::try_from(app_name.clone())?;
         let session_service = self.session_service.clone();
@@ -340,12 +696,51 @@ impl Runner {
         #[cfg(feature = "skills")]
         let skill_injector = self.skill_injector.clone();
         let mut run_config = run_config.unwrap_or_else(|| self.run_config.clone());
+        // The runner's policy and kill switch govern every run, including one started with
+        // its own config; the config travels into transfers and agent tools with them.
+        if run_config.tool_policy.is_none() {
+            run_config.tool_policy = self.tool_policy.clone();
+        }
+        if run_config.action_ledger.is_none() {
+            run_config.action_ledger = self.action_ledger.clone();
+        }
+        if run_config.approval_store.is_none() {
+            run_config.approval_store = self.approval_store.clone();
+        }
+        if run_config.spend_ledger.is_none() {
+            run_config.spend_ledger = self.spend_ledger.clone();
+        }
+        if run_config.audit.is_none() {
+            run_config.audit = self.audit.clone();
+        }
+        if !run_config.governance.iter().any(|control| control.same_as(&self.governance)) {
+            run_config.governance.push(self.governance.clone());
+        }
+        // Each run counts against fresh counters unless the caller supplied a tracker to share.
+        // Transfer targets, workflow sub-agents and agent tools inherit it through the config.
+        if run_config.budget_tracker.is_none()
+            && let Some(budget) = run_config.budget.clone()
+        {
+            run_config.budget_tracker = Some(Arc::new(adk_core::BudgetTracker::new(budget)));
+        }
+        let budget_tracker = run_config.budget_tracker.clone();
+        // Plugin model and tool callbacks run inside the agent, which reaches them through the
+        // run config; transfer targets and agent tools inherit the config, and with it the hooks.
+        #[cfg(feature = "plugins")]
+        if let Some(manager) = plugin_manager.as_ref() {
+            let hooks: Arc<dyn adk_core::InvocationHooks> = manager.clone();
+            if !run_config.invocation_hooks.iter().any(|existing| Arc::ptr_eq(existing, &hooks)) {
+                run_config.invocation_hooks.insert(0, hooks);
+            }
+        }
+        // Agents, compaction, sampling and routing read the estimate from the config.
+        run_config.llm_spend_estimate.get_or_insert(self.llm_spend_estimate);
+        let acting_resolver = self.acting_resolver();
         let compaction_config = self.compaction_config.clone();
         let context_cache_config = self.context_cache_config.clone();
         let cache_capable = self.cache_capable.clone();
         let cache_manager_ref = self.cache_manager.clone();
         let request_context = self.request_context.clone();
-        let cancellation_token = self.cancellation_token.clone();
         let intra_compactor = self.intra_compactor.clone();
         #[cfg(feature = "context-compaction")]
         let context_compaction = self.context_compaction.clone();
@@ -359,7 +754,14 @@ impl Runner {
         // unique run ID rather than the raw session ID: two identities can share a
         // session ID, and one identity can have two runs in flight, and both cases
         // previously overwrote each other's token.
-        let session_token = CancellationToken::new();
+        //
+        // A child of the global token fires when either the global token or this run's
+        // interrupt does, with no watcher task to outlive the run; dropping the run's
+        // last handle detaches the child from the global token.
+        let session_token = match self.cancellation_token.as_ref() {
+            Some(global) => global.child_token(),
+            None => CancellationToken::new(),
+        };
         let run_id = self.next_run_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
             let mut runs = self.active_runs.lock().unwrap_or_else(|e| e.into_inner());
@@ -369,36 +771,38 @@ impl Runner {
             );
         }
         let active_runs = self.active_runs.clone();
-        // Effective token: cancelled if either the global token or the session token fires
-        let effective_token = if let Some(ref global) = cancellation_token {
-            let combined = CancellationToken::new();
-            let combined_clone = combined.clone();
-            let global_clone = global.clone();
-            let session_clone = session_token.clone();
-            // Watch both tokens — cancel the combined token when either fires
-            let combined_for_global = combined_clone.clone();
-            tokio::spawn(async move {
-                global_clone.cancelled().await;
-                combined_for_global.cancel();
-            });
-            let combined_for_session = combined_clone;
-            tokio::spawn(async move {
-                session_clone.cancelled().await;
-                combined_for_session.cancel();
-            });
-            Some(combined)
-        } else {
-            Some(session_token.clone())
-        };
+        let effective_token = Some(session_token);
 
         // Built here rather than inside the generator: registration happens as soon
         // as `run` is called, so deregistration must also survive a stream that is
         // dropped before it is ever polled. Moving the guard into the generator
         // keeps it alive exactly as long as the stream.
         let cleanup = ActiveRunCleanup { active_runs: active_runs.clone(), run_id };
+        let stop_session_service = self.session_service.clone();
+        let stop_identity = identity.clone();
+        let stop_invocation_id = invocation_id.to_string();
+        let stop_default_author = self.root_agent.name().to_string();
 
         let s = stream! {
             let _cleanup = cleanup;
+
+            // A frozen runner refuses new work before touching the session.
+            if let Err(error) = run_config.check_governance() {
+                yield Err(error);
+                return;
+            }
+
+            // Read per run, so a rotating workload identity is current; the agent id is
+            // stable across redeploys while the instance may change. The subject is pinned
+            // to the session's user before any agent runs.
+            if let Err(error) = acting_resolver
+                .resolve(&mut run_config, user_id.as_ref(), session_id.as_ref(), &stream_invocation_id)
+                .await
+            {
+                tracing::warn!(error = %error, "run identity refused; the run does not start");
+                yield Err(error);
+                return;
+            }
 
             // Use the effective token (combines global + per-session)
             let cancellation_token = effective_token;
@@ -423,6 +827,20 @@ impl Runner {
             // Find which agent should handle this request
             let agent_to_run = Self::find_agent_to_run(&root_agent, session.as_ref());
 
+            // A resumed sub-agent gets the same parent and peer targets as on the
+            // transfer path, so it can still hand the conversation on.
+            if agent_to_run.name() != root_agent.name() {
+                let (parent_name, peer_names) =
+                    Self::compute_transfer_context(&root_agent, agent_to_run.name());
+                let mut targets = Vec::new();
+                if let Some(ref parent) = parent_name {
+                    targets.push(parent.clone());
+                }
+                targets.extend(peer_names);
+                run_config.transfer_targets = targets;
+                run_config.parent_agent = parent_name;
+            }
+
             // Let validated composite roots apply policy for the concrete agent
             // selected for this turn. Ordinary agents keep the default no-op.
             root_agent.configure_run(agent_to_run.name(), &mut run_config);
@@ -437,7 +855,7 @@ impl Runner {
             let memory_service_clone = memory_service.clone();
 
             // Create invocation context with MutableSession
-            let invocation_id = format!("inv-{}", uuid::Uuid::new_v4());
+            let invocation_id = stream_invocation_id;
             #[cfg(any(feature = "skills", feature = "plugins"))]
             let mut effective_user_content = user_content.clone();
             #[cfg(not(any(feature = "skills", feature = "plugins")))]
@@ -739,7 +1157,13 @@ impl Runner {
             if let Some(ref compactor) = intra_compactor {
                 compactor.reset_cycle();
                 let session_events = ctx.mutable_session().as_ref().events_snapshot();
-                match compactor.maybe_compact(&session_events).await {
+                // The summary call counts against the run's budget and spend ledger.
+                let scope = adk_core::ModelCallScope::for_run(
+                    adk_core::InvocationContext::run_config(ctx.as_ref()),
+                    ctx.app_name(),
+                    agent_to_run.name(),
+                );
+                match scope.within(compactor.maybe_compact(&session_events)).await {
                     Ok(Some(compacted_events)) => {
                         ctx.mutable_session().replace_events(compacted_events);
                         tracing::info!("intra-invocation compaction applied before agent execution");
@@ -765,7 +1189,12 @@ impl Runner {
                         budget = cc_config.context_budget,
                         "context exceeds budget, applying proactive compaction"
                     );
-                    match crate::compaction::apply_compaction_with_retry(cc_config, session_events).await {
+                    let scope = adk_core::ModelCallScope::for_run(
+                        adk_core::InvocationContext::run_config(ctx.as_ref()),
+                        ctx.app_name(),
+                        agent_to_run.name(),
+                    );
+                    match scope.within(crate::compaction::apply_compaction_with_retry(cc_config, session_events)).await {
                         Ok(compacted) => {
                             ctx.mutable_session().replace_events(compacted);
                             tracing::info!("proactive context compaction succeeded");
@@ -804,7 +1233,12 @@ impl Runner {
                         "agent execution failed with token limit error, attempting compaction"
                     );
                     let session_events = ctx.mutable_session().events_snapshot();
-                    match crate::compaction::apply_reactive_compaction(cc_config, session_events).await {
+                    let scope = adk_core::ModelCallScope::for_run(
+                        adk_core::InvocationContext::run_config(ctx.as_ref()),
+                        ctx.app_name(),
+                        agent_to_run.name(),
+                    );
+                    match scope.within(crate::compaction::apply_reactive_compaction(cc_config, session_events)).await {
                         Ok(compacted) => {
                             ctx.mutable_session().replace_events(compacted);
                             tracing::info!("context compaction succeeded after token limit error, retrying agent");
@@ -845,6 +1279,8 @@ impl Runner {
             use futures::StreamExt;
             let mut transfer_target: Option<(String, String)> = None;
             let mut streamed_content = HashMap::new();
+            let mut in_flight = InFlightCalls::default();
+            let mut cancelled = false;
             // A model call inside the agent's loop fails as an `Err` item in its
             // stream, not as an `Err` from `run()`, so the stream gets its own
             // compact-and-rerun — once per invocation, since a second overflow
@@ -863,11 +1299,8 @@ impl Runner {
                             biased;
                             _ = token.cancelled() => {
                                 tracing::info!("cancellation fired during agent stream await");
-                                #[cfg(feature = "plugins")]
-                                if let Some(manager) = plugin_manager.as_ref() {
-                                    manager.run_after_run(ctx.clone() as Arc<dyn adk_core::InvocationContext>).await;
-                                }
-                                return;
+                                cancelled = true;
+                                None
                             }
                             // Instrument the poll, not just the construction of the
                             // stream: `agent_to_run.run(..)` merely builds the
@@ -904,6 +1337,12 @@ impl Runner {
                         }
 
                         preserve_streamed_content(&mut streamed_content, &mut event);
+                        // Counts usage from agents that call models directly and
+                        // audits the budget after every event.
+                        let budget_check = budget_tracker
+                            .as_ref()
+                            .map_or(Ok(()), |tracker| tracker.record_event(&mut event));
+                        in_flight.observe(&event);
 
                         // Check for transfer action
                         if let Some(target) = &event.actions.transfer_to_agent {
@@ -966,6 +1405,14 @@ impl Runner {
                                 return;
                             }
                         yield Ok(event);
+                        if let Err(exceeded) = budget_check {
+                            #[cfg(feature = "plugins")]
+                            if let Some(manager) = plugin_manager.as_ref() {
+                                manager.run_after_run(ctx.clone() as Arc<dyn adk_core::InvocationContext>).await;
+                            }
+                            yield Err(exceeded.into());
+                            return;
+                        }
                     }
                     Err(e) => {
                         #[cfg(feature = "context-compaction")]
@@ -979,7 +1426,12 @@ impl Runner {
                                 "agent stream failed with token limit error, attempting compaction"
                             );
                             let session_events = ctx.mutable_session().events_snapshot();
-                            match crate::compaction::apply_reactive_compaction(cc_config, session_events).await {
+                            let scope = adk_core::ModelCallScope::for_run(
+                                adk_core::InvocationContext::run_config(ctx.as_ref()),
+                                ctx.app_name(),
+                                agent_to_run.name(),
+                            );
+                            match scope.within(crate::compaction::apply_reactive_compaction(cc_config, session_events)).await {
                                 Ok(compacted) => {
                                     ctx.mutable_session().replace_events(compacted);
                                     tracing::info!("context compaction succeeded after token limit error, rerunning agent");
@@ -1024,7 +1476,9 @@ impl Runner {
             let mut transfer_depth: u32 = 0;
             let mut current_transfer_target = transfer_target;
 
-            while let Some((transfer_source, target_name)) = current_transfer_target.take() {
+            while !cancelled
+                && let Some((transfer_source, target_name)) = current_transfer_target.take()
+            {
                 transfer_depth += 1;
                 if transfer_depth > max_depth {
                     tracing::warn!(
@@ -1182,11 +1636,8 @@ impl Runner {
                                 biased;
                                 _ = token.cancelled() => {
                                     tracing::info!("cancellation fired during transferred agent stream await");
-                                    #[cfg(feature = "plugins")]
-                                    if let Some(manager) = plugin_manager.as_ref() {
-                                        manager.run_after_run(ctx.clone() as Arc<dyn adk_core::InvocationContext>).await;
-                                    }
-                                    return;
+                                    cancelled = true;
+                                    None
                                 }
                                 result = transfer_stream.next() => result,
                             }
@@ -1218,6 +1669,10 @@ impl Runner {
                             }
 
                             preserve_streamed_content(&mut streamed_content, &mut event);
+                            let budget_check = budget_tracker
+                                .as_ref()
+                                .map_or(Ok(()), |tracker| tracker.record_event(&mut event));
+                            in_flight.observe(&event);
 
                             // Capture further transfer requests
                             if let Some(target) = &event.actions.transfer_to_agent {
@@ -1271,6 +1726,14 @@ impl Runner {
                                     return;
                                 }
                             yield Ok(event);
+                            if let Err(exceeded) = budget_check {
+                                #[cfg(feature = "plugins")]
+                                if let Some(manager) = plugin_manager.as_ref() {
+                                    manager.run_after_run(ctx.clone() as Arc<dyn adk_core::InvocationContext>).await;
+                                }
+                                yield Err(exceeded.into());
+                                return;
+                            }
                         }
                         Err(e) => {
                             #[cfg(feature = "plugins")]
@@ -1282,6 +1745,41 @@ impl Runner {
                         }
                     }
                 }
+            }
+
+            if cancelled {
+                // Stops the interrupted tool before its calls are answered.
+                drop(agent_stream);
+                if let Some(trail) = &run_config.audit {
+                    // The run is already over, so a failed write is logged by the trail.
+                    let _ = in_flight
+                        .audit_calls(
+                            trail,
+                            &run_config,
+                            &identity,
+                            "cancelled",
+                            |_| adk_core::audit_log::AuditRecordOutcome::OutcomeUnknown,
+                        )
+                        .await;
+                }
+                for event in in_flight.answer_interrupted() {
+                    ctx.mutable_session().append_event(event.clone());
+                    if let Err(error) = session_service
+                        .append_event_for_identity(adk_session::AppendEventRequest {
+                            identity: identity.clone(),
+                            event: event.clone(),
+                        })
+                        .await
+                    {
+                        tracing::error!(error = %error, "failed to persist the outcome of an interrupted tool call");
+                    }
+                    yield Ok(event);
+                }
+                #[cfg(feature = "plugins")]
+                if let Some(manager) = plugin_manager.as_ref() {
+                    manager.run_after_run(ctx.clone() as Arc<dyn adk_core::InvocationContext>).await;
+                }
+                return;
             }
 
             // ===== CONTEXT COMPACTION =====
@@ -1324,7 +1822,12 @@ impl Runner {
                         if compact_up_to > 0 {
                             let events_to_compact = &all_events[..compact_up_to];
 
-                            match compaction_cfg.summarizer.summarize_events(events_to_compact).await {
+                            let scope = adk_core::ModelCallScope::for_run(
+                                adk_core::InvocationContext::run_config(ctx.as_ref()),
+                                ctx.app_name(),
+                                ctx.agent_name(),
+                            );
+                            match scope.within(compaction_cfg.summarizer.summarize_events(events_to_compact)).await {
                                 Ok(Some(compaction_event)) => {
                                     // Persist the compaction event
                                     if let Err(e) = session_service
@@ -1360,7 +1863,44 @@ impl Runner {
             }
         };
 
-        Ok(Box::pin(s))
+        // A run stopped by its budget ends with an event that explains why, persisted like
+        // any other, followed by the structured `ResourceExhausted` error.
+        let events = stream! {
+            use futures::StreamExt;
+            let mut inner = Box::pin(s);
+            let mut author = stop_default_author;
+            while let Some(item) = inner.next().await {
+                match item {
+                    Ok(event) => {
+                        if !event.author.is_empty() && event.author != "user" {
+                            author.clone_from(&event.author);
+                        }
+                        yield Ok(event);
+                    }
+                    Err(error) => {
+                        if let Some(stop_event) =
+                            adk_core::budget_exceeded_event(&stop_invocation_id, &author, &error)
+                        {
+                            if let Err(persist_error) = stop_session_service
+                                .append_event_for_identity(adk_session::AppendEventRequest {
+                                    identity: stop_identity.clone(),
+                                    event: stop_event.clone(),
+                                })
+                                .await
+                            {
+                                tracing::warn!(error = %persist_error, "failed to persist the budget stop event");
+                            }
+                            yield Ok(stop_event);
+                        }
+                        yield Err(error);
+                        return;
+                    }
+                }
+            }
+        };
+
+        let events: EventStream = Box::pin(events);
+        Ok(RunnerInvocation { invocation_id, events })
     }
 
     /// Convenience method that accepts string arguments.
@@ -1408,6 +1948,7 @@ impl Runner {
     /// let mut stream = runner.run(user_id, session_id, new_content).await?;
     /// ```
     pub fn interrupt(&self, session_id: &str) -> bool {
+        self.request_durable_cancel(None, session_id);
         let runs = self.active_runs.lock().unwrap_or_else(|e| e.into_inner());
         let matching: Vec<&ActiveRun> =
             runs.values().filter(|run| run.identity.session_id.as_ref() == session_id).collect();
@@ -1424,6 +1965,165 @@ impl Runner {
             run.token.cancel();
         }
         true
+    }
+
+    /// Requests cancellation of the session's unfinished durable runs in the background.
+    ///
+    /// `interrupt` is synchronous, so the store write runs on a spawned task; callers that
+    /// need the outcome use [`Runner::cancel_durable_runs`].
+    fn request_durable_cancel(&self, user_id: Option<&str>, session_id: &str) {
+        let Some(store) = self.durable_runs.clone() else { return };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                session.id = session_id,
+                "no tokio runtime to request durable cancellation on; call cancel_durable_runs"
+            );
+            return;
+        };
+        let filter = durable_filter(&self.app_name, user_id, session_id);
+        let session = session_id.to_string();
+        handle.spawn(async move {
+            if let Err(error) = cancel_matching(store.as_ref(), filter).await {
+                tracing::error!(session.id = %session, error = %error, "could not request durable run cancellation");
+            }
+        });
+    }
+
+    /// Requests cancellation of every unfinished durable run of this app for the session,
+    /// and returns how many were asked to stop.
+    ///
+    /// Queued and waiting runs are cancelled at once; a running run is flagged, and the
+    /// worker that owns it stops it on its next heartbeat. Returns 0 when the runner has
+    /// no [`durable_runs`](RunnerConfig::durable_runs) store.
+    ///
+    /// # Errors
+    ///
+    /// Returns the run store's error.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let asked = runner.cancel_durable_runs("user-1", "session-1").await?;
+    /// ```
+    pub async fn cancel_durable_runs(&self, user_id: &str, session_id: &str) -> Result<usize> {
+        match &self.durable_runs {
+            Some(store) => {
+                cancel_matching(
+                    store.as_ref(),
+                    durable_filter(&self.app_name, Some(user_id), session_id),
+                )
+                .await
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Answers every function call in the session that has no response, from the action
+    /// ledger, and returns how many were answered.
+    ///
+    /// A process that stops mid-tool leaves its call unanswered. Before a recovered run
+    /// continues the session, this appends one response per such call, keyed by the
+    /// call's original [idempotency key](adk_core::ToolContext::idempotency_key):
+    ///
+    /// | Ledger record | Response |
+    /// |---------------|----------|
+    /// | Completed with a value | `already_succeeded` with the result digest |
+    /// | Completed with an error | `already_failed` with the error |
+    /// | Begun, no outcome; or none | [`outcome_unknown`](adk_core::outcome_unknown_response) |
+    ///
+    /// No tool executes: a call the model wants again is a new call with a new
+    /// idempotency key. The ledger consulted is the runner's
+    /// [`action_ledger`](RunnerConfig::action_ledger), falling back to its run config's.
+    ///
+    /// # Errors
+    ///
+    /// Returns the session or ledger error.
+    pub async fn recover_unanswered_calls(&self, user_id: &str, session_id: &str) -> Result<usize> {
+        self.recover_unanswered_calls_with_config(user_id, session_id, None).await
+    }
+
+    /// [`recover_unanswered_calls`](Self::recover_unanswered_calls), recording the
+    /// recovered calls under the identity `run_config` resolves to rather than the
+    /// runner's configured one.
+    ///
+    /// A durable worker passes the config it continues the run with, so the recovery
+    /// records name the same subject as the run's other records.
+    ///
+    /// # Errors
+    ///
+    /// Returns the session or ledger error, or `identity.subject_mismatch` when
+    /// `run_config` asks to act for a subject the runner does not allow.
+    pub async fn recover_unanswered_calls_with_config(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_config: Option<RunConfig>,
+    ) -> Result<usize> {
+        let identity = adk_core::AdkIdentity::new(
+            AppName::try_from(self.app_name.clone())?,
+            UserId::try_from(user_id)?,
+            SessionId::try_from(session_id)?,
+        );
+        let session = self.session_service.get_for_identity(&identity).await?;
+        let mut in_flight = InFlightCalls::default();
+        for event in session.events().all() {
+            in_flight.observe(&event);
+        }
+        if in_flight.0.is_empty() {
+            return Ok(0);
+        }
+        let ledger = self.action_ledger.clone().or_else(|| self.run_config.action_ledger.clone());
+        let mut records = HashMap::new();
+        for call in &in_flight.0 {
+            let (Some(ledger), Some(id)) = (&ledger, &call.id) else { continue };
+            let key =
+                format!("{}/{user_id}/{session_id}/{}/{id}", self.app_name, call.invocation_id);
+            records.insert(id.clone(), ledger.get(&key).await?);
+        }
+        // Recorded before the calls are answered, so a refused write leaves them for the
+        // next recovery rather than resolved without a record.
+        if let Some(trail) = self.audit.as_ref().or(self.run_config.audit.as_ref()) {
+            let mut run_config = run_config.unwrap_or_else(|| self.run_config.clone());
+            if run_config.audit.is_none() {
+                run_config.audit = Some(trail.clone());
+            }
+            let invocation = in_flight.0.first().map(|call| call.invocation_id.clone());
+            self.acting_resolver()
+                .resolve(&mut run_config, user_id, session_id, invocation.as_deref().unwrap_or(""))
+                .await?;
+            in_flight
+                .audit_calls(trail, &run_config, &identity, "recovered", |call| {
+                    use adk_core::audit_log::AuditRecordOutcome;
+                    let record = call.id.as_ref().and_then(|id| records.get(id)).cloned();
+                    match record.flatten().and_then(|record| record.outcome) {
+                        Some(adk_core::ActionOutcome::Succeeded { .. }) => {
+                            AuditRecordOutcome::Succeeded
+                        }
+                        Some(adk_core::ActionOutcome::Failed { .. }) => AuditRecordOutcome::Failed,
+                        _ => AuditRecordOutcome::OutcomeUnknown,
+                    }
+                })
+                .await?;
+        }
+        let answered = in_flight.0.len();
+        let events = in_flight.answer_with(|call| {
+            let record = call.id.as_ref().and_then(|id| records.get(id).cloned().flatten());
+            recovered_call_response(&call.name, record)
+        });
+        for event in events {
+            tracing::warn!(
+                session.id = session_id,
+                invocation.id = %event.invocation_id,
+                "answering function calls a stopped process left unanswered"
+            );
+            self.session_service
+                .append_event_for_identity(adk_session::AppendEventRequest {
+                    identity: identity.clone(),
+                    event,
+                })
+                .await?;
+        }
+        Ok(answered)
     }
 
     /// Interrupts runs for one exact identity.
@@ -1651,5 +2351,94 @@ mod streamed_content_tests {
 
         assert_eq!(text(&final_event), "Verify the invoice.");
         assert!(accumulated.is_empty());
+    }
+}
+
+/// The unfinished durable runs of `app_name` continuing `session_id`.
+fn durable_filter(app_name: &str, user_id: Option<&str>, session_id: &str) -> adk_core::RunFilter {
+    let filter = adk_core::RunFilter::default().app_name(app_name).session_id(session_id).states([
+        adk_core::RunState::Queued,
+        adk_core::RunState::Running,
+        adk_core::RunState::Waiting,
+    ]);
+    match user_id {
+        Some(user_id) => filter.user_id(user_id),
+        None => filter,
+    }
+}
+
+async fn cancel_matching(
+    store: &dyn adk_core::DurableRunStore,
+    filter: adk_core::RunFilter,
+) -> Result<usize> {
+    let runs = store.list(filter).await?;
+    for run in &runs {
+        store.request_cancel(&run.run_id).await?;
+        tracing::info!(run.id = %run.run_id, run.state = ?run.state, "durable run cancellation requested");
+    }
+    Ok(runs.len())
+}
+
+#[cfg(test)]
+mod in_flight_tests {
+    use super::InFlightCalls;
+    use adk_core::{Content, Event, FunctionResponseData, Part};
+    use serde_json::json;
+
+    fn call(name: &str, id: Option<&str>) -> Part {
+        Part::FunctionCall {
+            name: name.to_string(),
+            args: json!({}),
+            id: id.map(str::to_string),
+            thought_signature: None,
+        }
+    }
+
+    fn response(name: &str, id: Option<&str>) -> Part {
+        Part::FunctionResponse {
+            function_response: FunctionResponseData::new(name, json!({"ok": true})),
+            id: id.map(str::to_string),
+            annotations: None,
+        }
+    }
+
+    fn event(author: &str, role: &str, parts: Vec<Part>) -> Event {
+        let mut event = Event::new("inv-1");
+        event.author = author.to_string();
+        event.llm_response.content = Some(Content { role: role.to_string(), parts });
+        event
+    }
+
+    #[test]
+    fn only_unanswered_calls_are_answered_once_each() {
+        let mut in_flight = InFlightCalls::default();
+        in_flight.observe(&event(
+            "agent",
+            "model",
+            vec![call("pay", Some("c1")), call("ship", Some("c2")), call("notify", None)],
+        ));
+        in_flight.observe(&event("agent", "function", vec![response("ship", Some("c2"))]));
+        // A partial chunk never opens a call.
+        let mut partial = event("agent", "model", vec![call("refund", Some("c3"))]);
+        partial.llm_response.partial = true;
+        in_flight.observe(&partial);
+
+        let answered = in_flight.answer_interrupted();
+
+        assert_eq!(answered.len(), 1, "one event per author, branch, and invocation");
+        assert_eq!(answered[0].author, "agent");
+        let parts = &answered[0].llm_response.content.as_ref().unwrap().parts;
+        let answered_calls: Vec<_> = parts
+            .iter()
+            .map(|part| match part {
+                Part::FunctionResponse { function_response, id, .. } => {
+                    assert!(adk_core::is_outcome_unknown(&function_response.response));
+                    (function_response.name.as_str(), id.as_deref())
+                }
+                other => panic!("unexpected part {other:?}"),
+            })
+            .collect();
+        assert_eq!(answered_calls, [("pay", Some("c1")), ("notify", None)]);
+        assert!(in_flight.answer_interrupted().is_empty(), "calls are answered once");
     }
 }

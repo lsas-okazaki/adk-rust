@@ -8,8 +8,9 @@
 //! tool call (a write-ahead log written to session state via `state_delta`):
 //!
 //! - **before** ([`Disposition::PendingResult`]): if the process crashes during
-//!   the tool, recovery re-runs it (only pure script execution preceded it, so
-//!   that is safe);
+//!   the tool, recovery re-runs the call. With `RunConfig::action_ledger` set, a
+//!   non-idempotent call keeps its idempotency key on recovery, so the ledger
+//!   answers it instead of executing it again;
 //! - **after** ([`Disposition::Resolved`]): once the tool has returned, recovery
 //!   resumes with the stored result and never re-runs the tool.
 //!
@@ -29,11 +30,12 @@ use adk_core::{
     AdkError, AfterAgentCallback, AfterModelCallback, AfterToolCallback, AfterToolCallbackFull,
     Agent, Artifacts, BeforeAgentCallback, BeforeModelCallback, BeforeModelResult,
     BeforeToolCallback, CallbackContext, Content, ErrorCategory, ErrorComponent, Event,
-    EventActions, EventStream, GenerateContentConfig, GlobalInstructionProvider, IncludeContents,
-    InstructionProvider, InvocationContext, Llm, LlmRequest, LlmResponse, MemoryEntry,
-    OnToolErrorCallback, Part, ReadonlyContext, RetryBudget, SharedState, Tool,
-    ToolCallbackContext, ToolConfirmationDecision, ToolConfirmationHandler, ToolConfirmationPolicy,
-    ToolConfirmationRequest, ToolContext, ToolOutcome, Toolset,
+    EventActions, EventStream, GenerateContentConfig, GlobalInstructionProvider, GovernedCall,
+    IncludeContents, InstructionProvider, InvocationContext, Llm, LlmRequest, LlmResponse,
+    MemoryEntry, OnToolErrorCallback, Part, ReadonlyContext, RetryBudget, SharedState, Tool,
+    ToolAuthorization, ToolCallbackContext, ToolConfirmationDecision, ToolConfirmationPolicy,
+    ToolConfirmationRequest, ToolContext, ToolEffect, ToolGate, ToolOutcome, Toolset,
+    authorize_tool_call,
 };
 use async_stream::stream;
 use async_trait::async_trait;
@@ -49,6 +51,7 @@ use crate::codeact::error_map::{
 use crate::codeact::output::ScriptOutput;
 use crate::codeact::runtime::{CodeRuntime, ResumeWith, RunStep, RuntimeError, bind_call_args};
 use crate::guardrails::{GuardrailSet, enforce_guardrails};
+use crate::invocation_hooks::HookCallbacks;
 use crate::skill_shim::{SelectionPolicy, SkillIndex, select_skill_prompt_block};
 #[cfg(feature = "enhanced-plugins")]
 use adk_plugin::{
@@ -103,8 +106,6 @@ struct LoopInputs {
     runtime: Arc<dyn CodeRuntime>,
     tools: Vec<Arc<dyn Tool>>,
     policy: ToolConfirmationPolicy,
-    decisions: HashMap<String, ToolConfirmationDecision>,
-    confirmation_handler: Option<Arc<dyn ToolConfirmationHandler>>,
     /// The live invocation context; a fresh [`CodeToolContext`] is built from it
     /// per tool call so each call carries its own function-call id and actions.
     invocation_ctx: Arc<dyn InvocationContext>,
@@ -185,6 +186,10 @@ impl CircuitBreaker {
 
 /// The tool-execution policy shared across every call in one invocation.
 struct ToolPolicy<'a> {
+    /// The agent's own confirmation requirement.
+    confirmation: &'a ToolConfirmationPolicy,
+    /// The invocation the calls belong to; its run config drives the governed path.
+    invocation_ctx: &'a Arc<dyn InvocationContext>,
     tool_timeout: Duration,
     default_budget: Option<&'a RetryBudget>,
     tool_budgets: &'a HashMap<String, RetryBudget>,
@@ -192,6 +197,8 @@ struct ToolPolicy<'a> {
     before_tool: &'a [BeforeToolCallback],
     after_tool: &'a [AfterToolCallback],
     after_tool_full: &'a [AfterToolCallbackFull],
+    /// The run's invocation hooks, iterated ahead of the agent's own tool callbacks.
+    hooks: &'a HookCallbacks,
     #[cfg(feature = "enhanced-plugins")]
     plugins: Option<&'a EnhancedPluginManager>,
 }
@@ -211,7 +218,7 @@ impl ToolPolicy<'_> {
 fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>> {
     stream! {
         let LoopInputs {
-            model, runtime, tools, policy, decisions, confirmation_handler, invocation_ctx, incoming, system_prompt, conversation,
+            model, runtime, tools, policy, invocation_ctx, incoming, system_prompt, conversation,
             pending, invocation_id, agent_name, max_iterations, max_error_chars, supports_suspension,
             transfer_targets, generate_content_config, tool_timeout, output_key,
             default_retry_budget, tool_retry_budgets, circuit_breaker_threshold, on_tool_error,
@@ -223,12 +230,14 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
         } = input;
 
         let tool_map = build_tool_map(&tools);
-        let mut live_confirmation_decisions =
-            HashMap::<String, ToolConfirmationDecision>::new();
+        // Runner plugins and other run-wide hooks reach this agent through the run config.
+        let hook_callbacks = HookCallbacks::new(&invocation_ctx.run_config().invocation_hooks);
         let roster = roster(&tool_map);
 
         // Tool-robustness state for this invocation.
         let tool_policy = ToolPolicy {
+            confirmation: &policy,
+            invocation_ctx: &invocation_ctx,
             tool_timeout,
             default_budget: default_retry_budget.as_ref(),
             tool_budgets: &tool_retry_budgets,
@@ -236,18 +245,35 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
             before_tool: before_tool_callbacks.as_slice(),
             after_tool: after_tool_callbacks.as_slice(),
             after_tool_full: after_tool_callbacks_full.as_slice(),
+            hooks: &hook_callbacks,
             #[cfg(feature = "enhanced-plugins")]
             plugins: enhanced_plugin_manager.as_deref(),
         };
         let mut circuit = circuit_breaker_threshold.map(CircuitBreaker::new);
+        // Tool calls are keyed under the run that started the program, so a call replayed
+        // from a checkpoint in a later invocation keeps its idempotency key.
+        let run_id = pending
+            .as_ref()
+            .and_then(|cp| cp.run_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         // Callback context for model-level hooks (the invocation context is also a
         // callback context). Tool-level callbacks get a fresh per-call context.
         let model_ctx: Arc<dyn CallbackContext> = invocation_ctx.clone();
+        // Shared with every agent in the invocation through the run config.
+        let budget_tracker = invocation_ctx.run_config().budget_tracker.clone();
+        // Model calls reserve their upper-bound cost and count against the run budget.
+        let model_scope = adk_core::ModelCallScope::for_run(
+            invocation_ctx.run_config(),
+            invocation_ctx.app_name(),
+            invocation_ctx.agent_name(),
+        );
         let model_hooks = ModelHooks {
             before: before_model_callbacks.as_slice(),
             after: after_model_callbacks.as_slice(),
+            hooks: &hook_callbacks,
             ctx: &model_ctx,
+            scope: &model_scope,
             #[cfg(feature = "enhanced-plugins")]
             plugins: enhanced_plugin_manager.as_deref(),
         };
@@ -294,60 +320,36 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
                 // resume (escalate / skip-summarization / transfer). Checked
                 // before resuming the interpreter, mirroring the inline path.
                 let mut resume_control = ToolControl::default();
+                // A call still waiting for a decision, re-held with its final arguments.
+                let mut held: Option<ToolConfirmationRequest> = None;
                 let resolution: Option<ResolutionRecord> = match &cp.disposition {
-                    Disposition::PendingResult => {
-                        let (with, control) = execute_for_resume(
-                            &tool_map, &invocation_ctx, &cp.call, &mut pending_actions,
+                    // Recovery re-runs an unfinished call, and a confirmed call runs now.
+                    // Both pass through the governed path, which finds the decision.
+                    Disposition::PendingResult | Disposition::AwaitingConfirmation => {
+                        let tool_ctx: Arc<dyn ToolContext> = Arc::new(CodeToolContext::new(
+                            invocation_ctx.clone(), &run_id, cp.iteration, cp.call.call_id,
+                        ));
+                        match execute_for_resume(
+                            &tool_map, tool_ctx, &cp.call, &mut pending_actions,
                             &tool_policy, &mut circuit,
                         )
-                        .await;
-                        resume_control = control;
-                        Some(resume_to_record(with))
-                    }
-                    Disposition::Resolved(rec) => Some(rec.clone()),
-                    Disposition::AwaitingConfirmation => {
-                        let call_id = cp.call.call_id.to_string();
-                        // Static decisions are keyed by call ID, so a resumed
-                        // checkpoint is authorized only for its own call.
-                        let mut decision = live_confirmation_decisions
-                            .get(&call_id)
-                            .copied()
-                            .or_else(|| decisions.get(&call_id).copied());
-                        if decision.is_none()
-                            && let Some(handler) = confirmation_handler.as_ref()
+                        .await
                         {
-                            let request = ToolConfirmationRequest {
-                                tool_name: cp.call.tool.clone(),
-                                function_call_id: Some(cp.call.call_id.to_string()),
-                                args: cp.call.args.clone(),
-                            };
-                            match handler.decide(&request).await {
-                                Ok(value) => {
-                                    live_confirmation_decisions.insert(call_id, value);
-                                    decision = Some(value);
-                                }
-                                Err(error) => {
-                                    yield Err(error);
-                                    return;
-                                }
+                            Resumed::Ready(with, control) => {
+                                resume_control = control;
+                                Some(resume_to_record(with))
+                            }
+                            Resumed::Held(request) => {
+                                held = Some(request);
+                                None
+                            }
+                            Resumed::Abort(error) => {
+                                yield Err(error);
+                                return;
                             }
                         }
-                        match decision {
-                        Some(ToolConfirmationDecision::Approve) => {
-                            let (with, control) = execute_for_resume(
-                                &tool_map, &invocation_ctx, &cp.call, &mut pending_actions,
-                                &tool_policy, &mut circuit,
-                            )
-                            .await;
-                            resume_control = control;
-                            Some(resume_to_record(with))
-                        }
-                        Some(ToolConfirmationDecision::Deny) => {
-                            Some(ResolutionRecord::Raise(denied_message(&cp.call.tool)))
-                        }
-                        None => None,
-                        }
                     }
+                    Disposition::Resolved(rec) => Some(rec.clone()),
                     Disposition::AwaitingCompletion { .. } => {
                         completion_for(&incoming, &cp.call.tool, cp.call.call_id)
                             .map(ResolutionRecord::Value)
@@ -356,7 +358,16 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
                 match resolution {
                     // No resolution available yet — keep waiting (re-persist).
                     None => {
-                        let mut event = suspend_event(&invocation_id, &agent_name, &cp);
+                        let mut event = match held {
+                            Some(request) => {
+                                let waiting = CodeActCheckpoint {
+                                    disposition: Disposition::AwaitingConfirmation,
+                                    ..cp.clone()
+                                };
+                                held_event(&invocation_id, &agent_name, &waiting, request)
+                            }
+                            None => suspend_event(&invocation_id, &agent_name, &cp),
+                        };
                         flush_actions(&mut event, &mut pending_actions);
                         yield Ok(event);
                         return;
@@ -384,6 +395,7 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
                                 cp.call.clone(),
                                 Disposition::Resolved(rec.clone()),
                                 &roster,
+                                &run_id,
                             );
                             let mut after_ev =
                                 checkpoint_event(&invocation_id, &agent_name, &after);
@@ -418,6 +430,11 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
                         yield Err(AdkError::agent(format!(
                             "max iterations ({max_iterations}) exceeded without a final result"
                         )));
+                        return;
+                    }
+                    // The kill switch is checked before every model call.
+                    if let Err(error) = invocation_ctx.run_config().check_governance() {
+                        yield Err(error);
                         return;
                     }
                     let script = match next_script(
@@ -490,84 +507,12 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
                             args: args.clone(),
                         };
 
-                        // Confirmation gate.
-                        if policy.requires_confirmation(&name) {
-                            let call_id_key = call_id.to_string();
-                            let mut decision = live_confirmation_decisions
-                                .get(&call_id_key)
-                                .copied()
-                                .or_else(|| decisions.get(&call_id_key).copied());
-                            if decision.is_none()
-                                && let Some(handler) = confirmation_handler.as_ref()
-                            {
-                                let request = ToolConfirmationRequest {
-                                    tool_name: name.clone(),
-                                    function_call_id: Some(call_id.to_string()),
-                                    args: args.clone(),
-                                };
-                                match handler.decide(&request).await {
-                                    Ok(value) => {
-                                        live_confirmation_decisions
-                                            .insert(call_id_key, value);
-                                        decision = Some(value);
-                                    }
-                                    Err(error) => {
-                                        yield Err(error);
-                                        return;
-                                    }
-                                }
-                            }
-                            match decision {
-                                Some(ToolConfirmationDecision::Approve) => {}
-                                Some(ToolConfirmationDecision::Deny) => {
-                                    match call.resume(ResumeWith::Raise(denied_message(&name))) {
-                                        Ok(s) => step = s,
-                                        Err(e) => {
-                                            yield Err(runtime_err(e));
-                                            return;
-                                        }
-                                    }
-                                    continue 'script;
-                                }
-                                None if supports_suspension => {
-                                    let snapshot = match call.dump() {
-                                        Ok(s) => s,
-                                        Err(e) => {
-                                            yield Err(runtime_err(e));
-                                            return;
-                                        }
-                                    };
-                                    let cp = mk_checkpoint(
-                                        iteration,
-                                        transcript_with_stdout(
-                                            &transcript,
-                                            &script_output,
-                                            max_error_chars,
-                                        ),
-                                        snapshot,
-                                        pcall,
-                                        Disposition::AwaitingConfirmation,
-                                        &roster,
-                                    );
-                                    let mut event = suspend_event(&invocation_id, &agent_name, &cp);
-                                    flush_actions(&mut event, &mut pending_actions);
-                                    yield Ok(event);
-                                    return;
-                                }
-                                None => {
-                                    let msg = format!(
-                                        "tool '{name}' requires confirmation but this runtime cannot pause"
-                                    );
-                                    match call.resume(ResumeWith::Raise(msg)) {
-                                        Ok(s) => step = s,
-                                        Err(e) => {
-                                            yield Err(runtime_err(e));
-                                            return;
-                                        }
-                                    }
-                                    continue 'script;
-                                }
-                            }
+                        // The call counts against the run budget before it starts.
+                        if let Some(tracker) = budget_tracker.as_ref()
+                            && let Err(exceeded) = tracker.begin_tool_calls(1)
+                        {
+                            yield Err(exceeded.into());
+                            return;
                         }
 
                         // Long-running deferral (needs suspension).
@@ -580,9 +525,36 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
                                 }
                             };
                             let tool_ctx: Arc<dyn ToolContext> =
-                                Arc::new(CodeToolContext::new(invocation_ctx.clone(), call_id));
-                            let exec =
-                                run_tool(&tool, &tool_ctx, args, &tool_policy, &mut circuit).await;
+                                Arc::new(CodeToolContext::new(
+                                    invocation_ctx.clone(), &run_id, iteration, call_id,
+                                ));
+                            let exec = match run_tool(&tool, &tool_ctx, args, &tool_policy, &mut circuit).await {
+                                ToolRun::Finished(exec) => exec,
+                                ToolRun::Held(request) => {
+                                    let cp = mk_checkpoint(
+                                        iteration,
+                                        transcript_with_stdout(
+                                            &transcript,
+                                            &script_output,
+                                            max_error_chars,
+                                        ),
+                                        snapshot,
+                                        pcall,
+                                        Disposition::AwaitingConfirmation,
+                                        &roster,
+                                        &run_id,
+                                    );
+                                    let mut event =
+                                        held_event(&invocation_id, &agent_name, &cp, request);
+                                    flush_actions(&mut event, &mut pending_actions);
+                                    yield Ok(event);
+                                    return;
+                                }
+                                ToolRun::Abort(error) => {
+                                    yield Err(error);
+                                    return;
+                                }
+                            };
                             let control = capture_actions(&mut pending_actions, tool_ctx.actions());
                             // A terminal signal (escalate / skip-summarization /
                             // transfer) ends the run before suspending, matching
@@ -607,6 +579,7 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
                                         pcall,
                                         Disposition::AwaitingCompletion { pending_handle: Some(handle) },
                                         &roster,
+                                        &run_id,
                                     );
                                     let mut event = suspend_event(&invocation_id, &agent_name, &cp);
                                     flush_actions(&mut event, &mut pending_actions);
@@ -648,15 +621,44 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
                                 pcall.clone(),
                                 Disposition::PendingResult,
                                 &roster,
+                                &run_id,
                             );
                             let mut before_ev = checkpoint_event(&invocation_id, &agent_name, &before);
                             flush_actions(&mut before_ev, &mut pending_actions);
                             yield Ok(before_ev);
 
                             let tool_ctx: Arc<dyn ToolContext> =
-                                Arc::new(CodeToolContext::new(invocation_ctx.clone(), call_id));
-                            let exec =
-                                run_tool(&tool, &tool_ctx, args, &tool_policy, &mut circuit).await;
+                                Arc::new(CodeToolContext::new(
+                                    invocation_ctx.clone(), &run_id, iteration, call_id,
+                                ));
+                            let exec = match run_tool(&tool, &tool_ctx, args, &tool_policy, &mut circuit).await {
+                                ToolRun::Finished(exec) => exec,
+                                ToolRun::Held(request) => {
+                                    // Supersedes the SAVE-BEFORE checkpoint: the tool did not run.
+                                    let cp = mk_checkpoint(
+                                        iteration,
+                                        transcript_with_stdout(
+                                            &transcript,
+                                            &script_output,
+                                            max_error_chars,
+                                        ),
+                                        snapshot,
+                                        pcall,
+                                        Disposition::AwaitingConfirmation,
+                                        &roster,
+                                        &run_id,
+                                    );
+                                    let mut event =
+                                        held_event(&invocation_id, &agent_name, &cp, request);
+                                    flush_actions(&mut event, &mut pending_actions);
+                                    yield Ok(event);
+                                    return;
+                                }
+                                ToolRun::Abort(error) => {
+                                    yield Err(error);
+                                    return;
+                                }
+                            };
                             let control = capture_actions(&mut pending_actions, tool_ctx.actions());
                             let resolution = match exec {
                                 Ok(v) => ResolutionRecord::Value(v),
@@ -686,6 +688,7 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
                                 pcall,
                                 Disposition::Resolved(resolution.clone()),
                                 &roster,
+                                &run_id,
                             );
                             let mut after_ev = checkpoint_event(&invocation_id, &agent_name, &after);
                             flush_actions(&mut after_ev, &mut pending_actions);
@@ -693,9 +696,19 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
                             resolution_to_resume(resolution)
                         } else {
                             let tool_ctx: Arc<dyn ToolContext> =
-                                Arc::new(CodeToolContext::new(invocation_ctx.clone(), call_id));
-                            let exec =
-                                run_tool(&tool, &tool_ctx, args, &tool_policy, &mut circuit).await;
+                                Arc::new(CodeToolContext::new(
+                                    invocation_ctx.clone(), &run_id, iteration, call_id,
+                                ));
+                            let exec = match run_tool(&tool, &tool_ctx, args, &tool_policy, &mut circuit).await {
+                                ToolRun::Finished(exec) => exec,
+                                ToolRun::Held(_) => Err(format!(
+                                    "tool '{name}' requires confirmation but this runtime cannot pause"
+                                )),
+                                ToolRun::Abort(error) => {
+                                    yield Err(error);
+                                    return;
+                                }
+                            };
                             let control = capture_actions(&mut pending_actions, tool_ctx.actions());
                             if control.is_terminal() {
                                 let mut event =
@@ -816,6 +829,16 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
     }
 }
 
+/// How a resumed or recovered call ended.
+enum Resumed {
+    /// The value or error to feed back, with any terminal signal the tool raised.
+    Ready(ResumeWith, ToolControl),
+    /// The call still needs a confirmation decision.
+    Held(ToolConfirmationRequest),
+    /// The run must end.
+    Abort(AdkError),
+}
+
 /// Execute a tool to produce the value/error fed back into a resumed
 /// continuation (used on recovery for `PendingResult`/confirmed calls).
 ///
@@ -826,51 +849,82 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
 /// interpreter, exactly as the inline path does.
 async fn execute_for_resume(
     tools: &ToolMap,
-    invocation_ctx: &Arc<dyn InvocationContext>,
+    tool_ctx: Arc<dyn ToolContext>,
     call: &PendingToolCall,
     pending: &mut EventActions,
     policy: &ToolPolicy<'_>,
     circuit: &mut Option<CircuitBreaker>,
-) -> (ResumeWith, ToolControl) {
+) -> Resumed {
     match tools.get(&call.tool) {
         Some(tool) => {
-            let tool_ctx: Arc<dyn ToolContext> =
-                Arc::new(CodeToolContext::new(invocation_ctx.clone(), call.call_id));
             let result = match run_tool(tool, &tool_ctx, call.args.clone(), policy, circuit).await {
-                Ok(v) => ResumeWith::Value(v),
-                Err(msg) => ResumeWith::Raise(msg),
+                ToolRun::Finished(Ok(v)) => ResumeWith::Value(v),
+                ToolRun::Finished(Err(msg)) => ResumeWith::Raise(msg),
+                ToolRun::Held(request) => return Resumed::Held(request),
+                ToolRun::Abort(error) => return Resumed::Abort(error),
             };
             let control = capture_actions(pending, tool_ctx.actions());
-            (result, control)
+            Resumed::Ready(result, control)
         }
-        None => (ResumeWith::Raise(unknown_tool_message(&call.tool)), ToolControl::default()),
+        None => Resumed::Ready(
+            ResumeWith::Raise(unknown_tool_message(&call.tool)),
+            ToolControl::default(),
+        ),
     }
+}
+
+/// How one tool call ended.
+enum ToolRun {
+    /// A value to feed back into the script, or a message to raise in it.
+    Finished(Result<Value, String>),
+    /// The call needs a confirmation decision that does not exist yet.
+    Held(ToolConfirmationRequest),
+    /// The run must end: the kill switch is set, or the approval service failed.
+    Abort(AdkError),
 }
 
 /// Execute a tool with the full robustness policy and report a single outcome.
 ///
-/// In order: a tripped circuit breaker short-circuits with an error; otherwise
-/// the tool runs under a timeout, retrying per its [`RetryBudget`]; the circuit
-/// breaker records success/failure; and on ultimate failure the `on_tool_error`
-/// callbacks are tried for a fallback value. `Ok` is a value to feed back into
-/// the script (a real result or a fallback); `Err` is a message to raise.
+/// In order: a tripped circuit breaker short-circuits with an error; before-tool
+/// plugins and callbacks may rewrite the arguments or answer the call; the governed
+/// path (policy, guardrails, confirmation) authorizes the final arguments; the tool
+/// runs under a timeout, retrying per its [`RetryBudget`]; the circuit breaker
+/// records success/failure; and on ultimate failure the `on_tool_error` callbacks
+/// are tried for a fallback value.
 async fn run_tool(
     tool: &Arc<dyn Tool>,
     tool_ctx: &Arc<dyn ToolContext>,
     args: Value,
     policy: &ToolPolicy<'_>,
     circuit: &mut Option<CircuitBreaker>,
-) -> Result<Value, String> {
+) -> ToolRun {
     let name = tool.name().to_string();
 
     if let Some(cb) = circuit.as_ref()
         && cb.is_open(&name)
     {
-        return Err(format!(
+        return ToolRun::Finished(Err(format!(
             "tool '{name}' is temporarily disabled after {} consecutive failures",
             cb.threshold
-        ));
+        )));
     }
+
+    match run_authorized_tool(tool, tool_ctx, args, policy, circuit).await {
+        Ok(outcome) => outcome,
+        Err(message) => ToolRun::Finished(Err(message)),
+    }
+}
+
+/// The body of [`run_tool`] after the circuit-breaker check, with `?` for raised
+/// messages.
+async fn run_authorized_tool(
+    tool: &Arc<dyn Tool>,
+    tool_ctx: &Arc<dyn ToolContext>,
+    args: Value,
+    policy: &ToolPolicy<'_>,
+    circuit: &mut Option<CircuitBreaker>,
+) -> Result<ToolRun, String> {
+    let name = tool.name().to_string();
 
     // before-tool plugins: rewrite args or short-circuit with a synthetic result.
     #[cfg(feature = "enhanced-plugins")]
@@ -880,7 +934,9 @@ async fn run_tool(
             .await
         {
             Ok(BeforeToolCallResult::Continue(modified)) => modified,
-            Ok(BeforeToolCallResult::ShortCircuit(result)) => return Ok(result),
+            Ok(BeforeToolCallResult::ShortCircuit(result)) => {
+                return Ok(ToolRun::Finished(Ok(result)));
+            }
             Err(e) => return Err(e.to_string()),
         },
         None => args,
@@ -888,54 +944,149 @@ async fn run_tool(
 
     // before-tool callbacks: the first to return content short-circuits the call
     // (its value is fed back into the script as if the tool had returned it).
-    if !policy.before_tool.is_empty() {
+    if !policy.hooks.before_tool.is_empty() || !policy.before_tool.is_empty() {
         let cb_ctx: Arc<dyn CallbackContext> = Arc::new(ToolCallbackContext::new(
             tool_ctx.clone() as Arc<dyn CallbackContext>,
             name.clone(),
             args.clone(),
         ));
-        for callback in policy.before_tool {
+        for callback in policy.hooks.before_tool.iter().chain(policy.before_tool) {
             match callback(cb_ctx.clone()).await {
-                Ok(Some(content)) => return Ok(content_to_tool_value(&content)),
+                Ok(Some(content)) => {
+                    return Ok(ToolRun::Finished(Ok(content_to_tool_value(&content))));
+                }
                 Ok(None) => continue,
                 Err(e) => return Err(e.to_string()),
             }
         }
     }
 
-    let budget = policy.budget_for(&name);
+    // The governed path sees the final arguments, after every rewrite above.
+    let invocation_ctx = policy.invocation_ctx;
+    let call = GovernedCall::for_tool(tool.as_ref(), tool_ctx.function_call_id(), args)
+        .requiring_confirmation(
+            policy.confirmation.requires_confirmation(&name)
+                || invocation_ctx.requires_tool_confirmation(&name),
+        );
+    let args =
+        match authorize_tool_call(&ToolGate::for_context(invocation_ctx.as_ref()), call).await {
+            Ok(ToolAuthorization::Execute { args, .. }) => args,
+            Ok(ToolAuthorization::Refuse { reason, confirmation }) => {
+                return Err(match confirmation {
+                    Some(ToolConfirmationDecision::Deny) => denied_message(&name),
+                    _ => reason,
+                });
+            }
+            Ok(ToolAuthorization::Pending { request, .. }) => return Ok(ToolRun::Held(request)),
+            Err(error) => return Ok(ToolRun::Abort(error)),
+        };
+
+    // A non-idempotent call executes at most once per idempotency key. A ledger
+    // answer is raised into the script, so the code sees that the call did not run.
+    let effect = tool.effect();
+    let ledgered = match crate::tool_ledger::begin_ledgered_call(
+        invocation_ctx.as_ref(),
+        effect,
+        tool_ctx.idempotency_key(),
+        &name,
+        &args,
+    )
+    .await
+    {
+        Ok(Ok(ledgered)) => ledgered,
+        Ok(Err(answer)) => return Ok(ToolRun::Finished(Err(render_value(&answer)))),
+        Err(error) => return Ok(ToolRun::Abort(error)),
+    };
+
+    // Only a call that cannot repeat a side effect is retried, and only after a
+    // retryable error.
+    let budget = policy.budget_for(&name).filter(|_| effect.is_retry_safe());
     let max_attempts = budget.map(|b| b.max_retries + 1).unwrap_or(1);
-    let delay = budget.map(|b| b.delay).unwrap_or_default();
+    let timeout = tool.timeout_override().unwrap_or(Some(policy.tool_timeout));
+    // Actions are reset before each retry, so a failed attempt's state delta and
+    // escalation are never committed.
+    let initial_actions = tool_ctx.actions();
 
     let started = std::time::Instant::now();
     let mut last_error = String::new();
     let mut value = None;
+    // Set when the last attempt ended mid-flight (timeout or panic), so its side
+    // effect may or may not have happened.
+    let mut interrupted = false;
     // 0-based index of the attempt that produced the outcome (the successful
     // attempt, or the last failed one). Surfaced via `ToolOutcome::attempt`.
     let mut final_attempt: u32 = 0;
     for attempt in 0..max_attempts {
         final_attempt = attempt;
         if attempt > 0 {
-            tokio::time::sleep(delay).await;
+            if let Some(budget) = budget {
+                tokio::time::sleep(budget.backoff_delay(attempt)).await;
+            }
+            tool_ctx.set_actions(initial_actions.clone());
         }
+        let execution = tool.execute(tool_ctx.clone(), args.clone());
+        let bounded = async {
+            match timeout {
+                Some(limit) => tokio::time::timeout(limit, execution).await.map_err(|_| limit),
+                None => Ok(execution.await),
+            }
+        };
         // Catch panics so a misbehaving tool surfaces as a script-level error
         // rather than aborting the whole loop (matches LlmAgent).
-        let exec = std::panic::AssertUnwindSafe(tokio::time::timeout(
-            policy.tool_timeout,
-            tool.execute(tool_ctx.clone(), args.clone()),
-        ));
-        match futures::FutureExt::catch_unwind(exec).await {
-            Ok(Ok(Ok(v))) => {
-                value = Some(v);
-                break;
-            }
-            Ok(Ok(Err(err))) => last_error = tool_error_message(&err),
-            Ok(Err(_)) => {
-                last_error = format!("tool timed out after {}s", policy.tool_timeout.as_secs())
-            }
-            Err(_) => last_error = format!("tool '{name}' panicked during execution"),
+        let retryable =
+            match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(bounded)).await {
+                Ok(Ok(Ok(v))) => {
+                    value = Some(v);
+                    interrupted = false;
+                    break;
+                }
+                Ok(Ok(Err(err))) => {
+                    last_error = tool_error_message(&err);
+                    interrupted = false;
+                    err.is_retryable()
+                }
+                Ok(Err(limit)) => {
+                    last_error = format!("tool timed out after {}s", limit.as_secs());
+                    interrupted = true;
+                    true
+                }
+                Err(_) => {
+                    last_error = format!("tool '{name}' panicked during execution");
+                    interrupted = true;
+                    false
+                }
+            };
+        if !retryable {
+            break;
         }
     }
+
+    let outcome_unknown = interrupted && effect == ToolEffect::NonIdempotent;
+    if outcome_unknown
+        && let Err(error) = crate::tool_ledger::record_outcome_unknown(
+            invocation_ctx.as_ref(),
+            &name,
+            &args,
+            "interrupted",
+        )
+        .await
+    {
+        return Ok(ToolRun::Abort(error));
+    }
+    // A call that ended mid-flight keeps its begun record, so a replay is answered
+    // with an unknown outcome instead of executing again.
+    if let Some(ledgered) = ledgered
+        && !outcome_unknown
+    {
+        ledgered.complete(&name, value.as_ref(), &last_error).await;
+    }
+    // What the script and the after-tool callbacks see when the call failed.
+    let failure = if outcome_unknown {
+        crate::tool_ledger::interrupted_call_response(&last_error)
+    } else {
+        serde_json::json!({ "error": last_error })
+    };
+    let failure_message = if outcome_unknown { render_value(&failure) } else { last_error.clone() };
 
     let tool_succeeded = value.is_some();
     if let Some(cb) = circuit.as_mut() {
@@ -958,7 +1109,7 @@ async fn run_tool(
             // after-tool callbacks still see the original failed outcome even
             // when an on-tool-error fallback supplies the response value.
             let mut fallback = None;
-            for callback in policy.on_tool_error {
+            for callback in policy.hooks.on_tool_error.iter().chain(policy.on_tool_error) {
                 match callback(
                     tool_ctx.clone() as Arc<dyn CallbackContext>,
                     tool.clone(),
@@ -978,7 +1129,7 @@ async fn run_tool(
                     }
                 }
             }
-            fallback.ok_or_else(|| last_error.clone())
+            fallback.ok_or(failure_message)
         }
     };
 
@@ -987,14 +1138,17 @@ async fn run_tool(
     // Some replaces the tool result fed back into the script. They run for both
     // success and failure, with `ToolOutcome` carrying success/error metadata,
     // matching LlmAgent.
-    if !policy.after_tool.is_empty() || !policy.after_tool_full.is_empty() {
+    if !policy.hooks.after_tool.is_empty()
+        || !policy.after_tool.is_empty()
+        || !policy.after_tool_full.is_empty()
+    {
         let outcome_ctx: Arc<dyn CallbackContext> = Arc::new(ToolOutcomeContext::new(
             tool_ctx.clone() as Arc<dyn CallbackContext>,
             outcome,
         ));
         let cb_ctx: Arc<dyn CallbackContext> =
             Arc::new(ToolCallbackContext::new(outcome_ctx, name.clone(), args.clone()));
-        for callback in policy.after_tool {
+        for callback in policy.hooks.after_tool.iter().chain(policy.after_tool) {
             match callback(cb_ctx.clone()).await {
                 Ok(Some(content)) => {
                     result = Ok(content_to_tool_value(&content));
@@ -1004,8 +1158,10 @@ async fn run_tool(
                 Err(e) => return Err(e.to_string()),
             }
         }
-        let callback_value =
-            result.clone().unwrap_or_else(|message| serde_json::json!({ "error": message }));
+        let callback_value = match &result {
+            Ok(value) => value.clone(),
+            Err(_) => failure.clone(),
+        };
         for callback in policy.after_tool_full {
             match callback(cb_ctx.clone(), tool.clone(), args.clone(), callback_value.clone()).await
             {
@@ -1033,11 +1189,11 @@ async fn run_tool(
             )
             .await
         {
-            Ok(AfterToolCallResult::Continue(modified)) => Ok(modified),
+            Ok(AfterToolCallResult::Continue(modified)) => Ok(ToolRun::Finished(Ok(modified))),
             Err(e) => Err(e.to_string()),
         };
     }
-    Ok(result)
+    Ok(ToolRun::Finished(Ok(result)))
 }
 
 /// Run-control signals a tool may raise via its [`EventActions`].
@@ -1114,6 +1270,7 @@ fn mk_checkpoint(
     call: PendingToolCall,
     disposition: Disposition,
     roster: &[String],
+    run_id: &str,
 ) -> CodeActCheckpoint {
     CodeActCheckpoint {
         iteration,
@@ -1122,6 +1279,7 @@ fn mk_checkpoint(
         call,
         disposition,
         tool_roster: roster.to_vec(),
+        run_id: Some(run_id.to_string()),
     }
 }
 
@@ -1178,6 +1336,7 @@ fn suspend_event(invocation_id: &str, agent_name: &str, cp: &CodeActCheckpoint) 
                 tool_name: cp.call.tool.clone(),
                 function_call_id: Some(cp.call.call_id.to_string()),
                 args: cp.call.args.clone(),
+                acting: None,
             });
             // Mark the turn as interrupted and carry a human-readable prompt,
             // mirroring LlmAgent's confirmation interrupt event.
@@ -1201,6 +1360,19 @@ fn suspend_event(invocation_id: &str, agent_name: &str, cp: &CodeActCheckpoint) 
         }
         Disposition::PendingResult | Disposition::Resolved(_) => {}
     }
+    event
+}
+
+/// A suspend event for a call held for confirmation, carrying the request with the
+/// call's final arguments — the ones a decision's fingerprint must match.
+fn held_event(
+    invocation_id: &str,
+    agent_name: &str,
+    cp: &CodeActCheckpoint,
+    request: ToolConfirmationRequest,
+) -> Event {
+    let mut event = suspend_event(invocation_id, agent_name, cp);
+    event.actions.tool_confirmation = Some(request);
     event
 }
 
@@ -1250,7 +1422,11 @@ fn roster_list(targets: &[String]) -> String {
 struct ModelHooks<'a> {
     before: &'a [BeforeModelCallback],
     after: &'a [AfterModelCallback],
+    /// The run's invocation hooks, iterated ahead of `before` and `after`.
+    hooks: &'a HookCallbacks,
     ctx: &'a Arc<dyn CallbackContext>,
+    /// The run budget and spend ledger model calls count against.
+    scope: &'a adk_core::ModelCallScope,
     #[cfg(feature = "enhanced-plugins")]
     plugins: Option<&'a EnhancedPluginManager>,
 }
@@ -1285,7 +1461,7 @@ async fn next_script(
 
     // before-model callbacks: rewrite the request or skip the call with a response.
     if content.is_none() {
-        for callback in hooks.before {
+        for callback in hooks.hooks.before_model.iter().chain(hooks.before) {
             match callback(hooks.ctx.clone(), request.clone()).await? {
                 BeforeModelResult::Continue(modified) => request = modified,
                 BeforeModelResult::Skip(response) => {
@@ -1297,7 +1473,7 @@ async fn next_script(
     }
 
     if content.is_none() {
-        let mut stream = model.generate_content(request, false).await?;
+        let mut stream = hooks.scope.generate(model, request, false).await?;
         let mut text = String::new();
         while let Some(chunk) = stream.next().await {
             if let Some(c) = chunk?.content {
@@ -1312,7 +1488,7 @@ async fn next_script(
     }
 
     // after-model callbacks: rewrite the accumulated response.
-    for callback in hooks.after {
+    for callback in hooks.hooks.after_model.iter().chain(hooks.after) {
         let response = LlmResponse { content: content.clone(), ..Default::default() };
         if let Some(modified) = callback(hooks.ctx.clone(), response).await? {
             content = modified.content;
@@ -1707,6 +1883,8 @@ impl Agent for CodeActAgent {
     }
 
     async fn run(&self, ctx: Arc<dyn InvocationContext>) -> adk_core::Result<EventStream> {
+        // Under a workflow or team parent, the agent still acts as itself.
+        let ctx = crate::acting_agent_context::ActingAgentContext::scope(ctx, self.name());
         // Input guardrails run first; a block aborts the run, a transform
         // (e.g. PII redaction) rewrites the user content downstream.
         let ctx = self.apply_input_guardrails(ctx).await?;
@@ -1778,8 +1956,6 @@ impl Agent for CodeActAgent {
             runtime: self.runtime.clone(),
             tools: resolved_tools,
             policy: self.policy.clone(),
-            decisions: ctx.run_config().tool_confirmation_decisions.clone(),
-            confirmation_handler: ctx.run_config().tool_confirmation_handler.clone(),
             invocation_ctx: ctx.clone(),
             incoming: ctx.user_content().clone(),
             system_prompt,
@@ -1812,14 +1988,14 @@ impl Agent for CodeActAgent {
 
         let before = self.before_callbacks.clone();
         let after = self.after_callbacks.clone();
+        let hooks = HookCallbacks::new(&ctx.run_config().invocation_hooks);
         // Agent-level callbacks receive the invocation context as a callback
         // context (upcast), exactly like LlmAgent.
         let cb_ctx = ctx as Arc<dyn CallbackContext>;
 
         Ok(Box::pin(run_with_agent_callbacks(
             input,
-            before,
-            after,
+            AgentCallbacks { hooks, before, after },
             cb_ctx,
             invocation_id,
             agent_name,
@@ -1838,20 +2014,20 @@ impl Agent for CodeActAgent {
 ///   wins.
 fn run_with_agent_callbacks(
     input: LoopInputs,
-    before: Arc<Vec<BeforeAgentCallback>>,
-    after: Arc<Vec<AfterAgentCallback>>,
+    callbacks: AgentCallbacks,
     cb_ctx: Arc<dyn CallbackContext>,
     invocation_id: String,
     agent_name: String,
 ) -> impl Stream<Item = adk_core::Result<Event>> {
     stream! {
+        let AgentCallbacks { hooks, before, after } = callbacks;
         // ----- before-agent callbacks -----
-        for callback in before.iter() {
+        for callback in hooks.before_agent.iter().chain(before.iter()) {
             match callback(cb_ctx.clone()).await {
                 Ok(Some(content)) => {
                     yield Ok(callback_event(&invocation_id, &agent_name, content));
                     // Short-circuit: run after-agent callbacks, then stop.
-                    for after_cb in after.iter() {
+                    for after_cb in hooks.after_agent.iter().chain(after.iter()) {
                         match after_cb(cb_ctx.clone()).await {
                             Ok(Some(c)) => {
                                 yield Ok(callback_event(&invocation_id, &agent_name, c));
@@ -1904,7 +2080,7 @@ fn run_with_agent_callbacks(
 
         // ----- after-agent callbacks -----
         if !errored && completed && !handed_off {
-            for after_cb in after.iter() {
+            for after_cb in hooks.after_agent.iter().chain(after.iter()) {
                 match after_cb(cb_ctx.clone()).await {
                     Ok(Some(c)) => {
                         yield Ok(callback_event(&invocation_id, &agent_name, c));
@@ -1919,6 +2095,13 @@ fn run_with_agent_callbacks(
             }
         }
     }
+}
+
+/// Agent-level callbacks: the run's invocation hooks first, then the agent's own.
+struct AgentCallbacks {
+    hooks: HookCallbacks,
+    before: Arc<Vec<BeforeAgentCallback>>,
+    after: Arc<Vec<AfterAgentCallback>>,
 }
 
 /// An event carrying content produced by an agent-level callback.
@@ -2213,6 +2396,10 @@ impl CodeActAgentBuilder {
     }
 
     /// Set the per-tool execution timeout (default: 5 minutes).
+    ///
+    /// A [`ToolEffect::NonIdempotent`] call that times out is raised into the
+    /// script as an [`outcome_unknown_response`](adk_core::outcome_unknown_response),
+    /// because its side effect may already have happened.
     pub fn tool_timeout(mut self, timeout: Duration) -> Self {
         self.tool_timeout = timeout;
         self
@@ -2546,14 +2733,28 @@ fn assemble_system_prompt(
 struct CodeToolContext {
     inner: Arc<dyn InvocationContext>,
     function_call_id: String,
+    idempotency_key: String,
     actions: Mutex<EventActions>,
 }
 
 impl CodeToolContext {
-    fn new(inner: Arc<dyn InvocationContext>, call_id: u64) -> Self {
+    /// Builds the context for call `call_id` of the program on model turn
+    /// `iteration` of run `run_id`.
+    ///
+    /// Interpreter call ids restart with every program, so the idempotency key
+    /// names the run and the turn as well: two calls in one program never share
+    /// a key, and a call replayed from a checkpoint keeps its key.
+    fn new(inner: Arc<dyn InvocationContext>, run_id: &str, iteration: u32, call_id: u64) -> Self {
+        let idempotency_key = format!(
+            "{}/{}/{}/codeact/{run_id}/{iteration}/{call_id}",
+            inner.app_name(),
+            inner.user_id(),
+            inner.session_id(),
+        );
         Self {
             inner,
             function_call_id: call_id.to_string(),
+            idempotency_key,
             actions: Mutex::new(EventActions::default()),
         }
     }
@@ -2582,6 +2783,10 @@ impl ReadonlyContext for CodeToolContext {
     fn user_content(&self) -> &Content {
         self.inner.user_content()
     }
+
+    fn acting_context(&self) -> adk_core::ActingContext {
+        self.inner.acting_context()
+    }
 }
 
 #[async_trait]
@@ -2598,6 +2803,9 @@ impl CallbackContext for CodeToolContext {
 impl ToolContext for CodeToolContext {
     fn function_call_id(&self) -> &str {
         &self.function_call_id
+    }
+    fn idempotency_key(&self) -> String {
+        self.idempotency_key.clone()
     }
     fn actions(&self) -> EventActions {
         self.actions.lock().unwrap().clone()
@@ -2699,6 +2907,10 @@ impl ReadonlyContext for ToolOutcomeContext {
     fn user_content(&self) -> &Content {
         self.inner.user_content()
     }
+
+    fn acting_context(&self) -> adk_core::ActingContext {
+        self.inner.acting_context()
+    }
 }
 
 #[async_trait]
@@ -2720,8 +2932,8 @@ mod tests {
     use crate::codeact::test_support::{
         MockInvocationContext, Planned, ScriptedRuntime, call_id_tool, echo_tool,
         escalating_long_running_tool, escalating_tool, failing_tool, fake_agent, fake_toolset,
-        flaky_tool, long_running_tool, route_tool, skip_summarization_tool, sleeping_tool,
-        state_tool, text_agent,
+        flaky_tool, flaky_tool_with_effect, long_running_tool, route_tool, skip_summarization_tool,
+        sleeping_tool, state_tool, text_agent,
     };
     use adk_core::FunctionResponseData;
     use serde_json::json;
@@ -2783,8 +2995,6 @@ mod tests {
             runtime,
             tools: vec![],
             policy: ToolConfirmationPolicy::Never,
-            decisions: HashMap::new(),
-            confirmation_handler: None,
             invocation_ctx: Arc::new(MockInvocationContext::new(incoming.clone())),
             conversation: vec![incoming.clone()],
             incoming,
@@ -2828,10 +3038,11 @@ mod tests {
         pending: Option<CodeActCheckpoint>,
         supports_suspension: bool,
     ) -> Vec<Event> {
-        let mut input = base_inputs(model, runtime, incoming);
+        let mut input = base_inputs(model, runtime, incoming.clone());
+        input.invocation_ctx =
+            Arc::new(MockInvocationContext::new(incoming).with_confirmation_decisions(decisions));
         input.tools = tools;
         input.policy = policy;
-        input.decisions = decisions;
         input.pending = pending;
         input.supports_suspension = supports_suspension;
         collect(input).await
@@ -3050,6 +3261,7 @@ mod tests {
             call: PendingToolCall { call_id: 1, tool: "echo".into(), args: json!({}) },
             disposition: Disposition::Resolved(ResolutionRecord::Value(json!("stored"))),
             tool_roster: vec!["echo".to_string()],
+            run_id: None,
         };
         let events = drive(
             FakeLlm::new("noop"),
@@ -3413,12 +3625,27 @@ mod tests {
         ]]));
         let mut input = base_inputs(FakeLlm::new("noop"), rt.clone(), user("go"));
         input.tools = vec![flaky_tool(1)];
-        input.default_retry_budget = Some(RetryBudget { max_retries: 1, delay: Duration::ZERO });
+        input.default_retry_budget = Some(RetryBudget::new(1, Duration::ZERO));
         let events = collect(input).await;
         assert_eq!(final_text(events.last().unwrap()).as_deref(), Some("done"));
         // The retried call ultimately returned a value (not a raised error).
         assert_eq!(rt.last_value(), Some(json!({"ok": true})));
         assert!(rt.last_raise().is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_budget_never_repeats_a_non_idempotent_tool() {
+        let rt = Arc::new(ScriptedRuntime::with_suspension(vec![vec![
+            Planned::call("flaky", json!({}), 1),
+            Planned::Complete(json!({"type": "final_result", "value": "done"})),
+        ]]));
+        let mut input = base_inputs(FakeLlm::new("noop"), rt.clone(), user("go"));
+        input.tools = vec![flaky_tool_with_effect(1, adk_core::ToolEffect::NonIdempotent)];
+        input.default_retry_budget = Some(RetryBudget::new(3, Duration::ZERO));
+        collect(input).await;
+        // The single failure is raised into the script instead of being retried.
+        assert!(rt.last_raise().is_some_and(|message| message.contains("transient failure")));
+        assert_eq!(rt.last_value(), None);
     }
 
     #[tokio::test]
@@ -4137,6 +4364,76 @@ mod tests {
         assert!(rt.last_raise().is_none());
     }
 
+    /// Skips the model with a final-result script and short-circuits every tool call.
+    #[derive(Debug)]
+    struct PolicyHooks;
+
+    #[async_trait]
+    impl adk_core::InvocationHooks for PolicyHooks {
+        async fn before_model(
+            &self,
+            _ctx: Arc<dyn CallbackContext>,
+            _request: LlmRequest,
+        ) -> adk_core::Result<BeforeModelResult> {
+            Ok(BeforeModelResult::Skip(LlmResponse::new(
+                Content::new("model").with_text("```\nreturn final_result\n```"),
+            )))
+        }
+
+        async fn before_tool(
+            &self,
+            _ctx: Arc<dyn CallbackContext>,
+        ) -> adk_core::Result<Option<Content>> {
+            Ok(Some(Content::new("function").with_text("blocked by policy")))
+        }
+    }
+
+    #[tokio::test]
+    async fn invocation_hooks_skip_the_model_ahead_of_agent_callbacks() {
+        let model = FakeLlm::new("noop");
+        let agent_callback_ran = Arc::new(StdMutex::new(false));
+        let ran = agent_callback_ran.clone();
+        let before: BeforeModelCallback = Box::new(move |_ctx, request| {
+            *ran.lock().unwrap() = true;
+            Box::pin(async move { Ok(BeforeModelResult::Continue(request)) })
+        });
+        let agent = CodeActAgent::builder()
+            .model(model.clone())
+            .runtime(Arc::new(ScriptedRuntime::with_suspension(vec![vec![Planned::Complete(
+                json!({"type": "final_result", "value": "done"}),
+            )]])))
+            .before_model_callback(before)
+            .build()
+            .unwrap();
+        let ctx =
+            MockInvocationContext::new(user("go")).with_invocation_hook(Arc::new(PolicyHooks));
+
+        let events = run_collect(&agent, Arc::new(ctx)).await;
+
+        assert_eq!(final_text(events.last().unwrap()).as_deref(), Some("done"));
+        assert_eq!(model.calls(), 0, "the hook's response replaces the model call");
+        assert!(!*agent_callback_ran.lock().unwrap(), "a hook's value short-circuits callbacks");
+    }
+
+    #[tokio::test]
+    async fn invocation_hooks_short_circuit_a_tool_call() {
+        let rt = Arc::new(ScriptedRuntime::with_suspension(vec![vec![
+            Planned::call("boom", json!({}), 1),
+            Planned::Complete(json!({"type": "final_result", "value": "done"})),
+        ]]));
+        let mut input = base_inputs(FakeLlm::new("noop"), rt.clone(), user("go"));
+        input.tools = vec![failing_tool()];
+        input.invocation_ctx = Arc::new(
+            MockInvocationContext::new(user("go")).with_invocation_hook(Arc::new(PolicyHooks)),
+        );
+
+        let events = collect(input).await;
+
+        assert_eq!(final_text(events.last().unwrap()).as_deref(), Some("done"));
+        assert_eq!(rt.last_value(), Some(json!("blocked by policy")));
+        assert!(rt.last_raise().is_none());
+    }
+
     #[tokio::test]
     async fn after_tool_callback_full_rewrites_the_result() {
         let rt = Arc::new(ScriptedRuntime::with_suspension(vec![vec![
@@ -4231,6 +4528,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_run_policy_refuses_a_script_tool_call() {
+        let rt = Arc::new(ScriptedRuntime::with_suspension(vec![vec![
+            Planned::call("echo", json!({"msg": "x"}), 1),
+            Planned::Complete(json!({"type": "final_result", "value": "after"})),
+        ]]));
+        let mut input = base_inputs(FakeLlm::new("noop"), rt.clone(), user("go"));
+        input.tools = vec![echo_tool()];
+        let deny_all = adk_core::DeclarativePolicy::builder().build();
+        input.invocation_ctx = Arc::new(MockInvocationContext::new(user("go")).with_run_config(
+            adk_core::RunConfig::builder().tool_policy(Arc::new(deny_all)).build(),
+        ));
+
+        let events = collect(input).await;
+
+        let raised = rt.last_raise().expect("the refusal is raised into the script");
+        assert!(raised.contains("denied by policy"), "{raised}");
+        assert_eq!(rt.last_value(), None, "the tool must not run");
+        assert_eq!(final_text(events.last().unwrap()).as_deref(), Some("after"));
+    }
+
+    #[tokio::test]
+    async fn an_approval_by_fingerprint_resumes_a_held_call() {
+        let rt = Arc::new(ScriptedRuntime::with_suspension(vec![vec![
+            Planned::call("echo", json!({"msg": "x"}), 7),
+            Planned::Complete(json!({"type": "final_result", "value": "after"})),
+        ]]));
+        let mut input = base_inputs(FakeLlm::new("noop"), rt, user("go"));
+        input.tools = vec![echo_tool()];
+        input.policy = ToolConfirmationPolicy::Always;
+        let held = collect(input).await;
+        let last = held.last().unwrap();
+        let request = last.actions.tool_confirmation.clone().expect("held for confirmation");
+        let cp = pending_in(last).expect("checkpoint persisted");
+        assert!(matches!(cp.disposition, Disposition::AwaitingConfirmation));
+
+        let resumed_rt = Arc::new(ScriptedRuntime::with_suspension(vec![]));
+        let mut input = base_inputs(FakeLlm::new("noop"), resumed_rt.clone(), user("approved"));
+        input.tools = vec![echo_tool()];
+        input.policy = ToolConfirmationPolicy::Always;
+        input.pending = Some(cp);
+        input.invocation_ctx = Arc::new(
+            MockInvocationContext::new(user("approved")).with_run_config(
+                adk_core::RunConfig::builder()
+                    .tool_approval(request.fingerprint(), adk_core::ToolApproval::approve())
+                    .build(),
+            ),
+        );
+        let events = collect(input).await;
+
+        assert_eq!(resumed_rt.last_value(), Some(json!({"msg": "x"})), "the approved call ran");
+        assert_eq!(final_text(events.last().unwrap()).as_deref(), Some("after"));
+    }
+
+    #[tokio::test]
+    async fn a_frozen_run_stops_before_the_model_call() {
+        let model = FakeLlm::new("noop");
+        let control = adk_core::GovernanceControl::new();
+        control.freeze("drill");
+        let mut input = base_inputs(
+            model.clone(),
+            Arc::new(ScriptedRuntime::with_suspension(vec![])),
+            user("go"),
+        );
+        input.invocation_ctx = Arc::new(
+            MockInvocationContext::new(user("go"))
+                .with_run_config(adk_core::RunConfig::builder().governance(control).build()),
+        );
+        let mut stream = Box::pin(run_codeact(input));
+        let error = stream.next().await.expect("an item").expect_err("the run must fail");
+        assert_eq!(error.code, "governance.frozen");
+        assert_eq!(*model.calls.lock().unwrap(), 0, "the model must not be called");
+    }
+
+    #[tokio::test]
     async fn transfer_skips_after_agent_callbacks() {
         // A transfer hands control elsewhere, so after-agent callbacks must not
         // run (mirrors LlmAgent's early return on transfer).
@@ -4267,6 +4638,7 @@ mod tests {
             call: PendingToolCall { call_id: 1, tool: "echo".into(), args: json!({"v": 1}) },
             disposition: Disposition::PendingResult,
             tool_roster: vec!["echo".to_string()],
+            run_id: None,
         };
         let events = drive(
             FakeLlm::new("noop"),
@@ -4326,6 +4698,7 @@ mod tests {
             call: PendingToolCall { call_id: 1, tool: "panic_button".into(), args: json!({}) },
             disposition: Disposition::PendingResult,
             tool_roster: vec!["panic_button".to_string()],
+            run_id: None,
         };
         let events = drive(
             FakeLlm::new("noop"),
@@ -4431,5 +4804,314 @@ mod tests {
         assert!(!outcome.success);
         assert_eq!(outcome.attempt, 0);
         assert!(outcome.error_message.unwrap().contains("not_found"));
+    }
+
+    // ----- action ledger -----
+
+    /// A `charge` tool that records the idempotency key of every execution. With a
+    /// delay it records the key first, so a call that times out has taken effect.
+    struct ChargeTool {
+        effect: adk_core::ToolEffect,
+        delay: Option<Duration>,
+        keys: Arc<StdMutex<Vec<String>>>,
+    }
+
+    fn charge_tool(
+        effect: adk_core::ToolEffect,
+        delay: Option<Duration>,
+    ) -> (Arc<dyn Tool>, Arc<StdMutex<Vec<String>>>) {
+        let keys = Arc::new(StdMutex::new(Vec::new()));
+        (Arc::new(ChargeTool { effect, delay, keys: keys.clone() }), keys)
+    }
+
+    #[async_trait]
+    impl Tool for ChargeTool {
+        fn name(&self) -> &str {
+            "charge"
+        }
+        fn description(&self) -> &str {
+            "charges a card"
+        }
+        fn effect(&self) -> adk_core::ToolEffect {
+            self.effect
+        }
+        async fn execute(&self, ctx: Arc<dyn ToolContext>, args: Value) -> adk_core::Result<Value> {
+            self.keys.lock().unwrap().push(ctx.idempotency_key());
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(json!({ "charged": args["amount"] }))
+        }
+    }
+
+    /// An in-memory ledger that also records every key it begins.
+    #[derive(Debug, Default)]
+    struct RecordingLedger {
+        inner: adk_core::InMemoryActionLedger,
+        begun: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl adk_core::ActionLedger for RecordingLedger {
+        async fn begin(&self, record: &adk_core::ActionRecord) -> adk_core::Result<()> {
+            self.begun.lock().unwrap().push(record.key.clone());
+            self.inner.begin(record).await
+        }
+        async fn complete(
+            &self,
+            key: &str,
+            outcome: adk_core::ActionOutcome,
+        ) -> adk_core::Result<()> {
+            self.inner.complete(key, outcome).await
+        }
+        async fn get(&self, key: &str) -> adk_core::Result<Option<adk_core::ActionRecord>> {
+            self.inner.get(key).await
+        }
+    }
+
+    /// Loop inputs for one invocation `invocation` whose run config carries `ledger`.
+    fn ledgered_inputs(
+        runtime: Arc<dyn CodeRuntime>,
+        tools: Vec<Arc<dyn Tool>>,
+        ledger: Arc<RecordingLedger>,
+        invocation: &str,
+        decisions: HashMap<String, ToolConfirmationDecision>,
+    ) -> LoopInputs {
+        let incoming = user("pay");
+        let mut input = base_inputs(FakeLlm::new("noop"), runtime, incoming.clone());
+        input.invocation_ctx = Arc::new(
+            MockInvocationContext::new(incoming)
+                .with_invocation_id(invocation)
+                .with_run_config(adk_core::RunConfig::builder().action_ledger(ledger).build())
+                .with_confirmation_decisions(decisions),
+        );
+        input.tools = tools;
+        input
+    }
+
+    fn charge_program(call_ids: &[u64]) -> Vec<Planned> {
+        call_ids
+            .iter()
+            .map(|id| Planned::call("charge", json!({"amount": 5}), *id))
+            .chain(std::iter::once(Planned::Complete(
+                json!({"type": "final_result", "value": "paid"}),
+            )))
+            .collect()
+    }
+
+    fn checkpoints(events: &[Event]) -> Vec<CodeActCheckpoint> {
+        events.iter().filter_map(pending_in).collect()
+    }
+
+    #[tokio::test]
+    async fn a_non_idempotent_call_executes_once_when_its_step_is_replayed() {
+        let ledger = Arc::new(RecordingLedger::default());
+        let (charge, executions) = charge_tool(adk_core::ToolEffect::NonIdempotent, None);
+        let runtime = Arc::new(ScriptedRuntime::with_suspension(vec![charge_program(&[0])]));
+        let input =
+            ledgered_inputs(runtime, vec![charge.clone()], ledger.clone(), "inv-1", HashMap::new());
+        let events = collect(input).await;
+        assert_eq!(final_text(events.last().unwrap()).as_deref(), Some("paid"));
+        assert_eq!(executions.lock().unwrap().len(), 1);
+
+        // The process crashed after the charge but before SAVE-AFTER landed: a later
+        // invocation recovers from the SAVE-BEFORE checkpoint.
+        let save_before = checkpoints(&events)
+            .into_iter()
+            .find(|cp| cp.disposition == Disposition::PendingResult)
+            .expect("a SAVE-BEFORE checkpoint");
+        let runtime = Arc::new(ScriptedRuntime::with_suspension(vec![]));
+        let mut input =
+            ledgered_inputs(runtime.clone(), vec![charge], ledger.clone(), "inv-2", HashMap::new());
+        input.pending = Some(save_before);
+        let events = collect(input).await;
+
+        assert_eq!(executions.lock().unwrap().len(), 1, "the replayed call does not execute");
+        let raised: Value = serde_json::from_str(&runtime.last_raise().unwrap()).unwrap();
+        assert_eq!(raised["status"], "already_succeeded");
+        assert_eq!(final_text(events.last().unwrap()).as_deref(), Some("paid"));
+        assert_eq!(ledger.begun.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_call_is_answered_from_the_ledger_without_executing() {
+        use adk_core::ActionLedger as _;
+        let ledger = Arc::new(RecordingLedger::default());
+        let key = "app/user/sess-test/codeact/run-1/3/7";
+        let record = adk_core::ActionRecord::new(
+            key,
+            "charge",
+            &json!({"amount": 5}),
+            adk_core::ToolEffect::NonIdempotent,
+        );
+        ledger.inner.begin(&record).await.unwrap();
+        ledger
+            .inner
+            .complete(key, adk_core::ActionOutcome::Failed { error: "card declined".into() })
+            .await
+            .unwrap();
+        let (charge, executions) = charge_tool(adk_core::ToolEffect::NonIdempotent, None);
+        let runtime = Arc::new(ScriptedRuntime::with_suspension(vec![]));
+        let mut input =
+            ledgered_inputs(runtime.clone(), vec![charge], ledger.clone(), "inv-2", HashMap::new());
+        input.pending = Some(CodeActCheckpoint {
+            iteration: 3,
+            transcript: vec![],
+            snapshot: serde_json::to_vec(&vec![Planned::Complete(
+                json!({"type": "final_result", "value": "recovered"}),
+            )])
+            .unwrap(),
+            call: PendingToolCall { call_id: 7, tool: "charge".into(), args: json!({"amount": 5}) },
+            disposition: Disposition::PendingResult,
+            tool_roster: vec!["charge".to_string()],
+            run_id: Some("run-1".to_string()),
+        });
+        collect(input).await;
+
+        assert!(executions.lock().unwrap().is_empty());
+        let raised: Value = serde_json::from_str(&runtime.last_raise().unwrap()).unwrap();
+        assert_eq!(
+            raised,
+            json!({
+                "status": "already_failed",
+                "error": "card declined",
+                "detail": "this call to 'charge' already failed; it was not executed again",
+            })
+        );
+        assert!(ledger.begun.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_non_idempotent_call_is_outcome_unknown_and_stays_begun() {
+        use adk_core::ActionLedger as _;
+        let ledger = Arc::new(RecordingLedger::default());
+        let (charge, executions) =
+            charge_tool(adk_core::ToolEffect::NonIdempotent, Some(Duration::from_secs(3600)));
+        let runtime = Arc::new(ScriptedRuntime::with_suspension(vec![charge_program(&[0])]));
+        let mut input = ledgered_inputs(
+            runtime.clone(),
+            vec![charge.clone()],
+            ledger.clone(),
+            "inv-1",
+            HashMap::new(),
+        );
+        input.tool_timeout = Duration::from_millis(20);
+        // A retry budget never applies to a non-idempotent call.
+        input.default_retry_budget = Some(RetryBudget::new(3, Duration::from_millis(1)));
+        let events = collect(input).await;
+
+        assert_eq!(executions.lock().unwrap().len(), 1);
+        let raised: Value = serde_json::from_str(&runtime.last_raise().unwrap()).unwrap();
+        assert_eq!(
+            raised,
+            adk_core::outcome_unknown_response(
+                "tool timed out after 0s. The call may have taken effect; check its result before calling it again."
+            )
+        );
+        let key = ledger.begun.lock().unwrap()[0].clone();
+        let record = ledger.get(&key).await.unwrap().expect("a begun record");
+        assert!(!record.is_completed(), "a timed-out call keeps its begun record");
+
+        // A replay of the step is answered as unknown without executing.
+        let save_before = checkpoints(&events)
+            .into_iter()
+            .find(|cp| cp.disposition == Disposition::PendingResult)
+            .unwrap();
+        let runtime = Arc::new(ScriptedRuntime::with_suspension(vec![]));
+        let mut input =
+            ledgered_inputs(runtime.clone(), vec![charge], ledger.clone(), "inv-2", HashMap::new());
+        input.pending = Some(save_before);
+        collect(input).await;
+        assert_eq!(executions.lock().unwrap().len(), 1);
+        let raised: Value = serde_json::from_str(&runtime.last_raise().unwrap()).unwrap();
+        assert!(adk_core::is_outcome_unknown(&raised), "{raised}");
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_non_idempotent_call_is_outcome_unknown_without_a_ledger() {
+        let (charge, _) =
+            charge_tool(adk_core::ToolEffect::NonIdempotent, Some(Duration::from_secs(3600)));
+        let runtime = Arc::new(ScriptedRuntime::with_suspension(vec![charge_program(&[0])]));
+        let mut input = base_inputs(FakeLlm::new("noop"), runtime.clone(), user("pay"));
+        input.tools = vec![charge];
+        input.tool_timeout = Duration::from_millis(20);
+        collect(input).await;
+        let raised: Value = serde_json::from_str(&runtime.last_raise().unwrap()).unwrap();
+        assert!(adk_core::is_outcome_unknown(&raised), "{raised}");
+    }
+
+    #[tokio::test]
+    async fn identical_calls_in_one_program_and_across_programs_each_execute() {
+        let ledger = Arc::new(RecordingLedger::default());
+        let (charge, executions) = charge_tool(adk_core::ToolEffect::NonIdempotent, None);
+        let mut first = charge_program(&[0, 1]);
+        *first.last_mut().unwrap() = Planned::Complete(json!({"type": "observation", "value": 1}));
+        let runtime = Arc::new(ScriptedRuntime::with_suspension(vec![first, charge_program(&[0])]));
+        let input = ledgered_inputs(runtime, vec![charge], ledger.clone(), "inv-1", HashMap::new());
+        let events = collect(input).await;
+
+        assert_eq!(final_text(events.last().unwrap()).as_deref(), Some("paid"));
+        let keys = executions.lock().unwrap().clone();
+        assert_eq!(keys.len(), 3, "every call executes: {keys:?}");
+        let distinct: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(distinct.len(), 3, "every call has its own key: {keys:?}");
+        assert_eq!(*ledger.begun.lock().unwrap(), keys);
+        let run_id = checkpoints(&events)[0].run_id.clone().unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                format!("app/user/sess-test/codeact/{run_id}/1/0"),
+                format!("app/user/sess-test/codeact/{run_id}/1/1"),
+                format!("app/user/sess-test/codeact/{run_id}/2/0"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_and_idempotent_calls_are_not_ledgered() {
+        for effect in [adk_core::ToolEffect::ReadOnly, adk_core::ToolEffect::Idempotent] {
+            let ledger = Arc::new(RecordingLedger::default());
+            let (charge, executions) = charge_tool(effect, None);
+            let runtime = Arc::new(ScriptedRuntime::with_suspension(vec![charge_program(&[0])]));
+            let input =
+                ledgered_inputs(runtime, vec![charge], ledger.clone(), "inv-1", HashMap::new());
+            collect(input).await;
+            assert_eq!(executions.lock().unwrap().len(), 1);
+            assert!(ledger.begun.lock().unwrap().is_empty(), "{effect:?} is not ledgered");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_call_executes_once_when_its_resume_is_replayed() {
+        let ledger = Arc::new(RecordingLedger::default());
+        let (charge, executions) = charge_tool(adk_core::ToolEffect::NonIdempotent, None);
+        let runtime = Arc::new(ScriptedRuntime::with_suspension(vec![charge_program(&[1])]));
+        let mut input =
+            ledgered_inputs(runtime, vec![charge.clone()], ledger.clone(), "inv-1", HashMap::new());
+        input.policy = ToolConfirmationPolicy::Always;
+        let events = collect(input).await;
+        let held = checkpoints(&events).pop().expect("a held checkpoint");
+        assert_eq!(held.disposition, Disposition::AwaitingConfirmation);
+        assert!(executions.lock().unwrap().is_empty());
+        assert!(ledger.begun.lock().unwrap().is_empty(), "a held call never begins");
+
+        let approve = HashMap::from([("1".to_string(), ToolConfirmationDecision::Approve)]);
+        // The approved resume, then a replay of it after a crash before SAVE-AFTER landed.
+        for invocation in ["inv-2", "inv-3"] {
+            let runtime = Arc::new(ScriptedRuntime::with_suspension(vec![]));
+            let mut input = ledgered_inputs(
+                runtime,
+                vec![charge.clone()],
+                ledger.clone(),
+                invocation,
+                approve.clone(),
+            );
+            input.policy = ToolConfirmationPolicy::Always;
+            input.pending = Some(held.clone());
+            let events = collect(input).await;
+            assert_eq!(final_text(events.last().unwrap()).as_deref(), Some("paid"));
+        }
+        assert_eq!(executions.lock().unwrap().len(), 1);
+        assert_eq!(ledger.begun.lock().unwrap().len(), 1);
     }
 }

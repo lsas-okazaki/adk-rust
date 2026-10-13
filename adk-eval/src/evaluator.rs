@@ -7,13 +7,14 @@ use crate::criteria::EvaluationCriteria;
 use crate::error::Result;
 use crate::llm_judge::LlmJudge;
 use crate::report::{EvaluationReport, EvaluationResult, Failure, TurnResult};
-use crate::schema::{EvalCase, TestFile, ToolUse, Turn};
+use crate::schema::{EvalCase, SessionInput, TestFile, ToolUse, Turn};
 use crate::scoring::{ResponseScorer, ToolTrajectoryScorer};
 use crate::structured_judge::StructuredJudge;
 use crate::trace_analyzer::TraceAnalyzer;
 
-use adk_core::{Agent, Content, Event, Llm};
-use async_trait::async_trait;
+use adk_core::{Agent, Content, Event, Llm, SessionId, UserId};
+use adk_runner::Runner;
+use adk_session::{CreateRequest, InMemorySessionService, SessionService};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -253,44 +254,58 @@ impl Evaluator {
     }
 
     /// Evaluate a single test case
+    ///
+    /// The turns run in order through one session of an in-memory session service, so
+    /// each turn sees the conversation history of the turns before it, as it would in a
+    /// [`Runner`]. The session is created from the case's
+    /// [`session_input`](EvalCase::session_input): its `app_name` and `user_id` (default
+    /// `eval_app` and `eval_user` when empty) and its initial `state`.
+    ///
+    /// Each criterion's case score is the arithmetic mean of its per-turn scores. Cost
+    /// and trace analysis use the events from every turn of this run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session cannot be created from `session_input`, the
+    /// agent fails to start, or its event stream yields an error.
     pub async fn evaluate_case(
         &self,
         agent: Arc<dyn Agent>,
         eval_case: &EvalCase,
     ) -> Result<EvaluationResult> {
         let start = Instant::now();
-        let mut all_scores: HashMap<String, f64> = HashMap::new();
+        let mut score_totals: HashMap<String, (f64, usize)> = HashMap::new();
         let mut all_failures: Vec<Failure> = Vec::new();
         let mut turn_results: Vec<TurnResult> = Vec::new();
         let mut all_events: Vec<Event> = Vec::new();
+        let mut last_turn: Option<TurnResult> = None;
+
+        let conversation = EvalConversation::start(agent, &eval_case.session_input).await?;
 
         // Execute each turn in the conversation
         for turn in &eval_case.conversation {
-            let turn_result = self.execute_turn(agent.clone(), turn).await?;
+            let (turn_result, events) = self.execute_turn(&conversation, turn).await?;
+            all_events.extend(events);
 
             // Score this turn
             let (scores, failures) = self.score_turn(turn, &turn_result).await;
-
-            // Merge scores
-            for (criterion, score) in &scores {
-                all_scores
-                    .entry(criterion.clone())
-                    .and_modify(|s| *s = (*s + score) / 2.0)
-                    .or_insert(*score);
+            for (criterion, score) in scores {
+                let (sum, count) = score_totals.entry(criterion).or_insert((0.0, 0));
+                *sum += score;
+                *count += 1;
             }
             all_failures.extend(failures);
 
             if self.config.collect_turn_details {
-                turn_results.push(turn_result);
+                turn_results.push(turn_result.clone());
             }
+            last_turn = Some(turn_result);
         }
 
-        // Collect events for the full case by re-running (or using last turn's events)
-        // For cost/trace analysis we re-run the agent to get the full event stream
-        let case_events = self.collect_case_events(agent.clone(), eval_case).await;
-        if let Ok(events) = case_events {
-            all_events = events;
-        }
+        let mut all_scores: HashMap<String, f64> = score_totals
+            .into_iter()
+            .map(|(criterion, (sum, count))| (criterion, sum / count as f64))
+            .collect();
 
         let duration = start.elapsed();
 
@@ -304,27 +319,56 @@ impl Evaluator {
         let trace_analysis =
             self.trace_analyzer.as_ref().map(|analyzer| analyzer.analyze(&all_events));
 
-        // Invoke StructuredJudge if configured
+        // Invoke StructuredJudge if configured; a fail verdict or a judge error fails the case
         let mut verdicts = Vec::new();
         if let Some(judge) = &self.structured_judge
-            && let Some(last_turn_result) = turn_results.last()
-            && let (Some(expected), Some(actual)) =
-                (&last_turn_result.expected_response, &last_turn_result.actual_response)
+            && let Some(last_turn) = &last_turn
+            && let Some(expected) = &last_turn.expected_response
         {
-            match judge.judge(expected, actual, "overall_quality").await {
-                Ok(verdict) => {
-                    all_scores.insert("structured_judge".to_string(), verdict.score);
-                    verdicts.push(verdict);
-                }
-                Err(e) => {
-                    tracing::warn!("Structured judge failed: {e}");
-                    // Create a fallback verdict with score 0.0
-                    let fallback = crate::structured_judge::StructuredVerdict {
-                        score: 0.0,
-                        reasoning: format!("Judge error: {e}"),
-                        verdict: crate::structured_judge::Verdict::Fail,
-                    };
-                    verdicts.push(fallback);
+            match &last_turn.actual_response {
+                Some(actual) => match judge.judge(expected, actual, "overall_quality").await {
+                    Ok(verdict) => {
+                        all_scores.insert("structured_judge".to_string(), verdict.score);
+                        if matches!(verdict.verdict, crate::structured_judge::Verdict::Fail) {
+                            all_failures.push(
+                                Failure::new(
+                                    "structured_judge",
+                                    Value::String(expected.clone()),
+                                    Value::String(actual.clone()),
+                                    verdict.score,
+                                    1.0,
+                                )
+                                .with_details(&format!(
+                                    "Structured judge returned a fail verdict: {}",
+                                    verdict.reasoning
+                                )),
+                            );
+                        }
+                        verdicts.push(verdict);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "structured judge failed");
+                        all_scores.insert("structured_judge".to_string(), 0.0);
+                        all_failures.push(
+                            Failure::new(
+                                "structured_judge",
+                                Value::String(expected.clone()),
+                                Value::String(actual.clone()),
+                                0.0,
+                                1.0,
+                            )
+                            .with_details(&format!("Structured judge error: {e}")),
+                        );
+                        verdicts.push(crate::structured_judge::StructuredVerdict {
+                            score: 0.0,
+                            reasoning: format!("Judge error: {e}"),
+                            verdict: crate::structured_judge::Verdict::Fail,
+                        });
+                    }
+                },
+                None => {
+                    all_scores.insert("structured_judge".to_string(), 0.0);
+                    all_failures.push(unjudged("structured_judge", 1.0, NO_RESPONSE));
                 }
             }
         }
@@ -332,9 +376,9 @@ impl Evaluator {
         // Invoke EmbeddingScorer if configured
         #[cfg(feature = "embedding")]
         if let Some(scorer) = &self.embedding_scorer
-            && let Some(last_turn_result) = turn_results.last()
+            && let Some(last_turn) = &last_turn
             && let (Some(expected), Some(actual)) =
-                (&last_turn_result.expected_response, &last_turn_result.actual_response)
+                (&last_turn.expected_response, &last_turn.actual_response)
         {
             match scorer.score(expected, actual).await {
                 Ok(score) => {
@@ -366,34 +410,13 @@ impl Evaluator {
         Ok(result)
     }
 
-    /// Collect all events for a case by running the agent on the first turn input.
-    /// Used by cost tracker and trace analyzer to analyze the full execution.
-    async fn collect_case_events(
+    /// Execute a single turn, returning its result and the events the agent emitted
+    async fn execute_turn(
         &self,
-        agent: Arc<dyn Agent>,
-        eval_case: &EvalCase,
-    ) -> Result<Vec<Event>> {
-        // Only collect events if we have a cost tracker or trace analyzer configured
-        if self.cost_tracker.is_none() && self.trace_analyzer.is_none() {
-            return Ok(Vec::new());
-        }
-
-        // Use events from the first turn as representative
-        if let Some(first_turn) = eval_case.conversation.first() {
-            let input_content = first_turn.user_content.to_adk_content();
-            self.run_agent(agent, input_content).await
-        } else {
-            Ok(Vec::new())
-        }
-    }
-
-    /// Execute a single turn and collect results
-    async fn execute_turn(&self, agent: Arc<dyn Agent>, turn: &Turn) -> Result<TurnResult> {
-        // Create input content
-        let input_content = turn.user_content.to_adk_content();
-
-        // Run the agent
-        let events = self.run_agent(agent, input_content).await?;
+        conversation: &EvalConversation,
+        turn: &Turn,
+    ) -> Result<(TurnResult, Vec<Event>)> {
+        let events = conversation.send(turn.user_content.to_adk_content()).await?;
 
         // Extract response and tool calls from events
         let (actual_response, actual_tool_calls) = self.extract_from_events(&events);
@@ -403,39 +426,42 @@ impl Evaluator {
         let expected_tool_calls =
             turn.intermediate_data.as_ref().map(|d| d.tool_uses.clone()).unwrap_or_default();
 
-        Ok(TurnResult {
+        let turn_result = TurnResult {
             invocation_id: turn.invocation_id.clone(),
             actual_response,
             expected_response,
             actual_tool_calls,
             expected_tool_calls,
             scores: HashMap::new(),
-        })
-    }
-
-    /// Run agent and collect events
-    async fn run_agent(&self, agent: Arc<dyn Agent>, input: Content) -> Result<Vec<Event>> {
-        // Create a minimal invocation context for evaluation
-        let invocation_id = uuid::Uuid::new_v4().to_string();
-        let ctx = Arc::new(EvalInvocationContext::new(invocation_id, input, agent.clone()));
-
-        // Run the agent and collect all events
-        let stream = agent.run(ctx).await.map_err(|e| {
-            crate::error::EvalError::ExecutionError(format!("Agent run failed: {}", e))
-        })?;
-
-        // Collect all events from the stream
-        let events: Vec<Event> = stream.filter_map(|r| async { r.ok() }).collect().await;
-
-        Ok(events)
+        };
+        Ok((turn_result, events))
     }
 
     /// Extract response text and tool calls from events
     fn extract_from_events(&self, events: &[Event]) -> (Option<String>, Vec<ToolUse>) {
         let mut response_text = String::new();
         let mut tool_calls = Vec::new();
+        let complete_ids: std::collections::HashSet<_> = events
+            .iter()
+            .filter(|event| {
+                !event.llm_response.partial
+                    && event
+                        .llm_response
+                        .provider_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("content_complete"))
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+            })
+            .map(|event| (&event.invocation_id, &event.id))
+            .collect();
 
         for event in events {
+            if event.llm_response.partial
+                && complete_ids.contains(&(&event.invocation_id, &event.id))
+            {
+                continue;
+            }
             // Extract text content
             if let Some(content) = event.content() {
                 for part in &content.parts {
@@ -528,176 +554,264 @@ impl Evaluator {
             }
         }
 
-        // LLM-judged semantic matching
+        // The LLM-judged criteria below fail, rather than skip, a turn they cannot judge.
+
+        // LLM-judged semantic matching; turns without an expected response are not compared.
+        // An EQUIVALENT: NO verdict fails regardless of the score.
         if let Some(threshold) = self.config.criteria.semantic_match_score
-            && let Some(judge) = &self.llm_judge
-            && let (Some(expected), Some(actual)) =
-                (&result.expected_response, &result.actual_response)
+            && let Some(expected) = &result.expected_response
         {
-            match judge
-                .semantic_match(
-                    expected,
-                    actual,
-                    self.config.criteria.semantic_match_config.as_ref(),
-                )
-                .await
-            {
-                Ok(semantic_result) => {
-                    scores.insert("semantic_match".to_string(), semantic_result.score);
-                    if semantic_result.score < threshold {
+            match (&self.llm_judge, &result.actual_response) {
+                (Some(judge), Some(actual)) => match judge
+                    .semantic_match(
+                        expected,
+                        actual,
+                        self.config.criteria.semantic_match_config.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(semantic_result) => {
+                        scores.insert("semantic_match".to_string(), semantic_result.score);
+                        if !semantic_result.equivalent || semantic_result.score < threshold {
+                            let verdict = if semantic_result.equivalent {
+                                "equivalent"
+                            } else {
+                                "not equivalent"
+                            };
+                            failures.push(
+                                Failure::new(
+                                    "semantic_match",
+                                    Value::String(expected.clone()),
+                                    Value::String(actual.clone()),
+                                    semantic_result.score,
+                                    threshold,
+                                )
+                                .with_details(&format!(
+                                    "Judge verdict: {verdict}. {}",
+                                    semantic_result.reasoning
+                                )),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        scores.insert("semantic_match".to_string(), 0.0);
                         failures.push(
                             Failure::new(
                                 "semantic_match",
                                 Value::String(expected.clone()),
                                 Value::String(actual.clone()),
-                                semantic_result.score,
+                                0.0,
                                 threshold,
                             )
-                            .with_details(&semantic_result.reasoning),
+                            .with_details(&format!("LLM judge error: {}", e)),
                         );
                     }
+                },
+                (None, _) => {
+                    scores.insert("semantic_match".to_string(), 0.0);
+                    failures.push(unjudged("semantic_match", threshold, NO_LLM_JUDGE));
                 }
-                Err(e) => {
-                    // Record error but don't fail the whole evaluation
-                    failures.push(
-                        Failure::new(
-                            "semantic_match",
-                            Value::String(expected.clone()),
-                            Value::String(actual.clone()),
-                            0.0,
-                            threshold,
-                        )
-                        .with_details(&format!("LLM judge error: {}", e)),
-                    );
+                (Some(_), None) => {
+                    scores.insert("semantic_match".to_string(), 0.0);
+                    failures.push(unjudged("semantic_match", threshold, NO_RESPONSE));
                 }
             }
         }
 
         // Rubric-based evaluation
-        if let Some(threshold) = self.config.criteria.rubric_quality_score
-            && let Some(judge) = &self.llm_judge
-            && let Some(rubric_config) = &self.config.criteria.rubric_config
-            && let Some(actual) = &result.actual_response
-        {
-            // Use user input as context for rubric evaluation
-            let context = turn.user_content.get_text();
-            match judge.evaluate_rubrics(actual, &context, rubric_config).await {
-                Ok(rubric_result) => {
-                    scores.insert("rubric_quality".to_string(), rubric_result.overall_score);
-                    // Also store individual rubric scores
-                    for rs in &rubric_result.rubric_scores {
-                        scores.insert(format!("rubric_{}", rs.name), rs.score);
-                    }
-                    if rubric_result.overall_score < threshold {
-                        let details = rubric_result
-                            .rubric_scores
-                            .iter()
-                            .map(|rs| format!("{}: {:.2} - {}", rs.name, rs.score, rs.reasoning))
-                            .collect::<Vec<_>>()
-                            .join("; ");
-                        failures.push(
-                            Failure::new(
-                                "rubric_quality",
-                                Value::Number(
-                                    serde_json::Number::from_f64(threshold)
-                                        .unwrap_or(serde_json::Number::from(0)),
-                                ),
-                                Value::Number(
-                                    serde_json::Number::from_f64(rubric_result.overall_score)
-                                        .unwrap_or(serde_json::Number::from(0)),
-                                ),
-                                rubric_result.overall_score,
-                                threshold,
-                            )
-                            .with_details(&details),
-                        );
+        if let Some(threshold) = self.config.criteria.rubric_quality_score {
+            let rubric_config = self
+                .config
+                .criteria
+                .rubric_config
+                .as_ref()
+                .filter(|config| !config.rubrics.is_empty());
+            match (&self.llm_judge, rubric_config, &result.actual_response) {
+                (Some(judge), Some(rubric_config), Some(actual)) => {
+                    // Use user input as context for rubric evaluation
+                    let context = turn.user_content.get_text();
+                    match judge.evaluate_rubrics(actual, &context, rubric_config).await {
+                        Ok(rubric_result) => {
+                            scores
+                                .insert("rubric_quality".to_string(), rubric_result.overall_score);
+                            // Also store individual rubric scores
+                            for rs in &rubric_result.rubric_scores {
+                                scores.insert(format!("rubric_{}", rs.name), rs.score);
+                            }
+                            if rubric_result.overall_score < threshold {
+                                let details = rubric_result
+                                    .rubric_scores
+                                    .iter()
+                                    .map(|rs| {
+                                        format!("{}: {:.2} - {}", rs.name, rs.score, rs.reasoning)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("; ");
+                                failures.push(
+                                    Failure::new(
+                                        "rubric_quality",
+                                        Value::Number(
+                                            serde_json::Number::from_f64(threshold)
+                                                .unwrap_or(serde_json::Number::from(0)),
+                                        ),
+                                        Value::Number(
+                                            serde_json::Number::from_f64(
+                                                rubric_result.overall_score,
+                                            )
+                                            .unwrap_or(serde_json::Number::from(0)),
+                                        ),
+                                        rubric_result.overall_score,
+                                        threshold,
+                                    )
+                                    .with_details(&details),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            scores.insert("rubric_quality".to_string(), 0.0);
+                            failures.push(
+                                Failure::new(
+                                    "rubric_quality",
+                                    Value::Null,
+                                    Value::Null,
+                                    0.0,
+                                    threshold,
+                                )
+                                .with_details(&format!("LLM judge error: {}", e)),
+                            );
+                        }
                     }
                 }
-                Err(e) => {
-                    failures.push(
-                        Failure::new("rubric_quality", Value::Null, Value::Null, 0.0, threshold)
-                            .with_details(&format!("LLM judge error: {}", e)),
-                    );
+                (None, _, _) => {
+                    scores.insert("rubric_quality".to_string(), 0.0);
+                    failures.push(unjudged("rubric_quality", threshold, NO_LLM_JUDGE));
+                }
+                (Some(_), None, _) => {
+                    scores.insert("rubric_quality".to_string(), 0.0);
+                    failures.push(unjudged(
+                        "rubric_quality",
+                        threshold,
+                        "rubric_quality_score is set but rubric_config has no rubrics; \
+                         add them with EvaluationCriteria::with_rubrics",
+                    ));
+                }
+                (Some(_), Some(_), None) => {
+                    scores.insert("rubric_quality".to_string(), 0.0);
+                    failures.push(unjudged("rubric_quality", threshold, NO_RESPONSE));
                 }
             }
         }
 
-        // Safety evaluation
-        if let Some(threshold) = self.config.criteria.safety_score
-            && let Some(judge) = &self.llm_judge
-            && let Some(actual) = &result.actual_response
-        {
-            match judge.evaluate_safety(actual).await {
-                Ok(safety_result) => {
-                    scores.insert("safety".to_string(), safety_result.score);
-                    if safety_result.score < threshold {
+        // Safety evaluation; a SAFE: NO verdict fails regardless of the score
+        if let Some(threshold) = self.config.criteria.safety_score {
+            match (&self.llm_judge, &result.actual_response) {
+                (Some(judge), Some(actual)) => match judge.evaluate_safety(actual).await {
+                    Ok(safety_result) => {
+                        scores.insert("safety".to_string(), safety_result.score);
+                        if !safety_result.is_safe || safety_result.score < threshold {
+                            let verdict = if safety_result.is_safe { "safe" } else { "unsafe" };
+                            failures.push(
+                                Failure::new(
+                                    "safety",
+                                    Value::Number(
+                                        serde_json::Number::from_f64(threshold)
+                                            .unwrap_or(serde_json::Number::from(0)),
+                                    ),
+                                    Value::Number(
+                                        serde_json::Number::from_f64(safety_result.score)
+                                            .unwrap_or(serde_json::Number::from(0)),
+                                    ),
+                                    safety_result.score,
+                                    threshold,
+                                )
+                                .with_details(&format!(
+                                    "Judge verdict: {verdict}. Safety issues: {}",
+                                    safety_result.issues.join(", ")
+                                )),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        scores.insert("safety".to_string(), 0.0);
                         failures.push(
-                            Failure::new(
-                                "safety",
-                                Value::Number(
-                                    serde_json::Number::from_f64(threshold)
-                                        .unwrap_or(serde_json::Number::from(0)),
-                                ),
-                                Value::Number(
-                                    serde_json::Number::from_f64(safety_result.score)
-                                        .unwrap_or(serde_json::Number::from(0)),
-                                ),
-                                safety_result.score,
-                                threshold,
-                            )
-                            .with_details(&format!(
-                                "Safety issues: {}",
-                                safety_result.issues.join(", ")
-                            )),
+                            Failure::new("safety", Value::Null, Value::Null, 0.0, threshold)
+                                .with_details(&format!("LLM judge error: {}", e)),
                         );
                     }
+                },
+                (None, _) => {
+                    scores.insert("safety".to_string(), 0.0);
+                    failures.push(unjudged("safety", threshold, NO_LLM_JUDGE));
                 }
-                Err(e) => {
-                    failures.push(
-                        Failure::new("safety", Value::Null, Value::Null, 0.0, threshold)
-                            .with_details(&format!("LLM judge error: {}", e)),
-                    );
+                (Some(_), None) => {
+                    scores.insert("safety".to_string(), 0.0);
+                    failures.push(unjudged("safety", threshold, NO_RESPONSE));
                 }
             }
         }
 
-        // Hallucination detection
-        if let Some(threshold) = self.config.criteria.hallucination_score
-            && let Some(judge) = &self.llm_judge
-            && let Some(actual) = &result.actual_response
-        {
-            let context = turn.user_content.get_text();
-            let ground_truth = result.expected_response.as_deref();
-            match judge.detect_hallucinations(actual, &context, ground_truth).await {
-                Ok(hallucination_result) => {
-                    scores.insert("hallucination".to_string(), hallucination_result.score);
-                    if hallucination_result.score < threshold {
-                        failures.push(
-                            Failure::new(
-                                "hallucination",
-                                Value::Number(
-                                    serde_json::Number::from_f64(threshold)
-                                        .unwrap_or(serde_json::Number::from(0)),
-                                ),
-                                Value::Number(
-                                    serde_json::Number::from_f64(hallucination_result.score)
-                                        .unwrap_or(serde_json::Number::from(0)),
-                                ),
-                                hallucination_result.score,
-                                threshold,
-                            )
-                            .with_details(&format!(
-                                "Hallucinations detected: {}",
-                                hallucination_result.issues.join(", ")
-                            )),
-                        );
+        // Hallucination detection; a HALLUCINATION_FREE: NO verdict fails regardless of the score
+        if let Some(threshold) = self.config.criteria.hallucination_score {
+            match (&self.llm_judge, &result.actual_response) {
+                (Some(judge), Some(actual)) => {
+                    let context = turn.user_content.get_text();
+                    let ground_truth = result.expected_response.as_deref();
+                    match judge.detect_hallucinations(actual, &context, ground_truth).await {
+                        Ok(hallucination_result) => {
+                            scores.insert("hallucination".to_string(), hallucination_result.score);
+                            if !hallucination_result.hallucination_free
+                                || hallucination_result.score < threshold
+                            {
+                                let verdict = if hallucination_result.hallucination_free {
+                                    "hallucination-free"
+                                } else {
+                                    "hallucinations found"
+                                };
+                                failures.push(
+                                    Failure::new(
+                                        "hallucination",
+                                        Value::Number(
+                                            serde_json::Number::from_f64(threshold)
+                                                .unwrap_or(serde_json::Number::from(0)),
+                                        ),
+                                        Value::Number(
+                                            serde_json::Number::from_f64(
+                                                hallucination_result.score,
+                                            )
+                                            .unwrap_or(serde_json::Number::from(0)),
+                                        ),
+                                        hallucination_result.score,
+                                        threshold,
+                                    )
+                                    .with_details(&format!(
+                                        "Judge verdict: {verdict}. Hallucinations detected: {}",
+                                        hallucination_result.issues.join(", ")
+                                    )),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            scores.insert("hallucination".to_string(), 0.0);
+                            failures.push(
+                                Failure::new(
+                                    "hallucination",
+                                    Value::Null,
+                                    Value::Null,
+                                    0.0,
+                                    threshold,
+                                )
+                                .with_details(&format!("LLM judge error: {}", e)),
+                            );
+                        }
                     }
                 }
-                Err(e) => {
-                    failures.push(
-                        Failure::new("hallucination", Value::Null, Value::Null, 0.0, threshold)
-                            .with_details(&format!("LLM judge error: {}", e)),
-                    );
+                (None, _) => {
+                    scores.insert("hallucination".to_string(), 0.0);
+                    failures.push(unjudged("hallucination", threshold, NO_LLM_JUDGE));
+                }
+                (Some(_), None) => {
+                    scores.insert("hallucination".to_string(), 0.0);
+                    failures.push(unjudged("hallucination", threshold, NO_RESPONSE));
                 }
             }
         }
@@ -772,14 +886,15 @@ impl Evaluator {
         num_turns: usize,
     ) -> Result<Vec<Content>> {
         let mut history: Vec<Content> = Vec::new();
+        let conversation = EvalConversation::start(agent, &SessionInput::default()).await?;
 
         for _turn_idx in 0..num_turns {
             // 1. Generate user message from the simulator
             let user_message = simulator.generate_message(&history).await?;
             history.push(user_message.clone());
 
-            // 2. Run the agent with the user message
-            let events = self.run_agent(agent.clone(), user_message).await?;
+            // 2. Run the agent with the user message, in the same session as earlier turns
+            let events = conversation.send(user_message).await?;
 
             // 3. Extract the agent's response text
             let (response_text, _tool_calls) = self.extract_from_events(&events);
@@ -792,172 +907,475 @@ impl Evaluator {
     }
 }
 
+const NO_LLM_JUDGE: &str = "this criterion needs an LLM judge; build the evaluator with \
+                            Evaluator::with_llm_judge or call Evaluator::set_llm_judge";
+
+const NO_RESPONSE: &str = "the agent produced no text response to judge";
+
+/// A failure for a configured criterion that could not be judged.
+fn unjudged(criterion: &str, threshold: f64, reason: &str) -> Failure {
+    Failure::new(criterion, Value::Null, Value::Null, 0.0, threshold).with_details(reason)
+}
+
 impl Default for Evaluator {
     fn default() -> Self {
         Self::new(EvaluationConfig::default())
     }
 }
 
-// ============================================================================
-// EvalInvocationContext - Minimal context for running agents during evaluation
-// ============================================================================
+/// App name for a case whose `session_input.app_name` is empty.
+const DEFAULT_APP_NAME: &str = "eval_app";
 
-/// Minimal InvocationContext implementation for evaluation
-struct EvalInvocationContext {
-    invocation_id: String,
-    user_content: Content,
-    agent: Arc<dyn Agent>,
-    session: EvalSession,
-    run_config: adk_core::RunConfig,
-    ended: std::sync::atomic::AtomicBool,
+/// User id for a case whose `session_input.user_id` is empty.
+const DEFAULT_USER_ID: &str = "eval_user";
+
+/// One conversation with the agent under test.
+///
+/// Every turn runs through a [`Runner`] against the same session of a private in-memory
+/// session service, so the agent sees the history and state that earlier turns left.
+struct EvalConversation {
+    runner: Runner,
+    user_id: UserId,
+    session_id: SessionId,
 }
 
-impl EvalInvocationContext {
-    fn new(invocation_id: String, user_content: Content, agent: Arc<dyn Agent>) -> Self {
-        let session_id = format!("eval-session-{}", uuid::Uuid::new_v4());
-        Self {
-            invocation_id,
-            user_content,
-            agent,
-            session: EvalSession::new(session_id),
-            run_config: adk_core::RunConfig::default(),
-            ended: std::sync::atomic::AtomicBool::new(false),
+impl EvalConversation {
+    /// Creates the session described by `session_input` and a runner for `agent`.
+    async fn start(agent: Arc<dyn Agent>, session_input: &SessionInput) -> Result<Self> {
+        let app_name = if session_input.app_name.is_empty() {
+            DEFAULT_APP_NAME
+        } else {
+            session_input.app_name.as_str()
+        };
+        let user_id = if session_input.user_id.is_empty() {
+            DEFAULT_USER_ID
+        } else {
+            session_input.user_id.as_str()
+        };
+        let invalid_input = |e: String| {
+            crate::error::EvalError::ConfigError(format!(
+                "cannot create the eval session from session_input (app_name '{app_name}', \
+                 user_id '{user_id}'): {e}"
+            ))
+        };
+
+        let session_service = Arc::new(InMemorySessionService::new());
+        let session = session_service
+            .create(CreateRequest {
+                app_name: app_name.to_string(),
+                user_id: user_id.to_string(),
+                session_id: None,
+                state: session_input.state.clone(),
+            })
+            .await
+            .map_err(|e| invalid_input(e.to_string()))?;
+        let session_id =
+            SessionId::try_from(session.id()).map_err(|e| invalid_input(e.to_string()))?;
+        let user_id = UserId::try_from(user_id).map_err(|e| invalid_input(e.to_string()))?;
+
+        let runner = Runner::builder()
+            .app_name(app_name)
+            .agent(agent)
+            .session_service(session_service)
+            .build()
+            .map_err(|e| {
+                crate::error::EvalError::ExecutionError(format!(
+                    "cannot build the eval runner: {e}"
+                ))
+            })?;
+
+        Ok(Self { runner, user_id, session_id })
+    }
+
+    /// Runs one turn and collects its events, failing on the first stream error.
+    async fn send(&self, input: Content) -> Result<Vec<Event>> {
+        let mut stream =
+            self.runner.run(self.user_id.clone(), self.session_id.clone(), input).await.map_err(
+                |e| crate::error::EvalError::ExecutionError(format!("Agent run failed: {e}")),
+            )?;
+
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            let event = item.map_err(|e| {
+                crate::error::EvalError::ExecutionError(format!(
+                    "agent event stream failed after {} event(s): {e}",
+                    events.len()
+                ))
+            })?;
+            events.push(event);
         }
-    }
-}
 
-impl adk_core::ReadonlyContext for EvalInvocationContext {
-    fn invocation_id(&self) -> &str {
-        &self.invocation_id
-    }
-
-    fn agent_name(&self) -> &str {
-        self.agent.name()
-    }
-
-    fn user_id(&self) -> &str {
-        "eval_user"
-    }
-
-    fn app_name(&self) -> &str {
-        "eval_app"
-    }
-
-    fn session_id(&self) -> &str {
-        &self.session.id
-    }
-
-    fn branch(&self) -> &str {
-        "main"
-    }
-
-    fn user_content(&self) -> &Content {
-        &self.user_content
-    }
-}
-
-#[async_trait]
-impl adk_core::CallbackContext for EvalInvocationContext {
-    fn artifacts(&self) -> Option<Arc<dyn adk_core::Artifacts>> {
-        None
-    }
-}
-
-#[async_trait]
-impl adk_core::InvocationContext for EvalInvocationContext {
-    fn agent(&self) -> Arc<dyn Agent> {
-        self.agent.clone()
-    }
-
-    fn memory(&self) -> Option<Arc<dyn adk_core::Memory>> {
-        None
-    }
-
-    fn session(&self) -> &dyn adk_core::Session {
-        &self.session
-    }
-
-    fn run_config(&self) -> &adk_core::RunConfig {
-        &self.run_config
-    }
-
-    fn end_invocation(&self) {
-        self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    fn ended(&self) -> bool {
-        self.ended.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-/// Minimal Session implementation for evaluation
-struct EvalSession {
-    id: String,
-    state: EvalState,
-}
-
-impl EvalSession {
-    fn new(id: String) -> Self {
-        Self { id, state: EvalState::new() }
-    }
-}
-
-impl adk_core::Session for EvalSession {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn app_name(&self) -> &str {
-        "eval_app"
-    }
-
-    fn user_id(&self) -> &str {
-        "eval_user"
-    }
-
-    fn state(&self) -> &dyn adk_core::State {
-        &self.state
-    }
-
-    fn conversation_history(&self) -> Vec<Content> {
-        vec![]
-    }
-}
-
-/// Minimal State implementation for evaluation
-struct EvalState {
-    data: std::sync::RwLock<HashMap<String, serde_json::Value>>,
-}
-
-impl EvalState {
-    fn new() -> Self {
-        Self { data: std::sync::RwLock::new(HashMap::new()) }
-    }
-}
-
-impl adk_core::State for EvalState {
-    fn get(&self, key: &str) -> Option<serde_json::Value> {
-        self.data.read().ok()?.get(key).cloned()
-    }
-
-    fn set(&mut self, key: String, value: serde_json::Value) {
-        if let Err(msg) = adk_core::validate_state_key(&key) {
-            tracing::warn!(key = %key, "rejecting invalid state key: {msg}");
-            return;
-        }
-        if let Ok(mut data) = self.data.write() {
-            data.insert(key, value);
-        }
-    }
-
-    fn all(&self) -> HashMap<String, serde_json::Value> {
-        self.data.read().ok().map(|d| d.clone()).unwrap_or_default()
+        Ok(events)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::criteria::{ResponseMatchConfig, SimilarityAlgorithm};
+    use crate::schema::ContentData;
+    use async_trait::async_trait;
+
+    /// Replies with the user's message, optionally followed by a stream error.
+    struct EchoAgent {
+        fail_stream: bool,
+    }
+
+    #[async_trait]
+    impl Agent for EchoAgent {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn description(&self) -> &str {
+            "echoes the user message"
+        }
+
+        fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+            &[]
+        }
+
+        async fn run(
+            &self,
+            ctx: Arc<dyn adk_core::InvocationContext>,
+        ) -> adk_core::Result<adk_core::EventStream> {
+            let text: String = ctx.user_content().parts.iter().filter_map(|p| p.text()).collect();
+            let mut event = Event::new(ctx.invocation_id());
+            event.llm_response.content = Some(Content::new("model").with_text(text));
+            let mut items = vec![Ok(event)];
+            if self.fail_stream {
+                items.push(Err(adk_core::AdkError::model("connection reset")));
+            }
+            Ok(Box::pin(futures::stream::iter(items)))
+        }
+    }
+
+    fn echo_agent() -> Arc<dyn Agent> {
+        Arc::new(EchoAgent { fail_stream: false })
+    }
+
+    fn judge_replying(text: &str) -> Arc<dyn Llm> {
+        Arc::new(
+            adk_model::MockLlm::new("judge")
+                .with_response(adk_core::LlmResponse::new(Content::new("model").with_text(text))),
+        )
+    }
+
+    fn turn(user: &str, expected: &str) -> Turn {
+        Turn {
+            invocation_id: format!("inv-{user}"),
+            user_content: ContentData::text(user),
+            final_response: Some(ContentData::model_response(expected)),
+            intermediate_data: None,
+        }
+    }
+
+    fn case(turns: Vec<Turn>) -> EvalCase {
+        EvalCase {
+            eval_id: "case_1".to_string(),
+            description: String::new(),
+            conversation: turns,
+            session_input: Default::default(),
+            tags: vec![],
+            metadata: None,
+        }
+    }
+
+    fn criteria(criteria: EvaluationCriteria) -> EvaluationConfig {
+        EvaluationConfig { collect_turn_details: true, ..EvaluationConfig::with_criteria(criteria) }
+    }
+
+    fn failure_details(result: &EvaluationResult) -> Vec<(String, String)> {
+        result
+            .failures
+            .iter()
+            .map(|f| (f.criterion.clone(), f.details.clone().unwrap_or_default()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn case_score_is_the_mean_of_turn_scores() {
+        let evaluator = Evaluator::new(criteria(EvaluationCriteria {
+            response_similarity: Some(0.0),
+            response_match_config: Some(ResponseMatchConfig {
+                algorithm: SimilarityAlgorithm::Exact,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let eval_case =
+            case(vec![turn("one", "different"), turn("two", "two"), turn("three", "three")]);
+
+        let result = evaluator.evaluate_case(echo_agent(), &eval_case).await.unwrap();
+
+        let score = result.scores["response_similarity"];
+        assert!((score - 2.0 / 3.0).abs() < 1e-9, "score was {score}");
+    }
+
+    #[tokio::test]
+    async fn stream_error_fails_the_case() {
+        let evaluator = Evaluator::new(criteria(EvaluationCriteria::response_similarity(0.5)));
+        let test_file = TestFile {
+            eval_set_id: "set".to_string(),
+            name: "set".to_string(),
+            description: String::new(),
+            eval_cases: vec![case(vec![turn("hello", "hello")])],
+        };
+
+        let agent: Arc<dyn Agent> = Arc::new(EchoAgent { fail_stream: true });
+        let err =
+            evaluator.evaluate_case(agent.clone(), &test_file.eval_cases[0]).await.unwrap_err();
+        assert!(err.to_string().contains("connection reset"), "{err}");
+
+        let report = evaluator.evaluate_test_file(agent, &test_file).await.unwrap();
+        assert!(!report.all_passed());
+        assert_eq!(report.results[0].failures[0].criterion, "execution");
+    }
+
+    #[tokio::test]
+    async fn judge_criteria_without_a_judge_fail() {
+        let evaluator = Evaluator::new(criteria(EvaluationCriteria {
+            semantic_match_score: Some(0.8),
+            rubric_quality_score: Some(0.8),
+            safety_score: Some(0.9),
+            hallucination_score: Some(0.9),
+            ..Default::default()
+        }));
+
+        let result =
+            evaluator.evaluate_case(echo_agent(), &case(vec![turn("hi", "hi")])).await.unwrap();
+
+        assert!(!result.passed);
+        let mut details = failure_details(&result);
+        details.sort();
+        assert_eq!(
+            details,
+            vec![
+                ("hallucination".to_string(), NO_LLM_JUDGE.to_string()),
+                ("rubric_quality".to_string(), NO_LLM_JUDGE.to_string()),
+                ("safety".to_string(), NO_LLM_JUDGE.to_string()),
+                ("semantic_match".to_string(), NO_LLM_JUDGE.to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rubric_criterion_without_rubrics_fails() {
+        let evaluator = Evaluator::with_llm_judge(
+            criteria(EvaluationCriteria { rubric_quality_score: Some(0.5), ..Default::default() }),
+            judge_replying("SCORE: 1.0\nREASONING: fine"),
+        );
+
+        let result =
+            evaluator.evaluate_case(echo_agent(), &case(vec![turn("hi", "hi")])).await.unwrap();
+
+        assert!(!result.passed);
+        assert!(result.failures[0].details.as_deref().unwrap().contains("no rubrics"));
+    }
+
+    #[tokio::test]
+    async fn unsafe_verdict_fails_despite_high_score() {
+        let evaluator = Evaluator::with_llm_judge(
+            criteria(EvaluationCriteria { safety_score: Some(0.9), ..Default::default() }),
+            judge_replying("SAFE: NO\nSCORE: 1.0\nISSUES: discloses a home address"),
+        );
+
+        let result =
+            evaluator.evaluate_case(echo_agent(), &case(vec![turn("hi", "hi")])).await.unwrap();
+
+        assert!(!result.passed);
+        assert_eq!(result.failures[0].criterion, "safety");
+        assert!(result.failures[0].details.as_deref().unwrap().contains("unsafe"));
+    }
+
+    #[tokio::test]
+    async fn hallucination_verdict_fails_despite_high_score() {
+        let evaluator = Evaluator::with_llm_judge(
+            criteria(EvaluationCriteria { hallucination_score: Some(0.9), ..Default::default() }),
+            judge_replying("HALLUCINATION_FREE: NO\nSCORE: 0.95\nISSUES: invented a date"),
+        );
+
+        let result =
+            evaluator.evaluate_case(echo_agent(), &case(vec![turn("hi", "hi")])).await.unwrap();
+
+        assert!(!result.passed);
+        assert_eq!(result.failures[0].criterion, "hallucination");
+    }
+
+    #[tokio::test]
+    async fn not_equivalent_verdict_fails_despite_high_score() {
+        let evaluator = Evaluator::with_llm_judge(
+            criteria(EvaluationCriteria::semantic_match(0.8)),
+            judge_replying("EQUIVALENT: NO\nSCORE: 0.95\nREASONING: names the wrong city"),
+        );
+
+        let result =
+            evaluator.evaluate_case(echo_agent(), &case(vec![turn("hi", "hi")])).await.unwrap();
+
+        assert!(!result.passed);
+        assert_eq!(
+            failure_details(&result),
+            vec![(
+                "semantic_match".to_string(),
+                "Judge verdict: not equivalent. names the wrong city".to_string()
+            )]
+        );
+    }
+
+    /// Replies with the user text of every earlier turn in its session, then the
+    /// session's `topic` state value, so a test can see what the agent was given.
+    struct HistoryAgent;
+
+    #[async_trait]
+    impl Agent for HistoryAgent {
+        fn name(&self) -> &str {
+            "history"
+        }
+
+        fn description(&self) -> &str {
+            "reports the conversation it can see"
+        }
+
+        fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+            &[]
+        }
+
+        async fn run(
+            &self,
+            ctx: Arc<dyn adk_core::InvocationContext>,
+        ) -> adk_core::Result<adk_core::EventStream> {
+            let earlier: Vec<String> = ctx
+                .session()
+                .conversation_history()
+                .iter()
+                .filter(|content| content.role == "user")
+                .map(|content| content.parts.iter().filter_map(|p| p.text()).collect())
+                .collect();
+            let topic = ctx.session().state().get("topic").unwrap_or(Value::Null);
+            let mut event = Event::new(ctx.invocation_id());
+            event.author = self.name().to_string();
+            event.llm_response.content = Some(Content::new("model").with_text(format!(
+                "{} | {topic} | {}",
+                earlier.join(","),
+                ctx.user_id()
+            )));
+            Ok(Box::pin(futures::stream::iter(vec![Ok(event)])))
+        }
+    }
+
+    #[tokio::test]
+    async fn later_turns_see_the_history_of_earlier_turns() {
+        let evaluator = Evaluator::new(criteria(EvaluationCriteria {
+            response_similarity: Some(1.0),
+            response_match_config: Some(ResponseMatchConfig {
+                algorithm: SimilarityAlgorithm::Exact,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let eval_case = case(vec![
+            turn("my name is Ada", "my name is Ada | null | eval_user"),
+            turn("what is my name?", "my name is Ada,what is my name? | null | eval_user"),
+        ]);
+
+        let result = evaluator.evaluate_case(Arc::new(HistoryAgent), &eval_case).await.unwrap();
+
+        assert!(result.passed, "{:?}", result.turn_results);
+    }
+
+    #[tokio::test]
+    async fn session_input_sets_the_user_and_initial_state() {
+        let evaluator = Evaluator::new(criteria(EvaluationCriteria {
+            response_similarity: Some(1.0),
+            response_match_config: Some(ResponseMatchConfig {
+                algorithm: SimilarityAlgorithm::Exact,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let mut eval_case = case(vec![turn("hi", "hi | \"billing\" | ada")]);
+        eval_case.session_input = SessionInput {
+            app_name: "support".to_string(),
+            user_id: "ada".to_string(),
+            state: HashMap::from([("topic".to_string(), serde_json::json!("billing"))]),
+        };
+
+        let result = evaluator.evaluate_case(Arc::new(HistoryAgent), &eval_case).await.unwrap();
+
+        assert!(result.passed, "{:?}", result.turn_results);
+    }
+
+    #[tokio::test]
+    async fn malformed_judge_score_fails_the_criterion() {
+        let evaluator = Evaluator::with_llm_judge(
+            criteria(EvaluationCriteria { safety_score: Some(0.9), ..Default::default() }),
+            judge_replying("SAFE: YES\nSCORE: very safe\nISSUES: None"),
+        );
+
+        let result =
+            evaluator.evaluate_case(echo_agent(), &case(vec![turn("hi", "hi")])).await.unwrap();
+
+        assert!(!result.passed);
+        assert_eq!(result.scores["safety"], 0.0);
+        assert!(result.failures[0].details.as_deref().unwrap().contains("no valid SCORE line"));
+    }
+
+    #[tokio::test]
+    async fn structured_fail_verdict_fails_the_case() {
+        for collect_turn_details in [true, false] {
+            let mut evaluator = Evaluator::new(EvaluationConfig {
+                collect_turn_details,
+                ..EvaluationConfig::default()
+            });
+            evaluator.set_structured_judge(Arc::new(StructuredJudge::new(judge_replying(
+                r#"{"score": 0.9, "reasoning": "answers a different question", "verdict": "fail"}"#,
+            ))));
+
+            let result =
+                evaluator.evaluate_case(echo_agent(), &case(vec![turn("hi", "hi")])).await.unwrap();
+
+            assert!(!result.passed, "collect_turn_details = {collect_turn_details}");
+            assert_eq!(result.verdicts.len(), 1);
+            assert_eq!(
+                failure_details(&result),
+                vec![(
+                    "structured_judge".to_string(),
+                    "Structured judge returned a fail verdict: answers a different question"
+                        .to_string()
+                )]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_pass_verdict_passes_the_case() {
+        let mut evaluator = Evaluator::new(EvaluationConfig::default());
+        evaluator.set_structured_judge(Arc::new(StructuredJudge::new(judge_replying(
+            r#"{"score": 1.0, "reasoning": "same answer", "verdict": "pass"}"#,
+        ))));
+
+        let result =
+            evaluator.evaluate_case(echo_agent(), &case(vec![turn("hi", "hi")])).await.unwrap();
+
+        assert!(result.passed);
+        assert_eq!(result.scores["structured_judge"], 1.0);
+    }
+
+    #[test]
+    fn complete_snapshots_replace_partial_text_and_calls() {
+        let evaluator = Evaluator::new(EvaluationConfig::default());
+        let mut partial = Event::with_id("response", "invocation");
+        partial.llm_response.partial = true;
+        partial.llm_response.content = Some(Content::new("model").with_text("Draft"));
+        let mut final_event = partial.clone();
+        final_event.llm_response.partial = false;
+        final_event.llm_response.provider_metadata =
+            Some(serde_json::json!({"content_complete":true}));
+        final_event.llm_response.content = Some(Content::new("model").with_text("Corrected"));
+        let (text, calls) = evaluator.extract_from_events(&[partial, final_event]);
+        assert_eq!(text.as_deref(), Some("Corrected"));
+        assert!(calls.is_empty());
+    }
 
     #[test]
     fn test_evaluator_creation() {

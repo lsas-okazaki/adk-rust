@@ -106,10 +106,69 @@ fn test_native_declarations_are_exposed() {
     assert_eq!(gemini_decl["x-adk-gemini-tool"]["google_search"], json!({}));
 
     let openai_decl = OpenAIWebSearchTool::new().declaration();
-    assert_eq!(openai_decl["x-adk-openai-tool"]["type"], "web_search_2025_08_26");
+    assert_eq!(openai_decl["x-adk-openai-tool"]["type"], "web_search");
+    let openai_preview_decl = OpenAIWebSearchTool::new().preview().declaration();
+    assert_eq!(openai_preview_decl["x-adk-openai-tool"]["type"], "web_search_preview_2025_03_11");
 
     let anthropic_decl = WebSearchTool::new().declaration();
     assert_eq!(anthropic_decl["x-adk-anthropic-tool"]["type"], "web_search_20250305");
+}
+
+#[test]
+fn test_anthropic_web_search_dynamic_filtering_declaration() {
+    let tool = WebSearchTool::new()
+        .with_allowed_domains(["docs.rs"])
+        .with_max_uses(2)
+        .with_dynamic_filtering();
+
+    assert_eq!(
+        tool.declaration()["x-adk-anthropic-tool"],
+        json!({
+            "type": "web_search_20260209",
+            "name": "web_search",
+            "allowed_domains": ["docs.rs"],
+            "blocked_domains": null,
+            "max_uses": 2,
+            "user_location": null,
+            "allowed_callers": null,
+        })
+    );
+}
+
+#[test]
+fn test_anthropic_web_search_direct_callers_disable_dynamic_filtering() {
+    let tool = WebSearchTool::new().with_dynamic_filtering().with_allowed_callers(["direct"]);
+
+    assert_eq!(
+        tool.declaration()["x-adk-anthropic-tool"],
+        json!({
+            "type": "web_search_20260209",
+            "name": "web_search",
+            "allowed_domains": null,
+            "blocked_domains": null,
+            "max_uses": null,
+            "user_location": null,
+            "allowed_callers": ["direct"],
+        })
+    );
+}
+
+#[test]
+fn test_anthropic_web_search_basic_version_omits_allowed_callers() {
+    let tool = WebSearchTool::new().with_allowed_callers(["direct"]);
+
+    assert_eq!(
+        tool.declaration()["x-adk-anthropic-tool"],
+        json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "allowed_domains": null,
+            "blocked_domains": null,
+            "max_uses": null,
+            "user_location": null,
+            "allowed_callers": null,
+        })
+    );
 }
 
 #[tokio::test]
@@ -166,4 +225,41 @@ async fn test_anthropic_text_editor_tool_executes_local_edits() {
     assert_eq!(updated, json!("alpha\ngamma\n"));
 
     let _ = std::fs::remove_file(file_path);
+}
+
+#[test]
+fn builtin_tools_declare_effects_for_policy_rules() {
+    use adk_core::ToolEffect;
+    use adk_tool::{
+        GeminiCodeExecutionTool, GeminiComputerUseTool, GeminiFileSearchTool, GoogleMapsTool,
+        OpenAICodeInterpreterTool, OpenAIFileSearchTool, OpenAIImageGenerationTool,
+        OpenAIShellTool, UrlContextTool,
+    };
+
+    let read_only: Vec<Box<dyn Tool>> = vec![
+        Box::new(GoogleSearchTool::new()),
+        Box::new(UrlContextTool::new()),
+        Box::new(GoogleMapsTool::new()),
+        Box::new(GeminiFileSearchTool::new(["store"])),
+        Box::new(WebSearchTool::new()),
+        Box::new(OpenAIWebSearchTool::new()),
+        Box::new(OpenAIFileSearchTool::new(["vs_1"])),
+    ];
+    for tool in read_only {
+        assert!(tool.is_builtin(), "{}", tool.name());
+        assert_eq!(tool.effect(), ToolEffect::ReadOnly, "{}", tool.name());
+    }
+
+    let side_effecting: Vec<Box<dyn Tool>> = vec![
+        Box::new(GeminiCodeExecutionTool::new()),
+        Box::new(GeminiComputerUseTool::default()),
+        Box::new(OpenAICodeInterpreterTool::new()),
+        Box::new(OpenAIImageGenerationTool::new()),
+        Box::new(OpenAIShellTool::new()),
+        Box::new(AnthropicBashTool20250124::new()),
+        Box::new(AnthropicTextEditorTool20250728::new()),
+    ];
+    for tool in side_effecting {
+        assert_eq!(tool.effect(), ToolEffect::NonIdempotent, "{}", tool.name());
+    }
 }

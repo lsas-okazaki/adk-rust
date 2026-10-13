@@ -21,6 +21,12 @@ pub struct ExecutionConfig {
     pub thread_id: String,
     /// Resume from a specific checkpoint
     pub resume_from: Option<String>,
+    /// Values for functional-API interrupt sites, keyed by continuation key.
+    ///
+    /// An `#[entrypoint]` run hands these to its `TaskContext`, so an interrupt
+    /// whose key is present returns the value instead of suspending. The graph
+    /// executor does not read them: a graph node resumes from its state.
+    pub resume_values: HashMap<String, Value>,
     /// Recursion limit for cycles
     pub recursion_limit: usize,
     /// Additional configuration
@@ -34,6 +40,9 @@ pub struct ExecutionConfig {
     /// [`ExecutionConfig::with_parent_context`] to carry them through; leaving it
     /// unset is standalone mode and is what a graph invoked outside a `Runner` gets.
     pub parent_context: Option<Arc<dyn adk_core::InvocationContext>>,
+    /// When the run writes each super-step's checkpoint. Defaults to
+    /// [`Durability::Sync`](crate::checkpoint::Durability::Sync).
+    pub durability: crate::checkpoint::Durability,
 }
 
 impl ExecutionConfig {
@@ -42,10 +51,28 @@ impl ExecutionConfig {
         Self {
             thread_id: thread_id.to_string(),
             resume_from: None,
+            resume_values: HashMap::new(),
             recursion_limit: 50,
             metadata: HashMap::new(),
             parent_context: None,
+            durability: crate::checkpoint::Durability::default(),
         }
+    }
+
+    /// Sets when the run writes each super-step's checkpoint.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_graph::checkpoint::Durability;
+    /// use adk_graph::node::ExecutionConfig;
+    ///
+    /// let config = ExecutionConfig::new("thread").with_durability(Durability::Exit);
+    /// assert_eq!(config.durability, Durability::Exit);
+    /// ```
+    pub fn with_durability(mut self, durability: crate::checkpoint::Durability) -> Self {
+        self.durability = durability;
+        self
     }
 
     /// Carry the invocation this graph run belongs to into its nodes.
@@ -68,6 +95,30 @@ impl ExecutionConfig {
     /// Resume from a specific checkpoint
     pub fn with_resume_from(mut self, checkpoint_id: &str) -> Self {
         self.resume_from = Some(checkpoint_id.to_string());
+        self
+    }
+
+    /// Supplies the value for a functional-API interrupt site.
+    ///
+    /// `continuation_key` is the key a suspended `#[entrypoint]` run reported,
+    /// such as `interrupt-1`. The resumed run's interrupt at that site returns
+    /// `value` instead of suspending.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_graph::node::ExecutionConfig;
+    /// use serde_json::json;
+    ///
+    /// let config = ExecutionConfig::new("refund-42")
+    ///     .with_resume_from("checkpoint-id")
+    ///     .with_resume_value("interrupt-1", json!({ "approved": true }));
+    ///
+    /// assert_eq!(config.resume_values.get("interrupt-1"), Some(&json!({ "approved": true })));
+    /// ```
+    #[must_use]
+    pub fn with_resume_value(mut self, continuation_key: impl Into<String>, value: Value) -> Self {
+        self.resume_values.insert(continuation_key.into(), value);
         self
     }
 
@@ -138,6 +189,17 @@ impl NodeContext {
 
     pub(crate) fn run_config(&self) -> Option<adk_core::RunConfig> {
         self.run_config.clone()
+    }
+
+    /// Who the run executing this node acts as, and for whom.
+    ///
+    /// `Some` when the graph runs with a [`RunConfig`](adk_core::RunConfig), such as a
+    /// graph agent under a runner, or a call to
+    /// [`CompiledGraph::invoke_with_run_config`](crate::CompiledGraph::invoke_with_run_config).
+    /// Agent nodes give their agents the resolved context through
+    /// [`ReadonlyContext::acting_context`](adk_core::ReadonlyContext::acting_context).
+    pub fn acting(&self) -> Option<&adk_core::ActingConfig> {
+        self.run_config.as_ref().map(|config| &config.acting)
     }
 
     pub(crate) fn child_invoker(&self) -> Option<std::sync::Arc<crate::child::ChildInvoker>> {
@@ -634,7 +696,9 @@ fn default_output_mapper(events: &[adk_core::Event]) -> HashMap<String, Value> {
 
     // Collect text from events
     let mut messages = Vec::new();
+    let mut text_deltas = adk_core::EventTextDeltas::default();
     for event in events {
+        let event = text_deltas.push(event);
         if let Some(content) = event.content() {
             let text = content.parts.iter().filter_map(|p| p.text()).collect::<Vec<_>>().join("");
 
@@ -759,6 +823,7 @@ impl Node for AgentNode {
 
             tokio::pin!(stream);
             let mut all_events = Vec::new();
+            let mut text_deltas = adk_core::EventTextDeltas::default();
 
             while let Some(result) = stream.next().await {
                 match result {
@@ -775,7 +840,7 @@ impl Node for AgentNode {
                             return;
                         }
                         // Emit streaming event immediately
-                        if let Some(content) = event.content() {
+                        if let Some(content) = text_deltas.push(&event).content() {
                             let text: String = content.parts.iter().filter_map(|p| p.text()).collect();
                             if !text.is_empty() {
                                 yield Ok(StreamEvent::Message {
@@ -918,6 +983,10 @@ impl adk_core::ReadonlyContext for GraphInvocationContext {
 
     fn user_content(&self) -> &adk_core::Content {
         &self.user_content
+    }
+
+    fn acting_context(&self) -> adk_core::ActingContext {
+        self.run_config.acting_context_for(&self.app_name, self.agent.name(), &self.user_id)
     }
 }
 
@@ -1096,6 +1165,28 @@ mod tests {
 
         assert!(output.updates.is_empty());
         assert!(output.interrupt.is_none());
+    }
+
+    #[test]
+    fn default_output_mapper_does_not_repeat_a_complete_snapshot() {
+        let mut partial = adk_core::Event::new("invocation");
+        partial.llm_response.partial = true;
+        partial.set_content(adk_core::Content::new("model").with_text("Hello"));
+        let mut terminal = partial.clone();
+        terminal.llm_response.partial = false;
+        terminal.llm_response.provider_metadata =
+            Some(serde_json::json!({"content_complete": true}));
+        terminal.set_content(adk_core::Content::new("model").with_text("Hello world"));
+
+        let updates = default_output_mapper(&[partial, terminal]);
+
+        assert_eq!(
+            updates.get("messages"),
+            Some(&serde_json::json!([
+                {"role": "assistant", "content": "Hello"},
+                {"role": "assistant", "content": " world"},
+            ]))
+        );
     }
 
     #[test]

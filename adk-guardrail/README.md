@@ -19,10 +19,10 @@ Guardrails framework for ADK agents - input/output validation, content filtering
 
 ```toml
 [dependencies]
-adk-guardrail = "2.2.0"
+adk-guardrail = "3.0.0"
 
 # With JSON schema validation (default)
-adk-guardrail = { version = "2.2.0", features = ["schema"] }
+adk-guardrail = { version = "3.0.0", features = ["schema"] }
 ```
 
 ## Quick Start
@@ -54,8 +54,8 @@ let filter = ContentFilter::on_topic("cooking", vec!["recipe".into(), "bake".int
 // Limit response length
 let filter = ContentFilter::max_length(1000);
 
-// Block specific keywords
-let filter = ContentFilter::blocked_keywords(vec!["forbidden".into()]);
+// Block specific keywords (an error, not an open filter, if the list cannot compile)
+let filter = ContentFilter::blocked_keywords(vec!["forbidden".into()])?;
 ```
 
 ### Agent Integration
@@ -63,7 +63,7 @@ let filter = ContentFilter::blocked_keywords(vec!["forbidden".into()]);
 Requires `guardrails` feature on `adk-agent`:
 
 ```toml
-adk-agent = { version = "2.2.0", features = ["guardrails"] }
+adk-agent = { version = "3.0.0", features = ["guardrails"] }
 ```
 
 ```rust

@@ -2,15 +2,16 @@ use adk_core::{
     AfterAgentCallback, AfterModelCallback, AfterToolCallback, AfterToolCallbackFull, Agent,
     BeforeAgentCallback, BeforeModelCallback, BeforeModelResult, BeforeToolCallback,
     CallbackContext, Content, Event, EventActions, FunctionResponseData, GlobalInstructionProvider,
-    InstructionProvider, InvocationContext, Llm, LlmRequest, LlmResponse, MemoryEntry,
-    OnToolErrorCallback, Part, ReadonlyContext, Result, RetryBudget, Tool, ToolCallbackContext,
-    ToolConfirmationDecision, ToolConfirmationPolicy, ToolConfirmationRequest, ToolContext,
-    ToolExecutionStrategy, ToolOutcome, Toolset,
+    GovernedCall, InstructionProvider, InvocationContext, Llm, LlmRequest, LlmResponse,
+    MemoryEntry, OnToolErrorCallback, Part, ReadonlyContext, Result, RetryBudget, Tool,
+    ToolAuthorization, ToolCallbackContext, ToolConfirmationPolicy, ToolConfirmationRequest,
+    ToolContext, ToolEffect, ToolExecutionStrategy, ToolGate, ToolOutcome, Toolset,
+    authorize_tool_call,
 };
 use async_stream::stream;
 use async_trait::async_trait;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 use tracing::Instrument;
@@ -23,9 +24,8 @@ use adk_plugin::{
 #[cfg(feature = "skills")]
 use crate::skill_shim::load_skill_index;
 use crate::{
-    guardrails::{
-        GuardrailSet, ToolGuardrailSet, ToolScreening, enforce_guardrails, screen_tool_call,
-    },
+    guardrails::{GuardrailScreen, GuardrailSet, ToolGuardrailSet, enforce_guardrails},
+    invocation_hooks::HookCallbacks,
     skill_shim::{SelectionPolicy, SkillIndex, apply_skill_injection},
     tool_call_markup::normalize_option_content,
     workflow::with_user_content_override,
@@ -37,13 +37,25 @@ pub const DEFAULT_MAX_ITERATIONS: u32 = 100;
 /// Default tool execution timeout (5 minutes).
 pub const DEFAULT_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Recorded in place of a request, response, or tool payload when
+/// [`RunConfig::record_payloads`](adk_core::RunConfig::record_payloads) is off.
+const PAYLOAD_OMITTED: &str = "[omitted: set RunConfig::record_payloads to record payloads]";
+
+/// Renders a payload for a span field or debug log.
+///
+/// Payloads carry user text and tool data, so nothing of them is recorded unless
+/// `record_payloads` is set: in full with the `record-payloads` feature, otherwise
+/// truncated to `max_bytes`.
 fn trace_json_payload<T: serde::Serialize>(
     value: &T,
     record_payloads: bool,
     max_bytes: usize,
 ) -> String {
+    if !record_payloads {
+        return PAYLOAD_OMITTED.to_string();
+    }
     let json = serde_json::to_string(value).unwrap_or_default();
-    if cfg!(feature = "record-payloads") && record_payloads {
+    if cfg!(feature = "record-payloads") {
         return json;
     }
 
@@ -66,7 +78,6 @@ struct PendingToolCall {
     args: serde_json::Value,
     id: Option<String>,
     function_call_id: String,
-    guardrail_denial: Option<String>,
 }
 
 fn build_generation_config(
@@ -111,7 +122,6 @@ fn collect_function_calls(content: &Content, invocation_id: &str) -> Vec<Pending
             function_call_id: id
                 .clone()
                 .unwrap_or_else(|| format!("{invocation_id}_{name}_{index}")),
-            guardrail_denial: None,
         })
         .collect()
 }
@@ -134,25 +144,25 @@ fn collect_long_running_tool_ids(
         .collect()
 }
 
+/// Builds one streamed model event.
+///
+/// `request_debug` is the bounded request copy from [`trace_json_payload`]: the
+/// full request carries the whole conversation, so embedding it in every
+/// terminal event would make stored history grow quadratically.
 fn build_partial_llm_event(
     event_id: &str,
     invocation_id: &str,
     agent_name: &str,
-    request_json: &str,
+    request_debug: &str,
     chunk: &LlmResponse,
     long_running_tool_ids: Vec<String>,
 ) -> Event {
     let mut event = Event::with_id(event_id, invocation_id);
     event.author = agent_name.to_string();
-    // Keep payload snapshots on the terminal chunk for backwards-compatible
-    // debug tooling, but never repeat the full request and response on every
-    // incremental chunk. Large histories otherwise turn streaming into
-    // O(request_size * chunk_count) serialization and transport work.
+    // Payload snapshots go on the terminal chunk only; repeating them on every
+    // incremental chunk turns streaming into O(request_size * chunk_count) work.
     if !chunk.partial {
-        event.llm_request = Some(request_json.to_string());
-        event
-            .provider_metadata
-            .insert("gcp.vertex.agent.llm_request".to_string(), request_json.to_string());
+        event.llm_request = Some(request_debug.to_string());
         event.provider_metadata.insert(
             "gcp.vertex.agent.llm_response".to_string(),
             serde_json::to_string(chunk).unwrap_or_default(),
@@ -162,6 +172,7 @@ fn build_partial_llm_event(
     event.llm_response.turn_complete = chunk.turn_complete;
     event.llm_response.finish_reason = chunk.finish_reason;
     event.llm_response.usage_metadata = chunk.usage_metadata.clone();
+    event.llm_response.citation_metadata = chunk.citation_metadata.clone();
     event.llm_response.content = chunk.content.clone();
     event.llm_response.provider_metadata = chunk.provider_metadata.clone();
     event.llm_response.interaction_id = chunk.interaction_id.clone();
@@ -170,37 +181,42 @@ fn build_partial_llm_event(
     event.llm_response.interrupted = chunk.interrupted;
     event.llm_response.error_code = chunk.error_code.clone();
     event.llm_response.error_message = chunk.error_message.clone();
+    event.llm_response.model = chunk.model.clone();
+    event.llm_response.provider = chunk.provider.clone();
     event.long_running_tool_ids = long_running_tool_ids;
     event
 }
 
+/// Builds the single model event of a non-streaming turn; see
+/// [`build_partial_llm_event`] for `request_debug`.
 fn build_final_llm_event(
     event_id: &str,
     invocation_id: &str,
     agent_name: &str,
-    request_json: &str,
+    request_debug: &str,
     content: Option<&Content>,
     last_chunk: Option<&LlmResponse>,
     long_running_tool_ids: Vec<String>,
 ) -> Event {
     let mut event = Event::with_id(event_id, invocation_id);
     event.author = agent_name.to_string();
-    event.llm_request = Some(request_json.to_string());
-    event
-        .provider_metadata
-        .insert("gcp.vertex.agent.llm_request".to_string(), request_json.to_string());
+    event.llm_request = Some(request_debug.to_string());
     event.llm_response.content = content.cloned();
     event.llm_response.partial = false;
     event.llm_response.turn_complete = true;
 
     if let Some(last_chunk) = last_chunk {
+        event.llm_response.turn_complete = last_chunk.turn_complete;
         event.llm_response.finish_reason = last_chunk.finish_reason;
         event.llm_response.usage_metadata = last_chunk.usage_metadata.clone();
+        event.llm_response.citation_metadata = last_chunk.citation_metadata.clone();
         event.llm_response.provider_metadata = last_chunk.provider_metadata.clone();
         event.llm_response.interaction_id = last_chunk.interaction_id.clone();
         event.llm_response.interrupted = last_chunk.interrupted;
         event.llm_response.error_code = last_chunk.error_code.clone();
         event.llm_response.error_message = last_chunk.error_message.clone();
+        event.llm_response.model = last_chunk.model.clone();
+        event.llm_response.provider = last_chunk.provider.clone();
         event.provider_metadata.insert(
             "gcp.vertex.agent.llm_response".to_string(),
             serde_json::to_string(last_chunk).unwrap_or_default(),
@@ -208,6 +224,24 @@ fn build_final_llm_event(
     }
 
     event.long_running_tool_ids = long_running_tool_ids;
+    event
+}
+
+/// The event that ends a run on a call held for confirmation.
+fn confirmation_event(
+    invocation_id: &str,
+    agent_name: &str,
+    request: ToolConfirmationRequest,
+) -> Event {
+    let mut event = Event::new(invocation_id);
+    event.author = agent_name.to_string();
+    event.llm_response.interrupted = true;
+    event.llm_response.turn_complete = true;
+    event.llm_response.content = Some(Content::new("model").with_text(format!(
+        "Tool confirmation required for '{}'. Provide approve/deny decision to continue.",
+        request.tool_name
+    )));
+    event.actions.tool_confirmation = Some(request);
     event
 }
 
@@ -239,6 +273,8 @@ pub struct LlmAgent {
     include_contents: adk_core::IncludeContents,
     tools: Vec<Arc<dyn Tool>>,
     toolsets: Vec<Arc<dyn Toolset>>,
+    /// Whether a toolset that fails to resolve its tools fails the turn.
+    strict_toolsets: bool,
     sub_agents: Vec<Arc<dyn Agent>>,
     output_key: Option<String>,
     /// Default generation config (temperature, top_p, etc.) applied to every LLM request.
@@ -267,6 +303,8 @@ pub struct LlmAgent {
     /// Per-agent tool execution strategy override. When `Some`, overrides the
     /// `RunConfig` strategy for this agent's dispatch loop.
     tool_execution_strategy: Option<ToolExecutionStrategy>,
+    /// Whether consecutive agent-delegation calls may execute concurrently.
+    parallelize_agent_delegations: bool,
     input_guardrails: Arc<GuardrailSet>,
     output_guardrails: Arc<GuardrailSet>,
     tool_guardrails: Arc<ToolGuardrailSet>,
@@ -313,34 +351,36 @@ impl PromptConfig {
         ctx: &Arc<dyn InvocationContext>,
         agent_name: &str,
     ) -> Result<Vec<Content>> {
+        // Instructions travel as `system` contents so providers place them in their
+        // native system prompt instead of guessing from leading user turns.
         let mut preamble = Vec::new();
 
         if let Some(provider) = &self.global_instruction_provider {
             let instruction = provider(ctx.clone() as Arc<dyn ReadonlyContext>).await?;
             if !instruction.is_empty() {
-                preamble.push(Content::new("user").with_text(instruction));
+                preamble.push(Content::new("system").with_text(instruction));
             }
         } else if let Some(template) = &self.global_instruction {
             let instruction = adk_core::inject_session_state(ctx.as_ref(), template).await?;
             if !instruction.is_empty() {
-                preamble.push(Content::new("user").with_text(instruction));
+                preamble.push(Content::new("system").with_text(instruction));
             }
         }
 
         if let Some(provider) = &self.instruction_provider {
             let instruction = provider(ctx.clone() as Arc<dyn ReadonlyContext>).await?;
             if !instruction.is_empty() {
-                preamble.push(Content::new("user").with_text(instruction));
+                preamble.push(Content::new("system").with_text(instruction));
             }
         } else if let Some(template) = &self.instruction {
             let instruction = adk_core::inject_session_state(ctx.as_ref(), template).await?;
             if !instruction.is_empty() {
-                preamble.push(Content::new("user").with_text(instruction));
+                preamble.push(Content::new("system").with_text(instruction));
             }
         }
 
         if let Some(schema) = &self.output_schema {
-            preamble.push(Content::new("user").with_text(format!(
+            preamble.push(Content::new("system").with_text(format!(
                 "You MUST respond with valid JSON conforming to this schema: {schema}. Do not include any text outside the JSON object."
             )));
         }
@@ -364,6 +404,30 @@ impl PromptConfig {
             );
         }
         place_current_user_content(&mut session_history, ctx.user_content(), &current_user_content);
+        // A run that resumes held calls carries an empty user turn. It adds nothing to the
+        // conversation, and providers such as Anthropic reject empty text blocks.
+        session_history.retain(|content| {
+            content.role != "user"
+                || content
+                    .parts
+                    .iter()
+                    .any(|part| !matches!(part, Part::Text { text } if text.trim().is_empty()))
+        });
+        // Without its empty turn, a resuming run whose model already answered after the
+        // held call would end on a model message, which providers read as a prefill and
+        // models without prefill support (Anthropic's newer ones) reject.
+        let empty_turn = current_user_content
+            .parts
+            .iter()
+            .all(|part| matches!(part, Part::Text { text } if text.trim().is_empty()));
+        if empty_turn
+            && session_history.last().is_some_and(|last| {
+                last.role == "model"
+                    && !last.parts.iter().any(|part| matches!(part, Part::FunctionCall { .. }))
+            })
+        {
+            session_history.push(Content::new("user").with_text(RESUMED_TURN_NOTE));
+        }
 
         Ok(match self.include_contents {
             adk_core::IncludeContents::None => {
@@ -404,10 +468,15 @@ fn place_current_user_content(history: &mut Vec<Content>, original: &Content, cu
         history.push(current.clone());
     }
 }
+/// The user turn a run without user input sends when the conversation would otherwise
+/// end on a model message.
+const RESUMED_TURN_NOTE: &str =
+    "(No new message from the user. Continue from the tool results above.)";
 
 struct ToolSetup {
     tools: Vec<Arc<dyn Tool>>,
     toolsets: Vec<Arc<dyn Toolset>>,
+    strict_toolsets: bool,
     sub_agents: Vec<Arc<dyn Agent>>,
     disallow_transfer_to_parent: bool,
     disallow_transfer_to_peers: bool,
@@ -424,6 +493,7 @@ impl ToolSetup {
         Self {
             tools: agent.tools.clone(),
             toolsets: agent.toolsets.clone(),
+            strict_toolsets: agent.strict_toolsets,
             sub_agents: agent.sub_agents.clone(),
             disallow_transfer_to_parent: agent.disallow_transfer_to_parent,
             disallow_transfer_to_peers: agent.disallow_transfer_to_peers,
@@ -442,7 +512,21 @@ impl ToolSetup {
         );
 
         for toolset in active_toolsets {
-            for tool in toolset.tools(ctx.clone() as Arc<dyn ReadonlyContext>).await? {
+            let provided = match toolset.tools(ctx.clone() as Arc<dyn ReadonlyContext>).await {
+                Ok(provided) => provided,
+                // One unreachable server costs the model that server's tools, not the turn.
+                Err(error) if !self.strict_toolsets => {
+                    tracing::warn!(
+                        agent.name = %ctx.agent_name(),
+                        toolset.name = %toolset.name(),
+                        error = %error,
+                        "toolset failed to resolve its tools; continuing without them"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for tool in provided {
                 let name = tool.name().to_string();
                 if static_tool_names.contains(&name) {
                     return Err(adk_core::AdkError::agent(format!(
@@ -514,6 +598,20 @@ impl ToolSetup {
 
         Ok(ResolvedTools { map, declarations, transfer_targets })
     }
+
+    /// Lets static and invocation-scoped toolsets enrich each LLM request.
+    async fn process_llm_request(
+        &self,
+        ctx: &Arc<dyn InvocationContext>,
+        request: &mut LlmRequest,
+    ) -> Result<()> {
+        for toolset in self.toolsets.iter().map(AsRef::as_ref).chain(
+            ctx.run_config().runtime_toolsets.iter().map(|runtime| runtime.toolset().as_ref()),
+        ) {
+            toolset.process_llm_request(ctx.clone() as Arc<dyn ReadonlyContext>, request).await?;
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -527,35 +625,6 @@ impl std::fmt::Debug for LlmAgent {
             .field("sub_agents_count", &self.sub_agents.len())
             .finish()
     }
-}
-
-/// Resolves a static confirmation decision for one exact tool call.
-///
-/// Decisions are keyed by function call ID rather than tool name, so an approval
-/// cannot be replayed onto a different call that happens to use the same tool. When
-/// the run also supplies a fingerprint for that ID, the call's own fingerprint must
-/// match it; a mismatch is treated as no decision, which leaves the call
-/// unconfirmed rather than silently authorising different arguments.
-fn static_confirmation_decision(
-    decisions: &std::collections::HashMap<String, ToolConfirmationDecision>,
-    fingerprints: &std::collections::HashMap<String, String>,
-    function_call_id: &str,
-    tool_name: &str,
-    args: &serde_json::Value,
-) -> Option<ToolConfirmationDecision> {
-    let decision = decisions.get(function_call_id).copied()?;
-    if let Some(expected) = fingerprints.get(function_call_id) {
-        let actual = adk_core::tool_call_fingerprint(tool_name, args);
-        if &actual != expected {
-            tracing::warn!(
-                tool.name = %tool_name,
-                function_call.id = %function_call_id,
-                "confirmation decision does not match this call's arguments, treating as unconfirmed"
-            );
-            return None;
-        }
-    }
-    Some(decision)
 }
 
 impl LlmAgent {
@@ -611,6 +680,13 @@ impl LlmAgent {
             .flatten()
             .filter_map(|value| serde_json::from_value::<Part>(value.clone()).ok())
             .collect()
+    }
+
+    fn continues_turn(metadata: Option<&serde_json::Value>) -> bool {
+        metadata
+            .and_then(|metadata| metadata.get("continue_turn"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
     }
 
     fn augment_content_for_history(
@@ -716,6 +792,7 @@ pub struct LlmAgentBuilder {
     include_contents: adk_core::IncludeContents,
     tools: Vec<Arc<dyn Tool>>,
     toolsets: Vec<Arc<dyn Toolset>>,
+    strict_toolsets: bool,
     sub_agents: Vec<Arc<dyn Agent>>,
     output_key: Option<String>,
     generate_content_config: Option<adk_core::GenerateContentConfig>,
@@ -734,6 +811,7 @@ pub struct LlmAgentBuilder {
     circuit_breaker_threshold: Option<u32>,
     tool_confirmation_policy: ToolConfirmationPolicy,
     tool_execution_strategy: Option<ToolExecutionStrategy>,
+    parallelize_agent_delegations: bool,
     input_guardrails: GuardrailSet,
     output_guardrails: GuardrailSet,
     tool_guardrails: ToolGuardrailSet,
@@ -767,6 +845,7 @@ impl LlmAgentBuilder {
             include_contents: adk_core::IncludeContents::Default,
             tools: Vec::new(),
             toolsets: Vec::new(),
+            strict_toolsets: false,
             sub_agents: Vec::new(),
             output_key: None,
             generate_content_config: None,
@@ -785,6 +864,7 @@ impl LlmAgentBuilder {
             circuit_breaker_threshold: None,
             tool_confirmation_policy: ToolConfirmationPolicy::Never,
             tool_execution_strategy: None,
+            parallelize_agent_delegations: false,
             input_guardrails: GuardrailSet::new(),
             output_guardrails: GuardrailSet::new(),
             tool_guardrails: ToolGuardrailSet::new(),
@@ -938,6 +1018,10 @@ impl LlmAgentBuilder {
     }
 
     /// Set a state key where the agent's final output will be stored.
+    ///
+    /// The value is the concatenated text of the final model response. When an
+    /// `output_schema` is set, it is written only after the response passes schema
+    /// validation; a response that exhausts `output_max_retries` leaves the key unset.
     pub fn output_key(mut self, key: impl Into<String>) -> Self {
         self.output_key = Some(key.into());
         self
@@ -1010,6 +1094,12 @@ impl LlmAgentBuilder {
 
     /// Set the timeout for individual tool executions.
     /// Default is 5 minutes. Tools that exceed this timeout will return an error.
+    ///
+    /// A tool whose [`Tool::timeout_override`] returns `Some` uses that instead,
+    /// so an `AgentTool` delegation is bounded by its own timeout. A
+    /// [`ToolEffect::NonIdempotent`] call that times out is answered with an
+    /// [`outcome_unknown_response`](adk_core::outcome_unknown_response), because
+    /// its side effect may already have happened.
     pub fn tool_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.tool_timeout = timeout;
         self
@@ -1023,11 +1113,40 @@ impl LlmAgentBuilder {
 
     /// Register a dynamic toolset for per-invocation tool resolution.
     ///
-    /// Toolsets are resolved at the start of each `run()` call using the
-    /// invocation's `ReadonlyContext`. This enables context-dependent tools
-    /// like per-user browser sessions from a pool.
+    /// Toolsets are resolved at the start of each `run()` call, and again after
+    /// each round of tool calls, using the invocation's `ReadonlyContext`. This
+    /// enables context-dependent tools like per-user browser sessions from a
+    /// pool.
+    ///
+    /// A toolset whose `tools()` call fails is skipped for that resolution with
+    /// a `warn`-level trace naming the toolset and the error, and the turn
+    /// continues with the remaining tools. Use
+    /// [`strict_toolsets`](Self::strict_toolsets) to fail the turn instead.
     pub fn toolset(mut self, toolset: Arc<dyn Toolset>) -> Self {
         self.toolsets.push(toolset);
+        self
+    }
+
+    /// Fail the turn when any toolset cannot resolve its tools.
+    ///
+    /// Off by default: a failing toolset, such as an MCP server that is down,
+    /// is skipped and the model runs with the tools that did resolve. Turn this
+    /// on when the agent must not run without every toolset, for example when
+    /// a toolset supplies the only tools that can complete its task. It applies
+    /// to toolsets registered here and to `RunConfig::runtime_toolsets`.
+    /// Duplicate tool names fail the turn either way.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let agent = LlmAgentBuilder::new("operator")
+    ///     .model(model)
+    ///     .toolset(Arc::new(mcp_toolset))
+    ///     .strict_toolsets(true)
+    ///     .build()?;
+    /// ```
+    pub fn strict_toolsets(mut self, strict: bool) -> Self {
+        self.strict_toolsets = strict;
         self
     }
 
@@ -1108,8 +1227,11 @@ impl LlmAgentBuilder {
     /// a per-tool override.
     ///
     /// When a tool execution fails and a retry budget applies, the agent
-    /// retries up to `budget.max_retries` times with the configured delay
-    /// between attempts.
+    /// retries up to `budget.max_retries` times, with the backoff described on
+    /// [`RetryBudget::backoff_delay`]. Only a tool whose [`Tool::effect`] is
+    /// [`ToolEffect::ReadOnly`] or [`ToolEffect::Idempotent`] is retried, and
+    /// only after a retryable error or a timeout. Each attempt gets a fresh tool
+    /// context, so a retried attempt's state delta and escalation are discarded.
     pub fn default_retry_budget(mut self, budget: RetryBudget) -> Self {
         self.default_retry_budget = Some(budget);
         self
@@ -1136,6 +1258,12 @@ impl LlmAgentBuilder {
     }
 
     /// Configure tool confirmation requirements for this agent.
+    ///
+    /// The effective requirement is the union of this policy and
+    /// [`InvocationContext::requires_tool_confirmation`], so a runtime-injected requirement
+    /// (for example a team relationship with required approval) still pauses the call when
+    /// no decision exists and blocks it when the decision is
+    /// [`ToolConfirmationDecision::Deny`](adk_core::ToolConfirmationDecision::Deny).
     pub fn tool_confirmation_policy(mut self, policy: ToolConfirmationPolicy) -> Self {
         self.tool_confirmation_policy = policy;
         self
@@ -1162,6 +1290,16 @@ impl LlmAgentBuilder {
     /// concurrency safety.
     pub fn tool_execution_strategy(mut self, strategy: ToolExecutionStrategy) -> Self {
         self.tool_execution_strategy = Some(strategy);
+        self
+    }
+
+    /// Allow consecutive agent-delegation calls to execute concurrently.
+    ///
+    /// Ordinary tools remain sequential and retain their position relative to
+    /// each delegation batch. This setting takes precedence over the general
+    /// tool execution strategy for the agent.
+    pub fn parallelize_agent_delegations(mut self, parallelize: bool) -> Self {
+        self.parallelize_agent_delegations = parallelize;
         self
     }
 
@@ -1198,9 +1336,11 @@ impl LlmAgentBuilder {
     /// but not with these arguments". A [`ToolGuardrailSet`] receives the tool name and the
     /// arguments and may allow, deny, or narrow them.
     ///
-    /// Screening runs before the tool executes and before confirmation is resolved, so a denied
-    /// call neither prompts the user nor consumes a concurrency permit. A denial is reported to
-    /// the model as the tool's result, letting it correct the call rather than stalling the run.
+    /// Screening runs on the call's final arguments, after plugin and callback rewrites and the
+    /// run's [`ToolPolicy`](adk_core::ToolPolicy), and before confirmation is resolved, so a
+    /// denied call neither prompts the user nor consumes a concurrency permit. A denial is
+    /// reported to the model as the tool's result, letting it correct the call rather than
+    /// stalling the run.
     ///
     /// Requires the `guardrails` feature.
     ///
@@ -1375,6 +1515,7 @@ impl LlmAgentBuilder {
             include_contents: self.include_contents,
             tools: self.tools,
             toolsets: self.toolsets,
+            strict_toolsets: self.strict_toolsets,
             sub_agents: self.sub_agents,
             output_key: self.output_key,
             generate_content_config: self.generate_content_config,
@@ -1393,6 +1534,7 @@ impl LlmAgentBuilder {
             circuit_breaker_threshold: self.circuit_breaker_threshold,
             tool_confirmation_policy: self.tool_confirmation_policy,
             tool_execution_strategy: self.tool_execution_strategy,
+            parallelize_agent_delegations: self.parallelize_agent_delegations,
             input_guardrails: Arc::new(self.input_guardrails),
             output_guardrails: Arc::new(self.output_guardrails),
             tool_guardrails: Arc::new(self.tool_guardrails),
@@ -1609,6 +1751,10 @@ impl ReadonlyContext for AgentToolContext {
     fn user_content(&self) -> &Content {
         self.parent_ctx.user_content()
     }
+
+    fn acting_context(&self) -> adk_core::ActingContext {
+        self.parent_ctx.acting_context()
+    }
 }
 
 #[async_trait]
@@ -1758,6 +1904,10 @@ impl ReadonlyContext for ToolOutcomeCallbackContext {
     fn user_content(&self) -> &Content {
         self.inner.user_content()
     }
+
+    fn acting_context(&self) -> adk_core::ActingContext {
+        self.inner.acting_context()
+    }
 }
 
 #[async_trait]
@@ -1768,6 +1918,10 @@ impl CallbackContext for ToolOutcomeCallbackContext {
 
     fn tool_outcome(&self) -> Option<ToolOutcome> {
         Some(self.outcome.clone())
+    }
+
+    fn shared_state(&self) -> Option<Arc<adk_core::SharedState>> {
+        self.inner.shared_state()
     }
 }
 
@@ -1812,6 +1966,70 @@ struct ToolExecutionResult {
     content: Content,
     actions: EventActions,
     escalate_or_skip: bool,
+    /// Set when the call is held for a confirmation decision that does not exist yet.
+    pending: Option<ToolConfirmationRequest>,
+}
+
+/// Turns a tool callback's substitute content into the response to the call it replaces.
+///
+/// Providers reject a request whose function call has no function response with the same id,
+/// so a function response part is re-addressed to this call and text-only content is wrapped
+/// as one by `wrap_text`. Only the function response is kept, as OpenAI Chat reads the first
+/// part of a tool message and nothing else.
+fn callback_tool_response(
+    content: Content,
+    name: &str,
+    id: Option<&String>,
+    wrap_text: impl FnOnce(String) -> serde_json::Value,
+) -> Content {
+    let mut text = String::new();
+    let mut response = None;
+    for part in content.parts {
+        match part {
+            Part::FunctionResponse { mut function_response, annotations, .. }
+                if response.is_none() =>
+            {
+                function_response.name = name.to_string();
+                response = Some(Part::FunctionResponse {
+                    function_response,
+                    id: id.cloned(),
+                    annotations,
+                });
+            }
+            other => {
+                if let Some(chunk) = other.text() {
+                    text.push_str(chunk);
+                }
+            }
+        }
+    }
+    let response = response.unwrap_or_else(|| Part::FunctionResponse {
+        function_response: FunctionResponseData::new(name, wrap_text(text)),
+        id: id.cloned(),
+        annotations: None,
+    });
+    Content { role: "function".to_string(), parts: vec![response] }
+}
+
+#[derive(Clone, Copy)]
+enum ToolDispatchMode {
+    Sequential,
+    Parallel,
+    ParallelDelegations,
+    Auto,
+}
+
+impl ToolDispatchMode {
+    fn resolve(strategy: ToolExecutionStrategy, parallelize_agent_delegations: bool) -> Self {
+        if parallelize_agent_delegations {
+            return Self::ParallelDelegations;
+        }
+        match strategy {
+            ToolExecutionStrategy::Sequential => Self::Sequential,
+            ToolExecutionStrategy::Parallel => Self::Parallel,
+            ToolExecutionStrategy::Auto => Self::Auto,
+        }
+    }
 }
 
 struct ToolExecutor<'a> {
@@ -1823,138 +2041,169 @@ struct ToolExecutor<'a> {
     after_tool_callbacks: &'a Arc<Vec<AfterToolCallback>>,
     after_tool_callbacks_full: &'a Arc<Vec<AfterToolCallbackFull>>,
     on_tool_error_callbacks: &'a Arc<Vec<OnToolErrorCallback>>,
+    /// The run's invocation hooks, iterated ahead of the agent's own tool callbacks.
+    hook_callbacks: &'a HookCallbacks,
     tool_confirmation_policy: &'a ToolConfirmationPolicy,
+    tool_guardrails: &'a ToolGuardrailSet,
     cb_mutex: &'a std::sync::Mutex<Option<CircuitBreakerState>>,
     invocation_id: &'a str,
     concurrency_manager: &'a adk_core::ToolConcurrencyManager,
     progress_tx: tokio::sync::mpsc::Sender<Event>,
     tool_timeout: std::time::Duration,
-    confirmation_decisions: &'a std::collections::HashMap<String, ToolConfirmationDecision>,
-    confirmation_fingerprints: &'a std::collections::HashMap<String, String>,
-    live_confirmation_decisions: &'a std::collections::HashMap<String, ToolConfirmationDecision>,
+    /// Set when an approval fails, so calls still waiting for theirs stop waiting.
+    approval_failed: tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "enhanced-plugins")]
     enhanced_plugin_manager: &'a Option<Arc<EnhancedPluginManager>>,
 }
 
 impl ToolExecutor<'_> {
-    async fn execute(&self, call: PendingToolCall) -> ToolExecutionResult {
-        let PendingToolCall { index, name, args, id, function_call_id, guardrail_denial } = call;
+    /// Runs one batch of calls under `strategy`, returning results in completion order.
+    async fn dispatch(
+        &self,
+        strategy: ToolDispatchMode,
+        fc_parts: Vec<PendingToolCall>,
+    ) -> Result<Vec<ToolExecutionResult>> {
+        let results: Vec<ToolExecutionResult> = match strategy {
+            ToolDispatchMode::Sequential => {
+                let mut results = Vec::with_capacity(fc_parts.len());
+                for call in fc_parts {
+                    results.push(self.execute(call).await?);
+                }
+                results
+            }
+            ToolDispatchMode::Parallel => {
+                use futures::StreamExt as _;
+                // Parallel is an explicit caller override. Tool
+                // safety metadata is intentionally not inspected.
+                // All concurrency enforcement is handled by the
+                // ToolConcurrencyManager semaphore inside ToolExecutor.
+                // Use fc_parts.len() as buffer so all futures can start
+                // and queue on the semaphore for proper per-tool limiting.
+                let buffer_size = fc_parts.len().max(1);
+                futures::stream::iter(fc_parts.into_iter().map(|call| self.execute(call)))
+                    .buffer_unordered(buffer_size)
+                    // Running tools finish before an approval error ends the turn.
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()?
+            }
+            ToolDispatchMode::ParallelDelegations => {
+                use futures::StreamExt as _;
+
+                let mut all_results = Vec::with_capacity(fc_parts.len());
+                let mut calls = fc_parts.into_iter().peekable();
+                while let Some(call) = calls.next() {
+                    let is_delegation = self
+                        .tool_map
+                        .get(&call.name)
+                        .is_some_and(|tool| tool.is_agent_delegation());
+                    if !is_delegation {
+                        all_results.push(self.execute(call).await?);
+                        continue;
+                    }
+
+                    let mut delegation_batch = vec![call];
+                    while calls.peek().is_some_and(|next| {
+                        self.tool_map.get(&next.name).is_some_and(|tool| tool.is_agent_delegation())
+                    }) {
+                        if let Some(next) = calls.next() {
+                            delegation_batch.push(next);
+                        }
+                    }
+
+                    let buffer_size = delegation_batch.len();
+                    all_results.extend(
+                        futures::stream::iter(
+                            delegation_batch.into_iter().map(|call| self.execute(call)),
+                        )
+                        .buffer_unordered(buffer_size)
+                        .collect::<Vec<_>>()
+                        .await
+                        .into_iter()
+                        .collect::<Result<Vec<_>>>()?,
+                    );
+                }
+                all_results
+            }
+            ToolDispatchMode::Auto => {
+                // A call may overlap another only when its tool is
+                // read-only *and* declares concurrency safety.
+                let (concurrent_fcs, sequential_fcs): (Vec<_>, Vec<_>) =
+                    fc_parts.into_iter().partition(|call| {
+                        self.tool_map
+                            .get(&call.name)
+                            .is_some_and(|tool| tool.is_read_only() && tool.is_concurrency_safe())
+                    });
+                let mut all_results = Vec::new();
+
+                // Concurrency enforcement is handled by the semaphore
+                // inside ToolExecutor.
+                if !concurrent_fcs.is_empty() {
+                    use futures::StreamExt as _;
+                    let buffer_size = concurrent_fcs.len().max(1);
+                    all_results.extend(
+                        futures::stream::iter(
+                            concurrent_fcs.into_iter().map(|call| self.execute(call)),
+                        )
+                        .buffer_unordered(buffer_size)
+                        .collect::<Vec<_>>()
+                        .await
+                        .into_iter()
+                        .collect::<Result<Vec<_>>>()?,
+                    );
+                }
+
+                // Everything else runs one at a time.
+                for call in sequential_fcs {
+                    all_results.push(self.execute(call).await?);
+                }
+                all_results
+            }
+        };
+        Ok(results)
+    }
+
+    async fn execute(&self, call: PendingToolCall) -> Result<ToolExecutionResult> {
+        let result = self.execute_inner(call).await?;
+        let mut event = Event::new(self.invocation_id);
+        event.author = self.ctx.agent_name().to_owned();
+        event.branch = self.ctx.branch().to_owned();
+        event.actions = result.actions.clone();
+        event.llm_response.content = Some(result.content.clone());
+        // Runner commits each result while other calls are still awaiting approval.
+        let _ = self.progress_tx.send(event).await;
+        Ok(result)
+    }
+
+    async fn execute_inner(&self, call: PendingToolCall) -> Result<ToolExecutionResult> {
+        let PendingToolCall { index, name, args, id, function_call_id } = call;
         let mut tool_actions = EventActions::default();
         let mut response_content: Option<Content> = None;
         let mut run_after_tool_callbacks = true;
         let mut tool_outcome_for_callback: Option<ToolOutcome> = None;
         let mut executed_tool: Option<Arc<dyn Tool>> = None;
         let mut executed_tool_response: Option<serde_json::Value> = None;
-
-        if let Some(reason) = guardrail_denial {
-            // Screening happened before confirmation. Report a denial as the tool's result so the
-            // model can correct the call instead of the run stalling.
-            let denied_content = Content {
-                role: "function".to_string(),
-                parts: vec![Part::FunctionResponse {
-                    function_response: FunctionResponseData::new(
-                        name.clone(),
-                        serde_json::json!({ "error": reason }),
-                    ),
-                    id: id.clone(),
-                    annotations: None,
-                }],
-            };
-            return ToolExecutionResult {
-                index,
-                content: denied_content,
-                actions: tool_actions,
-                escalate_or_skip: false,
-            };
-        }
-
-        // Acquire concurrency permit before tool execution.
-        // The permit is held for the entire duration of this tool call
-        // and released on drop when this async block completes.
-        let _concurrency_permit = match self.concurrency_manager.acquire(&name).await {
-            Ok(permit) => Some(permit),
-            Err(e) => {
-                // Concurrency limit reached with Fail policy — return error
-                let error_content = Content {
-                    role: "function".to_string(),
-                    parts: vec![Part::FunctionResponse {
-                        function_response: FunctionResponseData::new(
-                            name.clone(),
-                            serde_json::json!({ "error": e.to_string() }),
-                        ),
-                        id: id.clone(),
-                        annotations: None,
-                    }],
-                };
-                return ToolExecutionResult {
-                    index,
-                    content: error_content,
-                    actions: tool_actions,
-                    escalate_or_skip: false,
-                };
-            }
+        let mut pending_confirmation: Option<ToolConfirmationRequest> = None;
+        let error_response = |message: String| Content {
+            role: "function".to_string(),
+            parts: vec![Part::FunctionResponse {
+                function_response: FunctionResponseData::new(
+                    name.clone(),
+                    serde_json::json!({ "error": message }),
+                ),
+                id: id.clone(),
+                annotations: None,
+            }],
         };
 
-        // Tool confirmation (deny case; None handled by pre-check)
-        if self.tool_confirmation_policy.requires_confirmation(&name) {
-            match self.live_confirmation_decisions.get(&function_call_id).copied().or_else(|| {
-                static_confirmation_decision(
-                    self.confirmation_decisions,
-                    self.confirmation_fingerprints,
-                    &function_call_id,
-                    &name,
-                    &args,
-                )
-            }) {
-                Some(ToolConfirmationDecision::Approve) => {
-                    tool_actions.tool_confirmation_decision =
-                        Some(ToolConfirmationDecision::Approve);
-                }
-                Some(ToolConfirmationDecision::Deny) => {
-                    tool_actions.tool_confirmation_decision = Some(ToolConfirmationDecision::Deny);
-                    response_content = Some(Content {
-                        role: "function".to_string(),
-                        parts: vec![Part::FunctionResponse {
-                            function_response: FunctionResponseData::new(
-                                name.clone(),
-                                serde_json::json!({
-                                    "error": format!("Tool '{}' execution denied by confirmation policy", name)
-                                }),
-                            ),
-                            id: id.clone(),
-                            annotations: None,
-                        }],
-                    });
-                    run_after_tool_callbacks = false;
-                }
-                None => {
-                    response_content = Some(Content {
-                        role: "function".to_string(),
-                        parts: vec![Part::FunctionResponse {
-                            function_response: FunctionResponseData::new(
-                                name.clone(),
-                                serde_json::json!({
-                                    "error": format!("Tool '{}' requires confirmation", name)
-                                }),
-                            ),
-                            id: id.clone(),
-                            annotations: None,
-                        }],
-                    });
-                    run_after_tool_callbacks = false;
-                }
-            }
-        }
-
-        // Before-tool callbacks
-        // Track potentially modified args for enhanced plugin after-hook
-        #[allow(unused_mut)]
-        let mut final_args = args.clone();
+        // Before-tool hooks run first and may rewrite the arguments. Governance below sees
+        // only the final arguments, so nothing can change a call after it is authorized.
+        let mut final_args = args;
 
         // ===== ENHANCED PLUGIN: BEFORE TOOL CALL =====
         #[cfg(feature = "enhanced-plugins")]
-        if response_content.is_none()
-            && let Some(epm) = self.enhanced_plugin_manager.as_ref()
+        if let Some(epm) = self.enhanced_plugin_manager.as_ref()
             && let Some(tool_ref) = self.tool_map.get(&name)
         {
             match epm
@@ -1984,17 +2233,7 @@ impl ToolExecutor<'_> {
                     executed_tool = Some(tool_ref.clone());
                 }
                 Err(e) => {
-                    response_content = Some(Content {
-                        role: "function".to_string(),
-                        parts: vec![Part::FunctionResponse {
-                            function_response: FunctionResponseData::new(
-                                name.clone(),
-                                serde_json::json!({ "error": e.to_string() }),
-                            ),
-                            id: id.clone(),
-                            annotations: None,
-                        }],
-                    });
+                    response_content = Some(error_response(e.to_string()));
                     run_after_tool_callbacks = false;
                 }
             }
@@ -2006,25 +2245,23 @@ impl ToolExecutor<'_> {
                 name.clone(),
                 final_args.clone(),
             ));
-            for callback in self.before_tool_callbacks.as_ref() {
+            for callback in
+                self.hook_callbacks.before_tool.iter().chain(self.before_tool_callbacks.iter())
+            {
                 match callback(tool_ctx.clone() as Arc<dyn CallbackContext>).await {
                     Ok(Some(c)) => {
-                        response_content = Some(c);
+                        // The tool did not run, so text is reported as the call's error.
+                        response_content = Some(callback_tool_response(
+                            c,
+                            &name,
+                            id.as_ref(),
+                            |text| serde_json::json!({ "error": text }),
+                        ));
                         break;
                     }
                     Ok(None) => continue,
                     Err(e) => {
-                        response_content = Some(Content {
-                            role: "function".to_string(),
-                            parts: vec![Part::FunctionResponse {
-                                function_response: FunctionResponseData::new(
-                                    name.clone(),
-                                    serde_json::json!({ "error": e.to_string() }),
-                                ),
-                                id: id.clone(),
-                                annotations: None,
-                            }],
-                        });
+                        response_content = Some(error_response(e.to_string()));
                         run_after_tool_callbacks = false;
                         break;
                     }
@@ -2043,30 +2280,133 @@ impl ToolExecutor<'_> {
                     name, cb_state.threshold
                 );
                 tracing::warn!(tool.name = %name, "circuit breaker open, skipping tool execution");
-                response_content = Some(Content {
-                    role: "function".to_string(),
-                    parts: vec![Part::FunctionResponse {
-                        function_response: FunctionResponseData::new(
-                            name.clone(),
-                            serde_json::json!({ "error": msg }),
-                        ),
-                        id: id.clone(),
-                        annotations: None,
-                    }],
-                });
+                response_content = Some(error_response(msg));
                 run_after_tool_callbacks = false;
             }
             drop(guard);
         }
 
+        // ===== GOVERNED PATH: POLICY, GUARDRAILS, CONFIRMATION =====
+        // Runtime-injected requirements such as team relationship approval gate execution
+        // exactly like the agent's own confirmation policy.
+        if response_content.is_none()
+            && let Some(tool) = self.tool_map.get(&name)
+        {
+            let screen = GuardrailScreen(self.tool_guardrails);
+            let mut gate = ToolGate::for_context(self.ctx.as_ref())
+                .with_abandon_signal(self.approval_failed.subscribe());
+            if !self.tool_guardrails.is_empty() {
+                gate = gate.with_screen(&screen);
+            }
+            let call =
+                GovernedCall::for_tool(tool.as_ref(), function_call_id.clone(), final_args.clone())
+                    .requiring_confirmation(
+                        self.tool_confirmation_policy.requires_confirmation(&name)
+                            || self.ctx.requires_tool_confirmation(&name),
+                    );
+            match authorize_tool_call(&gate, call).await {
+                Ok(ToolAuthorization::Execute { args, confirmation }) => {
+                    final_args = args;
+                    tool_actions.tool_confirmation_decision = confirmation;
+                }
+                Ok(ToolAuthorization::Refuse { reason, confirmation }) => {
+                    tool_actions.tool_confirmation_decision = confirmation;
+                    response_content = Some(error_response(reason));
+                    run_after_tool_callbacks = false;
+                }
+                Ok(ToolAuthorization::Pending { request, reason }) => {
+                    response_content = Some(Content {
+                        role: "function".to_string(),
+                        parts: vec![Part::FunctionResponse {
+                            function_response: FunctionResponseData::new(
+                                name.clone(),
+                                adk_core::confirmation_pending_response(reason),
+                            ),
+                            id: id.clone(),
+                            annotations: None,
+                        }],
+                    });
+                    pending_confirmation = Some(request);
+                    run_after_tool_callbacks = false;
+                }
+                Err(error) => {
+                    self.approval_failed.send_replace(true);
+                    return Err(error);
+                }
+            }
+        }
+
+        // Acquire concurrency permit after confirmation, so an approval waiting on a person
+        // does not hold the tool's slot, and a call that will not run takes none.
+        // The permit is held for the entire duration of this tool call
+        // and released on drop when this async block completes.
+        let _concurrency_permit = if response_content.is_some() {
+            None
+        } else {
+            match self.concurrency_manager.acquire(&name).await {
+                Ok(permit) => Some(permit),
+                Err(e) => {
+                    // Concurrency limit reached with Fail policy — return error
+                    return Ok(ToolExecutionResult {
+                        index,
+                        content: error_response(e.to_string()),
+                        actions: tool_actions,
+                        escalate_or_skip: false,
+                        pending: None,
+                    });
+                }
+            }
+        };
+
         // Execute tool with retry budget and tracing
         if response_content.is_none() {
             if let Some(tool) = self.tool_map.get(&name) {
-                let tool_ctx: Arc<dyn ToolContext> = Arc::new(
-                    AgentToolContext::new(self.ctx.clone(), function_call_id.clone())
-                        .with_tool_name(tool.name())
-                        .with_progress(self.progress_tx.clone()),
-                );
+                // Each attempt gets its own context, so the state delta and escalation of an
+                // attempt that is retried are never committed.
+                let attempt_context = || -> Arc<dyn ToolContext> {
+                    Arc::new(
+                        AgentToolContext::new(self.ctx.clone(), function_call_id.clone())
+                            .with_tool_name(tool.name())
+                            .with_progress(self.progress_tx.clone()),
+                    )
+                };
+                let mut tool_ctx = attempt_context();
+                let effect = tool.effect();
+
+                // A non-idempotent call executes at most once per idempotency key. A record
+                // that exists answers the call; a ledger that cannot be read or written
+                // fails the call closed.
+                let ledgered = match crate::tool_ledger::begin_ledgered_call(
+                    self.ctx.as_ref(),
+                    effect,
+                    tool_ctx.idempotency_key(),
+                    &name,
+                    &final_args,
+                )
+                .await?
+                {
+                    Ok(ledgered) => ledgered,
+                    Err(answer) => {
+                        return Ok(ToolExecutionResult {
+                            index,
+                            content: Content {
+                                role: "function".to_string(),
+                                parts: vec![Part::FunctionResponse {
+                                    function_response: FunctionResponseData::from_tool_result(
+                                        name.clone(),
+                                        answer,
+                                    ),
+                                    id: id.clone(),
+                                    annotations: None,
+                                }],
+                            },
+                            actions: tool_actions,
+                            escalate_or_skip: false,
+                            pending: None,
+                        });
+                    }
+                };
+
                 let span_name = format!("execute_tool {name}");
                 let tool_span = tracing::info_span!(
                     "",
@@ -2078,23 +2418,43 @@ impl ToolExecutor<'_> {
                     "gen_ai.conversation.id" = %self.ctx.session_id()
                 );
 
-                let budget =
-                    self.tool_retry_budgets.get(&name).or(self.default_retry_budget.as_ref());
+                // Only a call that cannot repeat a side effect is retried.
+                let budget = self
+                    .tool_retry_budgets
+                    .get(&name)
+                    .or(self.default_retry_budget.as_ref())
+                    .filter(|_| effect.is_retry_safe());
                 let max_attempts = budget.map(|b| b.max_retries + 1).unwrap_or(1);
-                let retry_delay = budget.map(|b| b.delay).unwrap_or_default();
+                let timeout = tool.timeout_override().unwrap_or(Some(self.tool_timeout));
 
+                let mut started = Event::new(self.invocation_id);
+                started.author = self.ctx.agent_name().to_owned();
+                started.branch = self.ctx.branch().to_owned();
+                // Partial, as tool progress is: never persisted, never a final response.
+                started.llm_response.partial = true;
+                started.provider_metadata.insert(
+                    "adk_tool_started".into(),
+                    serde_json::json!({"id": id, "name": name}).to_string(),
+                );
+                let _ = self.progress_tx.send(started).await;
                 let tool_clone = tool.clone();
                 let tool_start = std::time::Instant::now();
                 let mut last_error = String::new();
+                // Set when the last attempt ended mid-flight (timeout or panic), so its side
+                // effect may or may not have happened.
+                let mut interrupted = false;
                 let mut final_attempt: u32 = 0;
                 let mut retry_result: Option<serde_json::Value> = None;
 
                 for attempt in 0..max_attempts {
                     final_attempt = attempt;
                     if attempt > 0 {
-                        tokio::time::sleep(retry_delay).await;
+                        if let Some(budget) = budget {
+                            tokio::time::sleep(budget.backoff_delay(attempt)).await;
+                        }
+                        tool_ctx = attempt_context();
                     }
-                    match async {
+                    let attempt_result = async {
                         let args_payload = trace_json_payload(
                             &final_args,
                             self.ctx.run_config().record_payloads,
@@ -2102,21 +2462,32 @@ impl ToolExecutor<'_> {
                         );
                         tracing::debug!(tool.name = %name, tool.args = %args_payload, attempt = attempt, "tool_call");
                         let exec_future = tool_clone.execute(tool_ctx.clone(), final_args.clone());
-                        let unwind_safe_future = std::panic::AssertUnwindSafe(
-                            tokio::time::timeout(self.tool_timeout, exec_future),
-                        );
-                        match futures::FutureExt::catch_unwind(unwind_safe_future).await {
-                            Ok(result) => result,
-                            Err(_panic) => Ok(Err(adk_core::AdkError::tool(format!(
-                                "tool '{}' panicked during execution",
-                                name
-                            )))),
+                        let bounded = async {
+                            match timeout {
+                                Some(limit) => tokio::time::timeout(limit, exec_future)
+                                    .await
+                                    .map_err(|_| limit),
+                                None => Ok(exec_future.await),
+                            }
+                        };
+                        match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(bounded)).await {
+                            Ok(Ok(result)) => result.map_err(|error| (error.to_string(), error.is_retryable(), false)),
+                            Ok(Err(limit)) => Err((
+                                format!("Tool '{name}' timed out after {} seconds", limit.as_secs()),
+                                true,
+                                true,
+                            )),
+                            Err(_panic) => Err((
+                                format!("tool '{name}' panicked during execution"),
+                                false,
+                                true,
+                            )),
                         }
                     }
                     .instrument(tool_span.clone())
-                    .await
-                    {
-                        Ok(Ok(value)) => {
+                    .await;
+                    match attempt_result {
+                        Ok(value) => {
                             let result_payload = trace_json_payload(
                                 &value,
                                 self.ctx.run_config().record_payloads,
@@ -2126,32 +2497,45 @@ impl ToolExecutor<'_> {
                             retry_result = Some(value);
                             break;
                         }
-                        Ok(Err(e)) => {
-                            last_error = e.to_string();
-                            if attempt + 1 < max_attempts {
+                        Err((message, retryable, mid_flight)) => {
+                            last_error = message;
+                            interrupted = mid_flight;
+                            if retryable && attempt + 1 < max_attempts {
                                 tracing::warn!(tool.name = %name, attempt = attempt, error = %last_error, "tool execution failed, retrying");
                             } else {
                                 tracing::warn!(tool.name = %name, error = %last_error, "tool_error");
-                            }
-                        }
-                        Err(_) => {
-                            last_error = format!(
-                                "Tool '{}' timed out after {} seconds",
-                                name,
-                                self.tool_timeout.as_secs()
-                            );
-                            if attempt + 1 < max_attempts {
-                                tracing::warn!(tool.name = %name, attempt = attempt, timeout_secs = self.tool_timeout.as_secs(), "tool timed out, retrying");
-                            } else {
-                                tracing::warn!(tool.name = %name, timeout_secs = self.tool_timeout.as_secs(), "tool_timeout");
+                                break;
                             }
                         }
                     }
                 }
 
+                let outcome_unknown = interrupted && effect == ToolEffect::NonIdempotent;
+                if outcome_unknown {
+                    crate::tool_ledger::record_outcome_unknown(
+                        self.ctx.as_ref(),
+                        &name,
+                        &final_args,
+                        "interrupted",
+                    )
+                    .await?;
+                }
+                // A call that ended mid-flight keeps its begun record, so a replay is answered
+                // with an unknown outcome instead of executing again.
+                if let Some(ledgered) = ledgered
+                    && !outcome_unknown
+                {
+                    ledgered.complete(&name, retry_result.as_ref(), &last_error).await;
+                }
+
                 let tool_duration = tool_start.elapsed();
                 let (tool_success, tool_error_message, function_response) = match retry_result {
                     Some(value) => (true, None, value),
+                    None if outcome_unknown => (
+                        false,
+                        Some(last_error.clone()),
+                        crate::tool_ledger::interrupted_call_response(&last_error),
+                    ),
                     None => (
                         false,
                         Some(last_error.clone()),
@@ -2181,7 +2565,12 @@ impl ToolExecutor<'_> {
                 let final_function_response = if !tool_success {
                     let mut fallback_result = None;
                     let error_msg = tool_error_message.clone().unwrap_or_default();
-                    for callback in self.on_tool_error_callbacks.as_ref() {
+                    for callback in self
+                        .hook_callbacks
+                        .on_tool_error
+                        .iter()
+                        .chain(self.on_tool_error_callbacks.iter())
+                    {
                         match callback(
                             self.ctx.clone() as Arc<dyn CallbackContext>,
                             tool.clone(),
@@ -2253,10 +2642,17 @@ impl ToolExecutor<'_> {
             };
             let cb_ctx: Arc<dyn CallbackContext> =
                 Arc::new(ToolCallbackContext::new(outcome_ctx, name.clone(), final_args.clone()));
-            for callback in self.after_tool_callbacks.as_ref() {
+            for callback in
+                self.hook_callbacks.after_tool.iter().chain(self.after_tool_callbacks.iter())
+            {
                 match callback(cb_ctx.clone()).await {
                     Ok(Some(modified)) => {
-                        response_content = modified;
+                        response_content = callback_tool_response(
+                            modified,
+                            &name,
+                            id.as_ref(),
+                            |text| serde_json::json!({ "result": text }),
+                        );
                         break;
                     }
                     Ok(None) => continue,
@@ -2378,12 +2774,13 @@ impl ToolExecutor<'_> {
         }
 
         let escalate_or_skip = tool_actions.escalate || tool_actions.skip_summarization;
-        ToolExecutionResult {
+        Ok(ToolExecutionResult {
             index,
             content: response_content,
             actions: tool_actions,
             escalate_or_skip,
-        }
+            pending: pending_confirmation,
+        })
     }
 }
 
@@ -2424,6 +2821,8 @@ impl Agent for LlmAgent {
     )]
     async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<adk_core::EventStream> {
         adk_telemetry::info!("Starting agent execution");
+        // Under a workflow or team parent, the agent still acts as itself.
+        let ctx = crate::acting_agent_context::ActingAgentContext::scope(ctx, &self.name);
         let ctx = Self::apply_input_guardrails(ctx, self.input_guardrails.clone()).await?;
 
         let agent_name = self.name.clone();
@@ -2452,22 +2851,17 @@ impl Agent for LlmAgent {
         let tool_guardrails = Arc::clone(&self.tool_guardrails);
         let output_guardrails = self.output_guardrails.clone();
         let agent_tool_execution_strategy = self.tool_execution_strategy;
+        let parallelize_agent_delegations = self.parallelize_agent_delegations;
         #[cfg(feature = "enhanced-plugins")]
         let enhanced_plugin_manager = self.enhanced_plugin_manager.clone();
+        // Runner plugins and other run-wide hooks reach this agent through the run config.
+        let hook_callbacks = HookCallbacks::new(&ctx.run_config().invocation_hooks);
 
         let s = stream! {
-            let confirmation_decisions =
-                ctx.run_config().tool_confirmation_decisions.clone();
-            let confirmation_fingerprints =
-                ctx.run_config().tool_confirmation_fingerprints.clone();
-            let mut live_confirmation_decisions =
-                std::collections::HashMap::<String, ToolConfirmationDecision>::new();
-            let confirmation_handler = ctx.run_config().tool_confirmation_handler.clone();
-
             // ===== BEFORE AGENT CALLBACKS =====
             // Execute before the agent starts running
             // If any returns content, skip agent execution
-            for callback in before_agent_callbacks.as_ref() {
+            for callback in hook_callbacks.before_agent.iter().chain(before_agent_callbacks.iter()) {
                 match callback(ctx.clone() as Arc<dyn CallbackContext>).await {
                     Ok(Some(content)) => {
                         // Callback returned content - yield it and skip agent execution
@@ -2477,7 +2871,9 @@ impl Agent for LlmAgent {
                         yield Ok(early_event);
 
                         // Skip rest of agent execution and go to after callbacks
-                        for after_callback in after_agent_callbacks.as_ref() {
+                        for after_callback in
+                            hook_callbacks.after_agent.iter().chain(after_agent_callbacks.iter())
+                        {
                             match after_callback(ctx.clone() as Arc<dyn CallbackContext>).await {
                                 Ok(Some(after_content)) => {
                                     let mut after_event = Event::new(&invocation_id);
@@ -2544,6 +2940,166 @@ impl Agent for LlmAgent {
             // (a no-op for generateContent and all other providers).
             let mut last_interaction_id: Option<String> = None;
 
+            // Shared with sub-agents, transfer targets and agent tools through the run config.
+            let budget_tracker = ctx.run_config().budget_tracker.clone();
+            // Provider-executed built-in tools never reach the governed call path, so the
+            // policy and budget decide before each request whether they are attached.
+            let mut builtin_governor = adk_core::BuiltinToolGovernor::new();
+
+            // ===== RESUME HELD CALLS =====
+            // A call held for confirmation in an earlier run, with a decision now, is
+            // dispatched again as the same call before the first model call, so the
+            // decision applies whether or not the model would issue the call again. It
+            // runs the whole tool path, where the governed path finds the decision.
+            let mut resumed_calls = Vec::new();
+            {
+                let gate = ToolGate::for_context(ctx.as_ref());
+                for held in ctx.session().held_tool_calls(&agent_name, ctx.branch()) {
+                    let Some(function_call_id) = held.request.function_call_id.clone() else {
+                        continue;
+                    };
+                    match adk_core::confirmation_decision_available(&gate, &held.request).await {
+                        Ok(true) => resumed_calls.push(PendingToolCall {
+                            index: resumed_calls.len(),
+                            name: held.request.tool_name,
+                            args: held.args,
+                            id: held.id,
+                            function_call_id,
+                        }),
+                        Ok(false) => {}
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    }
+                }
+            }
+            if !resumed_calls.is_empty() {
+                if ctx.is_cancelled() {
+                    return;
+                }
+                // The held calls keep their pending responses, so a refused batch leaves
+                // them held for a later run.
+                if let Some(tracker) = budget_tracker.as_ref()
+                    && let Err(exceeded) = tracker.begin_tool_calls(resumed_calls.len() as u64)
+                {
+                    yield Err(exceeded.into());
+                    return;
+                }
+                tracing::info!(
+                    agent.name = %agent_name,
+                    tool.calls = resumed_calls.len(),
+                    "resuming tool calls held for confirmation"
+                );
+                let strategy = ToolDispatchMode::resolve(
+                    agent_tool_execution_strategy.unwrap_or(ToolExecutionStrategy::Sequential),
+                    parallelize_agent_delegations,
+                );
+                let cb_mutex = std::sync::Mutex::new(circuit_breaker_state.take());
+                let concurrency_manager =
+                    adk_core::ToolConcurrencyManager::new(&ctx.run_config().tool_concurrency);
+                let (progress_tx, mut progress_rx) =
+                    tokio::sync::mpsc::channel::<Event>(TOOL_PROGRESS_CAPACITY);
+                let executor = ToolExecutor {
+                    ctx: ctx.clone(),
+                    tool_map: &tool_map,
+                    tool_retry_budgets: &tool_retry_budgets,
+                    default_retry_budget: &default_retry_budget,
+                    before_tool_callbacks: &before_tool_callbacks,
+                    after_tool_callbacks: &after_tool_callbacks,
+                    after_tool_callbacks_full: &after_tool_callbacks_full,
+                    on_tool_error_callbacks: &on_tool_error_callbacks,
+                    hook_callbacks: &hook_callbacks,
+                    tool_confirmation_policy: &tool_confirmation_policy,
+                    tool_guardrails: tool_guardrails.as_ref(),
+                    cb_mutex: &cb_mutex,
+                    invocation_id: &invocation_id,
+                    concurrency_manager: &concurrency_manager,
+                    progress_tx,
+                    tool_timeout,
+                    approval_failed: tokio::sync::watch::channel(false).0,
+                    #[cfg(feature = "enhanced-plugins")]
+                    enhanced_plugin_manager: &enhanced_plugin_manager,
+                };
+                let mut results = {
+                    let dispatch = executor.dispatch(strategy, resumed_calls);
+                    tokio::pin!(dispatch);
+                    let results = loop {
+                        tokio::select! {
+                            biased;
+                            Some(progress_event) = progress_rx.recv() => {
+                                yield Ok(progress_event);
+                            }
+                            done = &mut dispatch => break done,
+                        }
+                    };
+                    while let Ok(progress_event) = progress_rx.try_recv() {
+                        yield Ok(progress_event);
+                    }
+                    match results {
+                        Ok(results) => results,
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    }
+                };
+                results.sort_by_key(|r| r.index);
+                drop(executor);
+                circuit_breaker_state = cb_mutex.into_inner().unwrap_or_else(|e| e.into_inner());
+
+                let mut held_again = Vec::new();
+                for result in results {
+                    if result.escalate_or_skip {
+                        return;
+                    }
+                    held_again.extend(result.pending);
+                    // Each result takes the place of its call's pending response, so the
+                    // model sees one response per call.
+                    for response in result.content.parts {
+                        let Part::FunctionResponse { function_response, id, .. } = &response else {
+                            continue;
+                        };
+                        let slot = conversation_history
+                            .iter_mut()
+                            .rev()
+                            .flat_map(|content| content.parts.iter_mut().rev())
+                            .find(|part| match part {
+                                Part::FunctionResponse {
+                                    function_response: pending,
+                                    id: pending_id,
+                                    ..
+                                } => {
+                                    adk_core::is_confirmation_pending(&pending.response)
+                                        && pending_id == id
+                                        && (id.is_some() || pending.name == function_response.name)
+                                }
+                                _ => false,
+                            });
+                        if let Some(slot) = slot {
+                            *slot = response;
+                        }
+                    }
+                }
+                if !held_again.is_empty() {
+                    for request in held_again {
+                        yield Ok(confirmation_event(&invocation_id, &agent_name, request));
+                    }
+                    return;
+                }
+
+                let refreshed_tools = match tool_setup.resolve(&ctx).await {
+                    Ok(tools) => tools,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+                tool_map = refreshed_tools.map;
+                tool_declarations = refreshed_tools.declarations;
+                valid_transfer_targets = refreshed_tools.transfer_targets;
+            }
+
             // Multi-turn loop with max iterations
             let mut iteration = 0;
             let mut schema_retry_count: usize = 0;
@@ -2553,6 +3109,11 @@ impl Agent for LlmAgent {
                 // if the invocation was cancelled (e.g. Runner::interrupt()).
                 if ctx.is_cancelled() {
                     tracing::info!(agent.name = %agent_name, "invocation cancelled — stopping agent loop");
+                    return;
+                }
+                // The kill switch is checked before every model call.
+                if let Err(error) = ctx.run_config().check_governance() {
+                    yield Err(error);
                     return;
                 }
                 iteration += 1;
@@ -2569,7 +3130,7 @@ impl Agent for LlmAgent {
                     ctx.run_config().cached_content.as_deref(),
                 );
 
-                let request = LlmRequest {
+                let mut request = LlmRequest {
                     model: model.name().to_string(),
                     contents: conversation_history.clone(),
                     tools: tool_declarations.clone(),
@@ -2582,6 +3143,11 @@ impl Agent for LlmAgent {
                     // for providers that never populate `interaction_id`.
                     previous_response_id: last_interaction_id.clone(),
                 };
+
+                if let Err(error) = tool_setup.process_llm_request(&ctx, &mut request).await {
+                    yield Err(error);
+                    return;
+                }
 
                 // ===== ENHANCED PLUGIN: BEFORE MODEL CALL =====
                 // Enhanced plugins can modify the request or short-circuit the model call.
@@ -2614,7 +3180,9 @@ impl Agent for LlmAgent {
                 let mut current_request = request;
                 let mut model_response_override = model_response_override_from_plugin;
                 if model_response_override.is_none() {
-                    for callback in before_model_callbacks.as_ref() {
+                    for callback in
+                        hook_callbacks.before_model.iter().chain(before_model_callbacks.iter())
+                    {
                         match callback(ctx.clone() as Arc<dyn CallbackContext>, current_request.clone()).await {
                             Ok(BeforeModelResult::Continue(modified_request)) => {
                                 // Callback may have modified the request, continue with it
@@ -2633,7 +3201,24 @@ impl Agent for LlmAgent {
                         }
                     }
                 }
-                let request = current_request;
+                let mut request = current_request;
+                // Governed after every request rewrite, so a callback cannot re-attach a
+                // withheld tool. A skipped model call sends nothing, so it is not governed.
+                let withheld_builtins = if model_response_override.is_none() {
+                    let gate = ToolGate::for_context(ctx.as_ref());
+                    match builtin_governor.govern(&gate, &mut request.tools, &tool_map).await {
+                        Ok(withheld) => withheld,
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                let withheld_builtins = (!withheld_builtins.is_empty())
+                    .then(|| serde_json::to_string(&withheld_builtins).unwrap_or_default());
+                let request = request;
 
                 // Determine streaming source: cached response or real model
                 let mut accumulated_content: Option<Content> = None;
@@ -2650,7 +3235,7 @@ impl Agent for LlmAgent {
                             .parts
                             .iter()
                             .any(|part| matches!(part, Part::FunctionCall { .. }));
-                        let content = if has_function_calls {
+                        let content = if has_function_calls || Self::continues_turn(final_provider_metadata.as_ref()) {
                             content
                         } else {
                             Self::apply_output_guardrails(output_guardrails.as_ref(), content).await?
@@ -2661,14 +3246,19 @@ impl Agent for LlmAgent {
                     let mut cached_event = Event::new(&invocation_id);
                     cached_event.author = agent_name.clone();
                     cached_event.llm_response.content = accumulated_content.clone();
+                    cached_event.llm_response.turn_complete = cached_response.turn_complete;
+                    cached_event.llm_response.citation_metadata = cached_response.citation_metadata.clone();
                     cached_event.llm_response.provider_metadata = cached_response.provider_metadata.clone();
                     // Surface and track the response id for provider-neutral continuity.
                     cached_event.llm_response.interaction_id = cached_response.interaction_id.clone();
                     if cached_response.interaction_id.is_some() {
                         last_interaction_id = cached_response.interaction_id.clone();
                     }
-                    cached_event.llm_request = Some(serde_json::to_string(&request).unwrap_or_default());
-                    cached_event.provider_metadata.insert("gcp.vertex.agent.llm_request".to_string(), serde_json::to_string(&request).unwrap_or_default());
+                    cached_event.llm_request = Some(trace_json_payload(
+                        &request,
+                        ctx.run_config().record_payloads,
+                        ctx.run_config().trace_payload_max_bytes,
+                    ));
                     cached_event.provider_metadata.insert("gcp.vertex.agent.llm_response".to_string(), serde_json::to_string(&cached_response).unwrap_or_default());
 
                     // Populate long_running_tool_ids for function calls from long-running tools
@@ -2679,8 +3269,7 @@ impl Agent for LlmAgent {
 
                     yield Ok(cached_event);
                 } else {
-                    // Record LLM request for tracing
-                    let request_json = serde_json::to_string(&request).unwrap_or_default();
+                    // One bounded copy of the request serves the span and the event.
                     let trace_request_json = trace_json_payload(
                         &request,
                         ctx.run_config().record_payloads,
@@ -2719,11 +3308,28 @@ impl Agent for LlmAgent {
                     let should_stream_to_client = matches!(streaming_mode, StreamingMode::SSE | StreamingMode::Bidi)
                         && output_guardrails.is_empty();
 
+                    // Reserves the call's upper-bound cost in the spend ledger and one model
+                    // call in the run budget before it starts; the stream records the call's
+                    // usage once, from its first non-partial response carrying usage, and
+                    // commits its cost. A refusal stops the run before anything is sent.
+                    let call_scope = adk_core::ModelCallScope::for_run(
+                        ctx.run_config(),
+                        ctx.app_name(),
+                        &agent_name,
+                    );
+                    let call_metered = call_scope.budget().is_some();
                     // Always use streaming internally for LLM calls
-                    let mut response_stream = model
-                        .generate_content(request, true)
+                    let mut response_stream = match call_scope
+                        .generate(model.as_ref(), request, true)
                         .instrument(llm_span.clone())
-                        .await?;
+                        .await
+                    {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    };
 
                     use futures::StreamExt;
 
@@ -2750,10 +3356,11 @@ impl Agent for LlmAgent {
                                 return;
                             }
                         };
-
                         // ===== AFTER MODEL CALLBACKS (per chunk) =====
                         // Callbacks can modify each streaming chunk
-                        for callback in after_model_callbacks.as_ref() {
+                        for callback in
+                            hook_callbacks.after_model.iter().chain(after_model_callbacks.iter())
+                        {
                             match callback(ctx.clone() as Arc<dyn CallbackContext>, chunk.clone())
                                 .instrument(llm_span.clone())
                                 .await
@@ -2779,7 +3386,12 @@ impl Agent for LlmAgent {
 
                         // Accumulate content for conversation history (always needed)
                         if let Some(chunk_content) = chunk.content.clone() {
-                            if let Some(ref mut acc) = accumulated_content {
+                            if !chunk.partial && chunk.provider_metadata.as_ref()
+                                .and_then(|metadata| metadata.get("content_complete"))
+                                .and_then(serde_json::Value::as_bool) == Some(true)
+                            {
+                                accumulated_content = Some(chunk_content);
+                            } else if let Some(ref mut acc) = accumulated_content {
                                 acc.parts.extend(chunk_content.parts);
                             } else {
                                 accumulated_content = Some(chunk_content);
@@ -2793,14 +3405,41 @@ impl Agent for LlmAgent {
                                 .as_ref()
                                 .map(|content| collect_long_running_tool_ids(&tool_map, content))
                                 .unwrap_or_default();
-                            yield Ok(build_partial_llm_event(
+                            let mut event = build_partial_llm_event(
                                 &llm_event_id,
                                 &invocation_id,
                                 &agent_name,
-                                &request_json,
+                                &trace_request_json,
                                 &chunk,
                                 long_running_tool_ids,
-                            ));
+                            );
+                            if call_metered {
+                                event.provider_metadata.insert(
+                                    adk_core::BUDGET_RECORDED_KEY.to_string(),
+                                    "true".to_string(),
+                                );
+                            }
+                            if !chunk.partial
+                                && let Some(withheld) = &withheld_builtins
+                            {
+                                event.provider_metadata.insert(
+                                    adk_core::BUILTIN_TOOLS_WITHHELD_KEY.to_string(),
+                                    withheld.clone(),
+                                );
+                            }
+                            // Runner persists terminal events as complete content.
+                            // Providers can finish with tools/metadata after text
+                            // deltas, so the last chunk alone is insufficient.
+                            if !chunk.partial {
+                                event.llm_response.content = accumulated_content.clone();
+                                if let Some(metadata) = event.llm_response.provider_metadata
+                                    .get_or_insert_with(|| serde_json::json!({}))
+                                    .as_object_mut()
+                                {
+                                    metadata.insert("content_complete".into(), true.into());
+                                }
+                            }
+                            yield Ok(event);
                         }
 
                         // Track the response id for provider-neutral continuity.
@@ -2819,6 +3458,14 @@ impl Agent for LlmAgent {
                         }
                     }
 
+                    if let Some(last) = &last_chunk {
+                        final_provider_metadata = last.provider_metadata.clone();
+                    }
+                    // A stream that ended without a non-partial usage report is settled
+                    // here, before any tool runs, from the best usage it carried.
+                    drop(response_stream);
+                    let metered = call_metered;
+
                     // For None mode: yield single final event with accumulated content
                     if !should_stream_to_client {
                         if let Some(content) = accumulated_content.take() {
@@ -2826,7 +3473,7 @@ impl Agent for LlmAgent {
                                 .parts
                                 .iter()
                                 .any(|part| matches!(part, Part::FunctionCall { .. }));
-                            let content = if has_function_calls {
+                            let content = if has_function_calls || Self::continues_turn(final_provider_metadata.as_ref()) {
                                 content
                             } else {
                                 Self::apply_output_guardrails(output_guardrails.as_ref(), content)
@@ -2836,22 +3483,32 @@ impl Agent for LlmAgent {
                             accumulated_content = Some(content);
                         }
 
-                        if let Some(last) = &last_chunk {
-                            final_provider_metadata = last.provider_metadata.clone();
-                        }
                         let long_running_tool_ids = accumulated_content
                             .as_ref()
                             .map(|content| collect_long_running_tool_ids(&tool_map, content))
                             .unwrap_or_default();
-                        yield Ok(build_final_llm_event(
+                        let mut final_event = build_final_llm_event(
                             &llm_event_id,
                             &invocation_id,
                             &agent_name,
-                            &request_json,
+                            &trace_request_json,
                             accumulated_content.as_ref(),
                             last_chunk.as_ref(),
                             long_running_tool_ids,
-                        ));
+                        );
+                        if metered {
+                            final_event.provider_metadata.insert(
+                                adk_core::BUDGET_RECORDED_KEY.to_string(),
+                                "true".to_string(),
+                            );
+                        }
+                        if let Some(withheld) = &withheld_builtins {
+                            final_event.provider_metadata.insert(
+                                adk_core::BUILTIN_TOOLS_WITHHELD_KEY.to_string(),
+                                withheld.clone(),
+                            );
+                        }
+                        yield Ok(final_event);
                     }
 
                     // A provider that reports a terminal error inside an `Ok`
@@ -2950,6 +3607,7 @@ impl Agent for LlmAgent {
                     .unwrap_or_default();
 
                 let has_function_calls = !function_call_names.is_empty();
+                let continues_turn = Self::continues_turn(final_provider_metadata.as_ref());
 
                 // Check if ALL function calls are from long-running tools
                 // If so, we should NOT continue the loop - the tool returned a pending status
@@ -2966,28 +3624,12 @@ impl Agent for LlmAgent {
                         content,
                         final_provider_metadata.as_ref(),
                     ));
+                }
 
-                    // Handle output_key: save final agent output to state_delta
-                    if let Some(ref output_key) = output_key
-                        && !has_function_calls
-                    {
-                        let mut text_parts = String::new();
-                        for part in &content.parts {
-                            if let Part::Text { text } = part {
-                                text_parts.push_str(text);
-                            }
-                        }
-                        if !text_parts.is_empty() {
-                            // Yield a final state update event
-                            let mut state_event = Event::new(&invocation_id);
-                            state_event.author = agent_name.clone();
-                            state_event.actions.state_delta.insert(
-                                output_key.clone(),
-                                serde_json::Value::String(text_parts),
-                            );
-                            yield Ok(state_event);
-                        }
-                    }
+                // Native server tools can pause a turn without calling a client
+                // tool. Continue through this same bounded, cancellable loop.
+                if !has_function_calls && continues_turn {
+                    continue;
                 }
 
                 if !has_function_calls {
@@ -3038,6 +3680,28 @@ impl Agent for LlmAgent {
                         }
                     }
 
+                    // Persist the final output only once it has passed schema validation, so a
+                    // rejected attempt never lands in `state[output_key]`.
+                    if let Some(ref output_key) = output_key
+                        && let Some(ref content) = accumulated_content
+                    {
+                        let mut text_parts = String::new();
+                        for part in &content.parts {
+                            if let Part::Text { text } = part {
+                                text_parts.push_str(text);
+                            }
+                        }
+                        if !text_parts.is_empty() {
+                            let mut state_event = Event::new(&invocation_id);
+                            state_event.author = agent_name.clone();
+                            state_event.actions.state_delta.insert(
+                                output_key.clone(),
+                                serde_json::Value::String(text_parts),
+                            );
+                            yield Ok(state_event);
+                        }
+                    }
+
                     // No function calls, we're done
                     // Record LLM response for tracing
                     if let Some(ref content) = accumulated_content {
@@ -3057,15 +3721,25 @@ impl Agent for LlmAgent {
                 if let Some(content) = &accumulated_content {
                     // ===== RESOLVE TOOL EXECUTION STRATEGY =====
                     // Per-agent override; defaults to Sequential if not set.
-                    let strategy = agent_tool_execution_strategy
-                        .unwrap_or(ToolExecutionStrategy::Sequential);
+                    let strategy = ToolDispatchMode::resolve(
+                        agent_tool_execution_strategy.unwrap_or(ToolExecutionStrategy::Sequential),
+                        parallelize_agent_delegations,
+                    );
 
-                    let fc_parts = collect_function_calls(content, &invocation_id);
+                    // Providers that omit call IDs get one unique to this model turn, so two
+                    // turns of one invocation never share an idempotency key.
+                    let fc_parts = collect_function_calls(
+                        content,
+                        &format!("{invocation_id}_{}", uuid::Uuid::new_v4().simple()),
+                    );
 
                     // ===== HANDLE transfer_to_agent BEFORE DISPATCH =====
                     // Transfer calls cause an immediate return from the stream,
                     // so they must be handled inline regardless of strategy.
                     let mut transfer_handled = false;
+                    // Calls already answered by an invalid-target error, so a later valid
+                    // transfer does not answer them a second time.
+                    let mut answered_calls = HashSet::new();
                     for call in &fc_parts {
                         if call.name == "transfer_to_agent" {
                             let target_agent = call
@@ -3098,11 +3772,37 @@ impl Agent for LlmAgent {
                                 error_event.author = agent_name.clone();
                                 error_event.llm_response.content = Some(error_content);
                                 yield Ok(error_event);
+                                answered_calls.insert(call.index);
                                 continue;
                             }
 
+                            // Every call in this model turn gets exactly one response, so providers
+                            // that require one per call accept any later history containing it.
+                            let responses = fc_parts
+                                .iter()
+                                .filter(|other| !answered_calls.contains(&other.index))
+                                .map(|other| {
+                                    let response = if other.index == call.index {
+                                        serde_json::json!({ "transferred_to": target_agent })
+                                    } else {
+                                        serde_json::json!({
+                                            "error": format!("not run: control transferred to {target_agent}")
+                                        })
+                                    };
+                                    Part::FunctionResponse {
+                                        function_response: FunctionResponseData::new(
+                                            other.name.clone(),
+                                            response,
+                                        ),
+                                        id: other.id.clone(),
+                                        annotations: None,
+                                    }
+                                })
+                                .collect();
                             let mut transfer_event = Event::new(&invocation_id);
                             transfer_event.author = agent_name.clone();
+                            transfer_event.llm_response.content =
+                                Some(Content { role: "function".to_string(), parts: responses });
                             transfer_event.actions.transfer_to_agent = Some(target_agent);
                             yield Ok(transfer_event);
                             transfer_handled = true;
@@ -3114,7 +3814,7 @@ impl Agent for LlmAgent {
                     }
 
                     // Filter out transfer_to_agent and built-in tools
-                    let mut fc_parts: Vec<_> = fc_parts
+                    let fc_parts: Vec<_> = fc_parts
                         .into_iter()
                         .filter(|call| {
                             if call.name == "transfer_to_agent" {
@@ -3130,78 +3830,30 @@ impl Agent for LlmAgent {
                         })
                         .collect();
 
-                    // Guardrails must run before confirmation requests are constructed. This also
-                    // makes a revised call's arguments the ones shown to the approver and included
-                    // in its confirmation fingerprint.
-                    for call in &mut fc_parts {
-                        match screen_tool_call(&tool_guardrails, &call.name, &call.args).await {
-                            ToolScreening::Allow(args) => call.args = args,
-                            ToolScreening::Deny(reason) => {
-                                call.guardrail_denial = Some(reason);
-                            }
-                        }
-                    }
-
-                    // ===== TOOL CONFIRMATION PRE-CHECK =====
-                    // Tool confirmation interrupts cause an immediate return,
-                    // so check before parallel dispatch.
-                    let mut confirmation_interrupted = false;
-                    for call in &fc_parts {
-                        if call.guardrail_denial.is_none()
-                            && (tool_confirmation_policy.requires_confirmation(&call.name)
-                                || ctx.requires_tool_confirmation(&call.name))
-                            && static_confirmation_decision(
-                                &confirmation_decisions,
-                                &confirmation_fingerprints,
-                                &call.function_call_id,
-                                &call.name,
-                                &call.args,
-                            )
-                            .is_none()
-                            && live_confirmation_decisions
-                                .get(&call.function_call_id)
-                                .copied()
-                                .is_none()
-                        {
-                            let request = ToolConfirmationRequest {
-                                tool_name: call.name.clone(),
-                                function_call_id: Some(call.function_call_id.clone()),
-                                args: call.args.clone(),
-                            };
-                            if let Some(handler) = confirmation_handler.as_ref() {
-                                match handler.decide(&request).await {
-                                    Ok(decision) => {
-                                        live_confirmation_decisions
-                                            .insert(call.function_call_id.clone(), decision);
-                                        continue;
-                                    }
-                                    Err(error) => {
-                                        yield Err(error);
-                                        return;
-                                    }
-                                }
-                            }
-
-                                let mut ce = Event::new(&invocation_id);
-                                ce.author = agent_name.clone();
-                                ce.llm_response.interrupted = true;
-                                ce.llm_response.turn_complete = true;
-                                ce.llm_response.content = Some(Content {
-                                    role: "model".to_string(),
-                                    parts: vec![Part::Text {
-                                        text: format!(
-                                            "Tool confirmation required for '{}'. Provide approve/deny decision to continue.",
-                                            call.name
-                                        ),
-                                    }],
-                                });
-                                ce.actions.tool_confirmation = Some(request);
-                                yield Ok(ce);
-                                confirmation_interrupted = true;
-                                break;
-                        }
-                    }
-                    if confirmation_interrupted {
+                    // ===== RUN BUDGET: TOOL CALLS =====
+                    // The whole batch is reserved before any call starts. A batch that does
+                    // not fit is answered with "not run" responses, so the history keeps one
+                    // response per call, and the run ends with the budget error.
+                    if let Some(tracker) = budget_tracker.as_ref()
+                        && let Err(exceeded) = tracker.begin_tool_calls(fc_parts.len() as u64)
+                    {
+                        let parts = fc_parts
+                            .iter()
+                            .map(|call| Part::FunctionResponse {
+                                function_response: FunctionResponseData::new(
+                                    call.name.clone(),
+                                    serde_json::json!({ "error": format!("not run: {exceeded}") }),
+                                ),
+                                id: call.id.clone(),
+                                annotations: None,
+                            })
+                            .collect();
+                        let mut budget_event = Event::new(&invocation_id);
+                        budget_event.author = agent_name.clone();
+                        budget_event.llm_response.content =
+                            Some(Content { role: "function".to_string(), parts });
+                        yield Ok(budget_event);
+                        yield Err(exceeded.into());
                         return;
                     }
 
@@ -3230,15 +3882,15 @@ impl Agent for LlmAgent {
                         after_tool_callbacks: &after_tool_callbacks,
                         after_tool_callbacks_full: &after_tool_callbacks_full,
                         on_tool_error_callbacks: &on_tool_error_callbacks,
+                        hook_callbacks: &hook_callbacks,
                         tool_confirmation_policy: &tool_confirmation_policy,
+                        tool_guardrails: tool_guardrails.as_ref(),
                         cb_mutex: &cb_mutex,
                         invocation_id: &invocation_id,
                         concurrency_manager: &concurrency_manager,
                         progress_tx: progress_tx.clone(),
                         tool_timeout,
-                        confirmation_decisions: &confirmation_decisions,
-                        confirmation_fingerprints: &confirmation_fingerprints,
-                        live_confirmation_decisions: &live_confirmation_decisions,
+                        approval_failed: tokio::sync::watch::channel(false).0,
                         #[cfg(feature = "enhanced-plugins")]
                         enhanced_plugin_manager: &enhanced_plugin_manager,
                     };
@@ -3255,68 +3907,7 @@ impl Agent for LlmAgent {
                     // and circuit-breaker mutex) is dropped before we reclaim
                     // `cb_mutex` below.
                     let mut results = {
-                        let dispatch = async {
-                            let results: Vec<ToolExecutionResult> = match strategy {
-                                ToolExecutionStrategy::Sequential => {
-                                    let mut results = Vec::with_capacity(fc_parts.len());
-                                    for call in fc_parts {
-                                        results.push(executor.execute(call).await);
-                                    }
-                                    results
-                                }
-                                ToolExecutionStrategy::Parallel => {
-                                    use futures::StreamExt as _;
-                                    // Parallel is an explicit caller override. Tool
-                                    // safety metadata is intentionally not inspected.
-                                    // All concurrency enforcement is handled by the
-                                    // ToolConcurrencyManager semaphore inside ToolExecutor.
-                                    // Use fc_parts.len() as buffer so all futures can start
-                                    // and queue on the semaphore for proper per-tool limiting.
-                                    let buffer_size = fc_parts.len().max(1);
-                                    futures::stream::iter(
-                                        fc_parts.into_iter().map(|call| executor.execute(call)),
-                                    )
-                                    .buffer_unordered(buffer_size)
-                                    .collect()
-                                    .await
-                                }
-                                ToolExecutionStrategy::Auto => {
-                                    // A call may overlap another only when its tool is
-                                    // read-only *and* declares concurrency safety.
-                                    let (concurrent_fcs, sequential_fcs): (Vec<_>, Vec<_>) =
-                                        fc_parts.into_iter().partition(|call| {
-                                            tool_map.get(&call.name).is_some_and(|tool| {
-                                                tool.is_read_only() && tool.is_concurrency_safe()
-                                            })
-                                        });
-                                    let mut all_results = Vec::new();
-
-                                    // Concurrency enforcement is handled by the semaphore
-                                    // inside ToolExecutor.
-                                    if !concurrent_fcs.is_empty() {
-                                        use futures::StreamExt as _;
-                                        let buffer_size = concurrent_fcs.len().max(1);
-                                        all_results.extend(
-                                            futures::stream::iter(
-                                                concurrent_fcs
-                                                    .into_iter()
-                                                    .map(|call| executor.execute(call)),
-                                            )
-                                            .buffer_unordered(buffer_size)
-                                            .collect::<Vec<_>>()
-                                            .await,
-                                        );
-                                    }
-
-                                    // Everything else runs one at a time.
-                                    for call in sequential_fcs {
-                                        all_results.push(executor.execute(call).await);
-                                    }
-                                    all_results
-                                }
-                            };
-                            results
-                        };
+                        let dispatch = executor.dispatch(strategy, fc_parts);
 
                         // Drain tool progress concurrently with execution, yielding
                         // each chunk as a partial Event the moment it arrives. The
@@ -3337,7 +3928,13 @@ impl Agent for LlmAgent {
                         while let Ok(progress_event) = progress_rx.try_recv() {
                             yield Ok(progress_event);
                         }
-                        results
+                        match results {
+                            Ok(results) => results,
+                            Err(error) => {
+                                yield Err(error);
+                                return;
+                            }
+                        }
                     };
                     // Preserve LLM-returned order even when tool futures finish out of order.
                     results.sort_by_key(|r| r.index);
@@ -3345,19 +3942,26 @@ impl Agent for LlmAgent {
                     // Restore circuit breaker state from the mutex
                     circuit_breaker_state = cb_mutex.into_inner().unwrap_or_else(|e| e.into_inner());
 
-                    // Yield results in original order
+                    // Events were already emitted on completion. Only model context
+                    // is assembled in call order; never emit a second result event.
+                    let mut held_for_confirmation = Vec::new();
                     for result in results {
-                        let mut tool_event = Event::new(&invocation_id);
-                        tool_event.author = agent_name.clone();
-                        tool_event.actions = result.actions;
-                        tool_event.llm_response.content = Some(result.content.clone());
-                        yield Ok(tool_event);
-
                         if result.escalate_or_skip {
                             return;
                         }
-
+                        held_for_confirmation.extend(result.pending);
                         conversation_history.push(result.content);
+                    }
+
+                    // ===== TOOL CONFIRMATION INTERRUPT =====
+                    // A call held for a decision ends the run. Its request carries the final
+                    // arguments, and the next run that has a decision for it resumes the call
+                    // before its first model call.
+                    if !held_for_confirmation.is_empty() {
+                        for request in held_for_confirmation {
+                            yield Ok(confirmation_event(&invocation_id, &agent_name, request));
+                        }
+                        return;
                     }
 
                     // A tool can update session state as part of its response. Resolve
@@ -3388,7 +3992,7 @@ impl Agent for LlmAgent {
 
             // ===== AFTER AGENT CALLBACKS =====
             // Execute after the agent completes
-            for callback in after_agent_callbacks.as_ref() {
+            for callback in hook_callbacks.after_agent.iter().chain(after_agent_callbacks.iter()) {
                 match callback(ctx.clone() as Arc<dyn CallbackContext>).await {
                     Ok(Some(content)) => {
                         // Callback returned content - yield it

@@ -42,6 +42,7 @@ install_pkg() {
   local name="$1"
   local brew_name="${2:-$name}"
   local apt_name="${3:-$name}"
+  local dnf_name="${4:-$apt_name}"
 
   if $CHECK_ONLY; then return; fi
 
@@ -58,7 +59,7 @@ install_pkg() {
       sudo apt-get install -y "$apt_name" 2>/dev/null || true
     elif command -v dnf &>/dev/null; then
       echo "  Installing $name via dnf..."
-      sudo dnf install -y "$apt_name" 2>/dev/null || true
+      sudo dnf install -y "$dnf_name" 2>/dev/null || true
     else
       warn "No supported package manager found for $name"
     fi
@@ -81,6 +82,21 @@ if command -v cargo &>/dev/null; then
   ok "cargo $(cargo --version | awk '{print $2}')"
 else
   miss "cargo — install from https://rustup.rs"
+fi
+
+# Gate-resolved toolchain — quality gates run through scripts/cargo-pinned.sh,
+# which routes to the rust-toolchain.toml pin via rustup when available and
+# otherwise requires ambient cargo to match the pin exactly. Report what the
+# gates will actually use; ambient cargo alone can mislead when shims are
+# shadowed.
+PINNED_TOOLCHAIN="$(sed -n 's/^channel *= *"//p' "$(dirname "${BASH_SOURCE[0]}")/../rust-toolchain.toml" 2>/dev/null | cut -d'"' -f1 | head -1)"
+GATE_CARGO="$(bash "$(dirname "${BASH_SOURCE[0]}")/cargo-pinned.sh" --version 2>/dev/null | awk '{print $2}')" || GATE_CARGO=""
+if [[ -z "$GATE_CARGO" ]]; then
+  miss "no cargo resolves the $PINNED_TOOLCHAIN pin for gates — run 'rustup toolchain install $PINNED_TOOLCHAIN' or use 'devenv shell'"
+elif [[ "$GATE_CARGO" == "$PINNED_TOOLCHAIN" ]]; then
+  ok "gates resolve cargo $GATE_CARGO (matches rust-toolchain.toml pin)"
+else
+  warn "gates resolve cargo $GATE_CARGO, pin is $PINNED_TOOLCHAIN"
 fi
 
 echo ""
@@ -141,6 +157,20 @@ if command -v protoc &>/dev/null; then
 else
   miss "protoc — needed for adk-rag --features lancedb"
   install_pkg protoc protobuf protobuf-compiler
+fi
+
+# ALSA headers — examples/desktop_audio (cpal) links alsa-sys on Linux, so the
+# pre-push examples gate fails without them. CI installs libasound2-dev on the
+# examples runners; macOS uses CoreAudio and needs nothing.
+if [[ "$OS" == "Linux" ]]; then
+  if pkg-config --exists alsa 2>/dev/null; then
+    ok "alsa $(pkg-config --modversion alsa 2>/dev/null)"
+  else
+    miss "alsa — needed for examples/desktop_audio (pre-push gate)"
+    install_pkg alsa-lib alsa-lib libasound2-dev alsa-lib-devel
+  fi
+else
+  ok "alsa — not needed on $OS (CoreAudio)"
 fi
 
 # NASM is only consumed by aws-lc-sys on MSVC targets, so Unix hosts never need

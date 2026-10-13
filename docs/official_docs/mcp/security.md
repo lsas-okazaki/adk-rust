@@ -37,7 +37,8 @@ The JSON-loading and runtime add/update paths validate server IDs.
 - bearer tokens;
 - a caller-selected API-key header;
 - arbitrary reviewed headers;
-- fixed OAuth 2.0 client-credentials token acquisition;
+- fixed OAuth 2.0 client-credentials token acquisition, refreshed before the
+  token's `expires_in` and after a 401;
 - request timeouts; and
 - one bounded session reinitialization after an expired-session response.
 
@@ -68,6 +69,11 @@ The default token-request timeout is 30 seconds.
 Use `with_tools` or `with_filter` to keep unnecessary capabilities out of the
 model request. Then apply ADK-Rust tool authorization and confirmation at
 execution time.
+
+Tool schemas are server-controlled input. `McpToolset` skips a tool whose input
+or output schema exceeds `McpSchemaLimits` (256 KiB and 10 000 JSON values by
+default) and logs the measured size, never the schema. See
+[Schema size limits](client.md#schema-size-limits).
 
 For consequential tools:
 

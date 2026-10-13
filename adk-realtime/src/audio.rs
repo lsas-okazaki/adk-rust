@@ -228,7 +228,7 @@ impl AudioChunk {
 /// Decode little-endian PCM16 bytes into i16 samples, borrowing when possible.
 ///
 /// Mirrors the idiom used by the LiveKit audio handler: on a little-endian host an
-/// aligned buffer is reinterpreted in place, which is free. The `chunks_exact`
+/// aligned buffer is reinterpreted in place, which is free. The `as_chunks`
 /// fallback covers both big-endian hosts (where the bytes need swapping) and
 /// misaligned buffers (where `i16` cannot be read directly).
 fn decode_pcm16_le(audio: &[u8]) -> Cow<'_, [i16]> {
@@ -241,7 +241,9 @@ fn decode_pcm16_le(audio: &[u8]) -> Cow<'_, [i16]> {
 
     Cow::Owned(
         audio
-            .chunks_exact(size_of::<i16>())
+            .as_chunks::<{ size_of::<i16>() }>()
+            .0
+            .iter()
             .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
             .collect(),
     )

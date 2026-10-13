@@ -45,6 +45,21 @@ pub trait Llm: Send + Sync {
     fn uses_interactions_api(&self) -> bool {
         false
     }
+
+    /// Returns an upper bound, in micro-USD, on what `request` can cost on this model.
+    ///
+    /// The spend ledger reserves this amount before the call, so the call's committed
+    /// cost never exceeds its reservation and a hard cap is never overshot. Providers
+    /// derive it from the request's size, its output cap (or the model's maximum output),
+    /// and the highest per-token rate that can apply. `None` means the call cannot be
+    /// bounded — an unpriced model, or a request whose size is unknown; see
+    /// [`ModelCallScope`](crate::ModelCallScope) for how such calls are reserved.
+    ///
+    /// The default returns `None`. Wrappers forward to the model they wrap.
+    fn max_cost_micro_usd(&self, request: &LlmRequest) -> Option<u64> {
+        let _ = request;
+        None
+    }
 }
 
 /// A request to an LLM provider.
@@ -130,6 +145,11 @@ pub struct LlmResponse {
     /// Error message from the provider, if any.
     pub error_message: Option<String>,
     /// Provider-specific metadata (e.g., response IDs, routing info).
+    ///
+    /// `LlmAgent` recognizes two optional boolean fields: `content_complete`
+    /// on a non-partial response replaces accumulated deltas with authoritative
+    /// content; `continue_turn` requests another bounded model iteration for
+    /// a provider-native tool pause without a client function call.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub provider_metadata: Option<serde_json::Value>,
     /// Interactions API: the server-assigned interaction id for this turn, used
@@ -137,6 +157,20 @@ pub struct LlmResponse {
     /// the generateContent transport and non-Gemini providers.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub interaction_id: Option<String>,
+    /// Model that produced this response: the version the provider reports when
+    /// it reports one, otherwise the identifier the request was sent to.
+    ///
+    /// Set by every `adk-model` provider. Budgets and pricing read it to
+    /// attribute usage and cost; `None` means the producer did not attribute it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model: Option<String>,
+    /// Provider that served this response, such as `"gemini"`, `"openai"`,
+    /// `"anthropic"` or `"bedrock"`.
+    ///
+    /// Set by every `adk-model` provider; `None` means the producer did not
+    /// attribute it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub provider: Option<String>,
 }
 
 /// Trait for LLM providers that support prompt caching.
@@ -247,6 +281,10 @@ pub struct UsageMetadata {
     pub audio_output_token_count: Option<i32>,
 
     /// Estimated cost in USD for this request.
+    ///
+    /// `adk-model` providers fill this from the provider's own report when it
+    /// sends one (OpenRouter), otherwise from `adk_model::pricing::PricingCatalog`.
+    /// `None` means the cost is unknown, never that the request was free.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cost: Option<f64>,
 
@@ -254,9 +292,76 @@ pub struct UsageMetadata {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub is_byok: Option<bool>,
 
-    /// Provider-specific usage details (e.g., server tool use, video tokens).
+    /// Provider-native usage data retained when available, including fields
+    /// that are not yet projected into the normalized counters above.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub provider_usage: Option<serde_json::Value>,
+
+    /// Provider-executed built-in tool uses the provider reported for this request.
+    ///
+    /// Each use counts as one tool call against a
+    /// [`RunBudget`](crate::RunBudget), and priced kinds add their per-use fee to
+    /// [`cost`](Self::cost). See [`BuiltinToolUse`] for the kinds providers report.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub builtin_tool_uses: Vec<BuiltinToolUse>,
+}
+
+impl UsageMetadata {
+    /// Total number of provider-executed built-in tool uses across all kinds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_core::{BuiltinToolUse, UsageMetadata};
+    ///
+    /// let usage = UsageMetadata {
+    ///     builtin_tool_uses: vec![BuiltinToolUse::new("web_search", 2), BuiltinToolUse::new("web_fetch", 1)],
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(usage.builtin_tool_use_count(), 3);
+    /// ```
+    pub fn builtin_tool_use_count(&self) -> u64 {
+        self.builtin_tool_uses.iter().map(|used| u64::from(used.count)).sum()
+    }
+}
+
+/// How many times the provider ran one kind of built-in tool for a request.
+///
+/// Kinds are provider-neutral names:
+///
+/// | Kind | Reported by |
+/// |------|-------------|
+/// | `web_search` | Anthropic `usage.server_tool_use.web_search_requests`, OpenAI `web_search_call` items |
+/// | `web_fetch` | Anthropic `usage.server_tool_use.web_fetch_requests` |
+/// | `code_execution` | Anthropic `usage.server_tool_use.code_execution_requests`, OpenAI `code_interpreter_call` items, Gemini `executableCode` parts |
+/// | `file_search` | OpenAI `file_search_call` items |
+/// | `image_generation` | OpenAI `image_generation_call` items |
+/// | `mcp` | OpenAI `mcp_call` items |
+/// | `google_search` | Gemini `groundingMetadata.webSearchQueries` (one per query) |
+/// | `google_maps` | Gemini grounding chunks with a `maps` source (one per grounded response) |
+///
+/// # Example
+///
+/// ```
+/// use adk_core::BuiltinToolUse;
+///
+/// let used = BuiltinToolUse::new("web_search", 3);
+/// assert_eq!(used.kind, "web_search");
+/// assert_eq!(used.count, 3);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuiltinToolUse {
+    /// Provider-neutral tool kind, such as `web_search`.
+    pub kind: String,
+    /// Number of uses the provider reported.
+    pub count: u32,
+}
+
+impl BuiltinToolUse {
+    /// Creates a record of `count` uses of `kind`.
+    pub fn new(kind: impl Into<String>, count: u32) -> Self {
+        Self { kind: kind.into(), count }
+    }
 }
 
 /// Citation metadata emitted by model providers for source attribution.
@@ -342,6 +447,8 @@ impl LlmResponse {
             error_message: None,
             provider_metadata: None,
             interaction_id: None,
+            model: None,
+            provider: None,
         }
     }
 }
@@ -451,6 +558,8 @@ mod tests {
             error_message: None,
             provider_metadata: None,
             interaction_id: None,
+            model: None,
+            provider: None,
         };
 
         let encoded = serde_json::to_string(&response).expect("serialize");
@@ -533,6 +642,7 @@ mod tests {
                         "video_tokens": 8
                     }
                 })),
+                builtin_tool_uses: vec![BuiltinToolUse::new("web_search", 1)],
             }),
             finish_reason: Some(FinishReason::Stop),
             citation_metadata: None,
@@ -548,6 +658,8 @@ mod tests {
                 }
             })),
             interaction_id: None,
+            model: None,
+            provider: None,
         };
 
         let encoded = serde_json::to_string(&response).expect("serialize");
@@ -561,6 +673,10 @@ mod tests {
         assert_eq!(
             decoded.usage_metadata.as_ref().and_then(|u| u.is_byok),
             response.usage_metadata.as_ref().and_then(|u| u.is_byok),
+        );
+        assert_eq!(
+            decoded.usage_metadata.as_ref().map(|u| u.builtin_tool_uses.clone()),
+            Some(vec![BuiltinToolUse::new("web_search", 1)]),
         );
         assert_eq!(
             decoded.usage_metadata.as_ref().and_then(|u| u.provider_usage.clone()),

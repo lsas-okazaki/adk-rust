@@ -20,13 +20,16 @@ Access control and authentication for Rust Agent Development Kit (ADK-Rust).
 
 ```toml
 [dependencies]
-adk-auth = "2.2.0"
+adk-auth = "3.0.0"
 
 # With SSO/JWT validation
-adk-auth = { version = "2.2.0", features = ["sso"] }
+adk-auth = { version = "3.0.0", features = ["sso"] }
 
 # With auth bridge for adk-server identity flow (implies sso)
-adk-auth = { version = "2.2.0", features = ["auth-bridge"] }
+adk-auth = { version = "3.0.0", features = ["auth-bridge"] }
+
+# With the signed, Merkle-hashed audit log
+adk-auth = { version = "3.0.0", features = ["signed-audit"] }
 ```
 
 ## Features
@@ -37,6 +40,7 @@ Core RBAC, scope-based security, and audit logging are always available with no 
 |---------|-------------|
 | `sso` | JWT/OIDC providers (Google, Azure AD, Okta, Auth0, generic OIDC) |
 | `auth-bridge` | `JwtRequestContextExtractor` for `adk-server` identity flow (implies `sso`) |
+| `token-exchange` | `TokenExchangeBroker`: RFC 8693 token exchange of the agent's credential for resource-scoped tokens |
 
 ## Declarative Scope-Based Security
 
@@ -224,6 +228,41 @@ Output:
 ```
 
 Implement the `AuditSink` trait for custom destinations (database, external service, etc.).
+
+A protected or scoped tool refuses a call whose decision the sink fails to record
+(`AuditFailureMode::Block`, the default); `with_audit_failure_mode(AuditFailureMode::Warn)`
+logs the failure and continues instead. `FileAuditSink::with_chaining` and
+`with_hmac_chaining` write a hash chain that resumes after a restart, and
+`FileAuditSink::verify` reports the first line that was edited, inserted, or removed.
+
+Protected and scoped tools record the acting agent on every decision: `agent_id`,
+`on_behalf_of`, and the principal's tenant (`AuditEvent::with_acting_context`).
+`AuditFilter::agent_id` selects one agent's records.
+
+### Signed audit log (`signed-audit`)
+
+`signed_audit::AuditLog` writes RFC 8785 records into an RFC 9162 Merkle tree per replica,
+signs C2SP checkpoints with Ed25519 (Go `sumdb/note` compatible), rotates keys with a
+dual-signed checkpoint, and publishes checkpoints to optional anchors. It is an `AuditSink`
+and an `AuditRecorder`, so `Runner::builder().audit_log(log)` records every governed tool
+decision, approval, kill-switch change, payment, and unknown outcome of a run in it.
+Records live in an `AuditLogStore` (in memory, or `adk-session` SQLite, PostgreSQL, Redis,
+MongoDB, Neo4j, or Firestore), and
+`signed_audit::verify` or `adk-rust audit verify` detects flipped bytes, deletions,
+reorders, truncation, and forks. See the
+[Audit Log guide](../docs/official_docs/security/audit-log.md).
+
+## Credential Brokers
+
+Both brokers implement `adk_core::CredentialBroker` and mint a `ScopedToken` whose audience is
+the requested resource (RFC 8707); `ScopedToken::authorize_for` refuses any other URL.
+
+| Broker | Feature | Token source |
+|--------|---------|--------------|
+| `SecretCredentialBroker` | none | A `SecretProvider` secret bound to an exact `(AgentId, resource)` pair and its granted scopes |
+| `TokenExchangeBroker` | `token-exchange` | RFC 8693 exchange of the `IdentitySource` credential; optional RFC 7009 revocation |
+
+See [Agent Identity](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/security/agent-identity.md).
 
 ## Error Types
 

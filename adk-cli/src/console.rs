@@ -61,10 +61,12 @@ pub async fn run_console(agent: Arc<dyn Agent>, app_name: String, user_id: Strin
                     .run(UserId::new(user_id.clone())?, SessionId::new(session_id)?, user_content)
                     .await?;
                 let mut printer = StreamPrinter::default();
+                let mut text_deltas = adk_core::EventTextDeltas::default();
 
                 while let Some(event) = events.next().await {
                     match event {
                         Ok(evt) => {
+                            let evt = text_deltas.push(&evt);
                             if let Some(content) = &evt.llm_response.content {
                                 for part in &content.parts {
                                     printer.handle_part(part);

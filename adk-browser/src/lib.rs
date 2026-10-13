@@ -44,10 +44,18 @@
 //! ## Available Tools
 //!
 //! ### Navigation
-//! - `browser_navigate` - Navigate to a URL
+//! - `browser_navigate` - Navigate to a URL (`http`/`https` unless
+//!   `BrowserToolset::with_allowed_schemes` says otherwise; private network
+//!   addresses, including redirect targets, refused unless
+//!   `BrowserToolset::with_private_network_access` permits them; host names that
+//!   do not resolve on the agent host refused unless
+//!   `BrowserToolset::with_unresolved_hosts` permits them)
 //! - `browser_back` - Go back in history
 //! - `browser_forward` - Go forward in history
 //! - `browser_refresh` - Refresh the page
+//!
+//! The history tools check the page they land on against the same private
+//! network policy.
 //!
 //! ### Interaction
 //! - `browser_click` - Click on an element
@@ -73,7 +81,8 @@
 //! - `browser_wait_for_text` - Wait for text to appear
 //!
 //! ### JavaScript
-//! - `browser_evaluate_js` - Execute JavaScript code
+//! - `browser_evaluate_js` - Execute JavaScript code (opt-in via
+//!   `BrowserToolset::with_evaluate_js(true)`)
 //! - `browser_scroll` - Scroll the page
 //! - `browser_hover` - Hover over an element
 //! - `browser_handle_alert` - Handle JavaScript alerts
@@ -106,7 +115,8 @@
 //! - `browser_focus` - Focus on an element
 //! - `browser_element_state` - Check element state
 //! - `browser_press_key` - Press keyboard keys
-//! - `browser_file_upload` - Upload files
+//! - `browser_file_upload` - Upload files from allowed directories (opt-in via
+//!   `BrowserToolset::with_file_upload(roots)`)
 //! - `browser_print_to_pdf` - Print page to PDF
 //!
 //! ## Requirements
@@ -188,6 +198,8 @@ pub use tools::{
     ClickTool,
     // Windows/Tabs
     CloseWindowTool,
+    // Navigation scheme allowlist
+    DEFAULT_ALLOWED_SCHEMES,
     DeleteAllCookiesTool,
     DeleteCookieTool,
     DoubleClickTool,

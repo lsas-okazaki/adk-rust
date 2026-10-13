@@ -572,13 +572,13 @@ impl AcpSessionHandler {
 
         // Accumulated tool-confirmation decisions, keyed by function-call ID (the
         // key `RunConfig::tool_confirmation_decisions` uses, so a decision
-        // authorizes only the call it was granted for). The map grows one decision
-        // per resume as the runner pauses at each still-undecided confirmation.
+        // authorizes only the call it was granted for). The agent resumes each held
+        // call under its original ID, so a call the model issues again under a new
+        // ID is asked about again rather than authorized by an earlier answer.
         let mut decisions: HashMap<String, ToolConfirmationDecision> = HashMap::new();
         // The first run carries the client's prompt content; every resume run
         // carries an empty user turn so the runner replays persisted history and
-        // continues from the paused tool call rather than re-appending the
-        // prompt (the documented resume shape).
+        // the agent resumes the held calls before its next model call.
         let mut is_resume = false;
 
         // The runner pauses at the first still-undecided confirmation and
@@ -611,6 +611,7 @@ impl AcpSessionHandler {
 
             // Confirmations surfaced during this run, awaiting a client decision.
             let mut pending: Vec<ToolConfirmationRequest> = Vec::new();
+            let mut text_deltas = adk_core::EventTextDeltas::default();
 
             loop {
                 let result = tokio::select! {
@@ -630,6 +631,7 @@ impl AcpSessionHandler {
                             pending.push(confirmation.clone());
                             continue;
                         }
+                        let event = text_deltas.push(&event);
                         for update in ResponseStreamer::map_event(&event) {
                             connection
                                 .send_notification(SessionNotification::new(

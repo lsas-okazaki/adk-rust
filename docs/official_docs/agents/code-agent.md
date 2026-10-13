@@ -48,15 +48,30 @@ freeform prompt. The intended production adapter wraps
 
 On suspension, the live interpreter continuation is serialized into a
 `CodeActCheckpoint` and written to session state; the next `run()` reads it back
-and resumes — the confirmation decision arrives via
-`RunConfig::tool_confirmation_decisions`, and a long-running result arrives as a
+and resumes — the confirmation decision arrives via `RunConfig::tool_approvals`
+(keyed by the request's fingerprint), an `ApprovalStore`, or
+`RunConfig::tool_confirmation_decisions` (keyed by call ID), and a long-running result arrives as a
 `FunctionResponse` in the next message. Inline tool calls are bracketed with
 write-ahead (SAVE-BEFORE) and SAVE-AFTER checkpoints: once the SAVE-AFTER
 checkpoint is persisted, recovery resumes with the stored result and never
-re-runs the tool. A crash in the narrow window after a tool's side effect but
-before its SAVE-AFTER checkpoint lands will re-run the tool on recovery, so
-tools that are not idempotent should guard against that (the same at-least-once
-boundary as `LlmAgent`).
+re-runs the tool. A crash after a tool's side effect but before its SAVE-AFTER
+checkpoint lands re-runs the call on recovery.
+
+With `RunConfig::action_ledger` set, a `ToolEffect::NonIdempotent` call is
+recorded before it executes, under an idempotency key that a recovered or
+resumed call keeps. The re-run is then answered from the ledger instead of
+executing again, and the answer is raised into the program at the call site:
+
+| Ledger state | Raised into the program |
+|--------------|-------------------------|
+| Completed with a result | `{"status": "already_succeeded", "result_digest": …}` |
+| Completed with an error | `{"status": "already_failed", "error": …}` |
+| Begun, never completed (crash or timeout mid-call) | `{"status": "outcome_unknown", "detail": …}` |
+
+A non-idempotent call that times out or panics is raised as `outcome_unknown`
+with or without a ledger. Without a ledger, recovery re-runs the call (at least
+once). See [Tool Effects and the Action Ledger](../tools/tool-effects.md) for the
+key format.
 
 This requires a runtime that can snapshot a paused call. A runtime that cannot
 runs long-running tools inline and rejects confirmation pauses.
@@ -94,7 +109,9 @@ The builder mirrors `LlmAgentBuilder`:
   `default_retry_budget`/`tool_retry_budget`, `circuit_breaker_threshold`, and
   `on_tool_error` fallbacks.
 - **Authorization**: `ToolConfirmationPolicy`
-  (`require_tool_confirmation`/`require_tool_confirmation_for_all`).
+  (`require_tool_confirmation`/`require_tool_confirmation_for_all`), and the run's
+  `ToolPolicy` and kill switch, applied through the same governed path as `LlmAgent`
+  after before-tool plugins and callbacks.
 - **Transfer**: `sub_agent`s and `disallow_transfer_to_parent`/
   `disallow_transfer_to_peers`.
 - **Output**: `output_key`, `output_schema`/`output_type` with a
@@ -181,15 +198,15 @@ kernel, which pins the `monty` crates in one place; rustc 1.95+ is required.
 
 ```toml
 [dependencies]
-adk-agent = { version = "2.2.0", features = ["codeact"] }
-adk-codeact-monty = "2.2.0"
+adk-agent = { version = "3.0.0", features = ["codeact"] }
+adk-codeact-monty = "3.0.0"
 ```
 
 Or through the umbrella crate (re-exported as `adk_rust::codeact_monty`):
 
 ```toml
 [dependencies]
-adk-rust = { version = "2.2.0", features = ["minimal", "codeact-monty"] }
+adk-rust = { version = "3.0.0", features = ["minimal", "codeact-monty"] }
 ```
 
 ```rust,ignore

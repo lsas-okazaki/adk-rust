@@ -154,10 +154,10 @@ Add dependencies to `Cargo.toml`:
 
 ```toml
 [dependencies]
-adk-graph = { version = "2.2.0", features = ["sqlite"] }
-adk-agent = "2.2.0"
-adk-model = "2.2.0"
-adk-core = "2.2.0"
+adk-graph = { version = "3.0.0", features = ["sqlite"] }
+adk-agent = "3.0.0"
+adk-model = "3.0.0"
+adk-core = "3.0.0"
 tokio = { version = "1", features = ["full"] }
 dotenvy = "0.15"
 serde_json = "1.0"
@@ -797,7 +797,10 @@ To bridge manually — for instance when driving a graph from your own executor 
 the invocation explicitly:
 
 ```rust
-let config = ExecutionConfig::new(ctx.session_id()).with_parent_context(ctx.clone());
+use adk_graph::agent::session_thread_id;
+
+let thread_id = session_thread_id(ctx.app_name(), ctx.user_id(), ctx.session_id());
+let config = ExecutionConfig::new(&thread_id).with_parent_context(ctx.clone());
 ```
 
 > **Note:** the node still runs on its own in-memory graph session, so agent
@@ -1183,27 +1186,55 @@ let graph = StateGraph::with_channels(&["task", "result"])
     .with_checkpointer(checkpointer);
 ```
 
+Every backend — memory, SQLite, PostgreSQL, Redis, MongoDB, Neo4j, and Firestore —
+passes one conformance suite. See [Graph Checkpointing](graph-checkpointing.md) for the
+backend matrix, the version rule that keeps two writers from interleaving, durability
+modes, and pending writes.
+
 ### What a Checkpoint Records
 
 A checkpoint stores the accumulated state, the step number, and the **frontier** —
 the nodes that still have to run. It is written after the frontier advances, so
-resuming never re-executes a node that already completed and never double-applies
-its updates. A run that finishes checkpoints an empty frontier, so resuming a
-completed thread returns the final state rather than restarting the graph.
+resuming an interrupted run does not re-execute a node whose step was checkpointed
+and never double-applies its updates. A run that finishes checkpoints an empty
+frontier, so resuming a completed thread with `invoke` returns the final state
+rather than restarting the graph.
 
-Two cases deliberately checkpoint the frontier that was *executing* rather than
-the next one, because the interrupted node has not produced its updates yet and
-must run again on resume:
+The frontier saved depends on how the step ended:
 
 | Situation | Frontier saved |
 |-----------|----------------|
 | Super-step completed | The next nodes to run |
 | Run finished | Empty |
-| Interrupt raised (blocking or streaming) | The nodes that were executing |
+| `interrupt_before` gate | The nodes that were executing; the gated node has not run |
+| `interrupt_after` gate | The successors of the nodes that ran |
+| Dynamic or tool-confirmation pause | The successors and `goto` targets of every node that completed in the step, plus each node that paused |
+
+A checkpoint also records the arrivals a fan-in node is still waiting on, so a join
+whose first predecessor finished before a pause or crash runs once the last one
+arrives after the resume. `update_state` keeps those arrivals, the answered gate,
+and the retry budget.
 
 Streamed runs checkpoint on the same schedule as blocking runs, including when an
 interrupt ends the stream, so a human-in-the-loop pause is resumable in either
 execution mode.
+
+### Execution Guarantees
+
+Node execution is **at-least-once**. A super-step runs its nodes, applies their
+updates, and only then saves its checkpoint, so:
+
+| Event | Effect on resume |
+|-------|------------------|
+| Crash while a super-step is running | Every node of that step runs again, including nodes that had finished |
+| A node of a super-step fails | The step is saved with the finished nodes' outputs as pending writes; a resume runs only the failed node |
+| Checkpoint save fails | The run fails; the last saved step is where a resume starts |
+| Another writer advanced the thread | The save fails with `GraphError::CheckpointConflict` and the run stops |
+| Pause or completed step | No node of a checkpointed step runs again |
+
+Make a node with external side effects — a payment, an email, a write to another
+system — idempotent, for example by deriving an idempotency key from the thread id
+and step, so a repeated execution is harmless.
 
 ### Checkpoint History (Time Travel)
 
@@ -1215,7 +1246,7 @@ execution mode.
 > it never did.
 
 
-Checkpoints also enable **durable resume** — if a graph execution crashes or the process restarts, execution resumes from the last persisted checkpoint rather than starting over. Use `SqliteCheckpointer` (the `sqlite` feature) for crash-safe persistence. `MemoryCheckpointer` holds checkpoints in the process, so they do not survive a restart. Those two are the backends this crate ships; implement the `Checkpointer` trait for anything else.
+Checkpoints also enable **durable resume** — if a graph execution crashes or the process restarts, execution resumes from the last persisted checkpoint rather than starting over. Use a durable backend — `SqliteCheckpointer`, `PostgresCheckpointer`, `RedisCheckpointer`, `MongoCheckpointer`, `Neo4jCheckpointer`, or `FirestoreCheckpointer` — for crash-safe persistence. `MemoryCheckpointer` holds checkpoints in the process, so they do not survive a restart. A custom backend implements the `Checkpointer` trait and runs the conformance suite; see [Graph Checkpointing](graph-checkpointing.md).
 
 ```rust
 // List all checkpoints for a thread
@@ -1528,6 +1559,12 @@ of executing the child again — which matters when the child costs a model call
 optional TTL, so an unchanged input skips the work. Requires the `node-cache`
 feature; a Redis-backed store is available behind `redis-cache`.
 
+The key is computed from the state at the start of the super-step, and a hit's
+cached updates are applied with the step's other updates, so a hit is
+indistinguishable from the node running: siblings in the same step never see it.
+The in-memory store belongs to the compiled graph, so every run of that graph
+shares it.
+
 ### Delta checkpoints
 
 The `delta` feature stores the difference between super-steps rather than the whole
@@ -1639,6 +1676,24 @@ let graph_agent = GraphAgent::builder("workflow")
 // GraphAgent implements Agent trait - use with Launcher or Runner
 // See adk-runner README for Runner configuration
 ```
+
+### Turns on a Checkpointed Thread
+
+Each `Agent::run` call is one turn on the session's thread. The thread id is
+`adk_graph::agent::session_thread_id(app_name, user_id, session_id)`: the three parts
+joined with `:`, with `%` and `:` percent-encoded inside each, so two users who choose
+the same session id never share checkpoints. `NodeTool` keys a graph tool call's thread
+the same way. With a checkpointer configured:
+
+| Thread's latest checkpoint | What the turn does |
+|----------------------------|--------------------|
+| None | Runs the graph from its entry nodes |
+| Paused (non-empty frontier) | Resumes the paused run, with the turn's input merged into its state |
+| Finished (empty frontier) | Runs the graph again from its entry nodes, starting from the previous turn's final state with the turn's input merged on top |
+
+The recursion limit applies to each turn separately. `GraphAgent::invoke` and
+`CompiledGraph::invoke` keep the direct-graph behaviour: re-invoking a finished
+thread returns its final state without running anything.
 
 ## Examples
 

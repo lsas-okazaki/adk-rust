@@ -121,10 +121,20 @@ impl EvaluationCriteria {
 /// Configuration for tool trajectory matching
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolTrajectoryConfig {
-    /// Require tools to be called in exact order
+    /// Require tools to be called in the expected order (default `true`).
+    ///
+    /// Applies to both [`ToolTrajectoryScorer::score`](crate::ToolTrajectoryScorer::score)
+    /// and [`ToolTrajectoryScorer::compare`](crate::ToolTrajectoryScorer::compare).
     #[serde(default = "default_true")]
     pub strict_order: bool,
-    /// Require exact argument match (vs partial)
+    /// Require exact argument match instead of a subset match (default `false`).
+    ///
+    /// With `false`, expected arguments match when every expected key is present in the
+    /// actual call with a matching value, recursively; extra keys are allowed at any depth.
+    /// With `true`, objects must have the same keys at every depth. In both modes arrays
+    /// match element by element, numbers compare by value (`1` matches `1.0`), and an
+    /// expected tool use without `args` matches any arguments. See
+    /// [`ToolUse::matches`](crate::ToolUse::matches).
     #[serde(default)]
     pub strict_args: bool,
 }
@@ -191,6 +201,10 @@ pub struct SemanticMatchConfig {
     #[serde(default = "default_judge_model")]
     pub judge_model: String,
     /// Custom prompt for the judge (optional)
+    ///
+    /// `{expected}` and `{actual}` are replaced with the two responses. The prompt must
+    /// ask for an `EQUIVALENT: YES/NO/PARTIAL` line and a `SCORE:` line from 0.0 to 1.0;
+    /// a reply without either is a judge error.
     pub custom_prompt: Option<String>,
 }
 

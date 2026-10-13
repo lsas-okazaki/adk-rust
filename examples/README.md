@@ -22,7 +22,9 @@ playground versions are being finalized:
 - `examples/acp_client_host` — vendor-neutral ACP client with streamed updates, async permissions, and a workspace-bounded filesystem
 - `examples/acp_kiro` — external coding-agent delegation, persistent sessions, and concurrent cancellation
 - `examples/acp_server` — expose a tool-using ADK-Rust agent to an editor through stable ACP v1
+- `examples/acp_openai_e2e` — live OpenAI end-to-end check: a coordinator agent delegates over ACP stdio to an ADK agent served by `AcpServer`, asserting environment passing, one-shot and persistent sessions, and the permission bridge
 - `examples/acp_full_protocol` — no-API-key, Runner-backed ACP v1 server-direction reference with an end-to-end validating test (embedded-resource + multimodal prompts, permission bridge, `session/load` replay, usage/tool-call updates)
+- `examples/autonomy_validation` — live OpenAI and Anthropic check of the autonomy-readiness Phase 0 fixes (agent transfer history, runner plugin denial, path guardrails, failing toolsets, shared session state, functional resume, eval judges, Anthropic web search replay and 1-hour cache pricing), asserting on history, counters, and usage
 
 ## Validated Feature Examples
 
@@ -43,6 +45,7 @@ Standalone crates demonstrating current ADK-Rust features. Each has its own `Car
 | `examples/acp_client_host` | External ACP agent with streamed UI events and client-controlled read-only files | Set `ACP_AGENT_COMMAND`, then `cargo run --manifest-path examples/acp_client_host/Cargo.toml` |
 | `examples/acp_kiro` | Direct, delegated, persistent, and cancellable coding-agent sessions | `cargo run --manifest-path examples/acp_kiro/Cargo.toml --bin acp-kiro-session` |
 | `examples/acp_server` | Gemini-backed ADK-Rust coding agent exposed to editors | Set `GOOGLE_API_KEY`, then `cargo run --manifest-path examples/acp_server/Cargo.toml` |
+| `examples/acp_openai_e2e` | Live OpenAI client-to-server ACP check with self-verifying assertions | Set `OPENAI_API_KEY`, then `cargo run --manifest-path examples/acp_openai_e2e/Cargo.toml` |
 | `examples/acp_full_protocol` | No-key, Runner-backed ACP v1 server-direction reference + validating test | `cargo test --manifest-path examples/acp_full_protocol/Cargo.toml` |
 
 **Dry-run mode (no external credentials):**
@@ -76,6 +79,23 @@ Standalone crates demonstrating current ADK-Rust features. Each has its own `Car
 | `examples/advanced_agents` | One embedded Runtime gallery for OpenAI chat, AmbientAgent scheduling, Realtime voice, A2A, MCP `2026-07-28` tasks, and telemetry | `cargo build --manifest-path examples/advanced_agents/Cargo.toml --bins && cargo run --manifest-path examples/advanced_agents/Cargo.toml --bin advanced-runtime` |
 | `examples/runtime_ui_showcase` | Embedded runtime UI gallery for a tool-calling agent, graph workflow, and portable team, with screenshots and walkthroughs | `cargo run --manifest-path examples/runtime_ui_showcase/Cargo.toml --bin runtime-ui-tools` |
 | `examples/team_architectures` | Portable `TeamSpec` examples for handoff, delegation, parallel shared-state swarms, and hybrid workflows | `cargo run --manifest-path examples/team_architectures/Cargo.toml --bin team-supervisor-handoff` |
+
+**Requires `DEEPSEEK_API_KEY`:**
+
+Drives a real desktop through [computer-use-mcp](https://github.com/zavora-ai/computer-use-mcp),
+so it needs an interactive session with Accessibility and Screen Recording permissions.
+
+| Example | Feature | Run |
+|---------|---------|-----|
+| `examples/bi_analyst` | Reads an organisation's saved dashboards, drills into what is odd, and explains it with the numbers behind it. Open-source BI (Apache Superset) with five commercial backends; runs on a seeded fixture with no credentials | `cargo run --manifest-path examples/bi_analyst/Cargo.toml` |
+| `examples/blender_console` | Multi-turn agent reporting a plan, task progress and live screen captures into a browser console a person can type into. Two MCP servers over two transports (HTTP + stdio) | `cargo run --manifest-path examples/blender_console/Cargo.toml` |
+| `examples/blender_studio` | Models in Blender through its own MCP for anything with an API, and desktop pixels only where Blender exposes no controls. The desktop surface is narrowed by a real toolset filter, not by approval configuration | `cargo run --manifest-path examples/blender_studio/Cargo.toml -- "<task>"` |
+
+**Requires `ORCAROUTER_API_KEY`:**
+
+| Example | Feature | Run |
+|---------|---------|-----|
+| `examples/orcarouter` | OrcaRouter through the `OpenAICompatibleConfig::orcarouter` preset — chat, tool calling, and a second vendor on the same client | `cargo run --manifest-path examples/orcarouter/Cargo.toml` |
 
 **Requires Google Cloud ADC (`gcloud auth application-default login`):**
 

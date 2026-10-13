@@ -53,6 +53,8 @@ impl Llm for MockModel {
                     error_message: None,
                     provider_metadata: None,
                     interaction_id: None,
+                    model: None,
+                    provider: None,
                 });
             }
         };
@@ -243,6 +245,7 @@ async fn test_streaming_chunks() {
 
     let mut received_chunks = Vec::new();
     let mut terminal_payloads = 0;
+    let mut final_text = String::new();
 
     while let Some(result) = stream.next().await {
         let event = result.unwrap();
@@ -252,17 +255,25 @@ async fn test_streaming_chunks() {
             assert!(!event.provider_metadata.contains_key("gcp.vertex.agent.llm_response"));
         } else {
             terminal_payloads += 1;
+            // One bounded request copy; the duplicate in `provider_metadata` is gone.
             assert!(event.llm_request.is_some());
-            assert!(event.provider_metadata.contains_key("gcp.vertex.agent.llm_request"));
+            assert!(!event.provider_metadata.contains_key("gcp.vertex.agent.llm_request"));
             assert!(event.provider_metadata.contains_key("gcp.vertex.agent.llm_response"));
         }
-        if let Some(content) = event.llm_response.content
-            && let Some(Part::Text { text }) = content.parts.first()
-        {
-            received_chunks.push(text.clone());
+        if let Some(content) = event.llm_response.content {
+            for part in content.parts {
+                if let Part::Text { text } = part {
+                    if event.llm_response.partial {
+                        received_chunks.push(text);
+                    } else {
+                        final_text.push_str(&text);
+                    }
+                }
+            }
         }
     }
 
-    assert_eq!(received_chunks, vec!["Hello", " ", "World", "!"]);
+    assert_eq!(received_chunks, vec!["Hello", " ", "World"]);
+    assert_eq!(final_text, "Hello World!");
     assert_eq!(terminal_payloads, 1);
 }

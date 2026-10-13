@@ -11,7 +11,7 @@ use futures::stream::Stream;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 
 use super::dreams::{CreateDreamParams, Dream, DreamListResponse};
-use super::events::{SessionEvent, UserEvent};
+use super::events::{OutcomeRubric, SessionEvent, UserEvent};
 use super::memory::{
     CreateMemoryParams, CreateMemoryStoreParams, Memory, MemoryListResponse, MemoryStore,
     MemoryVersion, UpdateMemoryParams,
@@ -25,7 +25,7 @@ use super::vaults::{
     CreateCredentialParams, CreateVaultParams, Credential, CredentialValidation,
     UpdateCredentialParams, Vault, VaultListResponse,
 };
-use crate::base_url::validate_base_url;
+use crate::base_url::{InsecureHttp, validate_base_url};
 use crate::{Error, Result};
 
 /// Default base URL for the Anthropic API.
@@ -49,7 +49,9 @@ const DEFAULT_SSE_TIMEOUT_SECS: u64 = 300;
 ///
 /// let client = ManagedAgentsClient::new("sk-ant-api03-...")?;
 /// ```
-#[derive(Debug, Clone)]
+///
+/// The `Debug` output redacts the API key.
+#[derive(Clone)]
 pub struct ManagedAgentsClient {
     pub(crate) client: reqwest::Client,
     #[allow(dead_code)] // Retained for potential reconnection/refresh scenarios
@@ -57,6 +59,18 @@ pub struct ManagedAgentsClient {
     pub(crate) base_url: String,
     pub(crate) sse_timeout: Duration,
     pub(crate) cached_headers: Arc<HeaderMap>,
+}
+
+impl std::fmt::Debug for ManagedAgentsClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedAgentsClient")
+            .field("client", &self.client)
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("sse_timeout", &self.sse_timeout)
+            .field("cached_headers", &self.cached_headers)
+            .finish()
+    }
 }
 
 impl ManagedAgentsClient {
@@ -146,7 +160,7 @@ impl ManagedAgentsClient {
     /// ```
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Result<Self> {
         let base_url = base_url.into();
-        validate_base_url(&base_url)?;
+        validate_base_url(&base_url, InsecureHttp::Rejected { opt_in: None })?;
         self.base_url = base_url;
         Ok(self)
     }
@@ -814,14 +828,37 @@ impl ManagedAgentsClient {
         self.send_event(session_id, event).await
     }
 
-    /// Define an outcome (success criteria) for the session.
+    /// Start an outcome: the agent works toward `description`, and a grader scores
+    /// each iteration against `rubric`.
+    ///
+    /// Uses the API's default iteration limit. To set `max_iterations`, send a
+    /// [`UserEvent::DefineOutcome`] through [`send_event`](Self::send_event).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails or the API rejects the event, for
+    /// example while another outcome is still active.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_anthropic::managed_agents::OutcomeRubric;
+    ///
+    /// client
+    ///     .define_outcome(
+    ///         &session.id,
+    ///         "Build a DCF model for Costco in .xlsx",
+    ///         OutcomeRubric::text("- The workbook has a sheet named `DCF`"),
+    ///     )
+    ///     .await?;
+    /// ```
     pub async fn define_outcome(
         &self,
         session_id: &str,
-        criteria: impl Into<String>,
+        description: impl Into<String>,
+        rubric: OutcomeRubric,
     ) -> Result<()> {
-        let event = UserEvent::DefineOutcome { criteria: criteria.into() };
-        self.send_event(session_id, event).await
+        self.send_event(session_id, UserEvent::define_outcome(description, rubric)).await
     }
 
     /// Archive an agent (makes it read-only).
@@ -974,6 +1011,8 @@ impl ManagedAgentsClient {
     }
 
     /// Rotate/update a credential's secret payload.
+    ///
+    /// Sends `POST /v1/vaults/{vault_id}/credentials/{credential_id}`.
     pub async fn update_credential(
         &self,
         vault_id: &str,
@@ -983,7 +1022,7 @@ impl ManagedAgentsClient {
         let url = self.build_url(&format!("vaults/{vault_id}/credentials/{credential_id}"));
         let response = self
             .client
-            .patch(&url)
+            .post(&url)
             .headers((*self.cached_headers).clone())
             .json(&params)
             .send()
@@ -1156,6 +1195,8 @@ impl ManagedAgentsClient {
     }
 
     /// Update a memory (content, path, or both).
+    ///
+    /// Sends `POST /v1/memory_stores/{store_id}/memories/{memory_id}`.
     pub async fn update_memory(
         &self,
         store_id: &str,
@@ -1532,11 +1573,14 @@ impl ManagedAgentsClient {
 
     /// List files scoped to a session.
     pub async fn list_session_files(&self, session_id: &str) -> Result<Vec<serde_json::Value>> {
-        let url = format!("{}?scope_id={session_id}", self.build_url("files"));
-        let response =
-            self.client.get(&url).headers((*self.cached_headers).clone()).send().await.map_err(
-                |e| Error::connection(format!("failed to list session files: {e}"), None),
-            )?;
+        let response = self
+            .client
+            .get(self.build_url("files"))
+            .query(&[("scope_id", session_id)])
+            .headers((*self.cached_headers).clone())
+            .send()
+            .await
+            .map_err(|e| Error::connection(format!("failed to list session files: {e}"), None))?;
 
         let body: serde_json::Value = handle_response(response).await?;
         Ok(body.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default())
@@ -1701,12 +1745,12 @@ fn parse_error_body(body: &str) -> (String, String) {
 /// - `content-type`: JSON content type
 fn build_headers(api_key: &str) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-api-key",
-        HeaderValue::from_str(api_key).map_err(|e| Error::Authentication {
-            message: format!("invalid API key header value: {e}"),
-        })?,
-    );
+    let mut api_key_value = HeaderValue::from_str(api_key).map_err(|e| Error::Authentication {
+        message: format!("invalid API key header value: {e}"),
+    })?;
+    // Keeps the key out of `Debug` output of the header map.
+    api_key_value.set_sensitive(true);
+    headers.insert("x-api-key", api_key_value);
     headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
     headers.insert("anthropic-beta", HeaderValue::from_static("managed-agents-2026-04-01"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -1716,6 +1760,16 @@ fn build_headers(api_key: &str) -> Result<HeaderMap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_redacts_the_api_key() {
+        let client = ManagedAgentsClient::new("sk-ant-secret-key-value").unwrap();
+
+        let debug = format!("{client:?}");
+
+        assert!(!debug.contains("sk-ant-secret-key-value"), "api key leaked: {debug}");
+        assert!(debug.contains("[REDACTED]"));
+    }
 
     #[test]
     fn test_new_creates_client_with_defaults() {
@@ -1776,7 +1830,9 @@ mod tests {
     fn test_default_base_url_is_https() {
         let client = ManagedAgentsClient::new("test-api-key").unwrap();
         assert!(client.base_url.starts_with("https://"));
-        assert!(validate_base_url(&client.base_url).is_ok());
+        assert!(
+            validate_base_url(&client.base_url, InsecureHttp::Rejected { opt_in: None }).is_ok()
+        );
     }
 
     #[test]

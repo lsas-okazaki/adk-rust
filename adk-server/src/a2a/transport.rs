@@ -36,7 +36,8 @@ pub(crate) async fn get(http: &HttpTransport, url: &str) -> Result<reqwest::Resp
     http.clone().oneshot(reqwest::Request::new(reqwest::Method::GET, url)).await
 }
 
-/// `POST url` with a JSON body through the transport.
+/// `POST url` with a JSON body through the transport, with `bearer` as the
+/// `Authorization` credential when given.
 ///
 /// The request is assembled by hand rather than via `reqwest::RequestBuilder`
 /// so it does not depend on which client executes it: the client inside the
@@ -45,12 +46,18 @@ pub(crate) async fn post_json<T: Serialize + ?Sized>(
     http: &HttpTransport,
     url: &str,
     body: &T,
+    bearer: Option<&str>,
 ) -> Result<reqwest::Response, BoxError> {
-    use reqwest::header::{CONTENT_TYPE, HeaderValue};
+    use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 
     let url = reqwest::Url::parse(url)?;
     let mut request = reqwest::Request::new(reqwest::Method::POST, url);
     request.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Some(token) = bearer {
+        let mut value = HeaderValue::from_str(&format!("Bearer {token}"))?;
+        value.set_sensitive(true);
+        request.headers_mut().insert(AUTHORIZATION, value);
+    }
     *request.body_mut() = Some(serde_json::to_vec(body)?.into());
     http.clone().oneshot(request).await
 }

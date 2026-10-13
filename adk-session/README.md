@@ -12,6 +12,8 @@ Session management and state persistence for Rust Agent Development Kit (ADK-Rus
 
 - **InMemorySessionService** - Simple in-memory session storage
 - **SqliteSessionService** - SQLite-backed persistence (`sqlite` feature)
+- **Durable stores** - `SpendLedger`, `ActionLedger`, and `ApprovalStore` for SQLite, PostgreSQL, Redis, MongoDB, Neo4j, and Firestore, each behind its backend's feature and proven by the `adk-core` conformance suites; the approval stores also hold the requests and delegations of the `adk-core` approval service
+- **Durable runtime stores** - `LeaseStore`, `DurableRunStore`, `ScheduleStore`, and `GovernanceStateStore` for SQLite, PostgreSQL, Redis, MongoDB, Neo4j, and Firestore, each proven by the `adk-core` conformance suites
 - **PostgresSessionService** - PostgreSQL-backed persistence (`postgres` feature)
 - **RedisSessionService** - Redis-backed persistence (`redis` feature)
 - **MongoSessionService** - MongoDB-backed persistence (`mongodb` feature)
@@ -24,14 +26,14 @@ Session management and state persistence for Rust Agent Development Kit (ADK-Rus
 
 ```toml
 [dependencies]
-adk-session = "2.2.0"
+adk-session = "3.0.0"
 ```
 
 Or use the meta-crate:
 
 ```toml
 [dependencies]
-adk-rust = { version = "2.2.0", features = ["sessions"] }
+adk-rust = { version = "3.0.0", features = ["sessions"] }
 ```
 
 ## Quick Start
@@ -80,19 +82,19 @@ let name = session.state().get("user:name");
 
 ```toml
 # SQLite
-adk-session = { version = "2.2.0", features = ["sqlite"] }
+adk-session = { version = "3.0.0", features = ["sqlite"] }
 
 # PostgreSQL
-adk-session = { version = "2.2.0", features = ["postgres"] }
+adk-session = { version = "3.0.0", features = ["postgres"] }
 
 # Redis
-adk-session = { version = "2.2.0", features = ["redis"] }
+adk-session = { version = "3.0.0", features = ["redis"] }
 
 # Encrypted sessions
-adk-session = { version = "2.2.0", features = ["encrypted-session"] }
+adk-session = { version = "3.0.0", features = ["encrypted-session"] }
 
 # Vertex AI sessions through the umbrella crate
-adk-rust = { version = "2.2.0", features = ["vertex-session"] }
+adk-rust = { version = "3.0.0", features = ["vertex-session"] }
 ```
 
 ## Vertex AI Sessions
@@ -237,9 +239,28 @@ operation has cached exactly one app/user scope for that ID. The cache is
 bounded; long-running processes may need to get or list an older session again
 after its scope is evicted.
 
+## Firestore Sessions
+
+`FirestoreSessionService` stores a session at `{root}/{app_name}/sessions/{session_id}`
+with the owning `user_id` as a document field. Every write re-reads the session
+document inside its transaction and applies only when the app, user, and session ID
+match the request:
+
+| Operation | Session missing, or owned by another user |
+|-----------|-------------------------------------------|
+| `create` | Fails with `session.already_exists` when the ID is taken in the app |
+| `get`, `append_event_for_identity` | Fails with `session.not_found` |
+| `delete` | No-op, identical to deleting a missing session |
+| `list`, `delete_all_sessions` | Only the caller's own sessions are returned or removed |
+
+App state lives at `{root}/{app_name}/app_state/current` and user state at
+`{root}/{app_name}/users/{user_id}/state/current`. App names, user IDs, and session
+IDs are Firestore document IDs, so they must not contain `/`.
+
 ## Encrypted Sessions
 
-Wrap any `SessionService` with `EncryptedSession` to encrypt session state at rest using AES-256-GCM:
+Wrap any `SessionService` with `EncryptedSession` to encrypt session state and event
+payloads at rest using AES-256-GCM:
 
 ```rust
 use adk_session::{EncryptedSession, EncryptionKey, InMemorySessionService};
@@ -251,6 +272,20 @@ let service = EncryptedSession::new(inner, key, vec![]);
 // Use like any SessionService — encryption is transparent
 ```
 
+| Data | Stored in the inner service as |
+|------|--------------------------------|
+| State values (create state and event `state_delta`) | Encrypted per value; key names stay in plaintext |
+| Event content, LLM response metadata, actions, long-running tool IDs | One encrypted envelope in the event content |
+| Event ID, timestamp, invocation ID, branch, author | Plaintext |
+| `llm_request`, event `provider_metadata` | Not persisted |
+
+- **Identity binding**: each ciphertext is bound to its app, user, session, and state
+  key or event ID, so data copied to another session fails to decrypt.
+- **Shared tiers**: `app:` and `user:` values are stored encrypted in the shared app
+  and user tiers and stay visible to every session of that app or user.
+- **Addressing**: `append_event(session_id, ..)` returns
+  `session.encryption.identity_required`; use `append_event_for_identity()`.
+
 Key rotation is supported by passing previous keys:
 
 ```rust
@@ -258,6 +293,15 @@ let new_key = EncryptionKey::generate();
 let old_key = EncryptionKey::from_env("OLD_KEY")?;
 let service = EncryptedSession::new(inner, new_key, vec![old_key]);
 ```
+
+`get` re-encrypts state values still under a previous key and returns any failure.
+Stored events cannot be rewritten, so keep a previous key until the sessions whose
+events it encrypted are deleted or expire.
+
+Data written by releases before the per-value format (a single `__encrypted_state`
+blob plus plaintext event deltas) is rejected with
+`session.encryption.unencrypted_data`. Enable `.with_legacy_migration(true)` while
+migrating; `get` then re-encrypts that state into the current format.
 
 ## Schema Migrations
 
@@ -277,6 +321,73 @@ println!("Schema version: {version}");
 ```
 
 Each backend detects pre-existing tables (baseline detection) and registers them as already applied, so `migrate()` is safe to call on both fresh and existing databases.
+
+## Durable Stores
+
+| Backend | Feature | Spend ledger | Action ledger | Approval store |
+|---------|---------|--------------|---------------|----------------|
+| SQLite | `sqlite` | `SqliteSpendLedger` | `SqliteActionLedger` | `SqliteApprovalStore` |
+| PostgreSQL | `postgres` | `PostgresSpendLedger` | `PostgresActionLedger` | `PostgresApprovalStore` |
+| Redis | `redis` | `RedisSpendLedger` | `RedisActionLedger` | `RedisApprovalStore` |
+| MongoDB | `mongodb` | `MongoSpendLedger` | `MongoActionLedger` | `MongoApprovalStore` |
+| Neo4j | `neo4j` | `Neo4jSpendLedger` | `Neo4jActionLedger` | `Neo4jApprovalStore` |
+| Firestore | `firestore` | `FirestoreSpendLedger` | `FirestoreActionLedger` | `FirestoreApprovalStore` |
+
+`SqliteAuditLogStore` (`sqlite`), `PostgresAuditLogStore` (`postgres`), `RedisAuditLogStore`
+(`redis`), `MongoAuditLogStore` (`mongodb`), `Neo4jAuditLogStore` (`neo4j`), and
+`FirestoreAuditLogStore` (`firestore`) hold the signed audit log written by
+`adk_auth::signed_audit::AuditLog`.
+
+Each type has `new(...)`, a constructor over the handle a session service holds
+(`from_pool`, `from_client`, `from_database`, `from_graph`, `from_db`), and `migrate()`.
+Spend ledgers add `with_limits`, `with_reservation_ttl`, and `with_clock`. Concurrent
+reservations never overshoot a cap, `begin` admits one caller per key, and a decision is
+taken once. Every type passes the `adk-core` conformance suites
+(`tests/store_conformance_*.rs`); see the
+[Durable Stores guide](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/security/durable-stores.md).
+
+```rust
+use adk_core::{SpendKey, SpendLimits, SpendPeriod};
+use adk_session::SqliteSpendLedger;
+
+let ledger = SqliteSpendLedger::new("sqlite://spend.db?mode=rwc")
+    .await?
+    .with_limits(SpendLimits::new().limit(SpendKey::org("my-app").per(SpendPeriod::Day), 50_000_000));
+ledger.migrate().await?;
+```
+
+## Durable Runtime Stores
+
+| Backend | Feature | Lease store | Run store | Schedule store | Governance state store |
+|---------|---------|-------------|-----------|----------------|------------------------|
+| SQLite | `sqlite` | `SqliteLeaseStore` | `SqliteRunStore` | `SqliteScheduleStore` | `SqliteGovernanceStateStore` |
+| PostgreSQL | `postgres` | `PostgresLeaseStore` | `PostgresRunStore` | `PostgresScheduleStore` | `PostgresGovernanceStateStore` |
+| Redis | `redis` | `RedisLeaseStore` | `RedisRunStore` | `RedisScheduleStore` | `RedisGovernanceStateStore` |
+| MongoDB | `mongodb` | `MongoLeaseStore` | `MongoRunStore` | `MongoScheduleStore` | `MongoGovernanceStateStore` |
+| Neo4j | `neo4j` | `Neo4jLeaseStore` | `Neo4jRunStore` | `Neo4jScheduleStore` | `Neo4jGovernanceStateStore` |
+| Firestore | `firestore` | `FirestoreLeaseStore` | `FirestoreRunStore` | `FirestoreScheduleStore` | `FirestoreGovernanceStateStore` |
+
+The SQL types have `new(url)` and `from_pool` over the pool a session service uses; the
+Redis, MongoDB, Neo4j, and Firestore types have `new(...)` and a constructor over a shared
+handle (`from_client`, `from_database`, `from_graph`, `from_db`). Every type has `migrate()`; the lease, run, and governance stores add `with_clock`. PostgreSQL claims runs
+with `SELECT ... FOR UPDATE SKIP LOCKED`, SQLite under `BEGIN IMMEDIATE`, and every worker
+write is fenced on the run's lease epoch. Every type passes the `adk-core` conformance
+suites; see the
+[Durable Runtime guide](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/core/durable-runtime.md).
+
+```rust
+use std::time::Duration;
+use adk_core::{DurableRunStore, NewRun, RunOutcome};
+use adk_session::PostgresRunStore;
+use serde_json::json;
+
+let runs = PostgresRunStore::new("postgres://localhost/app").await?;
+runs.migrate().await?;
+runs.enqueue(NewRun::new("default", "my-app", "user-1", "assistant", json!({"text": "hi"}))).await?;
+if let Some(claimed) = runs.claim("default", "worker-1", Duration::from_secs(30)).await? {
+    runs.finish(&claimed.record.run_id, claimed.epoch, RunOutcome::Completed(json!("done"))).await?;
+}
+```
 
 ## Rename: DatabaseSessionService → SqliteSessionService
 

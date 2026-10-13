@@ -41,14 +41,14 @@ Add the providers you need to your `Cargo.toml`:
 ```toml
 [dependencies]
 # Pick one or more providers:
-adk-model = { version = "2.2.0", features = ["gemini"] }        # Google Gemini (default)
-adk-model = { version = "2.2.0", features = ["openai"] }        # OpenAI GPT-5
-adk-model = { version = "2.2.0", features = ["anthropic"] }     # Anthropic Claude
-adk-model = { version = "2.2.0", features = ["deepseek"] }      # DeepSeek
-adk-model = { version = "2.2.0", features = ["groq"] }          # Groq (ultra-fast)
+adk-model = { version = "3.0.0", features = ["gemini"] }        # Google Gemini (default)
+adk-model = { version = "3.0.0", features = ["openai"] }        # OpenAI GPT-5
+adk-model = { version = "3.0.0", features = ["anthropic"] }     # Anthropic Claude
+adk-model = { version = "3.0.0", features = ["deepseek"] }      # DeepSeek
+adk-model = { version = "3.0.0", features = ["groq"] }          # Groq (ultra-fast)
 
 # Or all cloud providers at once:
-adk-model = { version = "2.2.0", features = ["all-providers"] }
+adk-model = { version = "3.0.0", features = ["all-providers"] }
 ```
 
 ## Step 2: Set Your API Key
@@ -60,6 +60,8 @@ export ANTHROPIC_API_KEY="your-key"   # Anthropic
 export DEEPSEEK_API_KEY="your-key"    # DeepSeek
 export GROQ_API_KEY="your-key"        # Groq
 ```
+
+For OpenCode Go and Zen, enable `opencode` and follow the [OpenCode configuration guide](opencode.md).
 
 ## Schema Normalization
 
@@ -204,6 +206,23 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+### Tool Calls on GPT-5.6 and Later
+
+OpenAI's Chat Completions endpoint rejects function tools on GPT-5.6 and later models
+(`gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-6-*`) unless reasoning is disabled,
+with HTTP 400 `Function tools with reasoning_effort are not supported`. `OpenAIClient`
+handles this per request:
+
+| Request | Endpoint |
+|---------|----------|
+| Declares tools, model GPT-5.6 or later, reasoning not `none` | Responses API (`/responses`), same key, base URL, reasoning effort, and retries; `store: false` |
+| No tools | Chat Completions |
+| Model before GPT-5.6, or reasoning effort `None` | Chat Completions |
+| Client built with `OpenAIClient::compatible` | Chat Completions |
+
+Use [`OpenAIResponsesClient`](./openai-responses.md) directly for reasoning summaries,
+built-in tools, or server-side conversation state.
+
 ### Structured Output (JSON Schema)
 
 OpenAI supports guaranteed JSON output via `output_schema`. ADK-Rust automatically wires this to OpenAI's `response_format` API:
@@ -289,6 +308,36 @@ let model = OpenAIClient::new(config)?;
 
 > **Note**: Structured output (`output_schema`) requires backend support. Native OpenAI fully supports it; local servers may have limited support.
 
+### OpenAI-Compatible Reasoning History
+
+Reasoning replay is disabled by default. `Part::Thinking` stays separate from
+visible message text regardless of the replay setting.
+
+| Client setting | Assistant history field |
+|---|---|
+| Default or `with_reasoning_replay(false)` | Neither field |
+| `with_reasoning_replay(true)` | `reasoning_content` |
+| `with_reasoning_replay_field(ReasoningReplayField::Reasoning)` | `reasoning` |
+
+```rust
+use adk_model::{OpenAICompatible, OpenAICompatibleConfig, ReasoningReplayField};
+
+fn main() -> Result<(), adk_core::AdkError> {
+    let config = OpenAICompatibleConfig::new("key", "model")
+        .with_base_url("http://localhost:8000/v1");
+    let model = OpenAICompatible::new(config)?.with_reasoning_replay(true);
+    // Select this override for vLLM endpoints that accept `reasoning`.
+    let model = model.with_reasoning_replay_field(ReasoningReplayField::Reasoning);
+    let _ = model;
+    Ok(())
+}
+```
+
+The last reasoning-replay builder call determines the setting. Enable replay
+only for endpoints that accept the chosen field; older vLLM deployments may use
+`reasoning_content`. This setting controls history serialization, not thinking
+generation. Standard OpenAI and Azure Chat Completions omit both fields by default.
+
 ### Gemini via the OpenAI-Compatible Endpoint
 
 Gemini models are reachable through the OpenAI Chat Completions wire format at
@@ -329,6 +378,49 @@ cargo run -p adk-model --features openai --example gemini_openai_compat
 # The same compat client driving a normal LlmAgent in a Runner.
 # (Lives in adk-agent: it exercises the agent layer, which sits above adk-model.)
 cargo run -p adk-agent --example gemini_openai_compat_agent
+```
+
+### OrcaRouter via the OpenAI-Compatible Endpoint
+
+OrcaRouter serves models from several vendors through the OpenAI Chat
+Completions wire format at `https://api.orcarouter.ai/v1`. Use the
+`OpenAICompatibleConfig::orcarouter(...)` preset (under the `openai` feature)
+with an `ORCAROUTER_API_KEY`:
+
+```toml
+[dependencies]
+adk-model = { version = "3.0.0", features = ["openai"] }
+```
+
+```rust
+use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let api_key = std::env::var("ORCAROUTER_API_KEY")?;
+    let model = OpenAICompatible::new(
+        OpenAICompatibleConfig::orcarouter(api_key, "openai/gpt-5.6-terra"),
+    )?;
+    let _ = model;
+    Ok(())
+}
+```
+
+Model IDs carry a vendor prefix, so changing the model string switches the
+upstream vendor while the key and client stay the same:
+
+| Model ID | Upstream vendor |
+|----------|-----------------|
+| `openai/gpt-5.6-terra` | OpenAI |
+| `anthropic/claude-sonnet-5` | Anthropic |
+
+Chat, streaming, function calling, and structured output go through the same
+`OpenAICompatible` client as every other preset.
+
+**Example** (requires `ORCAROUTER_API_KEY`):
+
+```bash
+# Chat, tool calling, and a second vendor on the same client.
+cargo run --manifest-path examples/orcarouter/Cargo.toml
 ```
 
 ### Legacy Reasoning-Effort API
@@ -401,12 +493,43 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+### Request Defaults
+
+| Setting | Default | Override |
+|---------|---------|----------|
+| `max_tokens` | 32,000 for Claude 4 and later, 4,096 for older or unrecognized models (`adk_model::catalog::anthropic_default_max_tokens`) | `AnthropicConfig::with_max_tokens`, or `max_output_tokens` per request |
+| Request timeout | 10 minutes for a whole non-streaming request, such as an agent called through `AgentTool`, and for the response headers of a stream | `AnthropicConfig::with_request_timeout` |
+
+Thinking counts toward `max_tokens`, and Claude 5 models think on every turn, so a
+small cap ends turns with `max_tokens` before the answer.
+
+```rust
+use adk_model::anthropic::{AnthropicClient, AnthropicConfig};
+use std::time::Duration;
+
+fn build() -> Result<AnthropicClient, adk_core::AdkError> {
+    let config = AnthropicConfig::new("sk-ant-xxx", "claude-opus-5-5")
+        .with_max_tokens(64_000)
+        .with_request_timeout(Duration::from_secs(1_800));
+    AnthropicClient::new(config)
+}
+```
+
+Thinking blocks, including `redacted_thinking` and the empty blocks returned under
+`display: "omitted"`, are replayed with their signatures in later requests, as the API
+requires for tool-use turns. Server tool results such as `web_fetch_tool_result` are
+replayed in the shape the API returned them.
+
 ### Available Models
 
 | Model | Description | Context |
 |-------|-------------|---------|
 | `claude-sonnet-5` | Balanced intelligence and cost (default) | 1M tokens |
-| `claude-opus-5` | Flagship capability | 1M tokens |
+| `claude-fable-5-1` | Most capable; demanding reasoning and long-horizon work | 1M tokens |
+| `claude-opus-5-5` | Current Opus; long-running agentic coding | 1M tokens |
+| `claude-sonnet-5-5` | Current Sonnet | 1M tokens |
+| `claude-haiku-5-5` | Current Haiku; high-volume, latency-sensitive work | 1M tokens |
+| `claude-opus-5` | Previous Opus | 1M tokens |
 | `claude-fable-5` | Premium creative and long-form work | 1M tokens |
 | `claude-haiku-4-5` | Cost-efficient previous generation | 200K tokens |
 
@@ -547,6 +670,169 @@ async fn main() -> anyhow::Result<()> {
 
 ---
 
+## Usage Attribution and Cost
+
+Every `adk-model` provider sets `LlmResponse::provider` and `LlmResponse::model`
+— the model version the provider reports when it reports one, otherwise the
+configured identifier — and fills `UsageMetadata::cost` in USD when the provider
+did not report a cost itself. Rates come from `adk_model::pricing::PricingCatalog`,
+which consolidates the Gemini, OpenAI and Anthropic pricing modules and adds
+DeepSeek, Groq, xAI and Mistral list prices. Each vendor table cites the
+published price page and the date it was read; `PricingCatalog::version()`
+returns that verification date.
+
+| Rule | Behaviour |
+|------|-----------|
+| Cached tokens | `prompt_token_count` includes cache reads and writes; each prompt token is billed once, at the uncached, cache-read or cache-write rate |
+| Anthropic cache writes | The 1-hour share of `cache_creation_input_tokens` bills at the 1-hour rate, the rest at the 5-minute rate |
+| Long context | Gemini (over 200K), OpenAI GPT-5.4/5.5 (272K and above) and Claude Haiku 5.5 (over 100K) switch the whole request to the long-context rates |
+| Dated aliases | `gpt-4.1-2025-04-14`, `claude-sonnet-4-5-20250929`, `claude-sonnet-4-5@20250929` and `us.anthropic.claude-sonnet-4-5-20250929-v1:0` resolve to the listed model |
+| Billing provider | A vendor's list price applies only to providers that bill it at that price; an OpenAI model name served by another gateway stays unpriced |
+| Gemini | `gemini-3.7-flash` requests are reported as `gemini-3.8-flash`; both are priced at the Gemini 3.8 Flash rates |
+| DeepSeek | `deepseek-flash` (and the legacy `deepseek-v4-flash`) and `deepseek-v4-pro` at peak rates during 01:00–04:00 and 06:00–10:00 UTC on weekdays, half price otherwise; Chinese public holidays bill at peak; `deepseek-chat` and `deepseek-reasoner` are unpriced |
+| Groq | GPT-OSS and Qwen models at Groq's published rates; models Groq prices only on request (Llama, MiniMax) stay unpriced |
+| xAI | Grok models, with the whole request at the long-context rate once the prompt reaches 200K tokens |
+| Mistral | Current models and their `-latest` aliases; retired dated ids and Mistral Large 4 (sale price) stay unpriced |
+| Ollama | Local models cost zero; `*cloud*` models stay unpriced |
+| OpenCode | Responses are attributed to `opencode` / `opencode-go` and stay unpriced |
+| Unknown models | `cost` stays `None`, which means unknown, never free |
+
+```rust
+use adk_core::UsageMetadata;
+use adk_model::pricing::{PRICING_EFFECTIVE_DATE, PricingCatalog};
+
+fn main() {
+    let usage = UsageMetadata {
+        prompt_token_count: 1_000_000,
+        candidates_token_count: 200_000,
+        cache_read_input_token_count: Some(400_000),
+        ..Default::default()
+    };
+    let catalog = PricingCatalog::standard();
+    let cost = catalog.cost_usd(Some("gemini"), "gemini-2.5-flash", &usage);
+    // 600K × $0.30 + 400K × $0.03 + 200K × $2.50 per million tokens.
+    assert!((cost.unwrap() - 0.692).abs() < 1e-9);
+    assert_eq!(catalog.version(), PRICING_EFFECTIVE_DATE);
+}
+```
+
+### Built-in tool uses and fees
+
+Providers report the built-in tools they ran in `UsageMetadata::builtin_tool_uses`, one
+`BuiltinToolUse { kind, count }` per kind. `cost` adds the published per-use fee of every priced
+kind to the token cost.
+
+| Kind | Reported from | Fee in `PricingCatalog::standard()` |
+|------|---------------|--------------------------------------|
+| `web_search` | Anthropic `usage.server_tool_use.web_search_requests` | $10 per 1,000 searches |
+| `web_fetch` | Anthropic `usage.server_tool_use.web_fetch_requests` | None — token cost only |
+| `code_execution` | Anthropic `usage.server_tool_use.code_execution_requests` | Unpriced (billed per container hour) |
+| `web_search` | OpenAI Responses `web_search_call` items | $10 per 1,000 calls |
+| `file_search` | OpenAI Responses `file_search_call` items | $2.50 per 1,000 calls |
+| `code_execution` | OpenAI Responses `code_interpreter_call` items | Unpriced (billed per container session) |
+| `image_generation`, `mcp` | OpenAI Responses `image_generation_call`, `mcp_call` items | Unpriced |
+| `google_search` | Gemini `groundingMetadata.webSearchQueries`, one per distinct query | Gemini 3 and newer: $14 per 1,000 queries. Gemini 2.5 Pro and Flash: $35 per 1,000 grounded prompts |
+| `google_maps` | Gemini grounding chunks with a Maps source, one per response | Gemini 2.5 Pro and Flash: $25 per 1,000 grounded prompts. Gemini 3: unpriced (billed per Maps query, which responses do not report) |
+| `code_execution` | Gemini `executableCode` parts | None — token cost only |
+
+- **Vendor API only**: fees apply when the provider is the vendor's own API (`gemini`, `openai`,
+  `anthropic`); Bedrock, Azure and other gateways keep the token cost only.
+- **Free allowances are not tracked**: Gemini's monthly search allowance and similar quotas are
+  ignored, so a run inside an allowance is over-estimated.
+- **Unpriced kinds add nothing**: the uses still count against the tool-call budget.
+- **OpenAI `web_search_preview` on non-reasoning models** is billed at $25 per 1,000 calls; the
+  response does not name the tool version, so the catalog charges the $10 rate.
+
+Add fees for other kinds or contracts with `PricingCatalog::with_builtin_tool_fee`:
+
+```rust
+use adk_core::{BuiltinToolUse, UsageMetadata};
+use adk_model::pricing::{BuiltinToolFee, ModelPrice, ModelRates, PriceVendor, PricingCatalog};
+
+fn main() {
+    let catalog = PricingCatalog::new("contract-2026")
+        .with_price(ModelPrice::new(PriceVendor::Google, "gemini-3.7-flash", ModelRates::new(0.75, 3.75)))
+        .with_builtin_tool_fee(
+            BuiltinToolFee::per_use(PriceVendor::Google, "google_search", 0.010)
+                .for_models(["gemini-3*"]),
+        );
+    let usage = UsageMetadata {
+        builtin_tool_uses: vec![BuiltinToolUse::new("google_search", 3)],
+        ..Default::default()
+    };
+    let cost = catalog.cost_usd(Some("gemini"), "gemini-3.7-flash", &usage).unwrap();
+    assert!((cost - 0.03).abs() < 1e-9);
+}
+```
+
+Run budgets read this cost to enforce a spend cap, and count each built-in tool use as a tool
+call; see [Run Budgets](../core/runner.md#run-budgets).
+
+---
+
+## Retries, Tool Calls, and Credentials
+
+These rules apply to every HTTP provider client in `adk-model` (OpenAI and
+OpenAI-compatible, Azure OpenAI, Azure AI Inference, Anthropic, DeepSeek, Groq).
+
+| Behaviour | Rule |
+|-----------|------|
+| Transient upstream errors | HTTP 500, 502, 503, 504, and 529 map to `ErrorCategory::Unavailable` with the upstream status recorded, so `RetryConfig` retries them |
+| `Retry-After` | A delay in seconds is attached to the error and used for the next retry, capped at `RetryConfig::max_delay` (default 5 seconds) |
+| Mid-stream Anthropic `error` event | Fails the stream with the category of the equivalent HTTP error, so `overloaded_error` and `rate_limit_error` are retryable |
+| Malformed streamed tool arguments | Fail with `model.<provider>.invalid_tool_arguments`; an empty payload is a zero-argument call with `{}` |
+| Text-encoded tool calls | Recognised only when the request declares the named tool; a ` ```json ` fence also needs an `arguments` or `parameters` object |
+| Tool order | Anthropic and Bedrock send tool definitions sorted by name, so the prompt-cache prefix is stable |
+| API keys | Provider configs redact the key in `Debug` output and omit it when serialized |
+| Redirects | Anthropic, Gemini, OpenAI, OpenAI-compatible, Azure OpenAI, Azure AI Inference and DeepSeek clients return a 3xx response as an error instead of following it |
+| Inline PDFs | OpenAI and Azure OpenAI receive a `file` part; other OpenAI-compatible providers receive the text fallback |
+
+```rust
+use std::time::Duration;
+
+use adk_model::catalog::GROQ_DEFAULT;
+use adk_model::groq::{GroqClient, GroqConfig};
+use adk_model::RetryConfig;
+
+fn build() -> Result<GroqClient, adk_core::AdkError> {
+    let api_key = std::env::var("GROQ_API_KEY").unwrap_or_default();
+    let retry = RetryConfig::default().with_max_delay(Duration::from_secs(30));
+    Ok(GroqClient::new(GroqConfig::new(api_key, GROQ_DEFAULT))?.with_retry_config(retry))
+}
+```
+
+### Request Adapters and Explicit Endpoints
+
+`OpenAICompatible` (and so every OpenAI-compatible preset) and `OpenAIResponsesClient`
+accept a `RequestAdapter` that edits the JSON body and headers of each generation
+request, retries included. Constructors that take the endpoint explicitly avoid ambient
+configuration when the application owns authentication:
+
+| Constructor | Provider | Reads environment |
+|-------------|----------|-------------------|
+| `Anthropic::new_with_base_url` | Anthropic | No |
+| `GeminiModel::new_with_base_url` | Gemini API | No |
+| `GeminiModel::new_google_cloud_endpoint` | Vertex AI (`gemini-vertex`) | Only ADC when no key is given |
+| `BedrockClient::new_with_api_key`, `BedrockClient::from_client` | Amazon Bedrock | No |
+
+```rust
+use std::sync::Arc;
+
+use adk_model::openai::{OpenAICompatible, OpenAICompatibleConfig, RequestAdapter};
+
+fn build(api_key: String) -> Result<OpenAICompatible, adk_core::AdkError> {
+    let adapter: RequestAdapter = Arc::new(|body, headers| {
+        body["metadata"] = serde_json::json!({"application": "support-bot"});
+        headers.insert("x-request-source", "support-bot".parse().expect("valid header"));
+        Ok(())
+    });
+    Ok(OpenAICompatible::new(OpenAICompatibleConfig::new(api_key, "gpt-5-mini"))?
+        .with_request_adapter(adapter))
+}
+```
+
+---
+
 ## Switching Providers
 
 All providers implement the same `Llm` trait, so switching is easy:
@@ -589,6 +875,7 @@ The generated projects are compiled in CI by `scripts/check-cargo-adk-templates.
 
 ## Related
 
+- [OpenCode Go and Zen](./opencode.md) - Per-model routing for OpenCode services
 - [Ollama (Local)](./ollama.md) - Run models locally with Ollama
 - [Local Models (mistral.rs)](./mistralrs.md) - Native Rust inference
 - [LlmAgent](../agents/llm-agent.md) - Using models with agents

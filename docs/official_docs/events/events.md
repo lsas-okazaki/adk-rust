@@ -511,6 +511,44 @@ render — not just `bash`-style tools.
 below) back to its originating call. Providers that omit call ids (e.g. Gemini)
 leave it `None`; fall back to `name` in that case.
 
+### Complete response snapshots
+
+Partial model events carry live deltas. A terminal event marked with
+`llm_response.provider_metadata.content_complete = true` contains the complete
+response for the same event ID, including text already streamed. Persist the
+original terminal event, or replace the matching partial projection with it.
+
+Append-only consumers can keep one `adk_core::EventTextDeltas` per stream and
+call `push(&event)` before rendering. The adapter removes previously emitted
+text and thinking prefixes while preserving tool parts, signatures, actions,
+and usage. It leaves unmarked deltas unchanged. A corrected snapshot that no
+longer starts with the emitted prefix is returned in full; append-only output
+cannot retract earlier content.
+
+### Lifecycle markers
+
+Two markers describe work in progress rather than a response. Neither event is
+a final response, so `is_final_response()` returns `false` for both.
+
+| Marker | Location | Meaning |
+|--------|----------|---------|
+| `adk_tool_started` | `event.provider_metadata` (event-level) | A tool call began executing. The value is a JSON string `{"id": <call id or null>, "name": <tool name>}`. The event has no content and is `partial = true`, so the runner does not persist it. |
+| `continue_turn` | `llm_response.provider_metadata` | A provider-native tool paused the turn without a client function call. `LlmAgent` sends another model request within the same `max_iterations` budget, skips output guardrails and `output_key` for the paused response, and keeps it in conversation history. |
+
+Tool-result events are emitted as each call completes, so with parallel dispatch
+they arrive in completion order. The model receives the results in call order.
+
+```rust
+use adk_core::Event;
+
+fn tool_started(event: &Event) -> Option<serde_json::Value> {
+    event
+        .provider_metadata
+        .get("adk_tool_started")
+        .and_then(|value| serde_json::from_str(value).ok())
+}
+```
+
 ### Streaming Tool Progress
 
 Long-running tools (a shell command, a build, a download) can push intermediate

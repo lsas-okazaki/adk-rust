@@ -128,7 +128,9 @@ impl Agent for ScriptedAgent {
     }
 
     async fn run(&self, ctx: Arc<dyn InvocationContext>) -> AdkResult<EventStream> {
-        let decision = ctx.run_config().tool_confirmation_decisions.get(CONFIRM_TOOL).copied();
+        // Decisions are keyed by function-call ID so an approval covers only the call it
+        // was granted for, never a later call to the same tool.
+        let decision = ctx.run_config().tool_confirmation_decisions.get(CONFIRM_CALL_ID).copied();
         let user_content = ctx.user_content().clone();
         let invocation = ctx.invocation_id().to_string();
         let delete_tool = self.delete_tool.clone();
@@ -189,10 +191,8 @@ impl Agent for ScriptedAgent {
             let mut echoes: Vec<String> = Vec::new();
             for part in &user_content.parts {
                 match part {
-                    Part::Text { text } => {
-                        if text.to_ascii_lowercase().contains("delete") {
-                            wants_delete = true;
-                        }
+                    Part::Text { text } if text.to_ascii_lowercase().contains("delete") => {
+                        wants_delete = true;
                     }
                     Part::EmbeddedResource { resource } => {
                         echoes.push(describe_embedded(resource));
@@ -218,6 +218,7 @@ impl Agent for ScriptedAgent {
                     tool_name: CONFIRM_TOOL.to_string(),
                     function_call_id: Some(CONFIRM_CALL_ID.to_string()),
                     args: json!({ "path": DELETE_TARGET }),
+                    acting: None,
                 });
                 yield Ok(event);
                 return;

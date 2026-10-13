@@ -24,6 +24,10 @@ use tracing::{error, info, warn};
 ///
 /// Consumes the batch and returns the final status. If there's an error during polling,
 /// the batch is returned in the error variant so it can be retried.
+///
+/// The large `Err` mirrors the library's retry-by-return contract: the batch
+/// comes back for retry instead of being dropped.
+#[allow(clippy::result_large_err)]
 pub async fn wait_for_completion(
     batch: Batch,
     delay: Duration,

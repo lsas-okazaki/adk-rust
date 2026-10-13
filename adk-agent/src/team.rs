@@ -340,22 +340,32 @@ impl Default for TeamPolicy {
 }
 
 /// Aggregate limits enforced across a root team invocation and its delegates.
+///
+/// Model calls, tokens, cost, tool calls and wall time are enforced by an
+/// [`adk_core::BudgetTracker`] shared by every member: a member stops before
+/// the model or tool call that would start past a reached limit. The tracker
+/// counts against the run's [`adk_core::RunBudget`] as well, so the stricter
+/// of the two applies. Events, delegations and handoffs are counted from the
+/// team's own events; partial streaming chunks never count.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TeamBudget {
-    /// Maximum emitted events.
+    /// Maximum emitted non-partial events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_events: Option<u64>,
-    /// Maximum model responses carrying usage metadata.
+    /// Maximum model calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_model_requests: Option<u64>,
-    /// Maximum tool calls observed in model events.
+    /// Maximum tool calls dispatched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tool_calls: Option<u64>,
     /// Maximum total input and output tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
-    /// Maximum estimated cost in millionths of a US dollar.
+    /// Maximum cost in millionths of a US dollar, from the providers' priced usage.
+    ///
+    /// A model response with no known cost stops the team unless
+    /// [`allow_unpriced_models`](Self::allow_unpriced_models) is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_microusd: Option<u64>,
     /// Maximum delegation relationship executions.
@@ -367,6 +377,10 @@ pub struct TeamBudget {
     /// Maximum wall-clock duration in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_wall_time_ms: Option<u64>,
+    /// Count model responses with no known cost as zero cost under
+    /// [`max_cost_microusd`](Self::max_cost_microusd).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_unpriced_models: bool,
 }
 
 /// Clean termination conditions independent from hard resource budgets.
@@ -625,7 +639,7 @@ impl From<TeamRuntimeError> for adk_core::AdkError {
                 (ErrorCategory::Forbidden, "agent.team.policy_denied")
             }
             TeamRuntimeError::BudgetExceeded(_) => {
-                (ErrorCategory::RateLimited, "agent.team.budget_exceeded")
+                (ErrorCategory::ResourceExhausted, "agent.team.budget_exceeded")
             }
             TeamRuntimeError::UnsafeResume(_) => {
                 (ErrorCategory::Unsupported, "agent.team.resume_unsafe")
@@ -1455,6 +1469,8 @@ async fn wrap_lifecycle_stream(
     lifecycle: TeamLifecycleContext,
     span: tracing::Span,
 ) -> Result<EventStream> {
+    // Alive as long as the stream; the invocation finishes when its last team stream ends.
+    let active = runtime.enter(&lifecycle.invocation_id);
     let mut inner = match inner {
         Ok(stream) => stream,
         Err(error) => {
@@ -1468,6 +1484,7 @@ async fn wrap_lifecycle_stream(
         }
     };
     Ok(Box::pin(async_stream::stream! {
+        let _active = active;
         while let Some(result) = inner.next().await {
             match result {
                 Ok(event) => {
@@ -1677,6 +1694,10 @@ impl Agent for TeamMemberAgent {
 
     async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
         let root_invocation_id = ctx.orchestration_root_invocation_id().to_string();
+        // Attached before any other ledger access so the team budget chains to the run budget.
+        let team_tracker = self
+            .runtime
+            .budget_tracker(&root_invocation_id, ctx.run_config().budget_tracker.clone());
         self.runtime.check_budget(&root_invocation_id)?;
         let member_lifecycle = TeamLifecycleContext {
             team: self.runtime.team_name().to_string(),
@@ -1712,6 +1733,7 @@ impl Agent for TeamMemberAgent {
         }
         let mut config = ctx.run_config().clone();
         self.configure_run(self.name(), &mut config);
+        config.budget_tracker = Some(team_tracker);
         let required_confirmations = self
             .relationships
             .iter()
@@ -1816,7 +1838,7 @@ impl Agent for TeamMemberAgent {
                     )
                     .await?;
             }
-            self.runtime.fail(&root_invocation_id, error.to_string());
+            self.runtime.fail(&root_invocation_id, &error);
             if let Some((relationship, incoming_edge)) = &incoming {
                 match &relationship.policy.failure {
                     RelationshipFailureStrategy::Fallback { target }
@@ -1923,7 +1945,7 @@ impl Agent for TeamMemberAgent {
                                     reason: "the exact edge is not declared".to_string(),
                                 }
                                 .into();
-                                runtime.fail(&root_invocation_id, error.to_string());
+                                runtime.fail(&root_invocation_id, &error);
                                 yield Err(error);
                                 return;
                             };
@@ -2041,6 +2063,13 @@ impl Agent for TeamMemberAgent {
                                 yield Ok(event);
                                 return;
                             }
+                            // The event's model call already happened, so it is kept
+                            // before the run stops on the shared budget.
+                            Err(error) if error.code.starts_with("budget.") => {
+                                yield Ok(event);
+                                yield Err(error);
+                                return;
+                            }
                             Err(error) => {
                                 yield Err(error);
                                 return;
@@ -2055,7 +2084,7 @@ impl Agent for TeamMemberAgent {
                                 Some(error.to_string()),
                             );
                         }
-                        runtime.fail(&root_invocation_id, error.to_string());
+                        runtime.fail(&root_invocation_id, &error);
                         if let Some(span) = &incoming_relationship_span {
                             span.record("team.status", "failed");
                             span.record(
@@ -2179,6 +2208,10 @@ impl adk_core::ReadonlyContext for TeamInvocationContext {
 
     fn user_content(&self) -> &adk_core::Content {
         self.inner.user_content()
+    }
+
+    fn acting_context(&self) -> adk_core::ActingContext {
+        self.inner.acting_context()
     }
 }
 
@@ -2362,6 +2395,18 @@ impl Tool for BoundedDelegateTool {
 
     fn is_concurrency_safe(&self) -> bool {
         self.inner.is_concurrency_safe()
+    }
+
+    fn is_agent_delegation(&self) -> bool {
+        self.inner.is_agent_delegation()
+    }
+
+    fn effect(&self) -> adk_core::ToolEffect {
+        self.inner.effect()
+    }
+
+    fn timeout_override(&self) -> Option<Option<std::time::Duration>> {
+        self.inner.timeout_override()
     }
 
     async fn execute(
@@ -3172,12 +3217,17 @@ mod tests {
     #[cfg(feature = "team-tools")]
     struct ScriptedModel {
         responses: std::sync::Mutex<std::collections::VecDeque<adk_core::LlmResponse>>,
+        /// Conversation contents of every request, in call order.
+        requests: std::sync::Mutex<Vec<Vec<Content>>>,
     }
 
     #[cfg(feature = "team-tools")]
     impl ScriptedModel {
         fn new(responses: Vec<adk_core::LlmResponse>) -> Self {
-            Self { responses: std::sync::Mutex::new(responses.into()) }
+            Self {
+                responses: std::sync::Mutex::new(responses.into()),
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
         }
 
         fn text(text: &str) -> adk_core::LlmResponse {
@@ -3193,6 +3243,8 @@ mod tests {
                 error_message: None,
                 provider_metadata: None,
                 interaction_id: None,
+                model: None,
+                provider: None,
             }
         }
 
@@ -3236,9 +3288,10 @@ mod tests {
 
         async fn generate_content(
             &self,
-            _request: adk_core::LlmRequest,
+            request: adk_core::LlmRequest,
             _stream: bool,
         ) -> Result<adk_core::LlmResponseStream> {
+            self.requests.lock().expect("request log lock").push(request.contents);
             let response = self
                 .responses
                 .lock()
@@ -3502,6 +3555,119 @@ mod tests {
             .unwrap();
         assert!(events.iter().any(|event| event.actions.tool_confirmation.is_some()));
         assert_eq!(researcher_runs.load(Ordering::SeqCst), 0);
+    }
+
+    /// Runs a supervisor whose delegate edge requires approval while its own agent policy is
+    /// `Never`, with a static decision recorded for the delegate call.
+    #[cfg(feature = "team-tools")]
+    async fn run_approved_delegate_with_decision(
+        decision: adk_core::ToolConfirmationDecision,
+    ) -> (Vec<Event>, usize, Vec<Vec<Content>>) {
+        let model = Arc::new(ScriptedModel::new(vec![
+            ScriptedModel::call("researcher"),
+            ScriptedModel::text("supervisor final"),
+        ]));
+        let supervisor = Arc::new(
+            crate::LlmAgentBuilder::new("supervisor")
+                .model(model.clone())
+                .tool_confirmation_policy(adk_core::ToolConfirmationPolicy::Never)
+                .build()
+                .unwrap(),
+        ) as Arc<dyn Agent>;
+        let researcher_runs = Arc::new(AtomicUsize::new(0));
+        let researcher = Arc::new(FlakyAgent {
+            name: "researcher".to_string(),
+            failures_before_success: 0,
+            runs: researcher_runs.clone(),
+        }) as Arc<dyn Agent>;
+        let team = TeamSpec {
+            name: "approval_team".to_string(),
+            description: String::new(),
+            coordinator: "supervisor".to_string(),
+            members: vec![TeamMemberSpec::new("supervisor"), TeamMemberSpec::new("researcher")],
+            relationships: vec![
+                TeamRelationship::new("supervisor", "researcher", RelationshipKind::Delegate)
+                    .with_policy(RelationshipPolicy {
+                        approval: RelationshipApprovalPolicy::Required,
+                        ..RelationshipPolicy::default()
+                    }),
+            ],
+            policy: TeamPolicy::default(),
+        }
+        .compile([supervisor, researcher])
+        .unwrap();
+        let config = RunConfig::builder()
+            .tool_confirmation_decisions(HashMap::from([("delegate-1".to_string(), decision)]))
+            .build();
+        let context = Arc::new(TestContext {
+            content: Content::new("user").with_text("approval decided"),
+            config,
+            session: TestSession,
+        });
+        let events = team
+            .run(context)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let requests = model.requests.lock().expect("request log lock").clone();
+        (events, researcher_runs.load(Ordering::SeqCst), requests)
+    }
+
+    #[cfg(feature = "team-tools")]
+    #[tokio::test]
+    async fn relationship_approval_deny_blocks_delegate_execution() {
+        let (events, researcher_runs, requests) =
+            run_approved_delegate_with_decision(adk_core::ToolConfirmationDecision::Deny).await;
+
+        assert_eq!(researcher_runs, 0);
+        assert!(events.iter().all(|event| event.actions.tool_confirmation.is_none()));
+        let denied = serde_json::to_value(Content {
+            role: "function".to_string(),
+            parts: vec![adk_core::Part::FunctionResponse {
+                function_response: adk_core::FunctionResponseData::new(
+                    "researcher",
+                    serde_json::json!({
+                        "error": "Tool 'researcher' execution denied by confirmation policy"
+                    }),
+                ),
+                id: Some("delegate-1".to_string()),
+                annotations: None,
+            }],
+        })
+        .unwrap();
+        let denial_event = events
+            .iter()
+            .find(|event| {
+                event.actions.tool_confirmation_decision
+                    == Some(adk_core::ToolConfirmationDecision::Deny)
+            })
+            .expect("the denied delegate call should produce a function response event");
+        assert_eq!(serde_json::to_value(denial_event.content()).unwrap(), denied);
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].iter().any(|content| serde_json::to_value(content).unwrap() == denied),
+            "the follow-up model request should carry the denial"
+        );
+    }
+
+    #[cfg(feature = "team-tools")]
+    #[tokio::test]
+    async fn relationship_approval_approve_runs_delegate() {
+        let (events, researcher_runs, requests) =
+            run_approved_delegate_with_decision(adk_core::ToolConfirmationDecision::Approve).await;
+
+        assert_eq!(researcher_runs, 1);
+        assert!(events.iter().all(|event| event.actions.tool_confirmation.is_none()));
+        assert!(events.iter().any(|event| {
+            event.actions.tool_confirmation_decision
+                == Some(adk_core::ToolConfirmationDecision::Approve)
+        }));
+        assert!(events.iter().any(|event| event.author == "researcher"));
+        assert_eq!(requests.len(), 2);
     }
 
     #[cfg(feature = "team-tools")]

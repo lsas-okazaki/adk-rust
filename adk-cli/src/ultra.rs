@@ -222,7 +222,7 @@ fn build_graph(
 fn coding_agent(model: Arc<dyn Llm>, root: &Path) -> Arc<dyn Agent> {
     CodingAgent::builder()
         .model(model)
-        .workspace(Workspace::new(root))
+        .workspace(Workspace::new(root).allow_bash(true))
         .build()
         .expect("coding agent")
         .into_agent()
@@ -270,8 +270,10 @@ async fn run_agent(
         )
         .await?;
     let mut text = String::new();
+    let mut text_deltas = adk_core::EventTextDeltas::default();
     while let Some(event) = stream.next().await {
         let event = event?;
+        let event = text_deltas.push(&event);
         if let Some(content) = &event.llm_response.content {
             for part in &content.parts {
                 match part {

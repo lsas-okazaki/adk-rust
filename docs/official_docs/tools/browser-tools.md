@@ -1,6 +1,6 @@
 # Browser Tools
 
-The `adk-browser` crate provides 46 comprehensive browser automation tools that enable AI agents to interact with web pages. Built on the WebDriver protocol (Selenium), it works with any WebDriver-compatible browser.
+The `adk-browser` crate provides 46 comprehensive browser automation tools (45 enabled by default) that enable AI agents to interact with web pages. Built on the WebDriver protocol (Selenium), it works with any WebDriver-compatible browser.
 
 ## Overview
 
@@ -19,9 +19,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-adk-browser = "2.2.0"
-adk-agent = "2.2.0"
-adk-model = "2.2.0"
+adk-browser = "3.0.0"
+adk-agent = "3.0.0"
+adk-model = "3.0.0"
 ```
 
 ### Prerequisites
@@ -56,7 +56,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let browser = Arc::new(BrowserSession::new(config));
     browser.start().await?;
 
-    // Create toolset with all 46 tools
+    // Create toolset with the 44 default tools (browser_evaluate_js and
+    // browser_file_upload are opt-in)
     let toolset = BrowserToolset::new(browser.clone());
     let tools = toolset.all_tools();
 
@@ -92,7 +93,7 @@ let toolset = BrowserToolset::new(browser)
     .with_interaction(true)  // click, double_click, type, clear, select
     .with_wait(true)         // wait_for_element, wait, wait_for_page_load, wait_for_text
     .with_screenshot(true)   // screenshot
-    .with_js(true)           // evaluate_js, scroll, hover, handle_alert
+    .with_js(true)           // scroll, hover, handle_alert, and evaluate_js
     .with_cookies(false)     // Disable cookie tools
     .with_frames(false)      // Disable frame tools
     .with_windows(false)     // Disable window tools
@@ -100,6 +101,41 @@ let toolset = BrowserToolset::new(browser)
 
 let tools = toolset.all_tools();
 ```
+
+## Security Defaults
+
+Five defaults limit what a model can reach through the browser:
+
+| Default | Why | Opt out |
+|---------|-----|---------|
+| `browser_evaluate_js` is excluded from every toolset and profile | It runs model-written JavaScript in the page, with the page's cookies and session | `.with_evaluate_js(true)` or `.with_js(true)` |
+| `browser_file_upload` is excluded from every toolset and profile | It hands a local file to the page, and the model chooses the path | `.with_file_upload([roots])` — uploads only existing files inside `roots`, after resolving symlinks |
+| `browser_navigate`, `browser_new_tab`, and `browser_new_window` accept only `http` and `https` | `file:` reads the host filesystem, `javascript:` and `data:` run script, and `chrome:` reaches browser settings | `.with_allowed_schemes([...])` |
+| The same tools refuse loopback, private, link-local, and cloud metadata addresses, and check the page they and `browser_back`, `browser_forward`, and `browser_refresh` end on after redirects | A page on `localhost` or `169.254.169.254` reaches services the operator never exposed, such as a metadata endpoint holding credentials | `.with_private_network_access(true)` |
+| The same tools refuse host names that do not resolve on the agent host | The agent cannot tell where such a name leads, and the browser may resolve it to a private address | `.with_unresolved_hosts(true)` |
+
+```rust
+use adk_browser::{BrowserConfig, BrowserSession, BrowserToolset};
+use std::sync::Arc;
+
+let browser = Arc::new(BrowserSession::new(BrowserConfig::new()));
+let toolset = BrowserToolset::new(browser)
+    .with_evaluate_js(true)           // opt in to arbitrary JavaScript
+    .with_allowed_schemes(["https"]); // HTTPS only
+```
+
+A refused URL fails with `URL scheme '<scheme>' is not allowed`, `points at a private
+network address`, or `does not resolve on the agent host` before the browser is touched.
+Host names are resolved, and one that resolves to a private address, or does not resolve
+at all, is refused.
+
+After a navigation, the page the browser ends on is checked the same way, so a public page
+that redirects to `169.254.169.254` fails the call and the page is replaced with
+`about:blank` before the model can read it. The check runs after the browser has loaded the
+page, so the request itself still reaches the address. Navigation started by the page or by
+an interaction tool, such as a link click or a form submission, and the subresources a page
+loads are not checked. Isolate the browser's network when it must not reach internal
+services at all.
 
 ## Multi-Tenant Usage with Pool-Backed Toolsets
 
@@ -125,15 +161,15 @@ let agent = LlmAgentBuilder::new("web_agent")
     .build()?;
 ```
 
-Browser sessions auto-start and auto-recover from stale WebDriver connections. You no longer need to call `browser.start()` before using tools — the session starts transparently on first use.
+Browser sessions auto-start and auto-recover from stale WebDriver connections, so `browser.start()` is optional. A host that manages the browser itself sets `BrowserConfig::require_explicit_start(true)`: tools then return an error until the host calls `start()`, and again after the session is lost.
 
-## Available Tools (46 Total)
+## Available Tools (46 Total, 45 by Default)
 
 ### Navigation (4 tools)
 
 | Tool | Description |
 |------|-------------|
-| `browser_navigate` | Navigate to a URL |
+| `browser_navigate` | Navigate to a URL (`http`/`https` by default) |
 | `browser_back` | Go back in history |
 | `browser_forward` | Go forward in history |
 | `browser_refresh` | Refresh current page |
@@ -177,7 +213,7 @@ Browser sessions auto-start and auto-recover from stale WebDriver connections. Y
 
 | Tool | Description |
 |------|-------------|
-| `browser_evaluate_js` | Execute JavaScript code |
+| `browser_evaluate_js` | Execute JavaScript code (opt-in) |
 | `browser_scroll` | Scroll the page |
 | `browser_hover` | Hover over an element |
 | `browser_handle_alert` | Handle JavaScript alerts |
@@ -222,7 +258,7 @@ Browser sessions auto-start and auto-recover from stale WebDriver connections. Y
 | `browser_focus` | Focus on element |
 | `browser_element_state` | Get element state (visible, enabled, selected) |
 | `browser_press_key` | Press keyboard key |
-| `browser_file_upload` | Upload file to input |
+| `browser_file_upload` | Upload a file from an allowed directory (opt-in) |
 | `browser_print_to_pdf` | Generate PDF from page |
 
 ## Element Selectors

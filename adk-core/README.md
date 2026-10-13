@@ -26,14 +26,14 @@ This crate is model-agnostic and contains no LLM-specific code.
 
 ```toml
 [dependencies]
-adk-core = "2.2.0"
+adk-core = "3.0.0"
 ```
 
 Or use the meta-crate:
 
 ```toml
 [dependencies]
-adk-rust = "2.2.0"
+adk-rust = "3.0.0"
 ```
 
 ## Core Traits
@@ -61,11 +61,18 @@ pub trait Tool: Send + Sync {
     fn is_long_running(&self) -> bool;
     fn is_read_only(&self) -> bool;           // default: false
     fn is_concurrency_safe(&self) -> bool;    // default: false
+    fn is_agent_delegation(&self) -> bool;    // default: false
+    fn effect(&self) -> ToolEffect;           // default: ReadOnly if is_read_only(), else NonIdempotent
+    fn timeout_override(&self) -> Option<Option<Duration>>; // default: None (agent's tool_timeout)
     async fn execute(&self, ctx: Arc<dyn ToolContext>, args: Value) -> Result<Value>;
 }
 ```
 
+`effect()` governs retries and the action ledger: only `ReadOnly` and `Idempotent` tools are retried, and only after a retryable error. With an `ActionLedger` on `RunConfig::action_ledger` (`InMemoryActionLedger` here, `SqliteActionLedger` in `adk-session`), a `NonIdempotent` call executes at most once per `ToolContext::idempotency_key()`; a replay of a call that never recorded an outcome is answered with `outcome_unknown_response()` instead of executing again.
+
 `ToolExecutionStrategy::Auto` includes a call in its concurrent subset only when the selected tool returns `true` from both `is_read_only()` and `is_concurrency_safe()`. It runs that safe subset first, then executes the remaining calls sequentially. Both methods default to `false`, so existing implementations remain sequential.
+
+Agent implementations may use `is_agent_delegation()` to identify consecutive delegation calls that can overlap without parallelizing ordinary tools.
 
 ### Toolset
 
@@ -168,6 +175,26 @@ event.actions    // State changes, transfers, escalation
 event.provider_metadata  // HashMap<String, String>
 ```
 
+#### Complete response snapshots
+
+Terminal events marked with `llm_response.provider_metadata.content_complete`
+contain the complete response for their event ID, including earlier streamed
+text. Preserve the original event for persistence and replacement-aware UIs.
+Append-only output can use one `EventTextDeltas` adapter per live stream:
+
+```rust
+let mut deltas = adk_core::EventTextDeltas::default();
+while let Some(event) = stream.next().await {
+    let event = event?;
+    let output = deltas.push(&event);
+    // Render output.content(); persist the original event.
+}
+```
+
+The adapter preserves tool parts, thinking signatures, actions and usage. A
+non-prefix correction is returned in full because append-only output cannot
+retract text already rendered.
+
 #### First-class tool events
 
 Events expose typed, render-ready views of tool activity, so UIs consume tool
@@ -267,6 +294,53 @@ InvocationContext (extends CallbackContext)
 
 ## Security
 
+### Governed Tool Execution
+
+Every agent runs each tool call through `authorize_tool_call` after plugin and callback
+rewrites and immediately before `Tool::execute`:
+
+| Step | Type | Effect |
+|------|------|--------|
+| Kill switch | `GovernanceControl` | A frozen run ends with a `governance.frozen` error |
+| Policy | `ToolPolicy`, `DeclarativePolicy` | Allow, deny, or require approval; `DeclarativePolicy` denies unlisted tools |
+| Screen | `ToolCallScreen` | The agent's guardrails; a rewrite is checked against the policy again |
+| Confirmation | `ToolApproval`, `ApprovalStore` | Decisions bind to the call's fingerprint, so they survive a re-issued call ID |
+| Approval service | `ApprovalService`, `StoreApprovalService`, `ApprovalPolicy` | An inbox over the approval store: quorum, delegation, escalation, expiry, and edit / reject / respond actions with compare-and-swap decisions |
+
+```rust
+use adk_core::{ArgPredicate, DeclarativePolicy, PolicyDecision, PolicyRule, ToolPolicyRequest};
+use serde_json::json;
+
+let policy = DeclarativePolicy::builder()
+    .allow_read_only()
+    .rule(PolicyRule::allow("transfer").when(ArgPredicate::at_most("/amount", 100.0)))
+    .build();
+
+let request = ToolPolicyRequest::new("transfer", json!({ "amount": 500 }));
+assert!(matches!(policy.decide(&request), PolicyDecision::Deny { .. }));
+```
+
+Provider-executed built-in tools (Gemini Google Search, OpenAI hosted web search, Anthropic
+web search) never reach `authorize_tool_call`. `BuiltinToolGovernor` applies the kill switch,
+the tool-call budget and the policy to them before each model request: a denied tool, or one
+that needs an approval that does not exist yet, is withheld from the request. The uses a
+provider reports are counted in `UsageMetadata::builtin_tool_uses`, against the run's tool-call
+budget, and in `UsageMetadata::cost`.
+
+### Store Conformance Suites
+
+The `conformance` feature provides one suite per durable store trait — `SpendLedger`,
+`ActionLedger`, `ApprovalStore`, `LeaseStore`, `DurableRunStore`, `ScheduleStore`, and
+`GovernanceStateStore`. A backend implements a harness that opens it and calls the matching
+`*_conformance_tests!` macro, which generates one `#[tokio::test]` per contract case:
+accounting, period rollover, fencing, single-winner concurrency across two handles, and
+restart survival. Every in-memory and `adk-session` backend runs the same suites.
+
+```toml
+[dev-dependencies]
+adk-core = { version = "3.0.0", features = ["conformance"] }
+```
+
 ### Inline Data Size Limit
 
 `Content::with_inline_data()` and `Part::inline_data()` enforce a 10 MB limit (`MAX_INLINE_DATA_SIZE`) to prevent oversized payloads.
@@ -280,6 +354,28 @@ use adk_core::context::validate_state_key;
 
 assert!(validate_state_key("user_name").is_ok());
 assert!(validate_state_key("../etc/passwd").is_err());
+```
+
+### Spend Ledger
+
+`SpendLedger` holds one budget for model calls and payments: `reserve` holds an amount
+against every `SpendLimits` cap that covers a `SpendKey` (org, agent, vendor; day, month,
+or lifetime in UTC), `commit` records the actual amount, and `release` drops the hold.
+Unsettled holds expire after a TTL. `InMemorySpendLedger` is the process-local
+implementation; `adk-session` provides SQLite, PostgreSQL, Redis, MongoDB, Neo4j, and
+Firestore ledgers. Set `RunConfig::spend_ledger` to cap a run. `with_clock` takes a
+`Clock`; `ManualClock` lets a test cross a day or month boundary.
+
+`ModelCallScope` applies the run budget and the spend ledger to model calls made outside
+an agent's own loop — compaction summaries, LLM routing, MCP sampling. `generate_metered`
+and `MeteredLlm` meter against the scope made current with `ModelCallScope::within`.
+
+```rust
+use adk_core::{InMemorySpendLedger, SpendKey, SpendLimits, SpendPeriod};
+
+let ledger = InMemorySpendLedger::new(
+    SpendLimits::new().limit(SpendKey::org("my-app").per(SpendPeriod::Day), 50_000_000),
+);
 ```
 
 ### Provider Metadata
@@ -347,6 +443,71 @@ pub enum StreamingMode {
     SSE,   // Server-Sent Events (default)
     Bidi,  // Bidirectional (realtime)
 }
+```
+
+## Durable Runtime Contracts
+
+Backend-neutral traits for running agents durably across replicas, each with an in-memory
+implementation that takes a `Clock` through `with_clock`:
+
+| Trait | In-memory | Holds |
+|-------|-----------|-------|
+| `LeaseStore` | `InMemoryLeaseStore` | Leases with fencing epochs |
+| `DurableRunStore` | `InMemoryRunStore` | The run queue: claims, heartbeats, waits, retries, cancellation |
+| `ScheduleStore` | `InMemoryScheduleStore` | Cron, one-shot, and interval schedules with a revision CAS |
+| `GovernanceStateStore` | `InMemoryGovernanceStateStore` | Freeze state per organisation, tenant, and agent |
+
+`AgentId`, `AgentPrincipal`, and `ActingContext` (module `principal`) identify the agent a
+run acts as; `ActingConfig` (module `acting`, on `RunConfig::acting`) resolves it per agent and
+pins the subject to the session's user, and `NewRun::with_service_subject` marks a scheduled,
+webhook, or queue run as acting for a service. `schedule::plan_fires` computes fire times; cron specs need the `cron` feature.
+
+```rust
+use std::time::Duration;
+
+use adk_core::{DurableRunStore, InMemoryRunStore, NewRun, RunOutcome};
+use serde_json::json;
+
+#[tokio::main]
+async fn main() -> adk_core::Result<()> {
+    let runs = InMemoryRunStore::new();
+    runs.enqueue(NewRun::new("default", "app", "user", "agent", json!({}))).await?;
+    let claimed = runs.claim("default", "worker-1", Duration::from_secs(30)).await?.unwrap();
+    let done = runs
+        .finish(&claimed.record.run_id, claimed.epoch, RunOutcome::Completed(json!("ok")))
+        .await?;
+    assert!(done.state.is_terminal());
+    Ok(())
+}
+```
+
+## Wake-ups and Webhooks
+
+| Module | Feature | Provides |
+|--------|---------|----------|
+| `webhook` | `webhooks` | Standard Webhooks `WebhookSigner` / `WebhookVerifier` (timestamp tolerance, several secrets for rotation), `WebhookReplayGuard` |
+| `webhook_delivery` | `webhook-delivery` | `WebhookDelivery`: signed outbound POSTs with exponential backoff and jitter, a `DeadLetterSink`, and an `EgressPolicy` that refuses internal destinations at resolve time |
+| `queue_source` | — | `QueueSource` (pull, ack, nack), `InMemoryQueueSource`, and `QueueIngress`, which enqueues each message as a durable run keyed by its message id and acks only after the enqueue succeeds |
+
+`queue_source_conformance_tests!` (feature `conformance`) checks any `QueueSource`. See
+[Wake-ups and Webhooks](../docs/official_docs/core/wake-ups.md).
+
+## Run Budgets
+
+`RunBudget` states limits on model calls, total tokens, cost (micro-USD), wall
+time and tool calls; `RunConfig::budget` carries it and `RunConfig::budget_tracker`
+carries the shared `BudgetTracker`. Call sites reserve work with
+`BudgetTracker::begin_model_call` and `begin_tool_calls`; `generate_with_budget`
+wraps a model call. Violations convert to `AdkError` with category
+`ErrorCategory::ResourceExhausted` and a `budget.*` code. `LlmResponse` carries
+`model` and `provider` so usage and cost are attributable.
+
+```rust
+use adk_core::{BudgetTracker, RunBudget};
+
+let tracker = BudgetTracker::new(RunBudget::new().max_tool_calls(2));
+assert!(tracker.begin_tool_calls(2).is_ok());
+assert!(tracker.begin_tool_calls(1).is_err());
 ```
 
 ## ToolExecutionStrategy

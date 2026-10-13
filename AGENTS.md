@@ -51,6 +51,7 @@ feature-gated builds and the `full` tier require.
 | `protoc` | `adk-rag --features lancedb` (lance build script) | `apt install protobuf-compiler` | `brew install protobuf` | [prebuilt release](https://github.com/protocolbuffers/protobuf/releases), then set `PROTOC` |
 | NASM | `aws-lc-sys` on MSVC — any rustls path, e.g. `adk-auth --features sso` | not needed | not needed | [nasm.us](https://www.nasm.us/), add to `PATH` |
 | `cmake` | `openai-webrtc` (audiopus builds Opus from source) | `apt install cmake` | `brew install cmake` | [get-cmake](https://github.com/lukka/get-cmake) or the official installer |
+| ALSA (`libasound2-dev`) | `examples/desktop_audio` (cpal links `alsa-sys`); pre-push examples gate | `apt install libasound2-dev` | not needed (CoreAudio) | not needed |
 | `bash` / `sh` | Shell-tool and external-runner tests across `adk-bench`, `adk-devtools`, `adk-managed`, `adk-sandbox`, `adk-tool` | preinstalled | preinstalled | [Git for Windows](https://git-scm.com/download/win) ships them in `Git\bin`, which the installer leaves off `PATH` — add it |
 | `python3` | `adk-sandbox` process-execution tests | preinstalled | preinstalled | [python.org](https://www.python.org/downloads/) — ensure `python3` resolves, not just `python` |
 | WebDriver | `adk-browser` examples | Chrome/Chromium | Chrome/Chromium | Chrome/Chromium |
@@ -132,7 +133,7 @@ A default `--workspace` build compiles no feature-gated module and no umbrella
 tier above `minimal`, so those need their own pass:
 
 ```bash
-# Feature-gated modules — mirrors the PR-tier feature-coverage matrix
+# Feature-gated modules — one pair from scripts/feature-coverage-pairs.txt
 cargo clippy -p adk-agent --features codeact --all-targets -- -D warnings
 
 # Umbrella tiers — `standard` and above compile code `minimal` never reaches
@@ -169,10 +170,15 @@ expensive axes move to a later tier.
   coverage: `fmt` (prerequisite gate), `clippy --workspace --all-targets -D warnings`,
   `nextest --workspace` (Linux, runs at most once), `feature-coverage` for
   feature-gated modules default builds skip (e.g. `adk-agent --features codeact`),
+  as eight shards driven by `scripts/feature-coverage-pairs.txt`,
   `docs` (`cargo doc --workspace --no-deps` plus doctests), standalone examples
   (4 shards), `templates`, a compile-only macOS build, a Windows workspace build
-  with a targeted sandbox portability smoke, and `semver` (stable strict,
-  everything else warn-only).
+  with a targeted sandbox portability smoke, and `semver` (stable strict against
+  the release type in `semver.yml`'s `SEMVER_RELEASE_TYPE`: `minor` fails breakage,
+  `major` during a major release candidate accepts it;
+  everything else warn-only). A `scope` job skips the Rust jobs when a change
+  touches only `docs/` or Markdown, and merge-queue builds skip `docs`, the
+  standalone examples and the macOS/Windows builds the pull request already passed.
 - **Merge tier** (`ci-merge.yml`, on `push: main`) — cross-platform
   `nextest --workspace` on macOS/Windows and doc-example compilation. Runs
   post-merge; not branch-protection-required.
@@ -183,15 +189,17 @@ expensive axes move to a later tier.
 
 Only the PR tier gates merges. Branch protection requires the aggregate
 `pr-gate` context plus the separate `semver` context; `pr-gate` fails unless
-every `ci.yml` dependency and matrix entry succeeds. See CONTRIBUTING.md
+every `ci.yml` dependency succeeds or was skipped by the change scope. See CONTRIBUTING.md
 ("Branch Protection — Required Status Checks") for the authoritative set.
 
 ### Local git hooks (lefthook)
 
 - **pre-commit** — `cargo fmt --all -- --check`, `cargo clippy --workspace
-  --all-targets -- -D warnings`, `shellcheck` on staged shell scripts, and
-  PSScriptAnalyzer on staged `*.ps1` via `scripts/lint-powershell.ps1` (skips
-  itself when the module is not installed).
+  --all-targets -- -D warnings`, `scripts/check-feature-growth.sh` (a new
+  `adk-rust` feature must change what links or carry a recorded decision — see
+  [docs/feature-surface.md](docs/feature-surface.md)), `shellcheck` on staged
+  shell scripts, and PSScriptAnalyzer on staged `*.ps1` via
+  `scripts/lint-powershell.ps1` (skips itself when the module is not installed).
 - **pre-push** — `cargo check --workspace` (a fast compilation check, not the full
   test suite), plus `scripts/check-examples-compile.sh` over all four shards when
   an example or a workspace crate it depends on has changed. The standalone
@@ -318,10 +326,17 @@ adk-action/      Action node definitions (14 node types), StandardProperties, va
 adk-enterprise/  Enterprise client SDK — lightweight HTTP/SSE client for the ADK-Rust Enterprise
                  Managed Agent Service. Zero adk-* runtime dependencies. Agents, sessions,
                  streaming, vaults, memory. Self-hosted support. EXPERIMENTAL.
-adk-managed/     Managed agent runtime — provider-neutral agent execution engine with in-process
-                 checkpointing (state does not survive process loss). ManagedAgentRuntime trait, DefaultManagedAgentRuntime, declarative
-                 ManagedAgentDef, supervised session loop with checkpointing, custom tool
-                 parking, event replay, ScriptedLlm test double, golden fixture tests.
+adk-managed/     Managed agent runtime — provider-neutral agent execution engine.
+                 ManagedAgentRuntime trait, DefaultManagedAgentRuntime, declarative
+                 ManagedAgentDef, supervised session loop, event replay. Every turn runs
+                 under a DurableRunStore run; a turn waiting on a custom tool result or a
+                 tool confirmation parks its run until a store-enforced expiry, and the
+                 answer (ApprovalStore, or the approval service) wakes it on any runtime
+                 instance over the same ManagedStores. Session state survives process loss
+                 with a durable ManagedStateStore (SessionServiceStateStore over any session
+                 backend, FileManagedStateStore). DefaultModelResolver builds Gemini, OpenAI,
+                 Anthropic, Ollama, and OpenAI-compatible models under provider features.
+                 ScriptedLlm test double, golden fixture tests.
                  Feature-gated: `managed-runtime` on umbrella crate. EXPERIMENTAL.
 adk-deploy/      Deployment utilities
 adk-payments/    Payment integration: ACP commerce, AP2 alpha mandates, multi-actor flows
@@ -362,7 +377,7 @@ adk-ui/          Dynamic UI generation (forms, cards, tables, charts) — extrac
 ### Examples and docs
 
 ```
-examples/              97 standalone example crates (each with own Cargo.toml) covering all major
+examples/              117 standalone example crates (each with own Cargo.toml) covering all major
                        features. Additional 120+ examples in the adk-playground repo.
 docs/official_docs/    Comprehensive documentation site content
 ```
@@ -377,6 +392,7 @@ docs/official_docs/    Comprehensive documentation site content
 - `gemini-vertex` — Gemini via Vertex AI (Studio + Vertex backends)
 - `gemini-interactions` — Gemini Interactions API (Beta); re-exports `adk_model::gemini::interactions` AND provides the runtime transport toggle on `GeminiModel` (`use_interactions_api`) that drives the standard `LlmAgent`/`Runner`/tool loop through the Interactions endpoint (allowlist, stateful continuity, `bypass_multi_tools_limit`)
 - `openrouter` — OpenRouter native chat, responses, routing, discovery, and credits APIs
+- `opencode` — OpenCode Go and Zen: `OpenCodeClient` routes each model through Chat Completions, Responses, Anthropic Messages, or Gemini `generateContent` with the application's identity headers (implies `openai`, `anthropic`, `gemini`)
 - `bedrock` — Amazon Bedrock via AWS SDK Converse API
 - `azure-ai` — Azure AI Inference endpoints
 - `all-providers` — enables all real feature flags
@@ -432,6 +448,7 @@ Graph capability features (forwarded to `adk-graph`, which has no default featur
 - `graph-time-travel` — step, fork and state history, in `full`
 - `graph-sqlite` — the SQLite checkpointer; needs a database, so not in `full`
 - `graph-redis-cache` — Redis-backed node cache; needs a server, so not in `full`
+- `graph-postgres`, `graph-redis`, `graph-mongodb`, `graph-neo4j`, `graph-firestore` — shared-database checkpointers; need a server, so not in `full`
 
 Production backend features (require external infrastructure, NOT included in `full`):
 - `postgres-session`, `redis-session`, `mongodb-session`, `firestore-session`, `neo4j-session`,
@@ -439,7 +456,7 @@ Production backend features (require external infrastructure, NOT included in `f
 - `sqlite-memory`, `database-memory`, `redis-memory`, `mongodb-memory`, `neo4j-memory`,
   `vertex-memory`
 - `auth-bridge`
-- `managed-runtime` — Managed agent runtime (adk-managed): durable sessions, event streaming, provider parity
+- `managed-runtime` — Managed agent runtime (adk-managed): durable sessions and parked tool calls, event streaming, provider parity; the `gemini`, `openai`, `anthropic` and `ollama` features also let its `DefaultModelResolver` build those providers
 
 Specialist opt-in features:
 - `yaml-agent`, `agent-registry` — YAML agent config and registry REST API
@@ -462,10 +479,11 @@ Specialist opt-in features:
 - `codeact` — CodeAct agents: the model acts by writing code (forwarded to adk-agent)
 - `codeact-monty` — Python `CodeRuntime` for the CodeActAgent via the Monty interpreter (adk-codeact-monty; implies `codeact`)
 - `slack`, `bigquery`, `spanner` — Native toolsets
-- `action`, `action-http`, `action-trigger`, `action-db`, `action-code`, `action-email`, `action-rss`, `action-full` — Action node executors
+- `action`, `action-http`, `action-trigger`, `action-db`, `action-code`, `action-email`, `action-rss`, `action-full` — Action node executors. Implemented: trigger, set, transform, switch, loop, merge, wait, file (confined to allowed roots), Rust code, HTTP and notification (`action-http`, host/scheme policy), RSS (`action-rss`). `action-db`, `action-email`, and `action-code` compile placeholders only: database, email, and JavaScript/TypeScript code nodes are not implemented and are rejected when the graph compiles
 - `video-avatar` — HeyGen/D-ID avatar providers
 - `acp` — Agent Client Protocol integration
 - `openrouter` — OpenRouter native APIs
+- `opencode` — OpenCode Go and Zen per-model routing (`OpenCodeClient`)
 - Audio ONNX models: `whisper-onnx`, `distil-whisper`, `moonshine`, `kokoro`, `chatterbox`, `qwen3-tts`
 
 Individual features (`agents`, `models`, `tools`, `sessions`, `server`, `graph`, `realtime`, `eval`, `browser`, `auth`, `guardrail`, `plugin`, `telemetry`, `cli`, `skills`, `artifacts`, `memory`, `code`, `sandbox`, `audio`, `awp`, `acp`, `rag`, `payments`, etc.) can be selected independently.
@@ -576,9 +594,32 @@ Use `adk_core::AdkError` (not `adk_core::Error`) when returning errors from agen
 
 ## Tool authorization
 
-Four mechanisms for controlling tool execution, composable in any combination:
+Five mechanisms for controlling tool execution, composable in any combination:
 
-1. **`ToolConfirmationPolicy`** — built-in HITL. Pauses execution, emits a `ToolConfirmationRequest` event, waits for `Approve`/`Deny` on the next run. Works in CLI and web server via SSE events.
+1. **`ToolPolicy`** — run-wide allow / deny / require-approval decision per call, set with
+   `Runner::builder().tool_policy(...)` or `RunConfig::tool_policy`. `DeclarativePolicy` matches
+   rules in order on a tool-name glob, the tool's declared `ToolEffect`, and JSON-pointer argument
+   predicates (`equals`, `in_set`, `at_most`, `starts_with`, `domain_in`), and the acting agent
+   (`for_agent` glob on its `AgentId`, `for_tenant`, `for_class`); a tool no rule permits is
+   **denied by default**.
+
+```rust
+let policy = DeclarativePolicy::builder()
+    .allow_read_only()
+    .rule(PolicyRule::allow("transfer").when(ArgPredicate::at_most("/amount", 100.0)))
+    .require_approval("transfer", "transfers over 100 need approval")
+    .build();
+let runner = Runner::builder()
+    .app_name("ops")
+    .agent(agent)
+    .session_service(sessions)
+    .tool_policy(Arc::new(policy))
+    .build()?;
+```
+
+2. **`ToolConfirmationPolicy`** — built-in HITL. A `ToolConfirmationHandler` decides each call
+   inside the run (bounded by `RunConfig::tool_confirmation_timeout`, denied when it expires);
+   without one the agent holds the call, emits a `ToolConfirmationRequest` event, and ends the run.
 
 ```rust
 let agent = LlmAgentBuilder::new("assistant")
@@ -589,9 +630,13 @@ let agent = LlmAgentBuilder::new("assistant")
     .build()?;
 ```
 
-The agent emits `event.actions.tool_confirmation = Some(ToolConfirmationRequest { tool_name, args, function_call_id })`. Pass the decision back via `RunConfig::tool_confirmation_decisions`.
+A decision binds to the call's fingerprint (`ToolConfirmationRequest::fingerprint()`: tool name
+plus canonical arguments), not its call ID, so it authorizes the same call re-issued by the next
+run. Pass it as `RunConfig::tool_approvals` (valid for the run, optional expiry) or record it in an
+`ApprovalStore` (`RunConfig::approval_store`; consumed by the call it authorizes). Decisions keyed
+by call ID (`RunConfig::tool_confirmation_decisions`) still apply to the exact call they name.
 
-2. **`BeforeToolCallback`** — programmatic gate. Return `Ok(Some(content))` to skip, `Ok(None)` to allow.
+3. **`BeforeToolCallback`** — programmatic gate. Return `Ok(Some(content))` to skip, `Ok(None)` to allow. `LlmAgent` answers the skipped call with that content: text becomes the call's `{"error": "<text>"}` function response.
 
 ```rust
 .before_tool_callback(Box::new(|ctx| {
@@ -604,11 +649,62 @@ The agent emits `event.actions.tool_confirmation = Some(ToolConfirmationRequest 
 }))
 ```
 
-3. **`adk-auth` RBAC** — role-based access control with `ProtectedTool` wrapper and audit logging.
+4. **`adk-auth` RBAC** — role-based access control with `ProtectedTool` wrapper and audit logging.
 
-4. **Graph interrupts** (`adk-graph`) — checkpoint-based pauses with durable state for complex approval workflows.
+5. **Graph interrupts** (`adk-graph`) — checkpoint-based pauses with durable state for complex approval workflows.
 
-Evaluation order: RBAC → BeforeToolCallback → ToolConfirmationPolicy → execute → AfterToolCallback.
+`GovernanceControl` is the org kill switch: `runner.governance().freeze(reason)` fails new runs at
+their start and stops running ones before their next model call or tool call. `adk-server` shares
+one through `ServerConfig::governance` and exposes `POST /api/admin/freeze` / `unfreeze`
+(`ServerBuilder::enable_governance_endpoints`), which also pause background and cron scheduling.
+`RealtimeAgent`, `RealtimeRunner`, and `IntegratedRealtimeRunner` dispatch through the same
+governed path.
+
+A held call resumes deterministically: at the start of each run, before its first model call,
+`LlmAgent` finds its held calls (`adk_core::held_tool_calls`) and dispatches each one that has a
+decision (`adk_core::confirmation_decision_available`) under its original call ID through the
+order below. Its response supersedes the call's `confirmation_pending_response` in the projected
+history; a call without a decision stays held. `CodeActAgent` resumes from its checkpoint.
+
+Evaluation order in `LlmAgent` (`adk-agent/src/llm_agent.rs`) and `CodeActAgent`:
+
+1. Run budget (`RunConfig::budget`) — the model turn's whole tool batch is reserved before any
+   call starts (`CodeActAgent`: each call); a refused batch is answered `not run` and the run
+   ends with `ResourceExhausted`.
+2. Enhanced plugins (`before_tool_call`) — may rewrite the arguments.
+3. Run-wide `InvocationHooks` (the runner's `PluginManager`), then `BeforeToolCallback`.
+4. Circuit breaker.
+5. The governed path, `adk_core::authorize_tool_call`, on the final arguments: kill switch →
+   `ToolPolicy` → `ToolGuardrailSet` (a rewrite is checked against the policy again) →
+   confirmation (call-ID decision, fingerprint approval, `ApprovalStore`, handler, or hold).
+6. Action ledger begin (`NonIdempotent` tools, `RunConfig::action_ledger`) — a recorded call is
+   answered from its record without executing (`CodeActAgent` raises the answer into the
+   script). Shared helper: `adk-agent/src/tool_ledger.rs`.
+7. `execute()` under the tool's timeout — `adk-auth` wrappers (`ProtectedTool`, `ScopeGuard`)
+   check RBAC and scopes here, so a denial is a tool error. Only `ReadOnly` and `Idempotent`
+   tools are retried (retryable error or timeout, with backoff).
+8. Action ledger complete — a `NonIdempotent` call that timed out or panicked stays begun and is
+   answered `outcome_unknown`.
+9. `on_tool_error` (hooks, then callbacks) when the tool failed.
+10. `AfterToolCallback` (hooks, then callbacks), `AfterToolCallbackFull`, then enhanced plugins
+    (`after_tool_call`).
+
+A hook or callback that returns a value short-circuits the remaining callbacks of its kind.
+
+Every run has an acting agent (`ActingContext`, `ReadonlyContext::acting_context()`), resolved
+for the agent that is executing — root, transfer target, or workflow/team sub-agent — from
+`RunConfig::acting` (`ActingConfig::principals` by agent name), the runner's
+`identity_source(...)` (root: `principal_for` or `current`; others: `principal_for`), else
+`urn:adk:agent:{app}/{agent}`. The subject is always the session's user as
+`ActingConfig::subject_kind` (`Human` by default, `Service` for scheduler, webhook, and queue
+runs); a run asking to act for anyone else fails with `identity.subject_mismatch` unless the
+runner's `subject_delegation(...)` policy allows it. `ActingContext` carries no invocation id —
+the execution identity's is the only one. `ToolPolicyRequest::acting`,
+`ToolConfirmationRequest::acting`, `SpendKey::agent`, and `adk_auth::AuditEvent::agent_id` carry
+it; `AgentTool` delegation appends the caller to the delegate's `delegation_chain`. Context
+wrappers must forward `acting_context()`. `DurableWorker` honours a run's stored principal only
+for agent ids in `DurableWorkerConfig::allowed_principals`. See
+`docs/official_docs/security/agent-identity.md`.
 
 See `docs/official_docs/security/tool-authorization.md` for full documentation with CLI and web server examples.
 
@@ -647,7 +743,8 @@ cargo nextest run -p adk-realtime --features full            # with features
 - When making a change that adds or changes an API, ensure that `docs/official_docs/` is up to date.
 - Documented examples (Cargo snippets, feature names, and package/example references in `README.md` and `docs/official_docs/`) are validated in CI by `scripts/check-doc-examples.sh` against `cargo metadata`. The PR tier compiles the standalone example workspaces and cargo-adk templates, so if you change a public API, keep those in sync.
 - Update the crate's `README.md` if capabilities changed.
-- Update `CHANGELOG.md` for user-facing changes.
+- Add a changelog fragment under `changelog.d/` for user-facing changes (`<section>.<slug>.md`,
+  see `changelog.d/README.md`). `CHANGELOG.md` itself changes only in release commits.
 
 ## Adding new code
 
@@ -788,7 +885,7 @@ pub async fn swap_adapter(&self, adapter_name: &str) -> Result<()> { ... }
 - **Branch naming**: Use `prefix/short-description`. Allowed prefixes: `feat/`, `fix/`, `docs/`, `refactor/`, `test/`, `chore/`.
 - **Reference**: Include `Fixes #123` or similar in the PR description.
 - **Scope**: Keep PRs focused — one logical change per PR. Don't mix unrelated changes.
-- **Local gates before pushing**: Run `fmt`, `clippy`, `test`, and `check` via `devenv shell`. These are local shorthand, not CI job names — `check` has no CI job at all.
+- **Local gates before pushing**: Run `fmt`, `clippy`, `test`, and `check` via `devenv shell`. These are local shorthand, not CI job names — `check` has no CI job at all. `scripts/validate-pr.sh` runs the PR tier scoped to the branch's changes (see CONTRIBUTING.md, "Validating a Branch Locally").
 - **CI gates that block merge**: `pr-gate` (all `ci.yml` PR-tier jobs) and `semver`; see [CI cost tiers](#ci-cost-tiers). CONTRIBUTING.md ("Branch Protection — Required Status Checks") is authoritative.
 
 ### PR Checklist requirements
@@ -803,7 +900,7 @@ pub async fn swap_adapter(&self, adapter_name: &str) -> Result<()> { ... }
    - Commit messages follow conventional format.
    - Branch targets `main` branch.
 3. **Documentation**:
-   - `CHANGELOG.md` updated for user-facing changes.
+   - Changelog fragment added under `changelog.d/` for user-facing changes.
    - `README.md` updated if crate capabilities changed.
    - Examples added or updated for new features.
 
@@ -822,21 +919,21 @@ Always verify builds during publish — never use `--no-verify`. Verification en
 Crates must be published in dependency order. `cargo xtask publish` (via
 `./publish.sh`) computes the order from the workspace graph, so this list is
 documentation rather than configuration — `scripts/check-publish-order.sh` is the
-gate that keeps it satisfiable. The current 8 tiers over 43 publishable crates:
+gate that keeps it satisfiable. The current 9 tiers over 43 publishable crates:
 
 ```
-Tier 1: adk-core, adk-anthropic, adk-deploy, adk-enterprise, adk-rust-macros,
-        adk-telemetry, awp-types
-Tier 2: adk-action, adk-artifact, adk-awp, adk-browser, adk-devtools, adk-gcp,
-        adk-gemini, adk-guardrail, adk-memory, adk-mistralrs, adk-plugin,
-        adk-sandbox, adk-session
-Tier 3: adk-code, adk-graph, adk-model, adk-rag, adk-realtime, adk-retry-reflect,
-        adk-skill
-Tier 4: adk-agent, adk-audio, adk-runner, adk-tool
-Tier 5: adk-acp, adk-codeact-monty, adk-eval, adk-managed, adk-server
-Tier 6: adk-auth, adk-bench, adk-cli
-Tier 7: adk-computer-use, adk-payments, cargo-adk
-Tier 8: adk-rust (umbrella — always last)
+Tier 1: adk-anthropic, adk-core, adk-enterprise, adk-rust-macros, adk-telemetry,
+        awp-types
+Tier 2: adk-action, adk-awp, adk-browser, adk-devtools, adk-gcp, adk-gemini,
+        adk-guardrail, adk-mistralrs, adk-plugin, adk-sandbox
+Tier 3: adk-artifact, adk-code, adk-deploy, adk-graph, adk-memory, adk-model,
+        adk-rag, adk-retry-reflect, adk-session, adk-skill
+Tier 4: adk-realtime, adk-runner, adk-tool
+Tier 5: adk-acp, adk-agent, adk-audio, adk-eval
+Tier 6: adk-bench, adk-codeact-monty, adk-managed, adk-server
+Tier 7: adk-auth, adk-cli, cargo-adk
+Tier 8: adk-computer-use, adk-payments
+Tier 9: adk-rust (umbrella — always last)
 ```
 
 > **Note:** internal **dev**-dependencies are declared path-only (no version) so
@@ -860,7 +957,7 @@ cargo publish -p <crate-name>
 
 - [ ] `[workspace.package] version` in root `Cargo.toml`
 - [ ] All `adk-*` entries in `[workspace.dependencies]`
-- [ ] `CHANGELOG.md` updated
+- [ ] Changelog fragments assembled into `CHANGELOG.md` (`bash scripts/changelog-assemble.sh --into <version>`)
 - [ ] Git tag created and pushed
 - [ ] GitHub release created with release notes
 

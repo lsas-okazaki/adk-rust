@@ -174,6 +174,8 @@ impl RecordingModel {
             error_message: None,
             provider_metadata: None,
             interaction_id: None,
+            model: None,
+            provider: None,
         }
     }
 
@@ -190,6 +192,8 @@ impl RecordingModel {
             error_message: None,
             provider_metadata: None,
             interaction_id: None,
+            model: None,
+            provider: None,
         }
     }
 }
@@ -451,6 +455,59 @@ struct CountingTool {
     calls: Arc<Mutex<usize>>,
 }
 
+#[derive(Default)]
+struct DelegationDispatchState {
+    delegation_active: AtomicUsize,
+    delegation_max_active: AtomicUsize,
+    ordinary_active: AtomicUsize,
+    ordinary_max_active: AtomicUsize,
+    delegation_overlapped_ordinary: AtomicBool,
+    ordinary_overlapped_delegation: AtomicBool,
+}
+
+struct DelegationDispatchTool {
+    name: &'static str,
+    delegation: bool,
+    state: Arc<DelegationDispatchState>,
+}
+
+#[async_trait]
+impl Tool for DelegationDispatchTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        "Records delegation-only dispatch behavior"
+    }
+
+    fn is_agent_delegation(&self) -> bool {
+        self.delegation
+    }
+
+    async fn execute(&self, _ctx: Arc<dyn ToolContext>, args: Value) -> Result<Value> {
+        if self.delegation {
+            if self.state.ordinary_active.load(Ordering::SeqCst) != 0 {
+                self.state.delegation_overlapped_ordinary.store(true, Ordering::SeqCst);
+            }
+            let active = self.state.delegation_active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state.delegation_max_active.fetch_max(active, Ordering::SeqCst);
+            let delay_ms = args.get("delay_ms").and_then(Value::as_u64).unwrap_or(50);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            self.state.delegation_active.fetch_sub(1, Ordering::SeqCst);
+        } else {
+            if self.state.delegation_active.load(Ordering::SeqCst) != 0 {
+                self.state.ordinary_overlapped_delegation.store(true, Ordering::SeqCst);
+            }
+            let active = self.state.ordinary_active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state.ordinary_max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.state.ordinary_active.fetch_sub(1, Ordering::SeqCst);
+        }
+        Ok(json!({ "ok": true }))
+    }
+}
+
 impl CountingTool {
     fn new() -> Self {
         Self { calls: Arc::new(Mutex::new(0)) }
@@ -516,6 +573,61 @@ async fn toolsets_are_refreshed_between_model_turns_after_a_tool_call() {
     assert_eq!(requests.len(), 3);
     assert!(!requests[0].tools.contains_key("activated_capability"));
     assert!(requests[1].tools.contains_key("activated_capability"));
+}
+
+/// A toolset whose backing server is unreachable.
+struct UnreachableToolset;
+
+#[async_trait]
+impl Toolset for UnreachableToolset {
+    fn name(&self) -> &str {
+        "unreachable"
+    }
+
+    async fn tools(&self, _ctx: Arc<dyn adk_core::ReadonlyContext>) -> Result<Vec<Arc<dyn Tool>>> {
+        Err(adk_core::AdkError::tool("Failed to list MCP tools: connection refused"))
+    }
+}
+
+#[tokio::test]
+async fn a_failing_toolset_is_skipped_and_the_turn_continues() {
+    let model = Arc::new(RecordingModel::new(vec![RecordingModel::text_response("answered")]));
+    let agent = LlmAgentBuilder::new("resilient-agent")
+        .model(model.clone())
+        .tool(Arc::new(IdCapturingTool::new()))
+        .toolset(Arc::new(UnreachableToolset))
+        .build()
+        .expect("agent builds");
+
+    let stream = agent.run(Arc::new(TestContext::new("hello"))).await.expect("run");
+    let events = drain_stream(stream).await.expect("a failing toolset must not fail the turn");
+
+    let answer = events
+        .iter()
+        .filter_map(|event| event.llm_response.content.as_ref())
+        .flat_map(|content| content.parts.iter())
+        .find_map(Part::text);
+    assert_eq!(answer, Some("answered"));
+    let requests = model.requests.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].tools.keys().collect::<Vec<_>>(), vec!["test_tool"]);
+}
+
+#[tokio::test]
+async fn strict_toolsets_fail_the_turn_when_a_toolset_fails() {
+    let model = Arc::new(RecordingModel::new(vec![RecordingModel::text_response("answered")]));
+    let agent = LlmAgentBuilder::new("strict-agent")
+        .model(model.clone())
+        .toolset(Arc::new(UnreachableToolset))
+        .strict_toolsets(true)
+        .build()
+        .expect("agent builds");
+
+    let stream = agent.run(Arc::new(TestContext::new("hello"))).await.expect("run");
+    let error = drain_stream(stream).await.expect_err("strict mode must surface the failure");
+
+    assert!(error.to_string().contains("connection refused"), "{error}");
+    assert!(model.requests.lock().unwrap_or_else(|error| error.into_inner()).is_empty());
 }
 
 #[tokio::test]
@@ -715,6 +827,79 @@ async fn test_parallel_is_explicit_tool_metadata_override() {
         max_concurrent_tool_calls(adk_core::ToolExecutionStrategy::Parallel, false).await;
 
     assert_eq!(max_active, 2);
+}
+
+#[tokio::test]
+async fn test_parallel_delegations_only_overlaps_consecutive_agent_tools() {
+    let model = Arc::new(RecordingModel::new(vec![
+        RecordingModel::function_calls(vec![
+            Part::FunctionCall {
+                name: "ordinary_probe".to_string(),
+                args: json!({}),
+                id: Some("ordinary-before".to_string()),
+                thought_signature: None,
+            },
+            Part::FunctionCall {
+                name: "delegate_probe".to_string(),
+                args: json!({ "delay_ms": 80 }),
+                id: Some("delegate-a".to_string()),
+                thought_signature: None,
+            },
+            Part::FunctionCall {
+                name: "delegate_probe".to_string(),
+                args: json!({ "delay_ms": 10 }),
+                id: Some("delegate-b".to_string()),
+                thought_signature: None,
+            },
+            Part::FunctionCall {
+                name: "ordinary_probe".to_string(),
+                args: json!({}),
+                id: Some("ordinary-after".to_string()),
+                thought_signature: None,
+            },
+        ]),
+        RecordingModel::text_response("done"),
+    ]));
+    let state = Arc::new(DelegationDispatchState::default());
+    let delegate_tool = Arc::new(DelegationDispatchTool {
+        name: "delegate_probe",
+        delegation: true,
+        state: state.clone(),
+    });
+    let ordinary_tool = Arc::new(DelegationDispatchTool {
+        name: "ordinary_probe",
+        delegation: false,
+        state: state.clone(),
+    });
+    let agent = LlmAgentBuilder::new("delegation-dispatch-agent")
+        .model(model.clone())
+        .tool(delegate_tool)
+        .tool(ordinary_tool)
+        .parallelize_agent_delegations(true)
+        .build()
+        .unwrap();
+
+    let stream = agent.run(Arc::new(TestContext::new("delegate safely"))).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), drain_stream(stream))
+        .await
+        .expect("delegation dispatch timed out")
+        .unwrap();
+
+    assert_eq!(state.delegation_max_active.load(Ordering::SeqCst), 2);
+    assert_eq!(state.ordinary_max_active.load(Ordering::SeqCst), 1);
+    assert!(!state.delegation_overlapped_ordinary.load(Ordering::SeqCst));
+    assert!(!state.ordinary_overlapped_delegation.load(Ordering::SeqCst));
+    let requests = model.requests.lock().unwrap_or_else(|error| error.into_inner());
+    let response_ids = requests[1]
+        .contents
+        .iter()
+        .flat_map(|content| &content.parts)
+        .filter_map(|part| match part {
+            Part::FunctionResponse { id, .. } => id.as_deref(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(response_ids, ["ordinary-before", "delegate-a", "delegate-b", "ordinary-after"]);
 }
 
 #[tokio::test]
@@ -1039,4 +1224,117 @@ async fn test_agent_leaves_previous_response_id_none_without_interaction_id() {
     assert_eq!(requests.len(), 2, "expected two model calls (tool loop)");
     assert_eq!(requests[0].previous_response_id, None);
     assert_eq!(requests[1].previous_response_id, None);
+}
+
+// ── output_key is persisted only after output-schema validation ─────────
+
+fn score_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "score": { "type": "number" } },
+        "required": ["score"]
+    })
+}
+
+/// Collects every `output_key` value the agent emitted, plus the terminal error, if any.
+async fn output_key_writes(
+    mut stream: EventStream,
+    output_key: &str,
+) -> (Vec<Value>, Option<adk_core::AdkError>) {
+    let mut writes = Vec::new();
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(event) => writes.extend(event.actions.state_delta.get(output_key).cloned()),
+            Err(error) => return (writes, Some(error)),
+        }
+    }
+    (writes, None)
+}
+
+#[tokio::test]
+async fn output_key_is_not_written_when_schema_validation_is_exhausted() {
+    let model = Arc::new(RecordingModel::new(vec![
+        RecordingModel::text_response("not json"),
+        RecordingModel::text_response("still not json"),
+    ]));
+    let agent = LlmAgentBuilder::new("schema-agent")
+        .model(model)
+        .output_schema(score_schema())
+        .output_max_retries(1)
+        .output_key("result")
+        .build()
+        .unwrap();
+
+    let stream = agent.run(Arc::new(TestContext::new("score this"))).await.unwrap();
+    let (writes, error) = output_key_writes(stream, "result").await;
+
+    assert_eq!(writes, Vec::<Value>::new(), "invalid output must not reach state[output_key]");
+    assert_eq!(
+        error.map(|error| error.message),
+        Some("output schema validation failed after 1 attempts".to_string())
+    );
+}
+
+#[tokio::test]
+async fn output_key_holds_only_the_validated_retry() {
+    let model = Arc::new(RecordingModel::new(vec![
+        RecordingModel::text_response("not json"),
+        RecordingModel::text_response(r#"{"score": 7}"#),
+    ]));
+    let agent = LlmAgentBuilder::new("schema-agent")
+        .model(model)
+        .output_schema(score_schema())
+        .output_max_retries(1)
+        .output_key("result")
+        .build()
+        .unwrap();
+
+    let stream = agent.run(Arc::new(TestContext::new("score this"))).await.unwrap();
+    let (writes, error) = output_key_writes(stream, "result").await;
+
+    assert!(error.is_none(), "unexpected error: {error:?}");
+    assert_eq!(writes, vec![json!(r#"{"score": 7}"#)]);
+}
+
+// ── After-tool callbacks see the parallel agent's shared state ─────────
+
+#[tokio::test]
+async fn after_tool_callback_receives_shared_state() {
+    let model = Arc::new(RecordingModel::new(vec![
+        RecordingModel::function_calls(vec![Part::FunctionCall {
+            name: "test_tool".to_string(),
+            args: json!({}),
+            id: Some("call-shared".to_string()),
+            thought_signature: None,
+        }]),
+        RecordingModel::text_response("done"),
+    ]));
+    let observed = Arc::new(Mutex::new(None));
+    let recorder = observed.clone();
+    let agent = LlmAgentBuilder::new("shared-agent")
+        .model(model)
+        .tool(Arc::new(CountingTool::new()))
+        .after_tool_callback(Box::new(move |ctx| {
+            let recorder = recorder.clone();
+            Box::pin(async move {
+                let shared =
+                    ctx.shared_state().expect("after-tool callbacks should see shared state");
+                shared.set_shared("after_tool", json!(ctx.tool_name())).await?;
+                let outcome_seen = ctx.tool_outcome().is_some();
+                *recorder.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((outcome_seen, shared.snapshot().await));
+                Ok(None)
+            })
+        }))
+        .build()
+        .unwrap();
+    let parallel = ParallelAgent::new("parallel", vec![Arc::new(agent)]).with_shared_state();
+
+    let stream = parallel.run(Arc::new(TestContext::new("use the tool"))).await.unwrap();
+    drain_stream(stream).await.unwrap();
+
+    assert_eq!(
+        *observed.lock().unwrap_or_else(|e| e.into_inner()),
+        Some((true, HashMap::from([("after_tool".to_string(), json!("test_tool"))])))
+    );
 }
