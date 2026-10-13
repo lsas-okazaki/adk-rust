@@ -19,7 +19,10 @@ use google_cloud_aiplatform_v1::client::PredictionService;
 #[cfg(feature = "vertex")]
 use google_cloud_auth::credentials::{self, Credentials};
 use mime::Mime;
-use reqwest::{ClientBuilder, header::InvalidHeaderValue};
+use reqwest::{
+    ClientBuilder,
+    header::{HeaderMap, HeaderValue, InvalidHeaderValue},
+};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use std::{
@@ -68,7 +71,8 @@ pub enum Model {
     Gemini31FlashImage,
 
     // ── Gemini 3 ─────────────────────────────────────────────────
-    /// Gemini 3 Pro preview.
+    /// Gemini 3 Pro preview (retired).
+    #[deprecated(note = "Retired. Use Model::Gemini31ProPreview instead.")]
     #[serde(rename = "models/gemini-3-pro-preview")]
     Gemini3ProPreview,
     /// Gemini 3 Pro Image (Nano Banana Pro) — GA multimodal output.
@@ -955,6 +959,7 @@ fn build_vertex_prediction_service(
                 .block_on(
                     PredictionService::builder()
                         .with_endpoint(endpoint)
+                        .with_retry_policy(google_cloud_gax::retry_policy::NeverRetry)
                         .with_credentials(credentials)
                         .build(),
                 )
@@ -999,6 +1004,8 @@ pub struct GeminiBuilder {
     base_url: Url,
     #[cfg(feature = "vertex")]
     google_cloud: Option<GoogleCloudConfig>,
+    #[cfg(feature = "vertex")]
+    google_cloud_endpoint: Option<String>,
     api_key: Option<String>,
     #[cfg(feature = "vertex")]
     google_cloud_auth: Option<GoogleCloudAuth>,
@@ -1013,6 +1020,8 @@ impl GeminiBuilder {
             base_url: DEFAULT_BASE_URL.clone(),
             #[cfg(feature = "vertex")]
             google_cloud: None,
+            #[cfg(feature = "vertex")]
+            google_cloud_endpoint: None,
             api_key: Some(key.into()),
             #[cfg(feature = "vertex")]
             google_cloud_auth: None,
@@ -1025,7 +1034,11 @@ impl GeminiBuilder {
         self
     }
 
-    /// Set a custom HTTP client builder.
+    /// Set a custom HTTP client builder for the AI Studio backend.
+    ///
+    /// Settings such as proxies, timeouts and default headers apply to every Studio
+    /// request. The redirect policy is always replaced with
+    /// [`reqwest::redirect::Policy::none`] so the API key is never re-sent to another host.
     pub fn with_http_client(mut self, client_builder: ClientBuilder) -> Self {
         self.client_builder = client_builder;
         self
@@ -1063,6 +1076,23 @@ impl GeminiBuilder {
     ) -> Self {
         self.google_cloud =
             Some(GoogleCloudConfig { project_id: project_id.into(), location: location.into() });
+        self
+    }
+
+    /// Override the Vertex API endpoint without switching to the Studio backend.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_gemini::GeminiBuilder;
+    ///
+    /// let builder = GeminiBuilder::new("api-key")
+    ///     .with_google_cloud("my-project", "us-central1")
+    ///     .with_google_cloud_endpoint("https://us-central1-aiplatform.googleapis.com");
+    /// ```
+    #[cfg(feature = "vertex")]
+    pub fn with_google_cloud_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.google_cloud_endpoint = Some(endpoint.into());
         self
     }
 
@@ -1108,7 +1138,7 @@ impl GeminiBuilder {
                     },
                 };
                 let credentials = google_cloud_auth.credentials()?;
-                let endpoint = config.endpoint();
+                let endpoint = self.google_cloud_endpoint.unwrap_or_else(|| config.endpoint());
                 let prediction =
                     build_vertex_prediction_service(endpoint.clone(), credentials.clone())?;
 
@@ -1129,8 +1159,20 @@ impl GeminiBuilder {
             return MissingApiKeySnafu.fail();
         }
 
+        let mut key = HeaderValue::from_str(&api_key).context(InvalidApiKeySnafu)?;
+        key.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-goog-api-key", key);
+        // A redirect would re-send `x-goog-api-key` to the target host, so the Studio
+        // client never follows one, whatever the configured builder says.
+        let client = self
+            .client_builder
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context(PerformRequestNewSnafu)?;
         let studio =
-            backend::studio::StudioBackend::new(&api_key, self.model.clone(), self.base_url)?;
+            backend::studio::StudioBackend::with_client(client, self.model.clone(), self.base_url);
 
         Ok(Gemini { client: Arc::new(GeminiClient::with_studio(self.model, studio)) })
     }
@@ -1793,5 +1835,37 @@ mod client_tests {
             location: "europe-west4".to_string(),
         };
         assert_eq!(config.endpoint(), "https://europe-west4-aiplatform.googleapis.com");
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::GeminiBuilder;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn studio_builder_does_not_follow_redirects() {
+        let target = MockServer::start().await;
+        Mock::given(any()).respond_with(ResponseTemplate::new(200)).expect(0).mount(&target).await;
+        let origin = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/landing", target.uri())),
+            )
+            .expect(1)
+            .mount(&origin)
+            .await;
+        let client = GeminiBuilder::new("test-key")
+            .with_base_url(format!("{}/v1beta/", origin.uri()).parse().unwrap())
+            .with_http_client(reqwest::ClientBuilder::new())
+            .build()
+            .unwrap();
+
+        let result = client.generate_content().with_user_message("hello").execute().await;
+
+        assert!(result.is_err());
+        assert_eq!(target.received_requests().await.unwrap().len(), 0);
     }
 }

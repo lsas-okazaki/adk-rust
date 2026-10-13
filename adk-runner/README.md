@@ -24,14 +24,14 @@ Agent execution runtime for ADK-Rust.
 
 ```toml
 [dependencies]
-adk-runner = "2.2.0"
+adk-runner = "3.0.0"
 ```
 
 Or use the meta-crate:
 
 ```toml
 [dependencies]
-adk-rust = { version = "2.2.0", features = ["runner"] }
+adk-rust = { version = "3.0.0", features = ["runner"] }
 ```
 
 ## Quick Start
@@ -67,6 +67,8 @@ while let Some(event) = stream.next().await {
 ```
 
 The builder enforces required fields (`app_name`, `agent`, `session_service`) at compile time. Optional fields default to sensible values. The old `Runner::new(RunnerConfig { ... })` constructor remains available for backward compatibility.
+
+`action_ledger`, `approval_store`, and `spend_ledger` install durable stores on every run that does not carry its own in `RunConfig`. Any backend implementing the `adk-core` traits works — in-memory, or SQLite, PostgreSQL, Redis, MongoDB, Neo4j, or Firestore from `adk-session`.
 
 ## RunnerConfig
 
@@ -119,6 +121,34 @@ After allowlist and depth validation, Runner awaits `Agent::govern_transfer`
 before executing the target. The default allows the transfer, preserving
 existing behavior; portable teams and other composite roots can deny it with an
 auditable reason. Denials surface as `agent.transfer.denied`.
+
+## Run Budgets
+
+`RunnerConfigBuilder::budget(RunBudget)` limits model calls, total tokens, cost,
+wall time and tool calls. Each run gets a fresh `BudgetTracker`, shared with
+transfer targets, workflow sub-agents and agent tools through the run config.
+Limits are checked before every model call and tool dispatch; a run that reaches
+one ends with a persisted event explaining why and an `AdkError` with category
+`ResourceExhausted`. Under a cost cap, a response with no known cost stops the
+run unless `RunBudget::allow_unpriced_models()` is set.
+
+```rust,ignore
+use adk_core::RunBudget;
+
+let runner = Runner::builder()
+    .app_name("my_app")
+    .agent(agent)
+    .session_service(sessions)
+    .budget(RunBudget::new().max_cost_usd(50.0).max_tool_calls(100))
+    .build()?;
+```
+
+## Model History After Overlapping or Interrupted Turns
+
+- **Actual results:** late tool responses are paired with their calls before a later user turn.
+- **Missing results:** unresolved calls from earlier turns are omitted from model history; no result is fabricated.
+- **Current execution:** unresolved calls at the history tail remain available for tool execution and confirmation.
+- **Persistence:** source session events are unchanged by this projection.
 
 ## State Propagation
 
@@ -189,6 +219,17 @@ When compaction triggers, `MutableSession::conversation_history()` automatically
 Re-exported for convenience: `adk_runner::{BaseEventsSummarizer, EventsCompactionConfig}`.
 
 See [Context Compaction](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/sessions/context-compaction.md) for full documentation.
+
+## Spend Ledger
+
+When `RunConfig::spend_ledger` is set, every model call of the run — agent turns,
+compaction summaries (post-run, intra-invocation and `context-compaction`), LLM routing and
+MCP sampling — reserves its upper-bound cost (`Llm::max_cost_micro_usd`) before it is sent
+and commits its reported `UsageMetadata::cost`, keyed by app, agent, and vendor, through
+`adk_core::ModelCallScope`. A reservation the ledger refuses fails the call, so a capped run
+never spends past its cap. `Runner::with_llm_spend_estimate` sets what an unpriced call
+commits when it reports no cost. See
+[Spend Ledger](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/security/spend-ledger.md).
 
 ## Related Crates
 

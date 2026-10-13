@@ -1,285 +1,228 @@
-//! Background runs must actually run, and a cron occurrence must be claimed once.
-//!
-//! Three defects motivated these tests:
-//!
-//! 1. `BackgroundRunner::run_with_timeout` received neither the workflow ID nor the
-//!    input. It checked cancellation and returned `Completed` with an empty object, so a
-//!    client got a completed status for work that never ran, and retry could never be
-//!    exercised because the placeholder had no way to fail.
-//! 2. Under the `Queue` concurrency policy the scheduler advanced `last_execution` only
-//!    when a run *started*, so an occurrence waiting behind an active run stayed due and
-//!    was enqueued again on every one-second poll. When the active run finished, its
-//!    monitor started one queued run without creating a monitor for it, leaving
-//!    `active_run_count` permanently nonzero and the queue stalled.
-//! 3. The module documented `GET /cron/{job_id}`; only PATCH and DELETE were mounted.
+//! Background runs execute real work through the embedded durable worker, and the cron
+//! routes manage schedules in the schedule store.
 
 #![cfg(feature = "background")]
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use adk_core::{RunFilter, RunState};
 use adk_server::background::{
-    BackgroundState, CronState, RunStatus, WorkflowRegistry, background_runs_router_with_state,
-    cron_jobs_router_with_state,
+    BackgroundState, CronState, WorkflowRegistry, background_runs_router_with_state,
+    cron_jobs_router_with_state, start_cron_scheduler,
 };
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use serde_json::{Value, json};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 use tower::ServiceExt;
 
-/// Polls a run until it reaches a terminal status, or gives up.
-async fn await_terminal(state: &BackgroundState, run_id: &str) -> RunStatus {
-    for _ in 0..200 {
-        if let Some(run) = state.store.get(run_id).await {
-            match run.status {
-                RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled => {
-                    return run.status;
-                }
-                _ => {}
-            }
+async fn call(app: Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+    let builder = Request::builder().method(method).uri(uri);
+    let request = match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+async fn await_terminal(state: &BackgroundState, run_id: &str) -> Value {
+    for _ in 0..500 {
+        let (status, body) = call(
+            background_runs_router_with_state(state.clone()),
+            "GET",
+            &format!("/runs/{run_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        if matches!(body["status"].as_str(), Some("completed" | "failed" | "cancelled")) {
+            return body;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("run {run_id} never reached a terminal status");
+    panic!("run {run_id} never finished");
 }
 
-// ── Background runs execute real work ──────────────────────────────────
+fn registry() -> WorkflowRegistry {
+    WorkflowRegistry::new()
+        .register("echo", |input, _cancel| async move {
+            Ok(json!({ "echoed": input.get("name").cloned().unwrap_or(Value::Null) }))
+        })
+        .register("boom", |_input, _cancel| async move { Err("exploded".to_string()) })
+}
 
 #[tokio::test]
 async fn a_run_executes_its_workflow_and_returns_the_output() {
-    let registry = WorkflowRegistry::new().register("echo", |input, _cancel| async move {
-        let name = input.get("name").cloned().unwrap_or(Value::Null);
-        Ok(json!({ "echoed": name }))
-    });
-    let state = BackgroundState::new().with_executor(Arc::new(registry));
-
-    let response = background_runs_router_with_state(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/runs")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({ "workflowId": "echo", "input": { "name": "ada" } }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let submitted: Value = serde_json::from_slice(&body).unwrap();
-    let run_id = submitted["runId"].as_str().unwrap().to_string();
-
-    assert_eq!(
-        await_terminal(&state, &run_id).await,
-        RunStatus::Completed,
-        "the run must complete by executing the workflow"
-    );
-    let run = state.store.get(&run_id).await.unwrap();
-    assert_eq!(
-        run.result,
-        Some(json!({ "echoed": "ada" })),
-        "the workflow's output must be returned, and its input must have reached it"
-    );
+    let state = BackgroundState::new().with_executor(Arc::new(registry()));
+    let (status, submitted) = call(
+        background_runs_router_with_state(state.clone()),
+        "POST",
+        "/runs",
+        Some(json!({ "workflowId": "echo", "input": { "name": "ada" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let run = await_terminal(&state, submitted["runId"].as_str().unwrap()).await;
+    assert_eq!(run["status"], "completed");
+    assert_eq!(run["result"], json!({ "echoed": "ada" }));
+    assert_eq!(run["attempt"], 1);
+    state.shutdown_worker().await;
 }
 
 #[tokio::test]
-async fn a_failing_workflow_fails_the_run() {
-    let registry = WorkflowRegistry::new()
-        .register("boom", |_input, _cancel| async move { Err("exploded".to_string()) });
-    let state = BackgroundState::new().with_executor(Arc::new(registry));
-
-    let run_id = submit(&state, json!({ "workflowId": "boom", "input": {} })).await;
-
-    assert_eq!(await_terminal(&state, &run_id).await, RunStatus::Failed);
-    let run = state.store.get(&run_id).await.unwrap();
-    assert_eq!(run.error.as_deref(), Some("exploded"), "the failure reason must be recorded");
+async fn a_failing_workflow_fails_the_run_after_its_retries() {
+    let state = BackgroundState::new().with_executor(Arc::new(registry()));
+    let (_, submitted) = call(
+        background_runs_router_with_state(state.clone()),
+        "POST",
+        "/runs",
+        Some(json!({ "target": "boom", "input": {}, "maxRetries": 1 })),
+    )
+    .await;
+    let run = await_terminal(&state, submitted["runId"].as_str().unwrap()).await;
+    assert_eq!(run["status"], "failed");
+    assert_eq!(run["error"], "exploded");
+    assert_eq!(run["attempt"], 2);
+    assert_eq!(run["retriesRemaining"], 0);
+    state.shutdown_worker().await;
 }
 
 #[tokio::test]
-async fn a_failing_workflow_consumes_its_retry_budget() {
-    // The placeholder could never fail, so the retry path was never exercised.
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let counter = attempts.clone();
-    let registry = WorkflowRegistry::new().register("flaky", move |_input, _cancel| {
-        let counter = counter.clone();
-        async move {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Err("still failing".to_string())
+async fn an_unknown_target_is_rejected_instead_of_queued() {
+    let state = BackgroundState::new().with_executor(Arc::new(registry()));
+    let (status, _) = call(
+        background_runs_router_with_state(state.clone()),
+        "POST",
+        "/runs",
+        Some(json!({ "workflowId": "missing", "input": {} })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(state.run_store().list(RunFilter::default()).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cancelling_a_queued_run_cancels_it_at_once() {
+    let state =
+        BackgroundState::new().with_executor(Arc::new(registry())).with_embedded_worker(false);
+    let (_, submitted) = call(
+        background_runs_router_with_state(state.clone()),
+        "POST",
+        "/runs",
+        Some(json!({ "target": "echo", "input": {} })),
+    )
+    .await;
+    let run_id = submitted["runId"].as_str().unwrap();
+    let (status, run) = call(
+        background_runs_router_with_state(state.clone()),
+        "DELETE",
+        &format!("/runs/{run_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(run["status"], "cancelled");
+    let (status, _) =
+        call(background_runs_router_with_state(state), "DELETE", "/runs/absent", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+fn cron_body(name: &str, expression: &str) -> Value {
+    json!({ "name": name, "workflowId": "echo", "cronExpression": expression })
+}
+
+#[tokio::test]
+async fn cron_jobs_are_created_read_paused_resumed_and_deleted() {
+    let cron = CronState::new(BackgroundState::new().with_embedded_worker(false));
+    let app = || cron_jobs_router_with_state(cron.clone());
+
+    let (status, created) =
+        call(app(), "POST", "/cron", Some(cron_body("nightly", "0 2 * * *"))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["jobId"], "nightly");
+    assert_eq!(created["timezone"], "UTC");
+    assert_eq!(created["concurrencyPolicy"], "skip");
+    assert!(created["nextFireAt"].is_string());
+
+    let (status, _) = call(app(), "POST", "/cron", Some(cron_body("nightly", "0 3 * * *"))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "a name is unique");
+    let (status, body) = call(app(), "POST", "/cron", Some(cron_body("bad", "not cron"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid cron expression");
+
+    let (status, job) = call(app(), "GET", "/cron/nightly", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(job["cronExpression"], "0 2 * * *");
+
+    let (_, paused) =
+        call(app(), "PATCH", "/cron/nightly", Some(json!({ "status": "paused" }))).await;
+    assert_eq!(paused["status"], "paused");
+    let (_, resumed) =
+        call(app(), "PATCH", "/cron/nightly", Some(json!({ "status": "active" }))).await;
+    assert_eq!(resumed["status"], "active");
+
+    let (_, list) = call(app(), "GET", "/cron", None).await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    let (status, _) = call(app(), "DELETE", "/cron/nightly", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = call(app(), "GET", "/cron/nightly", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Resuming a paused job moves its next fire time past now, so occurrences that fell
+/// inside the pause are skipped rather than replayed.
+#[tokio::test]
+async fn resuming_a_paused_job_skips_the_occurrences_missed_while_paused() {
+    let cron = CronState::new(BackgroundState::new().with_embedded_worker(false));
+    let app = || cron_jobs_router_with_state(cron.clone());
+    call(app(), "POST", "/cron", Some(cron_body("minutely", "* * * * *"))).await;
+    call(app(), "PATCH", "/cron/minutely", Some(json!({ "status": "paused" }))).await;
+    let mut stale = cron.schedules.get("minutely").await.unwrap().unwrap();
+    stale.next_fire_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
+    cron.schedules.upsert(stale).await.unwrap();
+
+    call(app(), "PATCH", "/cron/minutely", Some(json!({ "status": "active" }))).await;
+    let resumed = cron.schedules.get("minutely").await.unwrap().unwrap();
+    assert!(resumed.next_fire_at.unwrap() > chrono::Utc::now());
+}
+
+/// The scheduler fires a job through the run store and the embedded worker runs it.
+#[tokio::test]
+async fn a_cron_job_fires_and_its_run_executes() {
+    let background = BackgroundState::new().with_executor(Arc::new(registry()));
+    let cron = CronState::new(background.clone());
+    let (status, _) = call(
+        cron_jobs_router_with_state(cron.clone()),
+        "POST",
+        "/cron",
+        Some(json!({ "name": "each-second", "workflowId": "echo", "cronExpression": "* * * * * *", "input": { "name": "tick" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    background.ensure_worker_started();
+    let scheduler = start_cron_scheduler(cron.clone());
+
+    let runs = Arc::clone(background.run_store());
+    let mut completed = None;
+    for _ in 0..400 {
+        let done = runs.list(RunFilter::default().states([RunState::Completed])).await.unwrap();
+        if let Some(run) = done.into_iter().next() {
+            completed = Some(run);
+            break;
         }
-    });
-    let state = BackgroundState::new().with_executor(Arc::new(registry));
-
-    let run_id =
-        submit(&state, json!({ "workflowId": "flaky", "input": {}, "maxRetries": 2 })).await;
-    assert_eq!(await_terminal(&state, &run_id).await, RunStatus::Failed);
-
-    assert_eq!(
-        attempts.load(Ordering::SeqCst),
-        3,
-        "the workflow must run once plus twice more for the retry budget"
-    );
-}
-
-#[tokio::test]
-async fn an_unknown_workflow_is_rejected_instead_of_queued() {
-    let state = BackgroundState::new().with_executor(Arc::new(WorkflowRegistry::new()));
-
-    let response = background_runs_router_with_state(state)
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/runs")
-                .header("content-type", "application/json")
-                .body(Body::from(json!({ "workflowId": "nope", "input": {} }).to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response.status(),
-        StatusCode::NOT_FOUND,
-        "an unknown workflow must be refused rather than accepted and reported on"
-    );
-}
-
-#[tokio::test]
-async fn a_run_without_an_executor_fails_rather_than_reporting_success() {
-    // This is the original defect in its plainest form.
-    let state = BackgroundState::new();
-    let run_id = submit(&state, json!({ "workflowId": "anything", "input": {} })).await;
-
-    assert_eq!(
-        await_terminal(&state, &run_id).await,
-        RunStatus::Failed,
-        "with nothing able to run the workflow, the run must not report completion"
-    );
-}
-
-/// Submits a run and returns its ID.
-async fn submit(state: &BackgroundState, body: Value) -> String {
-    let response = background_runs_router_with_state(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/runs")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let submitted: Value = serde_json::from_slice(&bytes).unwrap();
-    submitted["runId"].as_str().unwrap().to_string()
-}
-
-// ── A cron occurrence is claimed once ──────────────────────────────────
-
-#[tokio::test]
-async fn an_occurrence_can_be_claimed_only_once() {
-    let state = CronState::new(BackgroundState::new());
-    let job_id = create_job(&state, "* * * * * *").await;
-
-    // Every-second schedule, so the job is due almost immediately.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    let due = state.cron_store.due_occurrences().await;
-    let (_, occurrence) =
-        due.iter().find(|(job, _)| job.job_id == job_id).expect("job must be due");
-
-    assert!(state.cron_store.claim_occurrence(&job_id, *occurrence).await, "the first claim wins");
-    assert!(
-        !state.cron_store.claim_occurrence(&job_id, *occurrence).await,
-        "the same occurrence must not be claimable twice; that is what turned one \
-         schedule point into a queue entry per poll"
-    );
-}
-
-#[tokio::test]
-async fn a_claimed_occurrence_is_no_longer_due() {
-    let state = CronState::new(BackgroundState::new());
-    let job_id = create_job(&state, "0 0 * * * *").await;
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    if let Some((_, occurrence)) =
-        state.cron_store.due_occurrences().await.into_iter().find(|(j, _)| j.job_id == job_id)
-    {
-        state.cron_store.claim_occurrence(&job_id, occurrence).await;
-        let still_due = state
-            .cron_store
-            .due_occurrences()
-            .await
-            .into_iter()
-            .any(|(j, o)| j.job_id == job_id && o == occurrence);
-        assert!(!still_due, "a claimed occurrence must not be offered again");
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-}
-
-#[tokio::test]
-async fn claiming_an_older_occurrence_is_refused() {
-    let state = CronState::new(BackgroundState::new());
-    let job_id = create_job(&state, "* * * * * *").await;
-
-    let now = Utc::now();
-    assert!(state.cron_store.claim_occurrence(&job_id, now).await);
-    assert!(
-        !state.cron_store.claim_occurrence(&job_id, now - chrono::Duration::seconds(30)).await,
-        "scheduling state must not move backwards"
-    );
-}
-
-// ── The documented cron detail route exists ────────────────────────────
-
-#[tokio::test]
-async fn the_cron_detail_route_is_mounted() {
-    let state = CronState::new(BackgroundState::new());
-    let job_id = create_job(&state, "0 * * * * *").await;
-
-    let found = cron_jobs_router_with_state(state.clone())
-        .oneshot(Request::builder().uri(format!("/cron/{job_id}")).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(found.status(), StatusCode::OK, "GET /cron/{{job_id}} is documented and must exist");
-
-    let bytes = axum::body::to_bytes(found.into_body(), usize::MAX).await.unwrap();
-    let job: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(job["jobId"].as_str(), Some(job_id.as_str()));
-
-    let missing = cron_jobs_router_with_state(state)
-        .oneshot(Request::builder().uri("/cron/absent").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-}
-
-/// Creates a cron job through the router and returns its ID.
-async fn create_job(state: &CronState, expression: &str) -> String {
-    let response = cron_jobs_router_with_state(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/cron")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "name": "scheduled job",
-                        "workflowId": "scheduled",
-                        "cronExpression": expression,
-                        "input": {}
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let created: Value = serde_json::from_slice(&bytes).unwrap();
-    created["jobId"].as_str().unwrap().to_string()
+    scheduler.abort();
+    background.shutdown_worker().await;
+    let run = completed.expect("the cron job fired and its run completed");
+    assert_eq!(run.result, Some(json!({ "echoed": "tick" })));
+    assert!(run.idempotency_key.unwrap().starts_with("schedule:each-second:"));
+    assert_eq!(run.concurrency_key.as_deref(), Some("cron:each-second"));
 }

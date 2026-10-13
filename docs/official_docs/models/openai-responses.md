@@ -2,6 +2,8 @@
 
 ADK-Rust provides a dedicated client for OpenAI's [Responses API](https://platform.openai.com/docs/api-reference/responses) (`/v1/responses` endpoint) — the successor to the Chat Completions API. The Responses API is the recommended way to use current GPT-5.6 models, including their full reasoning-effort range.
 
+> **Note:** Chat Completions rejects function tools on GPT-5.6 and later while reasoning is on, so `OpenAIClient` sends those tool-carrying requests through the Responses API automatically. See [Tool Calls on GPT-5.6 and Later](./providers.md#tool-calls-on-gpt-56-and-later).
+
 ## Overview
 
 ```
@@ -53,15 +55,15 @@ Use `OpenAIResponsesClient` when you need reasoning models with summaries, built
 
 ```toml
 [dependencies]
-adk-rust = { version = "2.2.0", features = ["openai"] }
-adk-tool = "2.2.0"
+adk-rust = { version = "3.0.0", features = ["openai"] }
+adk-tool = "3.0.0"
 ```
 
 Or with `adk-model` directly:
 
 ```toml
 [dependencies]
-adk-model = { version = "2.2.0", features = ["openai"] }
+adk-model = { version = "3.0.0", features = ["openai"] }
 ```
 
 Set your API key:
@@ -212,6 +214,30 @@ let client = OpenAIResponsesClient::new(config)?
 ```
 
 Retries are automatic for rate limits (429), server errors (500/502/503/504), and network failures.
+`RetryConfig` is the only retry policy: the client does not add async-openai's own retry
+layer, so `RetryConfig::disabled()` sends each request once.
+
+### Request Adapters
+
+`with_request_adapter` edits the JSON body and headers of every generation request before
+it is sent, including each retry attempt. The adapter must not perform I/O or change the
+response mode:
+
+```rust
+use std::sync::Arc;
+
+use adk_model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig, RequestAdapter};
+
+let adapter: RequestAdapter = Arc::new(|body, headers| {
+    body["metadata"] = serde_json::json!({"application": "support-bot"});
+    headers.insert("x-request-source", "support-bot".parse().expect("valid header"));
+    Ok(())
+});
+let client = OpenAIResponsesClient::new(OpenAIResponsesConfig::new(api_key, "gpt-5"))?
+    .with_request_adapter(adapter);
+```
+
+The client does not follow HTTP redirects on generation requests.
 
 ---
 
@@ -358,6 +384,11 @@ The Responses API client streams text and reasoning deltas in real-time:
 - The final event has `turn_complete: true` with usage metadata and finish reason
 
 This means you see text appearing token-by-token while the model generates, and function calls arrive as complete objects ready for execution.
+
+When the model emits commentary (phase-tagged progress messages), the deltas arrive as
+`Part::ServerToolCall` messages with `"phase": "commentary"`, and the final response sets
+`provider_metadata.content_complete` to `true`: it carries the complete output, so replace
+the earlier deltas with it.
 
 ---
 

@@ -78,7 +78,9 @@ mod error;
 pub mod execution_log;
 pub mod messages;
 pub mod reducers;
+mod resume;
 pub mod schema;
+mod task_id;
 pub mod typed_reducer;
 
 pub use context::TaskContext;
@@ -87,4 +89,11 @@ pub use execution_log::{ExecutionLog, TaskRecord, TaskStatus};
 pub use messages::{ChatMessage, MessageRole, MessagesValue};
 pub use reducers::{ReducedValue, UntrackedValue};
 pub use schema::{ExpectedType, StateSchemaValidator};
+/// Items the `#[entrypoint]` and `#[task]` expansions call; not public API.
+#[doc(hidden)]
+pub mod __private {
+    pub use super::resume::load_resume_point;
+    pub use super::task_id::__private::*;
+}
+pub use task_id::task_call_id;
 pub use typed_reducer::{AppendReducer, MergeReducer, ReplaceReducer, TypedReducer};

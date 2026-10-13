@@ -1,3 +1,5 @@
+#[cfg(feature = "audit")]
+mod audit;
 mod cli;
 mod deploy;
 mod graph;
@@ -100,6 +102,8 @@ async fn main() -> Result<()> {
         #[cfg(feature = "vertex-agent-registry")]
         Some(Commands::Registry { command }) => registry::run(command).await,
         Some(Commands::Graph { command }) => graph::run(command).await,
+        #[cfg(feature = "audit")]
+        Some(Commands::Audit { command }) => audit::run(command).await,
     }
 }
 
@@ -143,8 +147,10 @@ async fn stream_turn(runner: &Runner, session_id: &str, prompt: &str) -> Result<
         )
         .await?;
     let mut pending = String::new();
+    let mut text_deltas = adk_core::EventTextDeltas::default();
     while let Some(event) = stream.next().await {
         let event = event?;
+        let event = text_deltas.push(&event);
         if let Some(content) = &event.llm_response.content {
             for part in &content.parts {
                 match part {
@@ -236,7 +242,10 @@ async fn run_goal(args: GoalArgs) -> Result<()> {
 
     let (provider, model_id) = resolve_model_id(provider, model);
     let model = build_model(provider, &model_id, api_key, thinking_budget)?;
-    let coding = CodingAgent::builder().model(model).workspace(Workspace::new(&dir)).build()?;
+    let coding = CodingAgent::builder()
+        .model(model)
+        .workspace(Workspace::new(&dir).allow_bash(true))
+        .build()?;
 
     let state_path = state.unwrap_or_else(|| format!("{dir}/.adk/goal.json"));
 
@@ -362,7 +371,8 @@ async fn run_code(
 ) -> Result<()> {
     let (provider, model_id) = resolve_model_id(cli_provider, cli_model);
     let model = build_model(provider, &model_id, cli_api_key, thinking_budget)?;
-    let workspace = if read_only { Workspace::read_only(&dir) } else { Workspace::new(&dir) };
+    let workspace =
+        if read_only { Workspace::read_only(&dir) } else { Workspace::new(&dir).allow_bash(true) };
     let coding = CodingAgent::builder().model(model).workspace(workspace).build()?;
 
     let sessions: Arc<dyn SessionService> = Arc::new(InMemorySessionService::new());
@@ -525,6 +535,16 @@ fn create_model(
     }
 }
 
+// Only reachable from the `#[cfg(not(feature = ...))]` arms above; with every provider
+// compiled in there is no caller, and clippy's dead-code lint fails the build.
+#[cfg(not(all(
+    feature = "gemini",
+    feature = "openai",
+    feature = "anthropic",
+    feature = "deepseek",
+    feature = "groq",
+    feature = "ollama"
+)))]
 fn provider_feature_disabled(provider: ModelProvider, feature: &str) -> Result<Arc<dyn Llm>> {
     Err(anyhow::anyhow!(
         "{} support is not compiled into this adk-cli build. Reinstall with `--features {}` or `--features all-providers`.",

@@ -6,7 +6,7 @@ use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::multipart;
 
 use super::types::{FileDeleteResponse, FileListResponse, FileObject};
-use crate::base_url::validate_base_url;
+use crate::base_url::{InsecureHttp, validate_base_url};
 use crate::{Error, Result};
 
 /// Default base URL for the Anthropic API.
@@ -83,7 +83,7 @@ impl FilesClient {
     /// ```
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Result<Self> {
         let base_url = base_url.into();
-        validate_base_url(&base_url)?;
+        validate_base_url(&base_url, InsecureHttp::Rejected { opt_in: None })?;
         self.base_url = base_url;
         Ok(self)
     }
@@ -258,15 +258,7 @@ fn infer_mime_type(filename: &str) -> &'static str {
 }
 
 fn build_headers(api_key: &str) -> Result<HeaderMap> {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-api-key",
-        HeaderValue::from_str(api_key).map_err(|e| Error::Authentication {
-            message: format!("invalid API key header value: {e}"),
-        })?,
-    );
-    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-    headers.insert("anthropic-beta", HeaderValue::from_static("files-api-2025-04-14"));
+    let mut headers = build_upload_headers(api_key)?;
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     Ok(headers)
 }
@@ -274,12 +266,12 @@ fn build_headers(api_key: &str) -> Result<HeaderMap> {
 /// Headers for multipart uploads — no content-type (reqwest sets it with boundary).
 fn build_upload_headers(api_key: &str) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-api-key",
-        HeaderValue::from_str(api_key).map_err(|e| Error::Authentication {
-            message: format!("invalid API key header value: {e}"),
-        })?,
-    );
+    let mut api_key_value = HeaderValue::from_str(api_key).map_err(|e| Error::Authentication {
+        message: format!("invalid API key header value: {e}"),
+    })?;
+    // Keeps the key out of the client's derived `Debug` output.
+    api_key_value.set_sensitive(true);
+    headers.insert("x-api-key", api_key_value);
     headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
     headers.insert("anthropic-beta", HeaderValue::from_static("files-api-2025-04-14"));
     Ok(headers)
@@ -334,10 +326,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn debug_output_redacts_the_api_key() {
+        let client = FilesClient::new("sk-ant-secret-key-value").unwrap();
+
+        let debug = format!("{client:?}");
+
+        assert!(!debug.contains("sk-ant-secret-key-value"), "api key leaked: {debug}");
+    }
+
+    #[test]
     fn test_default_base_url_is_https() {
         let client = FilesClient::new("placeholder-api-key").unwrap();
         assert_eq!(client.base_url, DEFAULT_BASE_URL);
-        assert!(validate_base_url(&client.base_url).is_ok());
+        assert!(
+            validate_base_url(&client.base_url, InsecureHttp::Rejected { opt_in: None }).is_ok()
+        );
     }
 
     #[test]

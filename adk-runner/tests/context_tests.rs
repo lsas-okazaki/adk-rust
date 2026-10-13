@@ -506,6 +506,345 @@ fn conversation_history_preserves_tool_role() {
 }
 
 #[test]
+fn conversation_history_omits_interrupted_tool_calls_before_next_user_turn() {
+    let session = Arc::new(MockSessionWithState::new());
+    let mutable = MutableSession::new(session);
+
+    let mut first_user = Event::new("inv-1");
+    first_user.author = "user".to_string();
+    first_user.llm_response.content = Some(Content::new("user").with_text("run tests"));
+    mutable.append_event(first_user);
+
+    let mut tool_call = Event::new("inv-1");
+    tool_call.author = "assistant".to_string();
+    tool_call.llm_response.content = Some(Content {
+        role: "model".to_string(),
+        parts: vec![
+            Part::FunctionCall {
+                name: "bash".to_string(),
+                args: serde_json::json!({"command": "cargo test"}),
+                id: Some("call-1".to_string()),
+                thought_signature: None,
+            },
+            Part::FunctionCall {
+                name: "read_file".to_string(),
+                args: serde_json::json!({"path": "README.md"}),
+                id: Some("call-2".to_string()),
+                thought_signature: None,
+            },
+        ],
+    });
+    mutable.append_event(tool_call);
+
+    // The run is interrupted before the tool can persist its response. A new
+    // user message is the durable boundary that proves the previous turn ended.
+    let mut next_user = Event::new("inv-2");
+    next_user.author = "user".to_string();
+    next_user.llm_response.content = Some(Content::new("user").with_text("continue"));
+    mutable.append_event(next_user);
+
+    let history = mutable.conversation_history();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].role, "user");
+    assert_eq!(history[1].role, "user");
+    assert!(
+        !history.iter().flat_map(|content| &content.parts).any(|part| {
+            matches!(part, Part::FunctionCall { .. } | Part::FunctionResponse { .. })
+        })
+    );
+}
+
+#[test]
+fn conversation_history_does_not_interrupt_a_call_completed_after_an_overlapping_user_turn() {
+    let session = Arc::new(MockSessionWithState::new());
+    let mutable = MutableSession::new(session);
+
+    let mut first_user = Event::new("inv-1");
+    first_user.author = "user".to_string();
+    first_user.llm_response.content = Some(Content::new("user").with_text("run the slow tool"));
+    mutable.append_event(first_user);
+
+    let mut tool_call = Event::new("inv-1");
+    tool_call.author = "assistant".to_string();
+    tool_call.llm_response.content = Some(Content {
+        role: "model".to_string(),
+        parts: vec![Part::FunctionCall {
+            name: "slow_tool".to_string(),
+            args: serde_json::json!({}),
+            id: Some("call-1".to_string()),
+            thought_signature: None,
+        }],
+    });
+    mutable.append_event(tool_call);
+
+    // A second run may append its user event while the first run's tool is
+    // still executing. The later response proves that the call completed.
+    let mut overlapping_user = Event::new("inv-2");
+    overlapping_user.author = "user".to_string();
+    overlapping_user.llm_response.content =
+        Some(Content::new("user").with_text("start another task"));
+    mutable.append_event(overlapping_user);
+
+    let mut tool_response = Event::new("inv-1");
+    tool_response.author = "assistant".to_string();
+    tool_response.llm_response.content = Some(Content {
+        role: "tool".to_string(),
+        parts: vec![Part::FunctionResponse {
+            function_response: FunctionResponseData::new(
+                "slow_tool",
+                serde_json::json!({"ok": true}),
+            ),
+            id: Some("call-1".to_string()),
+            annotations: None,
+        }],
+    });
+    mutable.append_event(tool_response);
+
+    let history = mutable.conversation_history();
+    assert_eq!(history.len(), 4);
+    assert_eq!(history[2].role, "tool");
+    assert!(matches!(
+        &history[2].parts[..],
+        [Part::FunctionResponse {
+            id: Some(id),
+            function_response,
+            ..
+        }] if id == "call-1"
+            && function_response.response == serde_json::json!({"ok": true})
+    ));
+    assert_eq!(history[3].role, "user");
+}
+
+#[test]
+fn conversation_history_keeps_completed_batch_responses_before_late_response() {
+    let session = Arc::new(MockSessionWithState::new());
+    let mutable = MutableSession::new(session);
+
+    let mut first_user = Event::new("inv-1");
+    first_user.author = "user".to_string();
+    first_user.llm_response.content = Some(Content::new("user").with_text("run both tools"));
+    mutable.append_event(first_user);
+
+    let mut tool_calls = Event::new("inv-1");
+    tool_calls.author = "assistant".to_string();
+    tool_calls.llm_response.content = Some(Content {
+        role: "model".to_string(),
+        parts: vec![
+            Part::FunctionCall {
+                name: "fast_tool".to_string(),
+                args: serde_json::json!({}),
+                id: Some("call-1".to_string()),
+                thought_signature: None,
+            },
+            Part::FunctionCall {
+                name: "slow_tool".to_string(),
+                args: serde_json::json!({}),
+                id: Some("call-2".to_string()),
+                thought_signature: None,
+            },
+        ],
+    });
+    mutable.append_event(tool_calls);
+
+    let mut fast_response = Event::new("inv-1");
+    fast_response.author = "assistant".to_string();
+    fast_response.llm_response.content = Some(Content {
+        role: "function".to_string(),
+        parts: vec![Part::FunctionResponse {
+            function_response: FunctionResponseData::new(
+                "fast_tool",
+                serde_json::json!({"fast": true}),
+            ),
+            id: Some("call-1".to_string()),
+            annotations: None,
+        }],
+    });
+    mutable.append_event(fast_response);
+
+    let mut overlapping_user = Event::new("inv-2");
+    overlapping_user.author = "user".to_string();
+    overlapping_user.llm_response.content = Some(Content::new("user").with_text("next request"));
+    mutable.append_event(overlapping_user);
+
+    let mut slow_response = Event::new("inv-1");
+    slow_response.author = "assistant".to_string();
+    slow_response.llm_response.content = Some(Content {
+        role: "function".to_string(),
+        parts: vec![Part::FunctionResponse {
+            function_response: FunctionResponseData::new(
+                "slow_tool",
+                serde_json::json!({"slow": true}),
+            ),
+            id: Some("call-2".to_string()),
+            annotations: None,
+        }],
+    });
+    mutable.append_event(slow_response);
+
+    let history = mutable.conversation_history();
+    assert_eq!(history.len(), 5);
+    assert!(matches!(
+        &history[2].parts[..],
+        [Part::FunctionResponse { id: Some(id), .. }] if id == "call-1"
+    ));
+    assert!(matches!(
+        &history[3].parts[..],
+        [Part::FunctionResponse { id: Some(id), .. }] if id == "call-2"
+    ));
+    assert_eq!(history[4].role, "user");
+}
+
+#[test]
+fn conversation_history_matches_idless_tool_responses_by_name() {
+    let session = Arc::new(MockSessionWithState::new());
+    let mutable = MutableSession::new(session);
+
+    let mut first_user = Event::new("inv-1");
+    first_user.author = "user".to_string();
+    first_user.llm_response.content = Some(Content::new("user").with_text("read the file"));
+    mutable.append_event(first_user);
+
+    let mut tool_call = Event::new("inv-1");
+    tool_call.author = "assistant".to_string();
+    tool_call.llm_response.content = Some(Content {
+        role: "model".to_string(),
+        parts: vec![Part::FunctionCall {
+            name: "read_file".to_string(),
+            args: serde_json::json!({"path": "README.md"}),
+            id: None,
+            thought_signature: None,
+        }],
+    });
+    mutable.append_event(tool_call);
+
+    let mut tool_response = Event::new("inv-1");
+    tool_response.author = "assistant".to_string();
+    tool_response.llm_response.content = Some(Content {
+        role: "function".to_string(),
+        parts: vec![Part::FunctionResponse {
+            function_response: FunctionResponseData::new(
+                "read_file",
+                serde_json::json!({"content": "Sailry"}),
+            ),
+            id: None,
+            annotations: None,
+        }],
+    });
+    mutable.append_event(tool_response);
+
+    let mut next_user = Event::new("inv-2");
+    next_user.author = "user".to_string();
+    next_user.llm_response.content = Some(Content::new("user").with_text("continue"));
+    mutable.append_event(next_user);
+
+    let history = mutable.conversation_history();
+    assert_eq!(history.len(), 4);
+    assert_eq!(history[2].role, "function");
+    assert_eq!(history[3].role, "user");
+}
+
+#[test]
+fn conversation_history_matches_idless_responses_within_their_invocation() {
+    let session = Arc::new(MockSessionWithState::new());
+    let mutable = MutableSession::new(session);
+
+    let mut first_user = Event::new("inv-1");
+    first_user.author = "user".to_string();
+    first_user.llm_response.content = Some(Content::new("user").with_text("first request"));
+    mutable.append_event(first_user);
+
+    let mut first_call = Event::new("inv-1");
+    first_call.author = "assistant".to_string();
+    first_call.llm_response.content = Some(Content {
+        role: "model".to_string(),
+        parts: vec![Part::FunctionCall {
+            name: "slow_tool".to_string(),
+            args: serde_json::json!({"request": 1}),
+            id: None,
+            thought_signature: None,
+        }],
+    });
+    mutable.append_event(first_call);
+
+    let mut second_user = Event::new("inv-2");
+    second_user.author = "user".to_string();
+    second_user.llm_response.content = Some(Content::new("user").with_text("second request"));
+    mutable.append_event(second_user);
+
+    let mut second_call = Event::new("inv-2");
+    second_call.author = "assistant".to_string();
+    second_call.llm_response.content = Some(Content {
+        role: "model".to_string(),
+        parts: vec![Part::FunctionCall {
+            name: "slow_tool".to_string(),
+            args: serde_json::json!({"request": 2}),
+            id: None,
+            thought_signature: None,
+        }],
+    });
+    mutable.append_event(second_call);
+
+    let mut second_response = Event::new("inv-2");
+    second_response.author = "assistant".to_string();
+    second_response.llm_response.content = Some(Content {
+        role: "function".to_string(),
+        parts: vec![Part::FunctionResponse {
+            function_response: FunctionResponseData::new(
+                "slow_tool",
+                serde_json::json!({"request": 2}),
+            ),
+            id: None,
+            annotations: None,
+        }],
+    });
+    mutable.append_event(second_response);
+
+    let history = mutable.conversation_history();
+    assert_eq!(history.len(), 4);
+    assert!(matches!(
+        &history[2].parts[..],
+        [Part::FunctionCall { args, id: None, .. }]
+            if args == &serde_json::json!({"request": 2})
+    ));
+    assert!(matches!(
+        &history[3].parts[..],
+        [Part::FunctionResponse {
+            function_response,
+            id: None,
+            ..
+        }] if function_response.response == serde_json::json!({"request": 2})
+    ));
+}
+
+#[test]
+fn conversation_history_keeps_an_active_tool_call_open_at_the_tail() {
+    let session = Arc::new(MockSessionWithState::new());
+    let mutable = MutableSession::new(session);
+
+    let mut user = Event::new("inv-1");
+    user.author = "user".to_string();
+    user.llm_response.content = Some(Content::new("user").with_text("run tests"));
+    mutable.append_event(user);
+
+    let mut tool_call = Event::new("inv-1");
+    tool_call.author = "assistant".to_string();
+    tool_call.llm_response.content = Some(Content {
+        role: "model".to_string(),
+        parts: vec![Part::FunctionCall {
+            name: "bash".to_string(),
+            args: serde_json::json!({"command": "cargo test"}),
+            id: Some("call-1".to_string()),
+            thought_signature: None,
+        }],
+    });
+    mutable.append_event(tool_call);
+
+    let history = mutable.conversation_history();
+    assert_eq!(history.len(), 2);
+    assert!(matches!(history[1].parts.as_slice(), [Part::FunctionCall { .. }]));
+}
+
+#[test]
 fn conversation_history_maps_agent_events_to_model() {
     // Non-tool agent events should still map to "model"
     let session = Arc::new(MockSessionWithState::new());
@@ -826,4 +1165,105 @@ fn conversation_history_for_agent_double_transfer_sees_own_prior_events() {
     assert_eq!(filtered[1].role, "model"); // own function call
     assert_eq!(filtered[2].role, "function"); // own tool response
     assert_eq!(filtered[3].role, "model"); // own transfer-back text
+}
+
+fn event_with(author: &str, invocation: &str, role: &str, parts: Vec<Part>) -> Event {
+    let mut event = Event::new(invocation);
+    event.author = author.to_string();
+    event.llm_response.content = Some(Content { role: role.to_string(), parts });
+    event
+}
+
+fn response_part(response: serde_json::Value, id: Option<&str>) -> Part {
+    Part::FunctionResponse {
+        function_response: FunctionResponseData::new("pay", response),
+        id: id.map(str::to_string),
+        annotations: None,
+    }
+}
+
+/// Run 1 holds `pay`; run 2 resumes it after an empty user turn.
+fn held_then_resumed(id: Option<&str>) -> MutableSession {
+    let mutable = MutableSession::new(Arc::new(MockSessionWithState::new()));
+    mutable.append_event(event_with(
+        "user",
+        "inv-1",
+        "user",
+        vec![Part::Text { text: "pay 5".to_string() }],
+    ));
+    mutable.append_event(event_with(
+        "ops",
+        "inv-1",
+        "model",
+        vec![Part::FunctionCall {
+            name: "pay".to_string(),
+            args: serde_json::json!({"amount": 5}),
+            id: id.map(str::to_string),
+            thought_signature: None,
+        }],
+    ));
+    mutable.append_event(event_with(
+        "ops",
+        "inv-1",
+        "function",
+        vec![response_part(adk_core::confirmation_pending_response("held"), id)],
+    ));
+    let mut hold = Event::new("inv-1");
+    hold.author = "ops".to_string();
+    // The confirmation notice is left out of the projected history.
+    hold.llm_response.content =
+        Some(Content::new("model").with_text("Tool confirmation required for 'pay'."));
+    hold.actions.tool_confirmation = Some(adk_core::ToolConfirmationRequest {
+        tool_name: "pay".to_string(),
+        function_call_id: Some(id.unwrap_or("inv-1_pay_0").to_string()),
+        args: serde_json::json!({"amount": 5}),
+        acting: None,
+    });
+    mutable.append_event(hold);
+    mutable.append_event(event_with(
+        "user",
+        "inv-2",
+        "user",
+        vec![Part::Text { text: String::new() }],
+    ));
+    mutable
+}
+
+#[test]
+fn a_resumed_response_supersedes_the_pending_response_in_place() {
+    for id in [Some("call-1"), None] {
+        let mutable = held_then_resumed(id);
+        assert_eq!(mutable.held_tool_calls("ops", "").len(), 1);
+
+        mutable.append_event(event_with(
+            "ops",
+            "inv-2",
+            "function",
+            vec![response_part(serde_json::json!({"status": "paid"}), id)],
+        ));
+
+        assert!(mutable.held_tool_calls("ops", "").is_empty());
+        let history = mutable.conversation_history_for_agent("ops");
+        let roles: Vec<&str> = history.iter().map(|content| content.role.as_str()).collect();
+        assert_eq!(roles, ["user", "model", "function", "user"], "id {id:?}");
+        assert_eq!(
+            history[2].parts,
+            vec![response_part(serde_json::json!({"status": "paid"}), id)],
+            "exactly one response per call, the real one, in the pending one's place"
+        );
+    }
+}
+
+#[test]
+fn a_response_that_supersedes_nothing_pending_is_left_unchanged() {
+    let mutable = held_then_resumed(Some("call-1"));
+    let answered = response_part(serde_json::json!({"status": "paid"}), Some("call-1"));
+    mutable.append_event(event_with("ops", "inv-2", "function", vec![answered.clone()]));
+    // A second real response does not replace the first one.
+    let duplicate = response_part(serde_json::json!({"status": "again"}), Some("call-1"));
+    mutable.append_event(event_with("ops", "inv-2", "function", vec![duplicate.clone()]));
+
+    let history = mutable.conversation_history_for_agent("ops");
+    assert_eq!(history[2].parts, vec![answered]);
+    assert_eq!(history.last().unwrap().parts, vec![duplicate]);
 }

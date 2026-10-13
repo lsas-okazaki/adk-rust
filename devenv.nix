@@ -24,6 +24,9 @@
 
   # Load .env file automatically
   dotenv.enable = builtins.pathExists ./.env;
+  # Newer devenv CLIs read `dotenv.resolved` even when dotenv is disabled, while the
+  # pinned modules define it only when enabled; the module's own value wins when set.
+  dotenv.resolved = lib.mkDefault { };
 
   # --------------------------------------------------------------------------
   # Core Languages
@@ -91,6 +94,10 @@
   ++ lib.optionals pkgs.stdenv.isLinux [
     # Linux-only: faster linking, perf tools
     valgrind
+    # ALSA headers for cpal-based audio (examples/desktop_audio via alsa-sys);
+    # the pre-push examples gate fails without them. CI installs libasound2-dev.
+    pkgs.alsa-lib
+    pkgs.alsa-lib.dev
   ];
 
   # --------------------------------------------------------------------------
@@ -112,8 +119,8 @@
     # Explicitly set PROTOC for build-scripts (e.g., lance-encoding)
     PROTOC = "${pkgs.protobuf}/bin/protoc";
 
-    # Ensure pkg-config can find glib and dbus
-    PKG_CONFIG_PATH = "${pkgs.glib.dev}/lib/pkgconfig:${pkgs.dbus.dev}/lib/pkgconfig:$PKG_CONFIG_PATH";
+    # Ensure pkg-config can find glib, dbus and (on Linux) alsa
+    PKG_CONFIG_PATH = "${pkgs.glib.dev}/lib/pkgconfig:${pkgs.dbus.dev}/lib/pkgconfig${lib.optionalString pkgs.stdenv.isLinux ":${pkgs.alsa-lib.dev}/lib/pkgconfig"}:$PKG_CONFIG_PATH";
   };
 
   # --------------------------------------------------------------------------

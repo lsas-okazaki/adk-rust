@@ -913,6 +913,7 @@ mod tests {
                             tool_name: "delete_file".to_string(),
                             function_call_id: Some("call-1".to_string()),
                             args: serde_json::json!({"path": "/tmp/report.csv"}),
+                            acting: None,
                         });
                         yield Ok(event);
                     }
@@ -949,6 +950,33 @@ mod tests {
             applied_decision: applied_decision.clone(),
             executed: executed.clone(),
         });
+        let turn = drive_permission_prompt(agent, "delete the report", answer).await;
+        let applied_decision = *applied_decision.lock().expect("decision lock");
+        let executed = *executed.lock().expect("executed lock");
+        PermissionFlowResult {
+            stop_reason: turn.stop_reason,
+            streamed_text: turn.streamed_text,
+            applied_decision,
+            executed,
+            permission_tool_call_id: turn.permission_tool_call_ids.first().cloned(),
+        }
+    }
+
+    /// What the client observed during one permission-gated prompt turn.
+    struct PermissionPrompt {
+        stop_reason: StopReason,
+        streamed_text: Vec<String>,
+        /// The tool call ID of every `session/request_permission` request, in order.
+        permission_tool_call_ids: Vec<String>,
+    }
+
+    /// Sends `prompt` to an ACP server for `agent` and answers every
+    /// `session/request_permission` request with `answer`.
+    async fn drive_permission_prompt(
+        agent: Arc<dyn AdkAgent>,
+        prompt: &'static str,
+        answer: Answer,
+    ) -> PermissionPrompt {
         let session_service: Arc<dyn adk_session::SessionService> =
             Arc::new(adk_session::InMemorySessionService::new());
         let config = AcpServerConfigBuilder::new()
@@ -963,8 +991,8 @@ mod tests {
 
         let streamed = Arc::new(Mutex::new(Vec::<String>::new()));
         let streamed_for_client = streamed.clone();
-        let captured_call_id = Arc::new(Mutex::new(None::<String>));
-        let captured_for_client = captured_call_id.clone();
+        let captured_call_ids = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_for_client = captured_call_ids.clone();
         let (server_channel, client_channel) = Channel::duplex();
 
         let server = serve_connection(
@@ -992,8 +1020,10 @@ mod tests {
                       _connection: ConnectionTo<Agent>| {
                     let captured = captured_for_client.clone();
                     async move {
-                        *captured.lock().expect("captured lock") =
-                            Some(request.tool_call.tool_call_id.to_string());
+                        captured
+                            .lock()
+                            .expect("captured lock")
+                            .push(request.tool_call.tool_call_id.to_string());
                         let outcome = match answer {
                             Answer::Allow => {
                                 let option = request
@@ -1036,7 +1066,7 @@ mod tests {
                 let prompt = connection
                     .send_request(PromptRequest::new(
                         session.session_id.clone(),
-                        vec![ContentBlock::Text(TextContent::new("delete the report"))],
+                        vec![ContentBlock::Text(TextContent::new(prompt))],
                     ))
                     .block_task()
                     .await?;
@@ -1052,16 +1082,8 @@ mod tests {
         let _ = server_task.await;
 
         let streamed_text = streamed.lock().expect("streamed lock").clone();
-        let applied_decision = *applied_decision.lock().expect("decision lock");
-        let executed = *executed.lock().expect("executed lock");
-        let permission_tool_call_id = captured_call_id.lock().expect("captured lock").clone();
-        PermissionFlowResult {
-            stop_reason,
-            streamed_text,
-            applied_decision,
-            executed,
-            permission_tool_call_id,
-        }
+        let permission_tool_call_ids = captured_call_ids.lock().expect("captured lock").clone();
+        PermissionPrompt { stop_reason, streamed_text, permission_tool_call_ids }
     }
 
     /// **Feature: acp-v1-full-support, Property 8: Permission correlation**
@@ -1122,6 +1144,113 @@ mod tests {
         );
         assert!(!result.executed, "tool must not execute when the permission request is cancelled");
         assert_eq!(result.permission_tool_call_id.as_deref(), Some("call-1"));
+    }
+
+    /// Replays one tool call, then answers every later request with text.
+    struct CallOnceModel {
+        requests: Arc<Mutex<Vec<adk_core::LlmRequest>>>,
+    }
+
+    #[async_trait]
+    impl adk_core::Llm for CallOnceModel {
+        fn name(&self) -> &str {
+            "call-once"
+        }
+
+        async fn generate_content(
+            &self,
+            request: adk_core::LlmRequest,
+            _stream: bool,
+        ) -> AdkResult<adk_core::LlmResponseStream> {
+            let first = {
+                let mut requests = self.requests.lock().expect("requests lock");
+                requests.push(request);
+                requests.len() == 1
+            };
+            let content = if first {
+                Content {
+                    role: "model".to_string(),
+                    parts: vec![adk_core::Part::FunctionCall {
+                        name: "delete_file".to_string(),
+                        args: serde_json::json!({"path": "/tmp/report.csv"}),
+                        id: Some("call-1".to_string()),
+                        thought_signature: None,
+                    }],
+                }
+            } else {
+                // The model never issues the call again after it was held.
+                Content::new("model").with_text("report handled")
+            };
+            let response = adk_core::LlmResponse {
+                content: Some(content),
+                turn_complete: true,
+                ..Default::default()
+            };
+            Ok(Box::pin(futures::stream::iter([Ok(response)])))
+        }
+    }
+
+    struct DeleteFile {
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl adk_core::Tool for DeleteFile {
+        fn name(&self) -> &str {
+            "delete_file"
+        }
+
+        fn description(&self) -> &str {
+            "Deletes a file"
+        }
+
+        async fn execute(
+            &self,
+            _ctx: Arc<dyn adk_core::ToolContext>,
+            _args: serde_json::Value,
+        ) -> AdkResult<serde_json::Value> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({"deleted": true}))
+        }
+    }
+
+    /// An approved call held by a real `LlmAgent` executes exactly once on the
+    /// resume run, although the model never issues it again, and the model then
+    /// sees exactly one response for the call: the real result.
+    #[tokio::test]
+    async fn permission_allow_resumes_the_held_call_without_the_model_reissuing_it() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let agent = adk_agent::LlmAgentBuilder::new("confirming-agent")
+            .model(Arc::new(CallOnceModel { requests: requests.clone() }))
+            .tool(Arc::new(DeleteFile { executions: executions.clone() }))
+            .require_tool_confirmation("delete_file")
+            .build()
+            .expect("agent");
+
+        let turn =
+            drive_permission_prompt(Arc::new(agent), "delete the report", Answer::Allow).await;
+
+        assert_eq!(turn.stop_reason, StopReason::EndTurn);
+        assert_eq!(turn.permission_tool_call_ids, vec!["call-1".to_string()], "asked once");
+        assert_eq!(executions.load(Ordering::SeqCst), 1, "the approved call executes once");
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 2, "one model call per run");
+        let responses: Vec<_> = requests[1]
+            .contents
+            .iter()
+            .flat_map(|content| &content.parts)
+            .filter_map(|part| match part {
+                adk_core::Part::FunctionResponse { function_response, id, .. } => {
+                    Some((id.clone(), function_response.response.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            responses,
+            vec![(Some("call-1".to_string()), serde_json::json!({"deleted": true}))]
+        );
     }
 
     /// Session controls used by the mode/config integration tests: two modes
@@ -2007,5 +2136,136 @@ mod tests {
             .expect("official ACP client completed");
         server_task.abort();
         let _ = server_task.await;
+    }
+
+    /// Raw JSON-RPC lines in and out of `serve_connection`, standing in for an
+    /// editor on stdin/stdout. Dropping the returned sender is stdin EOF.
+    type RawServer = (
+        futures::channel::mpsc::UnboundedSender<std::io::Result<String>>,
+        futures::channel::mpsc::UnboundedReceiver<String>,
+        tokio::task::JoinHandle<Result<(), Error>>,
+    );
+
+    fn raw_server(agent: Arc<dyn AdkAgent>) -> RawServer {
+        use futures::SinkExt as _;
+        let (_, session_service) = mock_agent_and_session();
+        let config = AcpServerConfigBuilder::new()
+            .agent(agent)
+            .session_service(session_service)
+            .agent_name("raw-agent")
+            .build()
+            .expect("valid config");
+        let capabilities = CapabilitiesBuilder::build(&config);
+        let handler =
+            Arc::new(AcpSessionHandler::new(&config, CancellationToken::new()).expect("handler"));
+        let (in_tx, in_rx) = futures::channel::mpsc::unbounded::<std::io::Result<String>>();
+        let (out_tx, out_rx) = futures::channel::mpsc::unbounded::<String>();
+        let lines = agent_client_protocol::Lines::new(
+            out_tx.sink_map_err(|error| std::io::Error::other(error.to_string())),
+            in_rx,
+        );
+        let server = tokio::spawn(serve_connection(
+            handler,
+            capabilities,
+            "raw-agent".into(),
+            String::new(),
+            lines,
+        ));
+        (in_tx, out_rx, server)
+    }
+
+    async fn response_to(
+        out: &mut futures::channel::mpsc::UnboundedReceiver<String>,
+        id: u64,
+    ) -> serde_json::Value {
+        use futures::StreamExt as _;
+        loop {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), out.next())
+                .await
+                .expect("no response within 5s")
+                .expect("output closed");
+            let message: serde_json::Value = serde_json::from_str(&line).expect("json line");
+            if message["id"] == id {
+                return message;
+            }
+        }
+    }
+
+    fn open_session_lines(cwd: &str) -> [String; 2] {
+        [
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1}})
+            .to_string(),
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": {"cwd": cwd, "mcpServers": []}})
+            .to_string(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn server_returns_when_the_editor_closes_stdin_while_idle() {
+        let (agent, _) = mock_agent_and_session();
+        let (in_tx, mut out, server) = raw_server(agent);
+        let cwd = std::env::current_dir().expect("cwd").display().to_string();
+        let [init, new] = open_session_lines(&cwd);
+        in_tx.unbounded_send(Ok(init)).expect("send");
+        assert_eq!(response_to(&mut out, 1).await["result"]["protocolVersion"], 1);
+        in_tx.unbounded_send(Ok(new)).expect("send");
+        assert!(response_to(&mut out, 2).await["result"]["sessionId"].is_string());
+        drop(in_tx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server did not return after stdin EOF")
+            .expect("server task");
+        assert!(result.is_ok(), "got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn server_returns_when_the_editor_closes_stdin_mid_prompt() {
+        let started = Arc::new(Notify::new());
+        let agent: Arc<dyn AdkAgent> = Arc::new(PendingAgent { started: started.clone() });
+        let (in_tx, mut out, server) = raw_server(agent);
+        let cwd = std::env::current_dir().expect("cwd").display().to_string();
+        let [init, new] = open_session_lines(&cwd);
+        in_tx.unbounded_send(Ok(init)).expect("send");
+        response_to(&mut out, 1).await;
+        in_tx.unbounded_send(Ok(new)).expect("send");
+        let session_id = response_to(&mut out, 2).await["result"]["sessionId"].clone();
+        in_tx
+            .unbounded_send(Ok(serde_json::json!({"jsonrpc": "2.0", "id": 3,
+                "method": "session/prompt",
+                "params": {"sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "wait"}]}})
+            .to_string()))
+            .expect("send");
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+            .await
+            .expect("prompt did not start");
+        drop(in_tx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server did not return after stdin EOF during a running prompt")
+            .expect("server task");
+        assert!(result.is_ok(), "got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn server_errors_keep_their_json_rpc_codes_on_the_wire() {
+        let (agent, _) = mock_agent_and_session();
+        let (in_tx, mut out, _server) = raw_server(agent);
+        let cwd = std::env::current_dir().expect("cwd").display().to_string();
+        let [init, _] = open_session_lines(&cwd);
+        in_tx.unbounded_send(Ok(init)).expect("send");
+        response_to(&mut out, 1).await;
+        in_tx
+            .unbounded_send(Ok(serde_json::json!({"jsonrpc": "2.0", "id": 7,
+                "method": "session/prompt",
+                "params": {"sessionId": "no-such-session",
+                    "prompt": [{"type": "text", "text": "hi"}]}})
+            .to_string()))
+            .expect("send");
+        let response = response_to(&mut out, 7).await;
+        assert_eq!(response["error"]["code"], -32602, "got {response}");
+        assert!(response["error"]["data"].is_string(), "got {response}");
     }
 }

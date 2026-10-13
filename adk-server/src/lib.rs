@@ -73,11 +73,14 @@ pub mod yaml_agent;
 #[cfg(feature = "agent-registry")]
 pub mod registry;
 
-#[cfg(feature = "openai-webhooks")]
+#[cfg(any(feature = "openai-webhooks", feature = "webhook-ingress"))]
 pub mod webhooks;
 
 #[cfg(feature = "background")]
 pub mod background;
+
+#[cfg(feature = "approvals")]
+pub mod approvals;
 
 #[cfg(feature = "agent-engine")]
 pub mod agent_engine;
@@ -91,13 +94,14 @@ pub use agent_engine::{
 // Background runs and cron scheduling re-exports
 #[cfg(feature = "background")]
 pub use background::{
-    BackgroundRun, BackgroundRunner, BackgroundState, RunStatus, RunStatusResponse, RunStore,
-    SubmitRunRequest, SubmitRunResponse, WorkflowExecutor, WorkflowRegistry, WorkflowState,
-    background_runs_router, background_runs_router_with_state,
+    BackgroundState, DurableScheduler, DurableWorker, DurableWorkerConfig, RunStatus,
+    RunStatusResponse, SchedulerTick, SubmitRunRequest, SubmitRunResponse, WorkerHandle,
+    WorkflowExecutor, WorkflowRegistry, WorkflowRunContext, WorkflowState, background_runs_router,
+    background_runs_router_with_state,
 };
 #[cfg(feature = "background")]
 pub use background::{
-    ConcurrencyPolicy, CreateCronJobRequest, CronJob, CronJobResponse, CronJobStatus, CronState,
+    ConcurrencyPolicy, CreateCronJobRequest, CronJobResponse, CronJobStatus, CronState,
     cron_jobs_router, cron_jobs_router_with_state, start_cron_scheduler, validate_cron_expression,
 };
 
@@ -107,9 +111,11 @@ pub use a2a::{
 };
 #[cfg(feature = "a2a-v1")]
 pub use a2a::{A2aServer, A2aServerApp, A2aServerBuilder};
-pub use auth_bridge::{RequestContext, RequestContextError, RequestContextExtractor};
+pub use auth_bridge::{
+    AuthenticatedCaller, RequestContext, RequestContextError, RequestContextExtractor,
+};
 pub use config::{SecurityConfig, ServerConfig};
 pub use rest::{
-    A2aController, RuntimeController, ServerBuilder, SessionController, ShutdownHandle, create_app,
-    create_app_with_a2a, shutdown_signal,
+    A2aController, A2aTaskRetention, RuntimeController, ServerBuilder, SessionController,
+    ShutdownHandle, create_app, create_app_with_a2a, shutdown_signal,
 };

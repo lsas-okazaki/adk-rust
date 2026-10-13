@@ -70,6 +70,7 @@
 //!     .build()?;
 //! ```
 
+mod acting_agent_context;
 #[cfg(feature = "ambient")]
 pub mod ambient;
 
@@ -82,10 +83,12 @@ pub mod codeact;
 pub mod compaction;
 mod custom_agent;
 pub mod guardrails;
+mod invocation_hooks;
 mod llm_agent;
 mod skill_shim;
 pub mod team;
 pub mod tool_call_markup;
+mod tool_ledger;
 mod workflow;
 
 pub use adk_core::AfterToolCallbackFull;

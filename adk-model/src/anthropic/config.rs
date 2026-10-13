@@ -62,18 +62,37 @@ pub enum Effort {
 /// let config = AnthropicConfig::new("sk-ant-xxx", "claude-sonnet-4-6")
 ///     .with_prompt_caching(false); // opt out
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The API key is redacted from `Debug` output and omitted when serializing.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AnthropicConfig {
-    /// Anthropic API key.
+    /// Anthropic API key. Never serialized; deserializing a config without it
+    /// yields an empty key.
+    #[serde(skip_serializing, default)]
     pub api_key: String,
     /// Model name (e.g., `"claude-opus-5"`, `"claude-sonnet-5"`).
     pub model: String,
-    /// Maximum tokens to generate.
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: u32,
+    /// Maximum tokens to generate. `None` uses
+    /// [`anthropic_default_max_tokens`](crate::catalog::anthropic_default_max_tokens)
+    /// for the model: 32,000 for Claude 4 and later, whose thinking counts toward
+    /// this cap, and 4,096 for older or unrecognized models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Bound on a whole non-streaming request, and on the wait for the response
+    /// headers of a streaming one, in seconds. `None` uses 600 (10 minutes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_secs: Option<u64>,
     /// Optional custom base URL (for proxies, Ollama, Vercel Gateway, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+
+    /// Accept a plain `http://` [`base_url`](AnthropicConfig::base_url) on a
+    /// non-loopback host.
+    ///
+    /// Defaults to `false`. Set with
+    /// [`allow_insecure_http`](AnthropicConfig::allow_insecure_http).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_insecure_http: bool,
 
     /// Enable prompt caching with `cache_control` blocks.
     ///
@@ -82,6 +101,12 @@ pub struct AnthropicConfig {
     /// [`with_prompt_caching(false)`](AnthropicConfig::with_prompt_caching).
     #[serde(default = "default_prompt_caching")]
     pub prompt_caching: bool,
+
+    /// Lifetime of the prompt cache entries this client writes. `None` uses the
+    /// API default of 5 minutes. Set with
+    /// [`with_prompt_cache_ttl`](AnthropicConfig::with_prompt_cache_ttl).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_ttl: Option<adk_anthropic::CacheTtl>,
 
     /// Thinking mode configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -129,8 +154,29 @@ pub struct AnthropicConfig {
     pub tool_search: Option<ToolSearchConfig>,
 }
 
-fn default_max_tokens() -> u32 {
-    4096
+impl std::fmt::Debug for AnthropicConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("max_tokens", &self.max_tokens)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("base_url", &self.base_url)
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .field("prompt_caching", &self.prompt_caching)
+            .field("prompt_cache_ttl", &self.prompt_cache_ttl)
+            .field("thinking", &self.thinking)
+            .field("effort", &self.effort)
+            .field("fast_mode", &self.fast_mode)
+            .field("citations", &self.citations)
+            .field("inference_geo", &self.inference_geo)
+            .field("context_management", &self.context_management)
+            .field("service_tier", &self.service_tier)
+            .field("beta_features", &self.beta_features)
+            .field("api_version", &self.api_version)
+            .field("tool_search", &self.tool_search)
+            .finish()
+    }
 }
 
 fn default_prompt_caching() -> bool {
@@ -142,9 +188,12 @@ impl Default for AnthropicConfig {
         Self {
             api_key: String::new(),
             model: crate::catalog::ANTHROPIC_DEFAULT.to_string(),
-            max_tokens: default_max_tokens(),
+            max_tokens: None,
+            request_timeout_secs: None,
             base_url: None,
+            allow_insecure_http: false,
             prompt_caching: true,
+            prompt_cache_ttl: None,
             thinking: None,
             effort: None,
             fast_mode: false,
@@ -165,21 +214,97 @@ impl AnthropicConfig {
         Self { api_key: api_key.into(), model: model.into(), ..Default::default() }
     }
 
-    /// Set the maximum tokens to generate.
+    /// Set the maximum tokens to generate, replacing the model-aware default.
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = max_tokens;
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Bound each request, replacing the 10-minute default.
+    ///
+    /// The bound covers a whole non-streaming request, such as an agent called
+    /// through `AgentTool`, and the wait for the response headers of a streaming
+    /// request. Sub-second precision is rounded up to the next second.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use adk_model::anthropic::AnthropicConfig;
+    ///
+    /// let config = AnthropicConfig::new("sk-ant-xxx", "claude-opus-5-5")
+    ///     .with_request_timeout(Duration::from_secs(1_800));
+    /// assert_eq!(config.request_timeout_secs, Some(1_800));
+    /// ```
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout_secs = Some(timeout.as_secs() + u64::from(timeout.subsec_nanos() > 0));
         self
     }
 
     /// Set a custom base URL.
+    ///
+    /// The URL is validated when [`AnthropicClient::new`](super::AnthropicClient::new)
+    /// builds the client: it must use `https://`, or `http://` with a loopback host,
+    /// unless [`allow_insecure_http`](Self::allow_insecure_http) is set.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = Some(base_url.into());
+        self
+    }
+
+    /// Allow a plain `http://` base URL on a non-loopback host.
+    ///
+    /// Use this for a trusted internal gateway that is reachable only over plain
+    /// HTTP. Every request attaches the API key, which then crosses the network
+    /// unencrypted. The base URL is validated when
+    /// [`AnthropicClient::new`](super::AnthropicClient::new) builds the client, so
+    /// this method and [`with_base_url`](Self::with_base_url) can be called in
+    /// either order. Accepting a non-loopback `http://` URL logs a warning with
+    /// the host.
+    ///
+    /// The opt-in applies to the configured base URL. Without one, the client
+    /// reads `ANTHROPIC_BASE_URL`, and a plain-HTTP URL from that variable is
+    /// acknowledged by `ANTHROPIC_ALLOW_INSECURE_HTTP=1` instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_model::anthropic::{AnthropicClient, AnthropicConfig};
+    ///
+    /// let config = AnthropicConfig::new("sk-ant-xxx", "claude-sonnet-5")
+    ///     .allow_insecure_http()
+    ///     .with_base_url("http://10.60.1.20:8080/api/v1/llm/anthropic");
+    /// let client = AnthropicClient::new(config)?;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
+    pub fn allow_insecure_http(mut self) -> Self {
+        self.allow_insecure_http = true;
         self
     }
 
     /// Enable or disable prompt caching.
     pub fn with_prompt_caching(mut self, enabled: bool) -> Self {
         self.prompt_caching = enabled;
+        self
+    }
+
+    /// Set the lifetime of the prompt cache entries this client writes.
+    ///
+    /// Applies to both the system-prompt breakpoint and the automatic breakpoint
+    /// on the conversation tail. A 1-hour entry costs more to write than a
+    /// 5-minute one and pays off when requests sharing a prefix are more than five
+    /// minutes apart, such as a conversation waiting on a person.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_model::anthropic::{AnthropicConfig, CacheTtl};
+    ///
+    /// let config = AnthropicConfig::new("sk-ant-xxx", "claude-sonnet-5-5")
+    ///     .with_prompt_cache_ttl(CacheTtl::one_hour());
+    /// assert_eq!(config.prompt_cache_ttl, Some(CacheTtl::one_hour()));
+    /// ```
+    pub fn with_prompt_cache_ttl(mut self, ttl: adk_anthropic::CacheTtl) -> Self {
+        self.prompt_cache_ttl = Some(ttl);
         self
     }
 

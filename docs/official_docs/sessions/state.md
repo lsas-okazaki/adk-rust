@@ -223,6 +223,8 @@ The session service handles state scoping automatically:
 3. Load session state
 4. Merge all scopes (app → user → session)
 
+`get` and `list` load the app and user scopes at call time, so a value written through one session is visible to every other session of the same app or user on its next read. `VertexAiSessionService` is the exception: it keeps `app:` and `user:` keys in each session's own state.
+
 ### On Event Append
 
 1. Extract state delta from event
@@ -230,6 +232,17 @@ The session service handles state scoping automatically:
 3. Apply `app:` deltas to app state
 4. Apply `user:` deltas to user state
 5. Apply remaining deltas to session state
+
+Each scope receives only the keys in the delta, applied atomically by the backend, so concurrent appends keep each other's keys. When two concurrent appends write the same key, the later write wins. A `null` value is stored as `null`; it does not remove the key.
+
+| Backend | How a delta is applied |
+|---------|------------------------|
+| PostgreSQL | `state \|\| delta` in SQL under the row lock |
+| SQLite | Read and write inside `BEGIN IMMEDIATE` |
+| Redis | `HSET` of the delta's fields; session scope replaced by a compare-and-set script |
+| MongoDB | `$mergeObjects` update pipeline |
+| Firestore | Merge inside the commit transaction |
+| Neo4j | One node property per key, written with `SET n += $delta` |
 
 ## Complete Example
 

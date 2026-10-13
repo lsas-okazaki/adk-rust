@@ -19,6 +19,7 @@ use super::super::elicitation::{
     AdkClientHandler, AutoDeclineElicitationHandler, ElicitationHandler,
 };
 use super::super::resource_notifications::ResourceNotificationHandler;
+use super::super::schema_limits::McpSchemaLimits;
 use super::super::toolset::McpToolset;
 use super::super::{GetPromptResult, Prompt, Resource, ResourceContents, ResourceTemplate};
 use super::config::McpServerConfig;
@@ -88,6 +89,9 @@ pub struct McpServerManager {
 
     /// Name returned by the `Toolset::name()` implementation. Default: `"mcp_server_manager"`.
     pub(crate) name: String,
+
+    /// Size limits applied to the tool schemas of every managed server.
+    pub(crate) schema_limits: McpSchemaLimits,
 }
 
 impl McpServerManager {
@@ -136,6 +140,7 @@ impl McpServerManager {
             monitor_cancel: StdMutex::new(CancellationToken::new()),
             monitor_running: Arc::new(AtomicBool::new(false)),
             name: "mcp_server_manager".to_string(),
+            schema_limits: McpSchemaLimits::default(),
         }
     }
 
@@ -235,7 +240,8 @@ impl McpServerManager {
 
     /// Set the grace period reserved for managed-session shutdown.
     ///
-    /// Default: 5 seconds.
+    /// The period covers cancelling the server's pending MCP tasks and closing
+    /// its session. Default: 5 seconds.
     pub fn with_grace_period(mut self, period: Duration) -> Self {
         self.grace_period = period;
         self
@@ -246,6 +252,25 @@ impl McpServerManager {
     /// Default: `"mcp_server_manager"`.
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
+        self
+    }
+
+    /// Set the size limits applied to the tool schemas of every managed server.
+    ///
+    /// Each managed toolset is named after its server ID, so the warning for a
+    /// skipped tool names the server. Default: [`McpSchemaLimits::default`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_tool::mcp::{McpSchemaLimits, McpServerManager};
+    /// use std::collections::HashMap;
+    ///
+    /// let manager = McpServerManager::new(HashMap::new())
+    ///     .with_schema_limits(McpSchemaLimits::default().with_max_nodes(20_000));
+    /// ```
+    pub fn with_schema_limits(mut self, limits: McpSchemaLimits) -> Self {
+        self.schema_limits = limits;
         self
     }
 
@@ -281,6 +306,7 @@ impl McpServerManager {
             &self.elicitation_handler,
             &self.resource_notification_handler,
             &self.resource_subscriptions,
+            self.schema_limits,
             #[cfg(feature = "mcp-sampling")]
             &self.sampling_handler,
         )
@@ -296,6 +322,7 @@ impl McpServerManager {
         elicitation_handler: &Option<Arc<dyn ElicitationHandler>>,
         resource_notification_handler: &Option<Arc<dyn ResourceNotificationHandler>>,
         resource_subscriptions: &Arc<RwLock<HashMap<String, BTreeSet<String>>>>,
+        schema_limits: McpSchemaLimits,
         #[cfg(feature = "mcp-sampling")] sampling_handler: &Option<
             Arc<dyn crate::sampling::SamplingHandler>,
         >,
@@ -355,6 +382,8 @@ impl McpServerManager {
             .await
             .map(|client| {
                 McpToolset::new(client)
+                    .with_name(id)
+                    .with_schema_limits(schema_limits)
                     .with_task_support(config.task_config.clone())
                     .with_mrtr_handler(input_handler)
             })
@@ -390,8 +419,10 @@ impl McpServerManager {
 
     /// Stop a managed MCP server by ID.
     ///
-    /// Cancels the MCP session via the toolset's cancellation token, drops the
-    /// `McpToolset` connection, and sets the status to `Stopped`.
+    /// Cancels the server's pending MCP tasks (see
+    /// [`McpToolset::cancel_pending_tasks`]) and then its MCP session, both within
+    /// the grace period, drops the `McpToolset` connection, and sets the status
+    /// to `Stopped`.
     ///
     /// If the server is not running, this is a no-op and returns `Ok(())`.
     ///
@@ -428,17 +459,46 @@ impl McpServerManager {
             return;
         }
 
-        // Cancel the MCP session and drop the toolset
+        // Cancel remote tasks, then the MCP session, and drop the toolset
         if let Some(ref toolset) = entry.toolset {
-            let cancel_token = toolset.cancellation_token().await;
-            cancel_token.cancel();
-            let closed = tokio::time::timeout(grace_period, async {
-                while !toolset.is_closed().await {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+            // Task cleanup and session close share one grace period.
+            let deadline = tokio::time::Instant::now() + grace_period;
+            match tokio::time::timeout_at(deadline, toolset.cancel_pending_tasks()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(
+                    server.id = id,
+                    error = %error,
+                    "MCP tasks did not confirm cancellation before shutdown"
+                ),
+                Err(_) => tracing::warn!(
+                    server.id = id,
+                    shutdown.grace_ms = grace_period.as_millis(),
+                    "MCP task cancellation did not finish within the grace period"
+                ),
+            }
+            // A call blocked on the server holds the connection lock, so even
+            // reaching the session's token is bounded by the grace period.
+            let closed = match tokio::time::timeout_at(deadline, toolset.cancellation_token()).await
+            {
+                Ok(cancel_token) => {
+                    cancel_token.cancel();
+                    tokio::time::timeout_at(deadline, async {
+                        while !toolset.is_closed().await {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .is_ok()
                 }
-            })
-            .await
-            .is_ok();
+                Err(_) => {
+                    tracing::warn!(
+                        server.id = id,
+                        shutdown.grace_ms = grace_period.as_millis(),
+                        "MCP connection lock was still held at the end of the grace period"
+                    );
+                    false
+                }
+            };
             if !closed {
                 tracing::warn!(
                     server.id = id,
@@ -496,6 +556,7 @@ impl McpServerManager {
             &self.elicitation_handler,
             &self.resource_notification_handler,
             &self.resource_subscriptions,
+            self.schema_limits,
             #[cfg(feature = "mcp-sampling")]
             &self.sampling_handler,
         )
@@ -665,6 +726,7 @@ impl McpServerManager {
         let elicitation_handler = self.elicitation_handler.clone();
         let resource_notification_handler = self.resource_notification_handler.clone();
         let resource_subscriptions = Arc::clone(&self.resource_subscriptions);
+        let schema_limits = self.schema_limits;
         #[cfg(feature = "mcp-sampling")]
         let sampling_handler = self.sampling_handler.clone();
 
@@ -804,6 +866,7 @@ impl McpServerManager {
                                             &elicitation_handler,
                                             &resource_notification_handler,
                                             &resource_subscriptions,
+                                            schema_limits,
                                             #[cfg(feature = "mcp-sampling")]
                                             &sampling_handler,
                                         )
@@ -1090,8 +1153,9 @@ impl McpServerManager {
     /// Shut down all managed servers and stop health monitoring.
     ///
     /// This method first stops the health monitoring task, then stops all
-    /// running servers by cancelling their MCP sessions and dropping the child
-    /// transports. After shutdown, all server statuses are set to `Stopped`.
+    /// running servers by cancelling their pending MCP tasks and MCP sessions
+    /// and dropping the child transports. After shutdown, all server statuses
+    /// are set to `Stopped`.
     ///
     /// # Example
     ///
@@ -1226,6 +1290,14 @@ mod tests {
         let manager =
             McpServerManager::new(HashMap::new()).with_grace_period(Duration::from_secs(2));
         assert_eq!(manager.grace_period, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_builder_with_schema_limits() {
+        let limits = McpSchemaLimits::default().with_max_bytes(4096).with_max_nodes(64);
+        let manager = McpServerManager::new(HashMap::new()).with_schema_limits(limits);
+        assert_eq!(manager.schema_limits, limits);
+        assert_eq!(McpServerManager::new(HashMap::new()).schema_limits, McpSchemaLimits::default());
     }
 
     #[test]
@@ -1805,5 +1877,153 @@ mod tests {
         let manager = McpServerManager::new(configs);
         // Drop happens here — should not panic
         drop(manager);
+    }
+
+    /// Materializes one task that never finishes and counts `tasks/get` and
+    /// `tasks/cancel` requests.
+    #[derive(Clone, Default)]
+    struct HeldTaskServer {
+        gets: Arc<std::sync::atomic::AtomicUsize>,
+        cancels: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl rmcp::ServerHandler for HeldTaskServer {
+        fn get_info(&self) -> rmcp::model::InitializeResult {
+            rmcp::model::InitializeResult::new(
+                rmcp::model::ServerCapabilities::builder().enable_tools().enable_tasks().build(),
+            )
+        }
+
+        async fn call_tool(
+            &self,
+            params: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+            if params.name == "hang" {
+                std::future::pending::<()>().await;
+            }
+            Ok(rmcp::model::CreateTaskResult::new(held_task()).into())
+        }
+
+        async fn get_task(
+            &self,
+            _params: rmcp::model::GetTaskParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<rmcp::model::GetTaskResult, rmcp::ErrorData> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            Ok(rmcp::model::GetTaskResult::new(rmcp::model::DetailedTask::new(
+                held_task(),
+                rmcp::model::TaskPayload::Working,
+            )))
+        }
+
+        async fn cancel_task(
+            &self,
+            _params: rmcp::model::CancelTaskParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<(), rmcp::ErrorData> {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn held_task() -> rmcp::model::Task {
+        let now = "2026-10-08T00:00:00Z";
+        rmcp::model::Task::new("held", rmcp::model::TaskStatus::Working, now, now)
+    }
+
+    #[tokio::test]
+    async fn stop_server_cancels_pending_tasks_within_the_grace_period() {
+        use rmcp::ServiceExt;
+
+        let server = HeldTaskServer::default();
+        let (gets, cancels) = (server.gets.clone(), server.cancels.clone());
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            if let Ok(running) = server.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client = AdkClientHandler::new(Arc::new(AutoDeclineElicitationHandler))
+            .with_tasks()
+            .serve(client_io)
+            .await
+            .unwrap();
+        let toolset = McpToolset::new(client).with_task_support(
+            crate::mcp::McpTaskConfig::enabled().poll_interval(Duration::from_millis(1)),
+        );
+        // Dropping the call once it polls sends one `tasks/cancel`; the held task keeps
+        // running, so the toolset still tracks it.
+        tokio::select! {
+            result = toolset.call_tool_value("job", Default::default()) => {
+                panic!("a held task must not finish: {result:?}");
+            }
+            () = async {
+                while gets.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            } => {}
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while cancels.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the dropped call never sent tasks/cancel");
+
+        let manager = McpServerManager::new(HashMap::from([(
+            "tasks".to_string(),
+            McpServerConfig { command: "unused".to_string(), ..Default::default() },
+        )]))
+        .with_grace_period(Duration::from_secs(2));
+        {
+            let mut servers = manager.servers.write().await;
+            let entry = servers.get_mut("tasks").unwrap();
+            entry.status = ServerStatus::Running;
+            entry.toolset = Some(toolset);
+        }
+        manager.stop_server("tasks").await.unwrap();
+
+        assert_eq!(cancels.load(Ordering::SeqCst), 2, "shutdown must cancel the pending task");
+        assert_eq!(manager.server_status("tasks").await.unwrap(), ServerStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn stop_server_is_bounded_while_a_call_holds_the_connection() {
+        use rmcp::ServiceExt;
+
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            if let Ok(running) = HeldTaskServer::default().serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client = AdkClientHandler::new(Arc::new(AutoDeclineElicitationHandler))
+            .serve(client_io)
+            .await
+            .unwrap();
+        let toolset = McpToolset::new(client);
+        // The server never answers, so this call keeps the connection lock.
+        let hung = toolset.clone();
+        tokio::spawn(async move { hung.call_tool_value("hang", Default::default()).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let manager = McpServerManager::new(HashMap::from([(
+            "hung".to_string(),
+            McpServerConfig { command: "unused".to_string(), ..Default::default() },
+        )]))
+        .with_grace_period(Duration::from_millis(100));
+        {
+            let mut servers = manager.servers.write().await;
+            let entry = servers.get_mut("hung").unwrap();
+            entry.status = ServerStatus::Running;
+            entry.toolset = Some(toolset);
+        }
+        tokio::time::timeout(Duration::from_secs(5), manager.stop_server("hung"))
+            .await
+            .expect("stopping a server must not wait on a hung call")
+            .unwrap();
+        assert_eq!(manager.server_status("hung").await.unwrap(), ServerStatus::Stopped);
     }
 }

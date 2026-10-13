@@ -26,6 +26,10 @@ impl FileHandle {
     }
 
     /// Delete the file.
+    ///
+    /// The large `Err` is deliberate: the handle comes back for retry instead
+    /// of being dropped, so it cannot be boxed without breaking this contract.
+    #[allow(clippy::result_large_err)]
     pub async fn delete(self) -> Result<(), (Self, Error)> {
         match self.client.delete_file(&self.inner.name).await.context(ClientSnafu) {
             Ok(_) => Ok(()),

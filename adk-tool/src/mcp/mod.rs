@@ -1,9 +1,11 @@
 mod auth;
 mod elicitation;
 mod http;
+mod input;
 pub mod manager;
 mod reconnect;
 mod resource_notifications;
+mod schema_limits;
 mod task;
 mod toolset;
 
@@ -16,6 +18,7 @@ pub use reconnect::{
     should_refresh_connection,
 };
 pub use resource_notifications::ResourceNotificationHandler;
+pub use schema_limits::McpSchemaLimits;
 pub use task::{CreateTaskResult, McpTaskConfig, TaskError, TaskInfo, TaskStatus};
 pub use toolset::{McpToolset, ToolFilter};
 

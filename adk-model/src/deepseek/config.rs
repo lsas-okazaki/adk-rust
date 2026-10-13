@@ -1,7 +1,7 @@
 //! Configuration types for DeepSeek provider.
 //!
-//! Supports the DeepSeek V4 models (`deepseek-v4-flash`, `deepseek-v4-pro`,
-//! `deepseek-v4-flash-vision-exp`). The `deepseek-chat` and
+//! Supports the current DeepSeek models (`deepseek-flash`, `deepseek-v4-pro`).
+//! `deepseek-v4-flash`, `deepseek-v4-flash-vision-exp`, `deepseek-chat` and
 //! `deepseek-reasoner` aliases were retired on 2026-07-24.
 
 use serde::{Deserialize, Serialize};
@@ -69,11 +69,15 @@ impl std::fmt::Display for ReasoningEffort {
 /// let pro_max = DeepSeekConfig::v4_pro("api-key")
 ///     .with_reasoning_effort(ReasoningEffort::Max);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The API key is redacted from `Debug` output and omitted when serializing.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DeepSeekConfig {
-    /// DeepSeek API key.
+    /// DeepSeek API key. Never serialized; deserializing a config without it
+    /// yields an empty key.
+    #[serde(skip_serializing, default)]
     pub api_key: String,
-    /// Model name (e.g., `"deepseek-v4-flash"`, `"deepseek-v4-pro"`).
+    /// Model name (e.g., `"deepseek-flash"`, `"deepseek-v4-pro"`).
     pub model: String,
     /// Optional custom base URL.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,6 +105,22 @@ pub struct DeepSeekConfig {
     /// Prefer using `thinking` directly for new code.
     #[serde(default)]
     pub thinking_enabled: bool,
+}
+
+impl std::fmt::Debug for DeepSeekConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeepSeekConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("thinking", &self.thinking)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("max_tokens", &self.max_tokens)
+            .field("beta", &self.beta)
+            .field("strict_tools", &self.strict_tools)
+            .field("thinking_enabled", &self.thinking_enabled)
+            .finish()
+    }
 }
 
 impl Default for DeepSeekConfig {
@@ -139,13 +159,9 @@ impl DeepSeekConfig {
         }
     }
 
-    /// Create a config for `deepseek-v4-flash` (fast, cost-efficient).
+    /// Create a config for `deepseek-flash` (fast, cost-efficient, vision-capable).
     pub fn v4_flash(api_key: impl Into<String>) -> Self {
-        Self {
-            api_key: api_key.into(),
-            model: "deepseek-v4-flash".to_string(),
-            ..Default::default()
-        }
+        Self { api_key: api_key.into(), model: "deepseek-flash".to_string(), ..Default::default() }
     }
 
     // --- Named-role constructors ---
@@ -262,7 +278,7 @@ mod tests {
     #[test]
     fn test_default_model_is_v4_flash() {
         let config = DeepSeekConfig::default();
-        assert_eq!(config.model, "deepseek-v4-flash");
+        assert_eq!(config.model, "deepseek-flash");
     }
 
     #[test]
@@ -277,7 +293,7 @@ mod tests {
     #[test]
     fn test_v4_flash_constructor() {
         let config = DeepSeekConfig::v4_flash("key");
-        assert_eq!(config.model, "deepseek-v4-flash");
+        assert_eq!(config.model, "deepseek-flash");
         assert!(config.thinking.is_none());
     }
 

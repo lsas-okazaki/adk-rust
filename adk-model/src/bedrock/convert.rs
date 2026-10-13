@@ -477,7 +477,8 @@ fn mime_to_bedrock_document_format(mime_type: &str) -> Option<DocumentFormat> {
 /// typically contains `description` and `parameters` fields.
 ///
 /// When `prompt_caching` is provided, a `CachePoint` block is appended after
-/// the tool definitions.
+/// the tool definitions. Tools are sorted by name so the cached prefix is
+/// identical across requests built from the same `HashMap`.
 fn adk_tools_to_bedrock(
     tools: &HashMap<String, Value>,
     prompt_caching: Option<&BedrockCacheConfig>,
@@ -555,7 +556,15 @@ pub(crate) fn bedrock_response_to_adk(
     let finish_reason = Some(bedrock_stop_reason_to_adk(stop_reason));
 
     let usage_metadata = usage.map(|u| UsageMetadata {
-        prompt_token_count: u.input_tokens,
+        provider_usage: Some(serde_json::json!({
+            "inputTokens":u.input_tokens, "outputTokens":u.output_tokens, "totalTokens":u.total_tokens,
+            "cacheReadInputTokens":u.cache_read_input_tokens, "cacheWriteInputTokens":u.cache_write_input_tokens,
+        })),
+        // Converse reports uncached input separately from cache reads and writes.
+        prompt_token_count: u
+            .input_tokens
+            .saturating_add(u.cache_read_input_tokens.unwrap_or(0))
+            .saturating_add(u.cache_write_input_tokens.unwrap_or(0)),
         candidates_token_count: u.output_tokens,
         total_token_count: u.total_tokens,
         cache_read_input_token_count: u.cache_read_input_tokens,
@@ -563,18 +572,21 @@ pub(crate) fn bedrock_response_to_adk(
         ..Default::default()
     });
 
+    let turn_complete = content.as_ref().is_none_or(|content| !content.has_function_calls());
     LlmResponse {
         content,
         usage_metadata,
         finish_reason,
         citation_metadata: None,
         partial: false,
-        turn_complete: true,
+        turn_complete,
         interrupted: false,
         error_code: None,
         error_message: None,
         provider_metadata: None,
         interaction_id: None,
+        model: None,
+        provider: None,
     }
 }
 
@@ -688,6 +700,8 @@ pub(crate) fn bedrock_stream_content_start_to_adk(
                 error_message: None,
                 provider_metadata: None,
                 interaction_id: None,
+                model: None,
+                provider: None,
             })
         }
         _ => None,
@@ -718,6 +732,8 @@ pub(crate) fn bedrock_stream_delta_to_adk(delta: &ContentBlockDelta) -> Option<L
                     error_message: None,
                     provider_metadata: None,
                     interaction_id: None,
+                    model: None,
+                    provider: None,
                 })
             }
         }
@@ -744,6 +760,8 @@ pub(crate) fn bedrock_stream_delta_to_adk(delta: &ContentBlockDelta) -> Option<L
                         error_message: None,
                         provider_metadata: None,
                         interaction_id: None,
+                        model: None,
+                        provider: None,
                     })
                 }
             } else {
@@ -769,6 +787,8 @@ pub(crate) fn bedrock_stream_stop_to_adk(stop_reason: &StopReason) -> LlmRespons
         error_message: None,
         provider_metadata: None,
         interaction_id: None,
+        model: None,
+        provider: None,
     }
 }
 
@@ -843,6 +863,35 @@ mod tests {
         let doc = json_value_to_document(&value);
         let back = document_to_json_value(&doc);
         assert_eq!(value, back);
+    }
+
+    #[test]
+    fn tool_configuration_order_is_stable_across_maps() {
+        let names: Vec<String> = (0..12).map(|i| format!("tool_{i:02}")).collect();
+        let declaration = |name: &str| {
+            serde_json::json!({
+                "description": format!("{name} description"),
+                "parameters": {"type": "object", "properties": {}}
+            })
+        };
+        let forward: HashMap<String, Value> =
+            names.iter().map(|name| (name.clone(), declaration(name))).collect();
+        let reverse: HashMap<String, Value> =
+            names.iter().rev().map(|name| (name.clone(), declaration(name))).collect();
+
+        let from_forward = adk_tools_to_bedrock(&forward, None);
+        let from_reverse = adk_tools_to_bedrock(&reverse, None);
+
+        assert_eq!(from_forward, from_reverse);
+        let converted_names: Vec<String> = from_forward
+            .tools()
+            .iter()
+            .map(|tool| match tool {
+                Tool::ToolSpec(spec) => spec.name().to_string(),
+                other => panic!("unexpected tool entry {other:?}"),
+            })
+            .collect();
+        assert_eq!(converted_names, names);
     }
 
     #[test]
@@ -1457,6 +1506,35 @@ mod tests {
         // Signature deltas are not emitted as LlmResponse; they are
         // accumulated in the streaming client and emitted at block stop.
         assert!(bedrock_stream_delta_to_adk(&delta).is_none());
+    }
+
+    #[test]
+    fn prompt_tokens_include_cache_reads_and_writes() {
+        let message = Message::builder()
+            .role(ConversationRole::Assistant)
+            .content(ContentBlock::Text("ok".to_string()))
+            .build()
+            .unwrap();
+        // Converse reports uncached input apart from the cache: 12 + 3109 + 50 + 150 = 3321.
+        let usage = bedrock::TokenUsage::builder()
+            .input_tokens(12)
+            .output_tokens(150)
+            .total_tokens(3321)
+            .cache_read_input_tokens(3109)
+            .cache_write_input_tokens(50)
+            .build()
+            .unwrap();
+        let response = bedrock_response_to_adk(
+            &ConverseOutput::Message(message),
+            &StopReason::EndTurn,
+            Some(&usage),
+        );
+        let usage = response.usage_metadata.unwrap();
+        assert_eq!(usage.prompt_token_count, 3171);
+        assert_eq!(
+            usage.prompt_token_count + usage.candidates_token_count,
+            usage.total_token_count
+        );
     }
 
     #[test]

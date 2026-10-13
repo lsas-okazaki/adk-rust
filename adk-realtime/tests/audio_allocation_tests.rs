@@ -55,7 +55,11 @@ fn frame() -> AudioChunk {
 /// reconstruction that drifts with the crate.
 fn decode_owned(data: &[u8]) -> Vec<i16> {
     let mut samples = Vec::with_capacity(data.len() / size_of::<i16>());
-    for chunk in data.chunks_exact(size_of::<i16>()) {
+    // Deliberately not a constant size: this "before" snapshot must keep the
+    // shipped `chunks_exact` idiom verbatim, and newer clippy only suggests
+    // `as_chunks` for constant sizes.
+    let lane_bytes = size_of::<i16>();
+    for chunk in data.chunks_exact(lane_bytes) {
         samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
     }
     samples

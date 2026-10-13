@@ -48,7 +48,7 @@ rust-embed = "8.9.0"
 mime_guess = "2.0.5"
 reqwest.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
-a2a-protocol-types = { version = "0.5", optional = true }
+a2a-protocol-types = { version = "0.12.1", optional = true }
 # Optional: YAML agent definition parsing
 serde_yaml = { version = "0.9", optional = true }
 # Optional: filesystem watcher for hot reload
@@ -59,9 +59,6 @@ regex = { workspace = true, optional = true }
 hmac = { version = "0.12", optional = true }
 sha2 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
-
-# Optional: background run and cron scheduling
-cron = { version = "0.15", optional = true }
 
 [features]
 default = []
@@ -74,8 +71,12 @@ agent-registry = []
 a2a-interceptors = []
 # Enable OpenAI webhook handler for background task completion events
 openai-webhooks = ["dep:hmac", "dep:sha2", "dep:hex"]
+# Signed inbound webhooks (`POST /hooks/{name}`) that enqueue durable runs
+webhook-ingress = ["adk-core/webhooks"]
 # Enable background run endpoints and cron job management
-background = ["dep:cron"]
+background = ["adk-core/cron"]
+# Approval inbox endpoints, the approval ticker, and the signed approval webhook notifier
+approvals = ["adk-core/webhook-delivery"]
 # Enable the Gemini Enterprise Agent Platform (ReasoningEngine) dispatch surface
 # and the turnkey serve_agent_engine entrypoint (tokio/net for the listener)
 agent-engine = ["dep:adk-memory", "tokio/net"]
@@ -90,6 +91,8 @@ vertex-remote-engine = [
 ]
 
 [dev-dependencies]
+adk-graph = { path = "../adk-graph" }
+adk-session = { path = "../adk-session", features = ["sqlite", "postgres"] }
 async-stream.workspace = true
 tracing-subscriber = "0.3"
 uuid = { version = "1.23", features = ["v4"] }

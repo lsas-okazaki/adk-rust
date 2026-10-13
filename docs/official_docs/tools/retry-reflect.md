@@ -16,10 +16,10 @@ When a tool call fails, the default behavior is to return the error to the LLM a
 
 ```toml
 [dependencies]
-adk-retry-reflect = "2.2.0"
+adk-retry-reflect = "3.0.0"
 
 # Or via umbrella crate (included in standard tier)
-adk-rust = { version = "2.2.0", features = ["standard"] }
+adk-rust = { version = "3.0.0", features = ["standard"] }
 ```
 
 ## Quick Start
@@ -119,6 +119,15 @@ When a tool call fails, the plugin injects a reflection prompt into the conversa
 ```
 
 The reflection prompt gives the LLM explicit context about the failure so it can self-correct rather than repeating the same mistake.
+
+Two failures pass through unchanged, with no retry suggested:
+
+| Failure | Why |
+|---------|-----|
+| An authorization or approval refusal (missing scope, access denied, denied by confirmation policy) | Repeating the call is refused again |
+| A timeout of a tool whose `effect()` is `NonIdempotent` | The call may have taken effect, so repeating it could repeat a payment or other side effect |
+
+See [Tool Effects](tool-effects.md).
 
 ## When to Use
 

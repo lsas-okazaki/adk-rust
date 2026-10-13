@@ -1,6 +1,7 @@
 //! Window and tab management tools.
 
 use crate::session::BrowserSession;
+use crate::tools::navigate::UrlPolicy;
 use adk_core::{AdkError, Result, Tool, ToolContext};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -47,13 +48,54 @@ impl Tool for ListWindowsTool {
 }
 
 /// Tool for opening a new tab.
+///
+/// A `url` argument must use a scheme in the allowlist, which defaults to
+/// [`DEFAULT_ALLOWED_SCHEMES`](crate::tools::DEFAULT_ALLOWED_SCHEMES), and must not point at a
+/// private network address unless
+/// [`with_private_network_access`](Self::with_private_network_access) permits it. The page
+/// the new tab or window ends on is checked again, so a redirect to a refused address fails
+/// the call.
 pub struct NewTabTool {
     browser: Arc<BrowserSession>,
+    policy: UrlPolicy,
 }
 
 impl NewTabTool {
     pub fn new(browser: Arc<BrowserSession>) -> Self {
-        Self { browser }
+        Self { browser, policy: UrlPolicy::default() }
+    }
+
+    /// Permit or refuse a `url` that points at a private network address. Refused by default.
+    ///
+    /// See [`NavigateTool::with_private_network_access`](crate::tools::NavigateTool::with_private_network_access).
+    #[must_use]
+    pub fn with_private_network_access(mut self, enabled: bool) -> Self {
+        self.policy.allow_private_network = enabled;
+        self
+    }
+
+    /// Permit or refuse a `url` whose host name does not resolve on the agent host. Refused
+    /// by default.
+    ///
+    /// See [`NavigateTool::with_unresolved_hosts`](crate::tools::NavigateTool::with_unresolved_hosts).
+    #[must_use]
+    pub fn with_unresolved_hosts(mut self, enabled: bool) -> Self {
+        self.policy.allow_unresolved_hosts = enabled;
+        self
+    }
+
+    /// Replace the URL schemes accepted for the optional `url` argument.
+    ///
+    /// Schemes are compared case-insensitively. See
+    /// [`NavigateTool::with_allowed_schemes`](crate::tools::NavigateTool::with_allowed_schemes).
+    #[must_use]
+    pub fn with_allowed_schemes<I, S>(mut self, schemes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.policy.allowed_schemes = schemes.into_iter().map(Into::into).collect();
+        self
     }
 }
 
@@ -81,14 +123,19 @@ impl Tool for NewTabTool {
 
     async fn execute(&self, _ctx: Arc<dyn ToolContext>, args: Value) -> Result<Value> {
         let url = args.get("url").and_then(|v| v.as_str());
+        if let Some(url) = url {
+            self.policy.check(url).await?;
+        }
 
         let handle = self.browser.new_tab().await?;
 
-        if let Some(url) = url {
-            self.browser.navigate(url).await?;
-        }
-
-        let current_url = self.browser.current_url().await.unwrap_or_default();
+        let current_url = match url {
+            Some(url) => {
+                self.browser.navigate(url).await?;
+                self.policy.check_landing(&self.browser).await?
+            }
+            None => self.browser.current_url().await.unwrap_or_default(),
+        };
 
         Ok(json!({
             "success": true,
@@ -99,13 +146,54 @@ impl Tool for NewTabTool {
 }
 
 /// Tool for opening a new window.
+///
+/// A `url` argument must use a scheme in the allowlist, which defaults to
+/// [`DEFAULT_ALLOWED_SCHEMES`](crate::tools::DEFAULT_ALLOWED_SCHEMES), and must not point at a
+/// private network address unless
+/// [`with_private_network_access`](Self::with_private_network_access) permits it. The page
+/// the new tab or window ends on is checked again, so a redirect to a refused address fails
+/// the call.
 pub struct NewWindowTool {
     browser: Arc<BrowserSession>,
+    policy: UrlPolicy,
 }
 
 impl NewWindowTool {
     pub fn new(browser: Arc<BrowserSession>) -> Self {
-        Self { browser }
+        Self { browser, policy: UrlPolicy::default() }
+    }
+
+    /// Permit or refuse a `url` that points at a private network address. Refused by default.
+    ///
+    /// See [`NavigateTool::with_private_network_access`](crate::tools::NavigateTool::with_private_network_access).
+    #[must_use]
+    pub fn with_private_network_access(mut self, enabled: bool) -> Self {
+        self.policy.allow_private_network = enabled;
+        self
+    }
+
+    /// Permit or refuse a `url` whose host name does not resolve on the agent host. Refused
+    /// by default.
+    ///
+    /// See [`NavigateTool::with_unresolved_hosts`](crate::tools::NavigateTool::with_unresolved_hosts).
+    #[must_use]
+    pub fn with_unresolved_hosts(mut self, enabled: bool) -> Self {
+        self.policy.allow_unresolved_hosts = enabled;
+        self
+    }
+
+    /// Replace the URL schemes accepted for the optional `url` argument.
+    ///
+    /// Schemes are compared case-insensitively. See
+    /// [`NavigateTool::with_allowed_schemes`](crate::tools::NavigateTool::with_allowed_schemes).
+    #[must_use]
+    pub fn with_allowed_schemes<I, S>(mut self, schemes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.policy.allowed_schemes = schemes.into_iter().map(Into::into).collect();
+        self
     }
 }
 
@@ -133,14 +221,19 @@ impl Tool for NewWindowTool {
 
     async fn execute(&self, _ctx: Arc<dyn ToolContext>, args: Value) -> Result<Value> {
         let url = args.get("url").and_then(|v| v.as_str());
+        if let Some(url) = url {
+            self.policy.check(url).await?;
+        }
 
         let handle = self.browser.new_window().await?;
 
-        if let Some(url) = url {
-            self.browser.navigate(url).await?;
-        }
-
-        let current_url = self.browser.current_url().await.unwrap_or_default();
+        let current_url = match url {
+            Some(url) => {
+                self.browser.navigate(url).await?;
+                self.policy.check_landing(&self.browser).await?
+            }
+            None => self.browser.current_url().await.unwrap_or_default(),
+        };
 
         Ok(json!({
             "success": true,

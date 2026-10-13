@@ -26,8 +26,19 @@ pub const GEMINI_DEFAULT: &str = "gemini-3.7-flash";
 pub const OPENAI_DEFAULT: &str = "gpt-5.6-terra";
 /// Recommended Anthropic model balancing capability, latency, and cost.
 pub const ANTHROPIC_DEFAULT: &str = "claude-sonnet-5";
+/// Output-token cap ADK requests from Claude 4 and later models when the caller sets none.
+///
+/// Thinking counts toward the cap, and Claude 5 models think on every turn, so a
+/// small cap ends turns with `max_tokens` before the answer. Every Claude 4 and
+/// later model accepts at least 32,000 output tokens.
+pub const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 32_000;
+/// Output-token cap ADK requests from older or unrecognized Anthropic models.
+pub const ANTHROPIC_LEGACY_MAX_TOKENS: u32 = 4_096;
 /// Recommended DeepSeek model for general agent workloads.
-pub const DEEPSEEK_DEFAULT: &str = "deepseek-v4-flash";
+///
+/// This is the id the API reports back. `deepseek-v4-flash` and `deepseek-chat`
+/// are still accepted and are served by this same model.
+pub const DEEPSEEK_DEFAULT: &str = "deepseek-flash";
 /// Recommended Groq production model.
 pub const GROQ_DEFAULT: &str = "openai/gpt-oss-120b";
 /// Suggested local Ollama model. The model must already be installed locally.
@@ -242,6 +253,10 @@ pub const MODEL_CATALOG: &[ModelCatalogEntry] = &[
     ModelCatalogEntry::active("openai", "gpt-5.6-luna", ModelRole::Economy),
     ModelCatalogEntry::active("openai", "gpt-5.6", ModelRole::Flagship),
     ModelCatalogEntry::default("anthropic", ANTHROPIC_DEFAULT, ModelRole::Balanced),
+    ModelCatalogEntry::active("anthropic", "claude-fable-5-1", ModelRole::Flagship),
+    ModelCatalogEntry::active("anthropic", "claude-opus-5-5", ModelRole::Flagship),
+    ModelCatalogEntry::active("anthropic", "claude-sonnet-5-5", ModelRole::Balanced),
+    ModelCatalogEntry::active("anthropic", "claude-haiku-5-5", ModelRole::Economy),
     ModelCatalogEntry::active("anthropic", "claude-opus-5", ModelRole::Flagship),
     ModelCatalogEntry::active("anthropic", "claude-fable-5", ModelRole::Flagship),
     ModelCatalogEntry::active("anthropic", "claude-haiku-4-5", ModelRole::Economy),
@@ -475,6 +490,34 @@ pub fn recommended_model(provider: &str) -> Option<&'static str> {
     }
 }
 
+/// Returns the output-token cap ADK requests from an Anthropic model when the
+/// caller sets none.
+///
+/// Claude 4 and later models (`claude-opus-*`, `claude-sonnet-*`, `claude-haiku-*`,
+/// `claude-fable-*`, `claude-mythos-*`, with or without a platform prefix such as
+/// `us.anthropic.`) get [`ANTHROPIC_DEFAULT_MAX_TOKENS`]; older and unrecognized
+/// identifiers get [`ANTHROPIC_LEGACY_MAX_TOKENS`], which every model accepts.
+///
+/// # Example
+///
+/// ```
+/// use adk_model::catalog::{
+///     ANTHROPIC_DEFAULT_MAX_TOKENS, ANTHROPIC_LEGACY_MAX_TOKENS, anthropic_default_max_tokens,
+/// };
+///
+/// assert_eq!(anthropic_default_max_tokens("claude-opus-5-5"), ANTHROPIC_DEFAULT_MAX_TOKENS);
+/// assert_eq!(anthropic_default_max_tokens("claude-3-5-haiku-20241022"), ANTHROPIC_LEGACY_MAX_TOKENS);
+/// ```
+pub fn anthropic_default_max_tokens(model: &str) -> u32 {
+    let current_family = model.find("claude-").is_some_and(|start| {
+        let family = &model[start + "claude-".len()..];
+        ["opus-", "sonnet-", "haiku-", "fable-", "mythos-"]
+            .iter()
+            .any(|prefix| family.starts_with(prefix))
+    });
+    if current_family { ANTHROPIC_DEFAULT_MAX_TOKENS } else { ANTHROPIC_LEGACY_MAX_TOKENS }
+}
+
 /// Return whether a provider requires an account-, endpoint-, or deployment-specific model ID.
 pub fn requires_explicit_model(provider: &str) -> bool {
     matches!(provider, "azure-ai" | "bedrock" | "bytedance")
@@ -577,6 +620,46 @@ mod tests {
                 "obsolete default: {entry:?}"
             );
             assert!(entry.recommended_default, "default entry is not marked as default: {entry:?}");
+        }
+    }
+
+    #[test]
+    fn current_claude_models_are_active() {
+        for (model, role) in [
+            ("claude-fable-5-1", ModelRole::Flagship),
+            ("claude-opus-5-5", ModelRole::Flagship),
+            ("claude-sonnet-5-5", ModelRole::Balanced),
+            ("claude-haiku-5-5", ModelRole::Economy),
+        ] {
+            assert_eq!(
+                lookup_model("anthropic", model),
+                Some(&ModelCatalogEntry::active("anthropic", model, role)),
+                "{model}"
+            );
+            assert!(validate_model_selection("anthropic", model).is_ok());
+        }
+    }
+
+    #[test]
+    fn anthropic_max_tokens_default_fits_the_model_generation() {
+        for model in [
+            ANTHROPIC_DEFAULT,
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-haiku-5-5",
+            "claude-mythos-preview",
+            "claude-opus-4-1-20250805",
+            "claude-haiku-4-5",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        ] {
+            assert_eq!(
+                anthropic_default_max_tokens(model),
+                ANTHROPIC_DEFAULT_MAX_TOKENS,
+                "{model}"
+            );
+        }
+        for model in ["claude-3-5-haiku-20241022", "claude-3-opus-20240229", "my-proxy-model"] {
+            assert_eq!(anthropic_default_max_tokens(model), ANTHROPIC_LEGACY_MAX_TOKENS, "{model}");
         }
     }
 

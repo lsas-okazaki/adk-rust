@@ -15,7 +15,7 @@ Add dependencies to `Cargo.toml`:
 
 ```toml
 [dependencies]
-adk-rust = "2.2.0"
+adk-rust = "3.0.0"
 tokio = { version = "1.40", features = ["full"] }
 dotenvy = "0.15"
 serde_json = "1.0"
@@ -297,7 +297,7 @@ Add dependencies to `Cargo.toml`:
 
 ```toml
 [dependencies]
-adk-rust = { version = "2.2.0", features = ["tools"] }
+adk-rust = { version = "3.0.0", features = ["tools"] }
 tokio = { version = "1.40", features = ["full"] }
 dotenvy = "0.15"
 serde_json = "1.0"
@@ -533,12 +533,14 @@ Intercept agent behavior:
 | `instruction(text)` | System prompt |
 | `tool(Arc<dyn Tool>)` | Adds a static tool |
 | `toolset(Arc<dyn Toolset>)` | Adds a dynamic toolset resolved per invocation |
+| `strict_toolsets(bool)` | Fails the turn when a toolset cannot resolve its tools (default: skip it) |
 | `output_schema(json)` | JSON schema for structured output |
 | `output_key(key)` | Saves response to state |
 | `include_contents(mode)` | History visibility |
 | `max_iterations(n)` | Maximum LLM round-trips (default: 100) |
 | `tool_execution_strategy(strategy)` | Tool dispatch mode: `Sequential`, `Parallel`, or `Auto` |
-| `default_retry_budget(RetryBudget)` | Retry failed tools up to N times with delay |
+| `parallelize_agent_delegations(bool)` | Overlap consecutive agent-delegation calls without parallelizing ordinary tools |
+| `default_retry_budget(RetryBudget)` | Retry failed read-only and idempotent tools up to N times with exponential backoff |
 | `tool_retry_budget(name, RetryBudget)` | Per-tool retry override |
 | `circuit_breaker_threshold(u32)` | Disable tool after N consecutive failures |
 | `on_tool_error(callback)` | Register fallback handler for tool failures |
@@ -585,6 +587,18 @@ let agent = LlmAgentBuilder::new("web_agent")
 ```
 
 You can mix static `.tool()` and dynamic `.toolset()` on the same agent. Duplicate tool names across static tools and toolsets produce a deterministic error.
+
+A toolset whose `tools()` call fails, such as an MCP server that is down, is skipped for that resolution: the agent logs a `warn` naming the toolset and the error, and the model runs with the tools that did resolve. The toolset is tried again at the next resolution. Enable strict mode when the agent must not run without every toolset:
+
+```rust
+let agent = LlmAgentBuilder::new("operator")
+    .model(model)
+    .toolset(Arc::new(mcp_toolset))
+    .strict_toolsets(true) // a failing toolset fails the turn
+    .build()?;
+```
+
+Strict mode covers toolsets added with `.toolset()` and `RunConfig::runtime_toolsets`. Duplicate tool names fail the turn in both modes.
 
 `RealtimeAgentBuilder` also supports `.toolset()` with the same semantics, so realtime voice agents get dynamic tool resolution too.
 
@@ -650,6 +664,7 @@ Three strategies are available:
 Results are always returned in the original LLM order regardless of strategy. Failed tools produce a JSON error response without aborting the batch.
 
 The strategy is set per-agent via `LlmAgentBuilder::tool_execution_strategy()`. If not set, the default is `Sequential`.
+Use `LlmAgentBuilder::parallelize_agent_delegations(true)` when only consecutive agent-delegation calls should overlap. Ordinary tools remain sequential and keep their original phase ordering.
 
 ## Tool Resilience
 
@@ -662,7 +677,7 @@ use std::time::Duration;
 let agent = LlmAgentBuilder::new("resilient_agent")
     .model(model)
     .tool(Arc::new(my_tool))
-    // Retry all tools up to 2 times with 500ms delay
+    // Retry read-only and idempotent tools up to 2 times, starting at 500ms
     .default_retry_budget(RetryBudget::new(2, Duration::from_millis(500)))
     // Override for a specific tool
     .tool_retry_budget("flaky_api", RetryBudget::new(4, Duration::from_secs(1)))
@@ -677,6 +692,8 @@ let agent = LlmAgentBuilder::new("resilient_agent")
     }))
     .build()?;
 ```
+
+A retry budget applies only to tools whose `effect()` is `ReadOnly` or `Idempotent`, and only after a retryable error (rate limited, unavailable, timed out). A `NonIdempotent` tool — the default for any tool not marked read-only — runs once. The delay doubles on each retry up to `RetryBudget::max_delay`, with jitter. A `NonIdempotent` call that times out is answered with `{"status": "outcome_unknown"}` rather than an error, and an `AgentTool` delegation is bounded by its own `timeout` rather than `tool_timeout`. See [Tool Effects and the Action Ledger](../tools/tool-effects.md).
 
 After-tool callbacks can inspect structured `ToolOutcome` metadata via `CallbackContext::tool_outcome()`:
 

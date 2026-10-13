@@ -15,7 +15,7 @@ Tool system for Rust Agent Development Kit (ADK-Rust) agents (FunctionTool, MCP,
 - **SimpleToolContext** - Lightweight `ToolContext` for non-agent callers (testing, MCP servers)
 - **AgentTool** - Use agents as callable tools for composition (runs sub-agents in non-streaming mode for reliable response capture)
 - **GoogleSearchTool** - Web search via Gemini's grounding
-- **Provider-native wrappers** - Typed declarations for Gemini, Anthropic, and OpenAI built-in tools
+- **Provider-native wrappers** - Typed declarations for Gemini, Anthropic, and OpenAI built-in tools, each declaring a `ToolEffect` (search and fetch are `ReadOnly`) so a run's `ToolPolicy` can attach or withhold them per request
 - **McpToolset** - Model Context Protocol integration (local & remote servers)
 - **McpServerManager** - Multi-server lifecycle management with health monitoring and auto-restart
 - **BasicToolset** - Group multiple tools together
@@ -27,25 +27,26 @@ Tool system for Rust Agent Development Kit (ADK-Rust) agents (FunctionTool, MCP,
 - **LoadMemoryTool** - Agent-callable tool for on-demand memory search (feature: `memory-tools`)
 - **PreloadMemoryTool** - Auto-loads relevant memories at turn start (feature: `memory-tools`)
 - **ExampleStoreClient / ExampleStoreProvider** - Vertex AI Example Store few-shot retrieval (feature: `example-store`)
+- **BigQueryToolset / SpannerToolset** - SQL execution, schema inspection, and table listing (features: `bigquery`, `spanner`); SQL execution is read-only by default
 
 ## Installation
 
 ```toml
 [dependencies]
-adk-tool = "2.2.0"
+adk-tool = "3.0.0"
 
 # For local MCP servers via stdio:
-adk-tool = { version = "2.2.0", features = ["mcp"] }
+adk-tool = { version = "3.0.0", features = ["mcp"] }
 
 # For remote MCP servers via HTTP:
-adk-tool = { version = "2.2.0", features = ["mcp", "http-transport"] }
+adk-tool = { version = "3.0.0", features = ["mcp", "http-transport"] }
 ```
 
 Or use the meta-crate:
 
 ```toml
 [dependencies]
-adk-rust = { version = "2.2.0", features = ["tools"] }
+adk-rust = { version = "3.0.0", features = ["tools"] }
 ```
 
 ## Quick Start
@@ -215,6 +216,37 @@ let cancel_token = toolset.cancellation_token().await;
 cancel_token.cancel();
 ```
 
+### MCP Schema Size Limits
+
+Discovery skips a tool whose input or output schema exceeds `McpSchemaLimits`
+(256 KiB and 10 000 JSON values by default), logs a warning naming the toolset
+and the tool, and registers the remaining tools. Raise the limits for a trusted
+server:
+
+```rust
+use adk_tool::mcp::{McpSchemaLimits, McpToolset};
+
+let toolset = McpToolset::new(client).with_schema_limits(
+    McpSchemaLimits::default()
+        .with_max_bytes(1024 * 1024)
+        .with_max_nodes(40_000),
+);
+```
+
+`McpServerManager::with_schema_limits` applies the same limits to every managed
+server.
+
+### MCP Discovery Cache and Concurrency
+
+`McpToolset` reuses a `tools/list` result for 60 seconds, dropping it early on a
+reconnect, on `notifications/tools/list_changed` (connections served by
+`AdkClientHandler`), or on `invalidate_tool_list_cache()`. Set the TTL with
+`with_tool_list_cache_ttl`; `Duration::ZERO` disables the cache.
+
+Calls and discovery on one toolset run concurrently over its shared connection.
+A `tools/call` dropped before it completes, such as by an agent tool timeout,
+sends `notifications/cancelled` to the server.
+
 ### MCP Tools (Remote Server via HTTP)
 
 Connect to remote MCP servers using HTTP transport (requires `http-transport` feature):
@@ -264,6 +296,10 @@ let toolset = McpHttpClientBuilder::new("https://mcp.example.com/v1")
     .connect()
     .await?;
 ```
+
+With OAuth2, each request carries the current access token. The token is
+refreshed before the `expires_in` its token response declared, and a request the
+server rejects with HTTP 401 is sent once more with a newly fetched token.
 
 ### MCP Task Support (Long-Running Operations)
 
@@ -329,8 +365,14 @@ is easier to operate.
 The refresher handles these error conditions automatically:
 - Connection closed / EOF
 - Broken pipe / transport errors
+- `Transport closed`, reported when a stdio server process exits
 - Session not found (server restart)
 - Connection reset
+
+Requests through `ConnectionRefresher`, `SimpleClient`, and `McpToolset` share
+one connection and run concurrently. A connection whose transport has already
+closed is replaced before the next request is sent, so that request is never a
+replay.
 
 Discovery calls reconnect and retry automatically. Discovered tool wrappers
 also replay when the server publishes `readOnlyHint: true` or
@@ -361,6 +403,24 @@ let search = GoogleSearchTool::new();
 // Add to agent - enables grounded web search
 ```
 
+### BigQuery and Spanner (`bigquery`, `spanner` features)
+
+`bigquery_execute_sql` is **read-only by default**: it accepts a single `SELECT` or
+`WITH … SELECT` statement, a BigQuery dry run must classify it as `SELECT` before it
+runs, and the tool reports `is_read_only() == true`. `spanner_execute_sql` runs in a
+read-only single-use transaction.
+
+```rust
+use adk_tool::bigquery::BigQueryToolset;
+
+let read_only = BigQueryToolset::with_project("my-gcp-project");
+// Allow DML, DDL, and scripts; the tool then reports itself as mutating.
+let read_write = BigQueryToolset::with_project("my-gcp-project").with_read_only(false);
+```
+
+Service-account keys resolved through `from_secret` are parsed in memory and never
+written to disk.
+
 ## Code Execution Tools (`code` feature)
 
 Language-preset tool wrappers over the `adk-code` execution substrate: `CodeTool` (Rust), `JavaScriptCodeTool` (embedded JS via `code-embedded-js`), `PythonCodeTool` (container-backed CPython), and `MontyPythonCodeTool` (in-process Python via `code-embedded-python`).
@@ -389,6 +449,8 @@ let tool = MontyPythonCodeTool::builder()
 | `code-embedded-js` | `JavaScriptCodeTool` live path (boa_engine) |
 | `code-embedded-python` | `MontyPythonCodeTool` live path (Monty interpreter) |
 | `example-store` | Vertex AI Example Store client (v1beta1 data plane) and `ExampleStoreProvider` few-shot retrieval |
+| `bigquery` | `BigQueryToolset`: SQL execution (read-only by default), schemas, datasets, tables |
+| `spanner` | `SpannerToolset`: read-only SQL execution, schemas, tables |
 
 ## MCP examples and guides
 
@@ -496,6 +558,11 @@ negotiated them.
 Sampling, roots, and logging are deprecated upstream by SEP-2577. The
 `mcp-sampling` feature exists for compatible deployments and should not be the
 default design for a new system.
+
+`LlmSamplingHandler` meters each sampling request against the budget and spend ledger
+of the run whose tool call is in flight on the connection. Requests outside any run
+count against the scope attached with `McpToolset::with_sampling_scope`, or are
+unmetered without one.
 
 When migrating code that imports `rmcp` types directly, align it to `rmcp 3.1`
 or import the SDK through `adk_tool::mcp::rmcp`.

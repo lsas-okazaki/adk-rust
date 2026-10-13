@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adk-agent"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "adk-skill",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "adk-artifact"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -40,23 +40,27 @@ dependencies = [
 
 [[package]]
 name = "adk-core"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "futures",
+ "hmac",
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
 [[package]]
 name = "adk-memory"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -68,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "adk-model"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "adk-telemetry",
@@ -91,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "adk-plugin"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "serde_json",
@@ -101,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "adk-realtime"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-openai",
@@ -127,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "adk-runner"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-artifact",
  "adk-core",
@@ -148,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "adk-rust-macros"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -157,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "adk-server"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-agent",
  "adk-artifact",
@@ -190,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "adk-session"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -203,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "adk-skill"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "adk-plugin",
@@ -219,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "adk-telemetry"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "thiserror",
  "tracing",
@@ -228,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "adk-tool"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "adk-rust-macros",
@@ -823,6 +827,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
  "crypto-common 0.1.7",
+ "subtle",
 ]
 
 [[package]]
@@ -1129,6 +1134,15 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
+]
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -2327,9 +2341,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -2756,7 +2770,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3094,6 +3108,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

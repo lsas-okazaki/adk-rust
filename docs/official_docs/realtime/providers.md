@@ -49,6 +49,10 @@ let model: BoxedModel = Arc::new(GeminiRealtimeModel::new(
   (`vertex-live`, OAuth2 / ADC — see [Realtime Agents](../agents/realtime-agents.md#vertex-ai-live-google-cloud)).
 - **Audio**: 16 kHz PCM16 **in**, 24 kHz PCM16 **out**.
 - **Voices**: `Kore` and others; `with_voice("Kore")`.
+- **Language**: `with_language("en-US")` pins the spoken language
+  (`speechConfig.languageCode`) so transcription does not switch languages on short
+  or accented turns. Native-audio output models choose the language automatically
+  and ignore it.
 - **Auth**: `GEMINI_API_KEY` (or `GOOGLE_API_KEY`).
 
 > **Model names differ by endpoint.** AI Studio (API-key) uses names like
@@ -139,7 +143,7 @@ To diagnose drift with the frame in hand, compile `adk-realtime` with the
 
 ```toml
 [dependencies]
-adk-realtime = { version = "2.2.0", features = ["openai", "record-payloads"] }
+adk-realtime = { version = "3.0.0", features = ["openai", "record-payloads"] }
 ```
 
 The feature is off by default and is a deliberate choice per build, because schema drift is

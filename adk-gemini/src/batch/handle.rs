@@ -309,6 +309,10 @@ impl BatchHandle {
     ///
     /// Consumes the batch. If cancellation fails, returns the batch and error information
     /// so it can be retried.
+    ///
+    /// The large `Err` is deliberate: the handle comes back for retry instead
+    /// of being dropped, so it cannot be boxed without breaking this contract.
+    #[allow(clippy::result_large_err)]
     pub async fn cancel(self) -> Result<(), (Self, ClientError)> {
         match self.client.cancel_batch_operation(&self.name).await {
             Ok(()) => Ok(()),
@@ -324,6 +328,10 @@ impl BatchHandle {
     ///
     /// Consumes the batch. If deletion fails, returns the batch and error information
     /// so it can be retried.
+    ///
+    /// The large `Err` is deliberate: the handle comes back for retry instead
+    /// of being dropped, so it cannot be boxed without breaking this contract.
+    #[allow(clippy::result_large_err)]
     pub async fn delete(self) -> Result<(), (Self, ClientError)> {
         match self.client.delete_batch_operation(&self.name).await {
             Ok(()) => Ok(()),

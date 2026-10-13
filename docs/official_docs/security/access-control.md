@@ -126,10 +126,10 @@ sso.check_token(token, &permission).await?;
 
 ```toml
 [dependencies]
-adk-auth = "2.2.0"
+adk-auth = "3.0.0"
 
 # For SSO/OAuth support
-adk-auth = { version = "2.2.0", features = ["sso"] }
+adk-auth = { version = "3.0.0", features = ["sso"] }
 ```
 
 ## Core Components
@@ -286,12 +286,71 @@ let audit = FileAuditSink::new("/var/log/adk/audit.jsonl")?;
 let middleware = AuthMiddleware::with_audit(ac, audit);
 ```
 
+### When the Sink Fails
+
+`ProtectedTool`, `ScopedTool`, and the guards that build them refuse a call whose
+access decision the audit sink fails to record. The call fails with `auth.audit_failed`
+and the tool does not run.
+
+| Mode | Effect when `AuditSink::log` fails |
+|------|------------------------------------|
+| `AuditFailureMode::Block` (default) | The call is refused |
+| `AuditFailureMode::Warn` | A warning is logged and the access decision applies without a record |
+
+```rust
+use adk_auth::{AuditFailureMode, AuthMiddleware, ContextScopeResolver, ScopeGuard};
+
+let middleware = AuthMiddleware::with_audit(ac, audit).with_audit_failure_mode(AuditFailureMode::Warn);
+let guard = ScopeGuard::with_audit(ContextScopeResolver, audit_sink)
+    .with_audit_failure_mode(AuditFailureMode::Warn);
+```
+
+### Tamper-Evident Chain
+
+`FileAuditSink::with_chaining` writes each event with `prev_hash`, the SHA-256 of the
+previous line; `with_hmac_chaining` uses HMAC-SHA256 under a key instead, so the chain
+cannot be recomputed by someone who can write the file but does not hold the key. Opening
+a chained file resumes from its last line, so the chain survives restarts.
+
+```rust
+use adk_auth::FileAuditSink;
+
+let audit = FileAuditSink::with_hmac_chaining("/var/log/adk/audit.jsonl", key)?;
+// ... log events ...
+let events = audit.verify()?;
+
+// Verify an archived file without opening it for writing.
+let events = FileAuditSink::verify_file("/archive/audit.jsonl", Some(key.as_slice()))?;
+```
+
+`verify` fails with `AuthError::AuditError` naming the first line that was edited,
+inserted, reordered, or removed. A change to the newest line and lines cut from the end
+leave no broken link; record the newest line elsewhere to detect them.
+
+The chained file has one writer and a symmetric key. For logs that several replicas write,
+that a third party verifies with a public key, or that must detect truncation and rewrites,
+use the signed audit log (`signed-audit` feature): RFC 8785 records, an RFC 9162 Merkle tree,
+and Ed25519-signed checkpoints, stored in memory, SQLite, or PostgreSQL. `AuditLog` is itself
+an `AuditSink`. See [Audit Log](audit-log.md).
+
+| Sink | Integrity | Verifier needs | Writers |
+|------|-----------|----------------|---------|
+| `FileAuditSink::with_chaining` | SHA-256 chain | The file | One |
+| `FileAuditSink::with_hmac_chaining` | HMAC-SHA256 chain | The file and the secret key | One |
+| `signed_audit::AuditLog` | Chain, Merkle tree, signed checkpoints, optional anchors | The export and the public key | One per `log_id`, any number of replicas |
+
 ### Output Format (JSONL)
 
 ```json
 {"timestamp":"2025-01-01T10:30:00Z","user":"bob","session_id":"sess-123","event_type":"tool_access","resource":"search","outcome":"allowed"}
-{"timestamp":"2025-01-01T10:30:01Z","user":"bob","session_id":"sess-123","event_type":"tool_access","resource":"code_exec","outcome":"denied"}
+{"timestamp":"2025-01-01T10:30:01Z","user":"bob","session_id":"sess-123","event_type":"tool_access","resource":"code_exec","outcome":"denied","tenant_id":"acme","agent_id":"spiffe://acme.example/agent/billing","on_behalf_of":{"kind":"human","id":"bob"}}
 ```
+
+`ProtectedTool` and `ScopeGuard` record the calling agent on every decision:
+`AuditEvent::with_acting_context` sets `agent_id`, `on_behalf_of`, and, when unset, `tenant_id`
+from the tool context's acting context. `AuditFilter::agent_id` selects one agent's records, and
+the PostgreSQL and OTLP sinks store both fields (`migrate()` adds the PostgreSQL columns to an
+existing table). See [Agent Identity](agent-identity.md).
 
 ### Custom Audit Sink
 
@@ -516,7 +575,7 @@ match provider.validate(token).await {
 
 | Route | Authentication |
 |-------|----------------|
-| `GET /.well-known/agent.json` | **public** — peers fetch the card before they hold a credential |
+| `GET /.well-known/agent-card.json`, `GET /.well-known/agent.json` | **public** — peers fetch the card before they hold a credential |
 | `POST /a2a` | required, when a `RequestContextExtractor` is configured |
 | `POST /a2a/stream` | required, when a `RequestContextExtractor` is configured |
 

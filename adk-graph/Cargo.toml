@@ -18,7 +18,7 @@ adk-core.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true
 futures.workspace = true
-tokio = { workspace = true, features = ["sync", "time", "fs", "io-util", "macros"] }
+tokio = { workspace = true, features = ["sync", "time", "fs", "io-util", "macros", "rt"] }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
@@ -26,8 +26,17 @@ uuid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
-# Optional SQLite checkpointer
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"], optional = true }
+# Optional SQLite and PostgreSQL checkpointers
+sqlx = { version = "0.8", features = ["runtime-tokio"], optional = true }
+
+# Optional shared-database checkpointers. Versions match adk-session, so the lockfile
+# holds one copy of each driver.
+mongodb = { version = "3", optional = true }
+neo4rs = { version = "0.8", optional = true }
+firestore = { version = "0.48", optional = true }
+# Already a dependency of `firestore`; named directly for the emulator token source.
+gcloud-sdk = { version = "0.29", optional = true, default-features = false }
+sha2 = { workspace = true, optional = true }
 
 # Optional node caching dependencies
 blake3 = { version = "1", optional = true }
@@ -47,12 +56,20 @@ tokio-cron-scheduler = { version = "0.15", optional = true }
 
 [features]
 default = []
-sqlite = ["sqlx"]
+sqlite = ["dep:sqlx", "sqlx/sqlite"]
+# Checkpointers for shared databases; each passes the `conformance` suite.
+postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/chrono"]
+redis = ["dep:fred", "fred/i-scripts"]
+mongodb = ["dep:mongodb"]
+neo4j = ["dep:neo4rs"]
+firestore = ["dep:firestore", "dep:gcloud-sdk", "dep:sha2"]
 node-cache = ["dep:blake3"]
 redis-cache = ["node-cache", "dep:fred"]
 delta-checkpoint = ["dep:similar"]
 time-travel = []
 functional = ["dep:tokio-util"]
+# The Checkpointer conformance suite (`adk_graph::conformance`) for backend tests.
+conformance = []
 
 # Action node feature flags
 action = ["dep:adk-action", "dep:regex"]
@@ -69,12 +86,16 @@ action-full = ["action", "action-trigger", "action-http", "action-db", "action-c
 full = ["sqlite", "action-full"]
 
 [dev-dependencies]
+# Path-only self dependency, so the crate's own tests run the conformance suite.
+adk-graph = { path = ".", features = ["conformance"] }
 # Internal dev-deps are path-only (no version) so cargo strips them from the
 # published manifest — they can never block or reorder a crates.io publish.
-tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util"] }
 proptest = "1.5"
 adk-action = { path = "../adk-action" }
 # For `SimpleToolContext` when testing a graph exposed as a tool.
 adk-tool = { path = "../adk-tool" }
 # For composing SequentialAgent/ParallelAgent/LoopAgent as graph nodes.
 adk-agent = { path = "../adk-agent" }
+# For exercising the `#[entrypoint]`/`#[task]` expansion against this crate.
+adk-rust-macros = { path = "../adk-rust-macros" }

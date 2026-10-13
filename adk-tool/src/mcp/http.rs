@@ -4,12 +4,229 @@
 // Uses the streamable HTTP transport from rmcp when the http-transport feature is enabled.
 
 use super::auth::McpAuth;
+#[cfg(feature = "http-transport")]
+use super::auth::OAuth2Config;
 use super::elicitation::ElicitationHandler;
 use super::resource_notifications::ResourceNotificationHandler;
-use adk_core::{AdkError, Result};
+#[cfg(feature = "http-transport")]
+use adk_core::Url;
+use adk_core::{ActingContext, AdkError, CredentialBroker, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(feature = "http-transport")]
+use reqwest_mcp::header::{HeaderName, HeaderValue};
+#[cfg(feature = "http-transport")]
+use rmcp::{
+    model::ClientJsonRpcMessage,
+    transport::{
+        common::client_side_sse::BoxedSseResponse,
+        streamable_http_client::{
+            StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
+        },
+    },
+};
+
+#[cfg(feature = "http-transport")]
+type HttpResult<T> = std::result::Result<T, StreamableHttpError<reqwest_mcp::Error>>;
+
+/// Brokered credentials for an MCP HTTP connection: the broker, the acting context
+/// tokens are minted for, the requested scopes, and the endpoint as the resource.
+// Without `http-transport` the builder only stores the configuration.
+#[cfg_attr(not(feature = "http-transport"), allow(dead_code))]
+#[derive(Clone)]
+struct BrokeredAuth {
+    broker: Arc<dyn CredentialBroker>,
+    acting: ActingContext,
+    scopes: Vec<String>,
+}
+
+#[cfg(feature = "http-transport")]
+impl BrokeredAuth {
+    /// Mints a token for `resource` and returns its secret for a request to `request`.
+    ///
+    /// The token's audience is checked against the request URL, so a token minted for
+    /// one resource is never attached to a request for another.
+    async fn bearer_for(&self, resource: &Url, request: &Url) -> Result<String> {
+        let token = self.broker.token_for(&self.acting, resource, &self.scopes).await?;
+        Ok(token.authorize_for(request)?.expose().to_string())
+    }
+}
+
+/// The streamable HTTP client behind [`McpHttpClientBuilder`].
+///
+/// With OAuth2 it attaches the current access token to each request rather
+/// than the token fetched at connect time, so a long-lived connection keeps
+/// working after that first token expires.
+#[cfg(feature = "http-transport")]
+#[derive(Clone)]
+struct McpHttpClient {
+    inner: reqwest_mcp::Client,
+    oauth: Option<Arc<OAuth2Config>>,
+    brokered: Option<(Arc<BrokeredAuth>, Url)>,
+}
+
+#[cfg(feature = "http-transport")]
+impl McpHttpClient {
+    /// Sends one request with the current OAuth2 token and, when the server
+    /// answers 401, once more with a newly fetched token. Without OAuth2 the
+    /// transport's configured `Authorization` value is sent unchanged.
+    async fn authorized<T, F, Fut>(
+        &self,
+        uri: Arc<str>,
+        configured: Option<String>,
+        send: F,
+    ) -> HttpResult<T>
+    where
+        F: Fn(Option<String>) -> Fut,
+        Fut: Future<Output = HttpResult<T>>,
+    {
+        if let Some((brokered, resource)) = &self.brokered {
+            let request = Url::parse(&uri).map_err(|error| {
+                StreamableHttpError::UnexpectedServerResponse(
+                    format!("invalid MCP request URL '{uri}': {error}").into(),
+                )
+            })?;
+            let token = brokered.bearer_for(resource, &request).await.map_err(|error| {
+                StreamableHttpError::UnexpectedServerResponse(
+                    format!("brokered credential is unavailable: {error}").into(),
+                )
+            })?;
+            return send(Some(token)).await;
+        }
+        let Some(oauth) = &self.oauth else {
+            return send(configured).await;
+        };
+        let token = oauth_token(oauth).await?;
+        // A 401 is answered before the request runs, so resending it cannot
+        // repeat an effect. rmcp reports one with a `WWW-Authenticate` challenge
+        // as `AuthRequired`, one without it on a POST as an unexpected
+        // response, and one without it on a GET or DELETE as a client error.
+        match send(Some(token.clone())).await {
+            Err(StreamableHttpError::AuthRequired(_)) => {}
+            Err(StreamableHttpError::UnexpectedServerResponse(message))
+                if message.starts_with("HTTP 401 ") => {}
+            Err(StreamableHttpError::Client(error))
+                if error.status() == Some(reqwest_mcp::StatusCode::UNAUTHORIZED) => {}
+            result => return result,
+        }
+        tracing::debug!("MCP server rejected the OAuth2 access token; fetching a new one");
+        oauth.discard_token(&token).await;
+        send(Some(oauth_token(oauth).await?)).await
+    }
+}
+
+#[cfg(feature = "http-transport")]
+async fn oauth_token(oauth: &OAuth2Config) -> HttpResult<String> {
+    oauth.get_or_refresh_token().await.map_err(|error| {
+        StreamableHttpError::UnexpectedServerResponse(
+            format!("OAuth2 access token is unavailable: {error}").into(),
+        )
+    })
+}
+
+#[cfg(feature = "http-transport")]
+impl StreamableHttpClient for McpHttpClient {
+    type Error = reqwest_mcp::Error;
+
+    fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> impl Future<Output = HttpResult<StreamableHttpPostResponse>> + Send + '_ {
+        self.authorized(uri.clone(), auth_header, move |token| {
+            self.inner.post_message(
+                uri.clone(),
+                message.clone(),
+                session_id.clone(),
+                token,
+                custom_headers.clone(),
+            )
+        })
+    }
+
+    fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> impl Future<Output = HttpResult<StreamableHttpPostResponse>> + Send + '_ {
+        self.authorized(uri.clone(), auth_header, move |token| {
+            self.inner.post_message_with_max_sse_event_size(
+                uri.clone(),
+                message.clone(),
+                session_id.clone(),
+                token,
+                custom_headers.clone(),
+                max_sse_event_size,
+            )
+        })
+    }
+
+    fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> impl Future<Output = HttpResult<()>> + Send + '_ {
+        self.authorized(uri.clone(), auth_header, move |token| {
+            self.inner.delete_session(
+                uri.clone(),
+                session_id.clone(),
+                token,
+                custom_headers.clone(),
+            )
+        })
+    }
+
+    fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> impl Future<Output = HttpResult<BoxedSseResponse>> + Send + '_ {
+        self.authorized(uri.clone(), auth_header, move |token| {
+            self.inner.get_stream(
+                uri.clone(),
+                session_id.clone(),
+                last_event_id.clone(),
+                token,
+                custom_headers.clone(),
+            )
+        })
+    }
+
+    fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> impl Future<Output = HttpResult<BoxedSseResponse>> + Send + '_ {
+        self.authorized(uri.clone(), auth_header, move |token| {
+            self.inner.get_stream_with_max_sse_event_size(
+                uri.clone(),
+                session_id.clone(),
+                last_event_id.clone(),
+                token,
+                custom_headers.clone(),
+                max_sse_event_size,
+            )
+        })
+    }
+}
 
 #[cfg(feature = "http-transport")]
 #[derive(Clone)]
@@ -128,6 +345,8 @@ pub struct McpHttpClientBuilder {
     resource_notification_handler: Option<Arc<dyn ResourceNotificationHandler>>,
     /// Recreate the MCP session once when a remote HTTP session expires.
     reinit_on_expired_session: bool,
+    /// Brokered credentials; when set they replace `auth`.
+    brokered: Option<Arc<BrokeredAuth>>,
 }
 
 impl McpHttpClientBuilder {
@@ -145,7 +364,52 @@ impl McpHttpClientBuilder {
             elicitation_handler: None,
             resource_notification_handler: None,
             reinit_on_expired_session: true,
+            brokered: None,
         }
+    }
+
+    /// Authenticates with tokens minted by `broker` for `acting`, with `scopes`.
+    ///
+    /// The endpoint is the resource (RFC 8707): every request asks the broker for a
+    /// token for the endpoint and attaches it only after
+    /// [`ScopedToken::authorize_for`](adk_core::ScopedToken::authorize_for) accepts the
+    /// request URL, so a token minted for another resource is never sent. The
+    /// connection outlives any one run, so tokens are minted for the acting context
+    /// given here rather than for each calling run. Replaces [`with_auth`](Self::with_auth).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_core::{ActingContext, AgentId, AgentPrincipal};
+    /// use adk_tool::mcp::McpHttpClientBuilder;
+    ///
+    /// let acting =
+    ///     ActingContext::new(AgentPrincipal::new(AgentId::new("spiffe://example.org/agent/billing")?));
+    /// let toolset = McpHttpClientBuilder::new("https://mcp.example.com/v1")
+    ///     .with_credential_broker(broker, acting, vec!["tools.read".into()])
+    ///     .connect()
+    ///     .await?;
+    /// ```
+    pub fn with_credential_broker(
+        mut self,
+        broker: Arc<dyn CredentialBroker>,
+        acting: ActingContext,
+        scopes: Vec<String>,
+    ) -> Self {
+        self.brokered = Some(Arc::new(BrokeredAuth { broker, acting, scopes }));
+        self
+    }
+
+    /// Mints a brokered token for the endpoint and checks it may be sent there, so a
+    /// misconfigured broker fails the connection with its own error code.
+    #[cfg(feature = "http-transport")]
+    async fn check_brokered(&self) -> Result<Option<(Arc<BrokeredAuth>, Url)>> {
+        let Some(brokered) = &self.brokered else {
+            return Ok(None);
+        };
+        let resource = adk_core::resource_indicator(&self.endpoint)?;
+        brokered.bearer_for(&resource, &resource).await?;
+        Ok(Some((Arc::clone(brokered), resource)))
     }
 
     /// Set authentication for the connection.
@@ -186,11 +450,9 @@ impl McpHttpClientBuilder {
     #[cfg(feature = "http-transport")]
     async fn build_transport(
         &self,
-    ) -> Result<
-        rmcp::transport::streamable_http_client::StreamableHttpClientTransport<reqwest_mcp::Client>,
-    > {
+    ) -> Result<rmcp::transport::streamable_http_client::StreamableHttpClientTransport<McpHttpClient>>
+    {
         use adk_core::{ErrorCategory, ErrorComponent};
-        use reqwest_mcp::header::{HeaderName, HeaderValue};
         use rmcp::transport::streamable_http_client::{
             StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
         };
@@ -206,17 +468,24 @@ impl McpHttpClientBuilder {
             custom_headers.insert(name, value);
         }
 
+        let brokered = self.check_brokered().await?;
+        let mut oauth = None;
         let token = match &self.auth {
+            _ if brokered.is_some() => None,
             McpAuth::Bearer(token) => Some(token.clone()),
             McpAuth::OAuth2(config) => {
-                Some(config.get_or_refresh_token().await.map_err(|error| {
+                // Fetched now so bad credentials fail the connection rather than
+                // its first request. McpHttpClient attaches it, and its successors.
+                config.get_or_refresh_token().await.map_err(|error| {
                     AdkError::new(
                         ErrorComponent::Tool,
                         ErrorCategory::Unauthorized,
                         "mcp.oauth.token_fetch",
                         format!("OAuth2 client-credentials authentication failed: {error}"),
                     )
-                })?)
+                })?;
+                oauth = Some(Arc::clone(config));
+                None
             }
             McpAuth::ApiKey { header, key } => {
                 let name = HeaderName::from_bytes(header.as_bytes()).map_err(|error| {
@@ -238,11 +507,14 @@ impl McpHttpClientBuilder {
             config = config.auth_header(token);
         }
 
-        let client = reqwest_mcp::Client::builder()
+        let inner = reqwest_mcp::Client::builder()
             .timeout(self.timeout)
             .build()
             .map_err(|error| AdkError::tool(format!("failed to build MCP HTTP client: {error}")))?;
-        Ok(StreamableHttpClientTransport::with_client(client, config))
+        Ok(StreamableHttpClientTransport::with_client(
+            McpHttpClient { inner, oauth, brokered },
+            config,
+        ))
     }
 
     /// Configure an elicitation handler for the HTTP connection.
@@ -294,6 +566,7 @@ impl McpHttpClientBuilder {
     /// - Authentication fails
     #[cfg(feature = "http-transport")]
     pub async fn connect(self) -> Result<super::McpToolset<()>> {
+        self.check_brokered().await?;
         let factory = Arc::new(HttpConnectionFactory { builder: self.clone() });
         let client = factory
             .connect_once()
@@ -342,6 +615,7 @@ impl McpHttpClientBuilder {
             )
         })?;
 
+        self.check_brokered().await?;
         let resource_notification_handler = self.resource_notification_handler.clone();
         let factory = Arc::new(HttpElicitationConnectionFactory {
             builder: self,
@@ -369,6 +643,7 @@ impl std::fmt::Debug for McpHttpClientBuilder {
             .field("endpoint", &self.endpoint)
             .field("auth", &self.auth)
             .field("timeout", &self.timeout)
+            .field("credential_broker", &self.brokered.as_ref().map(|b| &b.broker))
             .field("headers", &self.headers.keys().collect::<Vec<_>>())
             .finish()
     }

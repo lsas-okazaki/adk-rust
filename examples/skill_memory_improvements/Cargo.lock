@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adk-agent"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "adk-skill",
@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "adk-artifact"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "adk-core"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -45,12 +45,13 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
 [[package]]
 name = "adk-gemini"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-stream",
@@ -76,7 +77,7 @@ dependencies = [
 
 [[package]]
 name = "adk-memory"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -88,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "adk-model"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "adk-gemini",
@@ -107,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "adk-plugin"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "serde_json",
@@ -117,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "adk-runner"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-artifact",
  "adk-core",
@@ -138,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "adk-session"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -151,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "adk-skill"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "adk-plugin",
@@ -167,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "adk-telemetry"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "thiserror",
  "tracing",
@@ -1636,9 +1637,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.37"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "758025cb5fccfd3bc2fd74708fd4682be41d99e5dff73c377c0646c6012c73a4"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "once_cell",
  "ring",
@@ -1672,9 +1673,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "ring",
  "rustls-pki-types",

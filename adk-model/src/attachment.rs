@@ -37,6 +37,17 @@ pub(crate) fn inline_attachment_to_text(mime_type: &str, data: &[u8]) -> String 
     format!("<attachment mime_type=\"{mime_type}\" encoding=\"base64\">{encoded}</attachment>")
 }
 
+/// Name an inline PDF after the last segment of its source URI, or `document.pdf`
+/// when the payload carries no usable name.
+#[cfg(feature = "openai")]
+pub(crate) fn pdf_filename(uri: Option<&str>) -> String {
+    uri.and_then(|uri| uri.split(['?', '#']).next())
+        .and_then(|path| path.rsplit('/').next())
+        .filter(|name| !name.is_empty() && !name.contains(':'))
+        .unwrap_or("document.pdf")
+        .to_string()
+}
+
 /// Convert file URI attachments into a text payload for providers without URI-native attachment
 /// support.
 #[cfg(any(

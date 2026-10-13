@@ -1,7 +1,9 @@
 use adk_core::{Agent, Content, EventStream, InvocationContext, Part, Result, SessionId, UserId};
 use adk_plugin::{Plugin, PluginConfig, PluginManager};
 use adk_runner::Runner;
-use adk_session::{Event, Events, GetRequest, Session, SessionService, State};
+use adk_session::{
+    Event, Events, GetRequest, InMemorySessionService, Session, SessionService, State,
+};
 use adk_skill::{SelectionPolicy, SkillInjector, SkillInjectorConfig};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -207,6 +209,33 @@ impl Agent for TransferAgent {
         event.actions.transfer_to_agent = self.target.clone();
         Ok(Box::pin(futures::stream::iter(vec![Ok(event)])))
     }
+}
+
+#[tokio::test]
+async fn started_run_exposes_the_invocation_identity_before_polling() {
+    let runner = Runner::builder()
+        .app_name("test_app")
+        .agent(Arc::new(TransferAgent { name: "test_agent".to_string(), target: None })
+            as Arc<dyn Agent>)
+        .session_service(Arc::new(MockSessionService) as Arc<dyn SessionService>)
+        .build()
+        .unwrap();
+
+    let started = runner
+        .start_with_config(
+            UserId::new("user123").unwrap(),
+            SessionId::new("session456").unwrap(),
+            Content::new("user").with_text("Hello"),
+            None,
+        )
+        .await
+        .unwrap();
+    let invocation_id = started.invocation_id().to_string();
+    let events = started.into_events().collect::<Vec<_>>().await;
+
+    assert!(!invocation_id.is_empty());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].as_ref().unwrap().invocation_id, invocation_id);
 }
 
 struct StrictTransferRoot {
@@ -446,6 +475,112 @@ async fn runner_preserves_orchestration_root_across_handoffs() {
     let results = stream.collect::<Vec<_>>().await;
     assert!(results.into_iter().all(|result| result.is_ok()));
     assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+/// Session service whose history ends with an event from `last_author`.
+struct HistorySessionService {
+    last_author: String,
+}
+
+#[async_trait]
+impl SessionService for HistorySessionService {
+    async fn create(&self, _req: adk_session::CreateRequest) -> Result<Box<dyn Session>> {
+        unimplemented!()
+    }
+
+    async fn get(&self, req: GetRequest) -> Result<Box<dyn Session>> {
+        let mut event = Event::new("earlier-invocation");
+        event.author = self.last_author.clone();
+        event.llm_response.content = Some(Content::new("model").with_text("earlier answer"));
+        Ok(Box::new(MockSession {
+            id: req.session_id,
+            app_name: req.app_name,
+            user_id: req.user_id,
+            events: MockEvents { events: vec![event] },
+            state: MockState,
+        }))
+    }
+
+    async fn list(&self, _req: adk_session::ListRequest) -> Result<Vec<Box<dyn Session>>> {
+        Ok(vec![])
+    }
+
+    async fn delete(&self, _req: adk_session::DeleteRequest) -> Result<()> {
+        Ok(())
+    }
+
+    async fn append_event(&self, _session_id: &str, _event: Event) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Transfer targets and parent agent seen by a probe agent.
+type ObservedTargets = Arc<Mutex<Option<(Vec<String>, Option<String>)>>>;
+
+/// Records the transfer targets and parent it is run with.
+struct TransferTargetsProbe {
+    name: String,
+    observed: ObservedTargets,
+}
+
+#[async_trait]
+impl Agent for TransferTargetsProbe {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        "records its transfer targets"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &[]
+    }
+
+    async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
+        let config = ctx.run_config();
+        *self.observed.lock().unwrap() =
+            Some((config.transfer_targets.clone(), config.parent_agent.clone()));
+        Ok(Box::pin(futures::stream::empty()))
+    }
+}
+
+#[tokio::test]
+async fn resumed_sub_agent_receives_parent_and_peer_transfer_targets() {
+    let observed = Arc::new(Mutex::new(None));
+    let resumed: Arc<dyn Agent> =
+        Arc::new(TransferTargetsProbe { name: "billing".to_string(), observed: observed.clone() });
+    let peer: Arc<dyn Agent> = Arc::new(MockAgent { name: "support".to_string() });
+    let root: Arc<dyn Agent> = Arc::new(MockAgentWithSubs {
+        name: "coordinator".to_string(),
+        sub_agents: vec![resumed, peer],
+    });
+    let runner = Runner::builder()
+        .app_name("test_app")
+        .agent(root)
+        .session_service(Arc::new(HistorySessionService { last_author: "billing".to_string() })
+            as Arc<dyn SessionService>)
+        .build()
+        .unwrap();
+
+    let stream = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("session456").unwrap(),
+            Content::new("user").with_text("now something else"),
+        )
+        .await
+        .unwrap();
+    let results = stream.collect::<Vec<_>>().await;
+    assert!(results.into_iter().all(|result| result.is_ok()));
+
+    assert_eq!(
+        observed.lock().unwrap().clone(),
+        Some((
+            vec!["coordinator".to_string(), "support".to_string()],
+            Some("coordinator".to_string())
+        ))
+    );
 }
 
 #[test]
@@ -959,6 +1094,146 @@ fn test_compute_transfer_context_nested() {
     assert!(peers.is_empty());
 }
 
+struct InterruptedHistoryAgent {
+    call_persisted: Arc<tokio::sync::Notify>,
+    captured_history: Arc<Mutex<Option<Vec<Content>>>>,
+}
+
+#[async_trait]
+impl Agent for InterruptedHistoryAgent {
+    fn name(&self) -> &str {
+        "interrupted-history"
+    }
+
+    fn description(&self) -> &str {
+        "Captures history after an interrupted tool call"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &[]
+    }
+
+    async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
+        let is_first =
+            ctx.user_content().parts.iter().filter_map(Part::text).any(|text| text == "first");
+        if !is_first {
+            *self.captured_history.lock().unwrap_or_else(|error| error.into_inner()) =
+                Some(ctx.session().conversation_history());
+            return Ok(Box::pin(futures::stream::empty()));
+        }
+
+        let invocation_id = ctx.invocation_id().to_string();
+        let call_persisted = self.call_persisted.clone();
+        Ok(Box::pin(async_stream::stream! {
+            let mut call = Event::new(&invocation_id);
+            call.author = "interrupted-history".to_string();
+            call.llm_response.content = Some(Content {
+                role: "model".to_string(),
+                parts: vec![Part::FunctionCall {
+                    name: "slow_tool".to_string(),
+                    args: serde_json::json!({}),
+                    id: Some("call-1".to_string()),
+                    thought_signature: None,
+                }],
+            });
+            yield Ok(call);
+
+            call_persisted.notify_one();
+            futures::future::pending::<()>().await;
+        }))
+    }
+}
+
+#[tokio::test]
+async fn interrupted_run_answers_its_in_flight_call_with_an_unknown_outcome() {
+    let session_service = Arc::new(InMemorySessionService::new());
+    session_service
+        .create(adk_session::CreateRequest {
+            app_name: "test_app".to_string(),
+            user_id: "user123".to_string(),
+            session_id: Some("interrupted-history".to_string()),
+            state: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    let call_persisted = Arc::new(tokio::sync::Notify::new());
+    let captured_history = Arc::new(Mutex::new(None));
+    let agent = Arc::new(InterruptedHistoryAgent {
+        call_persisted: call_persisted.clone(),
+        captured_history: captured_history.clone(),
+    });
+    let runner = Runner::builder()
+        .app_name("test_app")
+        .agent(agent as Arc<dyn Agent>)
+        .session_service(session_service as Arc<dyn SessionService>)
+        .build()
+        .unwrap();
+
+    let first = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("interrupted-history").unwrap(),
+            Content::new("user").with_text("first"),
+        )
+        .await
+        .unwrap();
+    let first_task = tokio::spawn(async move {
+        let mut first = first;
+        while let Some(result) = first.next().await {
+            result.unwrap();
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), call_persisted.notified())
+        .await
+        .expect("the first invocation must persist its tool call");
+
+    assert!(runner.interrupt("interrupted-history"));
+    tokio::time::timeout(std::time::Duration::from_secs(2), first_task)
+        .await
+        .expect("the interrupted invocation must stop promptly")
+        .unwrap();
+
+    let mut second = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("interrupted-history").unwrap(),
+            Content::new("user").with_text("second"),
+        )
+        .await
+        .unwrap();
+    while let Some(result) = second.next().await {
+        result.unwrap();
+    }
+
+    let history = captured_history
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+        .expect("the second invocation must capture history");
+    // The call stays visible and is answered exactly once, so the model knows the
+    // tool may have taken effect instead of the call silently disappearing.
+    let roles: Vec<&str> = history.iter().map(|content| content.role.as_str()).collect();
+    assert_eq!(roles, ["user", "model", "function", "user"]);
+    let responses: Vec<_> = history
+        .iter()
+        .flat_map(|content| &content.parts)
+        .filter_map(|part| match part {
+            Part::FunctionResponse { function_response, id, .. } => Some((
+                id.clone(),
+                function_response.name.clone(),
+                function_response.response.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(responses.len(), 1);
+    let (id, name, response) = &responses[0];
+    assert_eq!(id.as_deref(), Some("call-1"));
+    assert_eq!(name, "slow_tool");
+    assert!(adk_core::is_outcome_unknown(response), "{response}");
+}
+
 // Agent that emits events in a loop until cancelled or `max_ticks` is reached.
 // Used to validate cooperative cancellation (issue #402): it honors
 // `ctx.is_cancelled()` between ticks, and the runner's cancellation race
@@ -1073,4 +1348,208 @@ async fn test_runner_runs_to_completion_without_interrupt() {
         count += 1;
     }
     assert_eq!(count, 3, "agent should emit exactly max_ticks events when not interrupted");
+}
+
+// ── Global cancellation token ──────────────────────────────────────────
+
+fn runner_with_global_token(
+    agent: Arc<dyn Agent>,
+    global: tokio_util::sync::CancellationToken,
+) -> Runner {
+    Runner::builder()
+        .app_name("test_app")
+        .agent(agent)
+        .session_service(Arc::new(MockSessionService) as Arc<dyn SessionService>)
+        .cancellation_token(global)
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn global_cancellation_token_leaves_no_task_behind_per_run() {
+    let global = tokio_util::sync::CancellationToken::new();
+    let runner = runner_with_global_token(
+        Arc::new(MockAgent { name: "test_agent".to_string() }),
+        global.clone(),
+    );
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let baseline = metrics.num_alive_tasks();
+
+    for run in 0..5 {
+        let mut stream = runner
+            .run(
+                UserId::new("user123").unwrap(),
+                SessionId::new(format!("session-{run}")).unwrap(),
+                Content::new("user").with_text("go"),
+            )
+            .await
+            .unwrap();
+        while let Some(result) = stream.next().await {
+            result.unwrap();
+        }
+    }
+    tokio::task::yield_now().await;
+
+    assert_eq!(metrics.num_alive_tasks(), baseline, "a completed run must not leave tasks behind");
+    assert_eq!(runner.active_runs(), Vec::new());
+    assert!(!global.is_cancelled());
+}
+
+#[tokio::test]
+async fn global_cancellation_token_stops_an_in_flight_run() {
+    let global = tokio_util::sync::CancellationToken::new();
+    let runner = runner_with_global_token(
+        Arc::new(CancellableLoopAgent { max_ticks: 1000 }),
+        global.clone(),
+    );
+    let mut stream = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("global-cancel").unwrap(),
+            Content::new("user").with_text("go"),
+        )
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("first event should arrive within timeout");
+    assert!(first.is_some(), "expected at least one event before cancellation");
+
+    global.cancel();
+
+    let remaining = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut count = 0usize;
+        while stream.next().await.is_some() {
+            count += 1;
+        }
+        count
+    })
+    .await
+    .expect("stream should terminate after the global token is cancelled");
+    assert!(remaining < 50, "stream kept producing events after cancellation");
+}
+
+#[tokio::test]
+async fn interrupt_with_a_global_token_cancels_only_the_target_run() {
+    let global = tokio_util::sync::CancellationToken::new();
+    let runner =
+        runner_with_global_token(Arc::new(CancellableLoopAgent { max_ticks: 3 }), global.clone());
+    let mut interrupted = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("interrupted").unwrap(),
+            Content::new("user").with_text("go"),
+        )
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), interrupted.next())
+        .await
+        .expect("first event should arrive within timeout");
+    assert!(first.is_some(), "expected at least one event before interrupt");
+
+    assert!(runner.interrupt("interrupted"));
+    while interrupted.next().await.is_some() {}
+    assert!(!global.is_cancelled(), "interrupting one run must not cancel the global token");
+
+    let mut next = runner
+        .run(
+            UserId::new("user123").unwrap(),
+            SessionId::new("next").unwrap(),
+            Content::new("user").with_text("go"),
+        )
+        .await
+        .unwrap();
+    let mut count = 0usize;
+    while let Some(result) = next.next().await {
+        result.unwrap();
+        count += 1;
+    }
+    assert_eq!(count, 3, "a later run must not inherit the interrupted run's cancellation");
+}
+
+// ── Durable stores ─────────────────────────────────────────────────────
+
+/// The durable stores one run's config carried.
+type SeenStores = (
+    Option<Arc<dyn adk_core::ActionLedger>>,
+    Option<Arc<dyn adk_core::ApprovalStore>>,
+    Option<Arc<dyn adk_core::SpendLedger>>,
+);
+
+/// Records the durable stores each run's config carries.
+#[derive(Default)]
+struct StoreCapturingAgent {
+    seen: Mutex<Vec<SeenStores>>,
+}
+
+#[async_trait]
+impl Agent for StoreCapturingAgent {
+    fn name(&self) -> &str {
+        "store_capturing_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Records the durable stores in its run config"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &[]
+    }
+
+    async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
+        let config = ctx.run_config();
+        self.seen.lock().unwrap().push((
+            config.action_ledger.clone(),
+            config.approval_store.clone(),
+            config.spend_ledger.clone(),
+        ));
+        Ok(Box::pin(futures::stream::empty()))
+    }
+}
+
+#[tokio::test]
+async fn runner_installs_its_durable_stores_on_runs_that_carry_none() {
+    let agent = Arc::new(StoreCapturingAgent::default());
+    let actions: Arc<dyn adk_core::ActionLedger> = Arc::new(adk_core::InMemoryActionLedger::new());
+    let approvals: Arc<dyn adk_core::ApprovalStore> =
+        Arc::new(adk_core::InMemoryApprovalStore::new());
+    let spend: Arc<dyn adk_core::SpendLedger> = Arc::new(adk_core::InMemorySpendLedger::default());
+    let runner = Runner::builder()
+        .app_name("test_app")
+        .agent(agent.clone() as Arc<dyn Agent>)
+        .session_service(Arc::new(MockSessionService) as Arc<dyn SessionService>)
+        .action_ledger(actions.clone())
+        .approval_store(approvals.clone())
+        .spend_ledger(spend.clone())
+        .build()
+        .unwrap();
+
+    let run_own = adk_core::RunConfig::builder()
+        .action_ledger(Arc::new(adk_core::InMemoryActionLedger::new()))
+        .build();
+    let own_ledger = run_own.action_ledger.clone().unwrap();
+    for config in [None, Some(run_own)] {
+        let mut stream = runner
+            .run_with_config(
+                UserId::new("user123").unwrap(),
+                SessionId::new("stores-session").unwrap(),
+                Content::new("user").with_text("go"),
+                config,
+            )
+            .await
+            .unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    }
+
+    let seen = agent.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    let (action, approval, spent) = &seen[0];
+    assert!(Arc::ptr_eq(action.as_ref().unwrap(), &actions), "runner's action ledger");
+    assert!(Arc::ptr_eq(approval.as_ref().unwrap(), &approvals), "runner's approval store");
+    assert!(Arc::ptr_eq(spent.as_ref().unwrap(), &spend), "runner's spend ledger");
+    let (action, approval, _) = &seen[1];
+    assert!(Arc::ptr_eq(action.as_ref().unwrap(), &own_ledger), "a run's own ledger is kept");
+    assert!(Arc::ptr_eq(approval.as_ref().unwrap(), &approvals), "missing stores are filled");
 }

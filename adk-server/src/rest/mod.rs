@@ -3,7 +3,7 @@ mod routes;
 
 pub use controllers::{
     A2aController, AppsController, ArtifactsController, DebugController, RuntimeController,
-    SessionController,
+    SessionController, a2a::A2aTaskRetention,
 };
 
 use crate::{
@@ -307,6 +307,18 @@ impl crate::yaml_agent::ModelFactory for NoOpModelFactory {
     }
 }
 
+/// Public A2A discovery routes.
+///
+/// The card is served at `/.well-known/agent-card.json`, the well-known path since
+/// A2A 0.3.0 and the one the bundled v1 client fetches, and at the earlier
+/// `/.well-known/agent.json` that existing peers use.
+fn a2a_discovery_router(controller: A2aController) -> Router {
+    Router::new()
+        .route("/.well-known/agent-card.json", get(controllers::a2a::get_agent_card))
+        .route("/.well-known/agent.json", get(controllers::a2a::get_agent_card))
+        .with_state(controller)
+}
+
 /// Create the server application with A2A support at the specified base URL
 pub fn create_app_with_a2a(config: ServerConfig, a2a_base_url: Option<&str>) -> Router {
     let session_controller = SessionController::new(config.session_service.clone());
@@ -452,12 +464,10 @@ pub fn create_app_with_a2a(config: ServerConfig, a2a_base_url: Option<&str>) -> 
         // authentication as every other mutation surface. They were previously merged at the
         // root, outside the layer applied to `/api`, so anyone who could reach the port could
         // drive the agent and incur its costs.
-        let a2a_discovery = Router::new()
-            .route("/.well-known/agent.json", get(controllers::a2a::get_agent_card))
-            .with_state(a2a_controller.clone());
+        let a2a_discovery = a2a_discovery_router(a2a_controller.clone());
         let a2a_rpc = Router::new()
-            .route("/a2a", post(controllers::a2a::handle_jsonrpc))
-            .route("/a2a/stream", post(controllers::a2a::handle_jsonrpc_stream))
+            .route("/a2a", post(controllers::a2a::handle_jsonrpc_for_caller))
+            .route("/a2a/stream", post(controllers::a2a::handle_jsonrpc_stream_for_caller))
             .with_state(a2a_controller)
             .layer(auth_layer.clone());
         app = app.merge(a2a_discovery).merge(a2a_rpc);
@@ -541,9 +551,17 @@ pub struct ServerBuilder {
     api_routes: Vec<Router>,
     root_routes: Vec<Router>,
     shutdown_endpoint: bool,
+    governance_endpoints: bool,
     skill_index: Option<Arc<adk_skill::SkillIndex>>,
+    a2a_task_retention: Option<A2aTaskRetention>,
     #[cfg(feature = "agent-engine")]
     agent_engine: bool,
+    #[cfg(feature = "background")]
+    background_state: Option<crate::background::BackgroundState>,
+    #[cfg(feature = "background")]
+    cron_state: Option<crate::background::CronState>,
+    #[cfg(feature = "webhook-ingress")]
+    webhook_ingress: Option<crate::webhooks::WebhookIngress>,
 }
 
 impl ServerBuilder {
@@ -555,9 +573,17 @@ impl ServerBuilder {
             api_routes: Vec::new(),
             root_routes: Vec::new(),
             shutdown_endpoint: false,
+            governance_endpoints: false,
             skill_index: None,
+            a2a_task_retention: None,
             #[cfg(feature = "agent-engine")]
             agent_engine: false,
+            #[cfg(feature = "background")]
+            background_state: None,
+            #[cfg(feature = "background")]
+            cron_state: None,
+            #[cfg(feature = "webhook-ingress")]
+            webhook_ingress: None,
         }
     }
 
@@ -602,8 +628,8 @@ impl ServerBuilder {
 
     /// Expose the skills in `skill_index` on the A2A agent card.
     ///
-    /// When A2A is enabled via [`with_a2a`](Self::with_a2a), the card served at
-    /// `/.well-known/agent.json` appends one `skills[]` entry per indexed
+    /// When A2A is enabled via [`with_a2a`](Self::with_a2a), the served agent
+    /// card appends one `skills[]` entry per indexed
     /// skill, mapped by [`agent_skills_from_index`](crate::a2a::agent_skills_from_index).
     /// Has no effect without `with_a2a`.
     ///
@@ -621,6 +647,98 @@ impl ServerBuilder {
     /// ```
     pub fn with_skill_index(mut self, skill_index: Arc<adk_skill::SkillIndex>) -> Self {
         self.skill_index = Some(skill_index);
+        self
+    }
+
+    /// Bound how many finished A2A task records the server keeps, and for how long.
+    ///
+    /// Defaults to [`A2aTaskRetention::default`]: the newest 1,000 records, each for
+    /// at most one hour. Has no effect without [`with_a2a`](Self::with_a2a).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_server::{A2aTaskRetention, ServerBuilder};
+    /// use std::time::Duration;
+    ///
+    /// let app = ServerBuilder::new(config)
+    ///     .with_a2a("http://localhost:8080")
+    ///     .with_a2a_task_retention(A2aTaskRetention::default().with_ttl(Duration::from_secs(300)))
+    ///     .build();
+    /// ```
+    pub fn with_a2a_task_retention(mut self, retention: A2aTaskRetention) -> Self {
+        self.a2a_task_retention = Some(retention);
+        self
+    }
+
+    /// Mount the background run endpoints under `/api`, behind the auth middleware.
+    ///
+    /// Serves `POST /api/runs`, `GET /api/runs`, `GET /api/runs/{run_id}`, and
+    /// `DELETE /api/runs/{run_id}` from `state`, and starts its embedded worker when the
+    /// router is built inside a Tokio runtime. The state obeys
+    /// [`ServerConfig::governance`] unless it carries its own control. When a
+    /// `RequestContextExtractor` is configured, every request must authenticate, and an
+    /// authenticated run belongs to the caller's user id. Mounting
+    /// [`background_runs_router_with_state`](crate::background::background_runs_router_with_state)
+    /// yourself skips that layer.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_server::background::BackgroundState;
+    ///
+    /// let app = ServerBuilder::new(config)
+    ///     .with_background_runs(BackgroundState::new().with_executor(executor))
+    ///     .build();
+    /// ```
+    #[cfg(feature = "background")]
+    pub fn with_background_runs(mut self, state: crate::background::BackgroundState) -> Self {
+        self.background_state = Some(state);
+        self
+    }
+
+    /// Mount the cron job endpoints under `/api`, behind the auth middleware.
+    ///
+    /// Serves `POST /api/cron`, `GET /api/cron`, and `GET`/`PATCH`/`DELETE
+    /// /api/cron/{job_id}` from `state`. The scheduler is not started here — call
+    /// [`start_cron_scheduler`](crate::background::start_cron_scheduler) with a
+    /// clone of the same state on every replica; each fire time is enqueued once.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_server::background::{BackgroundState, CronState, start_cron_scheduler};
+    ///
+    /// let cron_state = CronState::new(BackgroundState::new());
+    /// start_cron_scheduler(cron_state.clone());
+    /// let app = ServerBuilder::new(config).with_cron_jobs(cron_state).build();
+    /// ```
+    #[cfg(feature = "background")]
+    pub fn with_cron_jobs(mut self, state: crate::background::CronState) -> Self {
+        self.cron_state = Some(state);
+        self
+    }
+
+    /// Mount `POST /hooks/{name}`: each signed delivery enqueues a durable run.
+    ///
+    /// The route is served at the root, outside `/api` and without the auth middleware:
+    /// the Standard Webhooks signature is the authentication. When `ingress` has no kill
+    /// switch of its own, [`ServerConfig::governance`] is installed, so a freeze refuses
+    /// deliveries with `503`. Runs execute when a worker claims them from the ingress's
+    /// run store.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_server::webhooks::{WebhookHook, WebhookIngress};
+    ///
+    /// let ingress = WebhookIngress::new(run_store.clone())
+    ///     .with_hook(WebhookHook::new("billing", verifier, "billing", "invoice_agent"));
+    /// let app = ServerBuilder::new(config).with_webhook_ingress(ingress).build();
+    /// ```
+    #[cfg(feature = "webhook-ingress")]
+    pub fn with_webhook_ingress(mut self, ingress: crate::webhooks::WebhookIngress) -> Self {
+        self.webhook_ingress = Some(ingress);
         self
     }
 
@@ -659,6 +777,48 @@ impl ServerBuilder {
     pub fn enable_shutdown_endpoint(mut self) -> Self {
         self.shutdown_endpoint = true;
         self
+    }
+
+    /// Mount the governance admin endpoints under `/api/admin`, behind the auth middleware.
+    ///
+    /// | Route | Effect |
+    /// |-------|--------|
+    /// | `POST /api/admin/freeze` | Freezes [`ServerConfig::governance`], failing new runs and stopping running ones before their next model or tool call; background workers stop claiming and schedules stop firing; running durable runs are asked to cancel. A mirrored control writes the freeze to the shared store, so it reaches every replica. Body: `{"reason": "..."}` |
+    /// | `POST /api/admin/unfreeze` | Lifts the freeze |
+    /// | `GET /api/admin/governance` | Reports `{"frozen", "reason", "mirrored", "stale"}` |
+    ///
+    /// The endpoints carry the same authentication as every other mutation surface. Without
+    /// a `RequestContextExtractor` they are open to anyone who reaches the server, so enable
+    /// them only behind an authenticating layer.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let app = ServerBuilder::new(config).enable_governance_endpoints().build();
+    /// ```
+    pub fn enable_governance_endpoints(mut self) -> Self {
+        self.governance_endpoints = true;
+        self
+    }
+
+    /// Mount the approval inbox endpoints for `service` under `/api/approvals`, behind
+    /// the auth middleware. See [`crate::approvals`] for the routes.
+    ///
+    /// The endpoints need an authenticated caller, so configure a
+    /// `RequestContextExtractor`; without one every route answers `401`. Run
+    /// [`spawn_approval_ticker`](crate::approvals::spawn_approval_ticker) as well so
+    /// requests expire and escalate.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let app = ServerBuilder::new(config).with_approval_service(service).build();
+    /// ```
+    #[cfg(feature = "approvals")]
+    pub fn with_approval_service(self, service: Arc<dyn adk_core::ApprovalService>) -> Self {
+        self.add_api_routes(crate::approvals::approvals_router(
+            crate::approvals::ApprovalEndpoints::new(service),
+        ))
     }
 
     /// Build the final Axum router with all routes and middleware applied.
@@ -821,6 +981,52 @@ impl ServerBuilder {
             api_router = api_router.merge(custom_routes.layer(auth_layer.clone()));
         }
 
+        // Background runs and cron schedules obey the server's kill switch unless they
+        // carry their own, and a freeze asks their running runs to cancel.
+        #[cfg(feature = "background")]
+        let mut background_run_stores: Vec<Arc<dyn adk_core::DurableRunStore>> = Vec::new();
+        #[cfg(feature = "background")]
+        for state in self
+            .background_state
+            .iter()
+            .chain(self.cron_state.iter().map(|cron| &cron.background_state))
+        {
+            state.governance_or(&config.governance);
+            background_run_stores.push(Arc::clone(state.run_store()));
+        }
+
+        if self.governance_endpoints {
+            let controller = controllers::GovernanceController::new(config.governance.clone());
+            #[cfg(feature = "background")]
+            let controller = background_run_stores
+                .iter()
+                .fold(controller, |controller, store| controller.with_run_store(Arc::clone(store)));
+            api_router = api_router.merge(
+                Router::new()
+                    .route("/admin/freeze", post(controllers::governance::freeze))
+                    .route("/admin/unfreeze", post(controllers::governance::unfreeze))
+                    .route("/admin/governance", get(controllers::governance::status))
+                    .with_state(controller)
+                    .layer(auth_layer.clone()),
+            );
+        }
+
+        // Background runs and cron jobs submit and schedule work, so they carry the
+        // same authentication as every other mutation surface.
+        #[cfg(feature = "background")]
+        if let Some(state) = self.background_state {
+            api_router = api_router.merge(
+                crate::background::background_runs_router_with_state(state)
+                    .layer(auth_layer.clone()),
+            );
+        }
+        #[cfg(feature = "background")]
+        if let Some(state) = self.cron_state {
+            api_router = api_router.merge(
+                crate::background::cron_jobs_router_with_state(state).layer(auth_layer.clone()),
+            );
+        }
+
         // Add shutdown endpoint if enabled
         let shutdown_handle = if self.shutdown_endpoint {
             let handle = ShutdownHandle::new();
@@ -843,6 +1049,16 @@ impl ServerBuilder {
 
         let mut app = Router::new().nest("/api", api_router).merge(ui_router);
 
+        #[cfg(feature = "webhook-ingress")]
+        if let Some(ingress) = self.webhook_ingress {
+            let ingress = if ingress.has_governance() {
+                ingress
+            } else {
+                ingress.with_governance(config.governance.clone())
+            };
+            app = app.merge(crate::webhooks::webhook_ingress_router(ingress));
+        }
+
         // Merge custom root routes
         for custom_routes in self.root_routes {
             app = app.merge(custom_routes);
@@ -858,7 +1074,8 @@ impl ServerBuilder {
             let mut runner_builder = adk_runner::Runner::builder()
                 .app_name(root_agent.name())
                 .agent(root_agent.clone())
-                .session_service(config.session_service.clone());
+                .session_service(config.session_service.clone())
+                .governance(config.governance.clone());
             if let Some(artifact_service) = &config.artifact_service {
                 runner_builder = runner_builder.artifact_service(artifact_service.clone());
             }
@@ -879,13 +1096,15 @@ impl ServerBuilder {
                 }
                 None => A2aController::new(config.clone(), base_url),
             };
+            let a2a_controller = match self.a2a_task_retention {
+                Some(retention) => a2a_controller.with_task_retention(retention),
+                None => a2a_controller,
+            };
             // Same split as `create_app_with_a2a`: discovery is public, RPC is authenticated.
-            let a2a_discovery = Router::new()
-                .route("/.well-known/agent.json", get(controllers::a2a::get_agent_card))
-                .with_state(a2a_controller.clone());
+            let a2a_discovery = a2a_discovery_router(a2a_controller.clone());
             let a2a_rpc = Router::new()
-                .route("/a2a", post(controllers::a2a::handle_jsonrpc))
-                .route("/a2a/stream", post(controllers::a2a::handle_jsonrpc_stream))
+                .route("/a2a", post(controllers::a2a::handle_jsonrpc_for_caller))
+                .route("/a2a/stream", post(controllers::a2a::handle_jsonrpc_stream_for_caller))
                 .with_state(a2a_controller)
                 .layer(auth_layer.clone());
             app = app.merge(a2a_discovery).merge(a2a_rpc);

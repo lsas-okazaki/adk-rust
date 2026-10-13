@@ -14,7 +14,7 @@ Provider-native tools are now declared through the normal `Tool` API instead of 
 | `UrlContextTool` | Gemini URL grounding | Summarize or reason over live URLs |
 | `GoogleMapsTool` | Gemini Google Maps grounding | Places, routes, and local context |
 | `GeminiCodeExecutionTool` | Gemini native code execution | Server-side Python execution |
-| `WebSearchTool` | Anthropic native web search | Claude server-side web search |
+| `WebSearchTool` | Anthropic native web search | Claude server-side web search; `with_dynamic_filtering()` declares `web_search_20260209`, and `with_allowed_callers(["direct"])` turns its dynamic filtering off |
 | `OpenAIWebSearchTool` | OpenAI Responses web search | OpenAI-hosted retrieval |
 | `AgentTool` | Wrap agents as callable tools | Agent composition and delegation |
 | `ExitLoopTool` | Loop termination | Controlling LoopAgent iterations |
@@ -63,6 +63,11 @@ Unlike regular function tools, `GoogleSearchTool` operates differently:
 2. **Automatic invocation**: The model decides when to search based on the query
 3. **Integrated results**: Search results are incorporated directly into the model's response
 
+> **Note:** The answer text contains only what the model wrote. The search queries,
+> sources and supports are in the response's `provider_metadata` (`webSearchQueries`,
+> `groundingChunks`, `groundingSupports`); display them as your application's grounding
+> requirements specify.
+
 The tool implementation returns an error if called directly because the actual search happens within the Gemini API:
 
 ```rust
@@ -80,6 +85,12 @@ async fn execute(&self, _ctx: Arc<dyn ToolContext>, _args: Value) -> Result<Valu
 | Description | "Performs a Google search to retrieve information from the web." |
 | Parameters | Determined by Gemini model |
 | Execution | Server-side (Gemini grounding) |
+| Effect | `ToolEffect::ReadOnly` |
+
+> **Important:** a run's `ToolPolicy` decides whether the tool is attached to each request, and
+> every search the response reports counts against the run's tool-call budget and cost. A
+> default-deny `DeclarativePolicy` withholds it unless a rule allows it, such as
+> `allow_read_only()`. See [Built-in Tools](../security/tool-authorization.md#built-in-tools).
 
 ### Use Cases
 

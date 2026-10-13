@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adk-agent"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "adk-skill",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "adk-artifact"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -40,22 +40,26 @@ dependencies = [
 
 [[package]]
 name = "adk-core"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
  "futures",
+ "hmac",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
 [[package]]
 name = "adk-model"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "adk-telemetry",
@@ -78,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "adk-plugin"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "serde_json",
@@ -88,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "adk-runner"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-artifact",
  "adk-core",
@@ -109,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "adk-session"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -122,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "adk-skill"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "adk-plugin",
@@ -138,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "adk-telemetry"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "thiserror",
  "tracing",
@@ -629,6 +633,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -948,6 +953,15 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "http"
@@ -2028,14 +2042,14 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -2086,7 +2100,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2097,9 +2111,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -2430,7 +2444,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2717,6 +2731,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

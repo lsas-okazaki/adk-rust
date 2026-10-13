@@ -17,12 +17,13 @@ fn main() {
     // Warm-up
     for _ in 0..warmup {
         let mut s = Vec::with_capacity(bytes.len() / 2);
-        for chunk in bytes.chunks_exact(2) {
+        for chunk in bytes.as_chunks::<2>().0 {
             s.push(i16::from_le_bytes([chunk[0], chunk[1]]));
         }
         black_box(s);
 
-        let s: Vec<i16> = bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+        let s: Vec<i16> =
+            bytes.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
         black_box(s);
 
         let s: Cow<[i16]> = unsafe {
@@ -35,14 +36,15 @@ fn main() {
     for _ in 0..iterations {
         let start = Instant::now();
         let mut s = Vec::with_capacity(bytes.len() / 2);
-        for chunk in bytes.chunks_exact(2) {
+        for chunk in bytes.as_chunks::<2>().0 {
             s.push(i16::from_le_bytes([chunk[0], chunk[1]]));
         }
         manual_durations.push(start.elapsed());
         samples1 = s;
 
         let start = Instant::now();
-        let s: Vec<i16> = bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+        let s: Vec<i16> =
+            bytes.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
         iter_durations.push(start.elapsed());
         samples2 = s;
 

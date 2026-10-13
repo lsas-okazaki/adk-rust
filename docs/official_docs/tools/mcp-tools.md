@@ -63,13 +63,13 @@ Local stdio MCP support is opt-in:
 
 ```toml
 [dependencies]
-adk-tool = { version = "2.2.0", features = ["mcp"] }
+adk-tool = { version = "3.0.0", features = ["mcp"] }
 ```
 
 Add Streamable HTTP when connecting to remote services:
 
 ```toml
-adk-tool = { version = "2.2.0", features = ["mcp", "http-transport"] }
+adk-tool = { version = "3.0.0", features = ["mcp", "http-transport"] }
 ```
 
 Legacy sampling callbacks require the separate `mcp-sampling` feature. The MCP
@@ -224,7 +224,9 @@ The builder applies request timeouts, custom headers, bearer tokens, custom
 API-key headers, and bounded recovery when an HTTP session expires.
 
 `OAuth2Config` implements a fixed OAuth 2.0 client-credentials token request.
-It is useful for a server with a known token endpoint. It is not the complete
+It is useful for a server with a known token endpoint. The connection attaches
+the current token to each request, refreshing it before its `expires_in` and
+again when the server answers 401. It is not the complete
 MCP authorization flow: it does not perform protected-resource metadata
 discovery, authorization-server discovery, browser authorization, PKCE, or
 resource-indicator negotiation. Use `rmcp`'s authorization APIs or an external
@@ -281,11 +283,51 @@ For task mode, ADK-Rust:
 does not yet have a protocol-neutral resume channel for supplying that missing
 input. Design that interaction explicitly in the owning workflow.
 
+### Dropped calls and cleanup
+
+A remote task outlives the future that started it. When a tool-call future is
+dropped while it polls a task — an agent turn is cancelled, a timeout fires, or
+the caller stops polling — the toolset sends `tasks/cancel` for that task, bounded
+by a 2-second acknowledgement timeout. Cancellation is cooperative, so the
+toolset keeps tracking every task it has not seen finish, including tasks
+returned while task support is disabled; those are cancelled at once.
+
+`McpToolset::cancel_pending_tasks` cleans up the tracked set:
+
+| Server reports | Action |
+|---|---|
+| Terminal status | Released without a cancel request |
+| Unknown task (`-32602`, for example after a TTL expiry or a reconnect) | Released without a cancel request |
+| Still running | `tasks/cancel`, then released once a second `tasks/get` reports it terminal or unknown |
+
+A task the server has not confirmed stays tracked, and the call returns an error
+naming it, so a later call re-checks it. In-flight calls are tracked too, so
+cleanup also cancels them. Cancellation is cooperative on the server, so bound
+the call with your shutdown deadline:
+
+```rust
+use adk_tool::mcp::McpToolset;
+use std::time::Duration;
+
+async fn shutdown(toolset: &McpToolset) {
+    let cleanup = toolset.cancel_pending_tasks();
+    match tokio::time::timeout(Duration::from_secs(5), cleanup).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "remote MCP tasks may still run"),
+        Err(_) => tracing::warn!("MCP task cleanup exceeded the shutdown deadline"),
+    }
+    toolset.cancellation_token().await.cancel();
+}
+```
+
+`McpServerManager` runs this cleanup for each server it stops, within the
+configured grace period and before it cancels the session.
+
 ## Capability map
 
 | MCP capability | ADK-Rust 2 surface | Notes |
 |---|---|---|
-| Tool discovery and calls | `McpToolset`, `Toolset` | Raw schemas; multimodal and structured results preserved |
+| Tool discovery and calls | `McpToolset`, `Toolset` | Raw schemas within `McpSchemaLimits`; multimodal and structured results preserved |
 | Tool filtering | `with_filter`, `with_tools` | Filter before exposure to the model |
 | Resources and templates | list/read methods | Method-not-found handled for older servers |
 | Prompts | list/get methods | Typed argument maps |

@@ -15,10 +15,10 @@ Guardrails validate and transform agent inputs and outputs to ensure safety, com
 
 ```toml
 [dependencies]
-adk-guardrail = "2.2.0"
+adk-guardrail = "3.0.0"
 
 # For JSON schema validation
-adk-guardrail = { version = "2.2.0", features = ["schema"] }
+adk-guardrail = { version = "3.0.0", features = ["schema"] }
 ```
 
 ## Core Concepts
@@ -91,11 +91,12 @@ let filter = ContentFilter::harmful_content();
 // Strict variant that also blocks "hack" and "exploit"
 let filter = ContentFilter::harmful_content_strict();
 
-// Block specific keywords
+// Block specific keywords. Returns an error when the list cannot be compiled
+// (for example, past the regex size limit) rather than a filter that blocks nothing.
 let filter = ContentFilter::blocked_keywords(vec![
     "forbidden".into(),
     "banned".into(),
-]);
+])?;
 
 // Enforce topic relevance
 let filter = ContentFilter::on_topic("cooking", vec![
@@ -121,7 +122,7 @@ let config = ContentFilterConfig {
     severity: Severity::High,
 };
 
-let filter = ContentFilter::new("custom_filter", config);
+let filter = ContentFilter::new("custom_filter", config)?;
 ```
 
 ## Schema Validation
@@ -254,6 +255,8 @@ impl Guardrail for ProfanityFilter {
 Guardrails integrate with `LlmAgentBuilder`:
 
 Configured input guardrails run before model execution, and configured output guardrails run on generated responses before they are returned to the caller.
+
+> **Note:** `LlmAgentBuilder` accepts these sets only when `adk-agent` is built with its `guardrails` feature. The `adk-rust` `guardrail` feature enables it.
 
 ```rust
 use adk_agent::LlmAgentBuilder;

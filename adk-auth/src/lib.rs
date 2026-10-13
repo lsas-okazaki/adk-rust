@@ -19,6 +19,9 @@
 //! - `aws-secrets` - Enable AWS Secrets Manager provider
 //! - `azure-keyvault` - Enable Azure Key Vault provider
 //! - `gcp-secrets` - Enable GCP Secret Manager provider
+//! - `postgres-audit` - PostgreSQL audit sink
+//! - `otlp-audit` - OpenTelemetry audit sink
+//! - `signed-audit` - Signed, Merkle-hashed audit log ([`signed_audit`])
 //!
 //! ## Quick Start
 //!
@@ -44,6 +47,7 @@
 
 mod access_control;
 mod audit;
+mod broker;
 mod error;
 mod middleware;
 mod permission;
@@ -60,17 +64,23 @@ pub mod sso;
 // Cloud secret manager integration
 pub mod secrets;
 
+#[cfg(feature = "token-exchange")]
+mod token_exchange;
+
 // Enterprise audit sinks (feature-gated)
 #[cfg(feature = "otlp-audit")]
 pub mod audit_otlp;
 #[cfg(feature = "postgres-audit")]
 pub mod audit_postgres;
+#[cfg(feature = "signed-audit")]
+pub mod signed_audit;
 
 pub use access_control::{AccessControl, AccessControlBuilder};
 pub use audit::{
-    AuditEvent, AuditEventType, AuditFilter, AuditOutcome, AuditSink, FileAuditSink,
-    InMemoryAuditSink,
+    AuditEvent, AuditEventType, AuditFailureMode, AuditFilter, AuditOutcome, AuditSink,
+    FileAuditSink, InMemoryAuditSink,
 };
+pub use broker::SecretCredentialBroker;
 pub use error::{AccessDenied, AuthError};
 pub use middleware::{AuthMiddleware, ProtectedTool, ProtectedToolDyn, ToolExt};
 pub use permission::Permission;
@@ -82,6 +92,9 @@ pub use scope::{
 
 #[cfg(feature = "auth-bridge")]
 pub use auth_bridge::{JwtRequestContextExtractor, JwtRequestContextExtractorBuilder};
+
+#[cfg(feature = "token-exchange")]
+pub use token_exchange::TokenExchangeBroker;
 
 #[cfg(feature = "otlp-audit")]
 pub use audit_otlp::OtlpAuditSink;

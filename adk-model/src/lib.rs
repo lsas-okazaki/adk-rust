@@ -13,7 +13,7 @@
 //! - [`GeminiModel`] - Google's Gemini models (3 Pro, 2.5 Flash, etc.)
 //! - `OpenAIClient` - OpenAI models (GPT-5, GPT-5-mini, o3, etc.) — requires `openai` feature
 //! - `AzureOpenAIClient` - Azure OpenAI Service — requires `openai` feature
-//! - `OpenAICompatible` - Any OpenAI-compatible API (xAI, Fireworks, Together, Mistral, Perplexity, Cerebras, SambaNova, or custom) — requires `openai` feature, use `OpenAICompatibleConfig` presets
+//! - `OpenAICompatible` - Any OpenAI-compatible API (xAI, Fireworks, Together, Mistral, Perplexity, Cerebras, SambaNova, OrcaRouter, or custom) — requires `openai` feature, use `OpenAICompatibleConfig` presets
 //! - `AnthropicClient` - Anthropic Claude models — requires `anthropic` feature
 //! - `DeepSeekClient` - DeepSeek models — requires `deepseek` feature
 //! - `GroqClient` - Groq ultra-fast inference — requires `groq` feature
@@ -101,7 +101,7 @@
 //! let reasoner = DeepSeekClient::reasoner(std::env::var("DEEPSEEK_API_KEY").unwrap()).unwrap();
 //! ```
 //!
-//! ### OpenAI-Compatible Providers (Fireworks, Together, Mistral, Perplexity, Cerebras, SambaNova, xAI)
+//! ### OpenAI-Compatible Providers (Fireworks, Together, Mistral, Perplexity, Cerebras, SambaNova, xAI, OrcaRouter)
 //!
 //! All OpenAI-compatible providers use `OpenAICompatible` with provider presets:
 //!
@@ -179,13 +179,17 @@
 //! | Model | Description |
 //! |-------|-------------|
 //! | `claude-sonnet-5` | Balanced default |
-//! | `claude-opus-5` | Flagship capability |
+//! | `claude-fable-5-1` | Most capable; demanding reasoning and long-horizon work |
+//! | `claude-opus-5-5` | Current Opus; long-running agentic coding |
+//! | `claude-sonnet-5-5` | Current Sonnet |
+//! | `claude-haiku-5-5` | Current Haiku; high-volume, latency-sensitive work |
+//! | `claude-opus-5` | Previous Opus |
 //! | `claude-fable-5` | Premium creative and long-form work |
 //!
 //! ### DeepSeek
 //! | Model | Description |
 //! |-------|-------------|
-//! | `deepseek-v4-flash` | Fast balanced default |
+//! | `deepseek-flash` | Fast balanced default |
 //! | `deepseek-v4-pro` | Advanced reasoning |
 //!
 //! ### Groq
@@ -207,6 +211,7 @@
 //! | Cerebras | `OpenAICompatibleConfig::cerebras()` | `CEREBRAS_API_KEY` |
 //! | SambaNova | `OpenAICompatibleConfig::sambanova()` | `SAMBANOVA_API_KEY` |
 //! | xAI (Grok) | `OpenAICompatibleConfig::xai()` | `XAI_API_KEY` |
+//! | OrcaRouter | `OpenAICompatibleConfig::orcarouter()` | `ORCAROUTER_API_KEY` |
 //!
 //! ### Other Providers
 //!
@@ -270,15 +275,30 @@ pub mod ollama;
 pub mod openai;
 #[cfg(feature = "openai")]
 pub mod openai_compatible;
+#[cfg(feature = "opencode")]
+pub mod opencode;
 #[cfg(feature = "openrouter")]
 pub mod openrouter;
 /// Conversion outcomes for content parts sent to a provider.
 pub mod part_conversion;
+/// Token prices for every provider and cost calculation from usage.
+pub mod pricing;
 
 /// Canonical provider identifiers and metadata.
 pub mod provider;
 /// Retry logic with exponential backoff for transient provider errors.
 pub mod retry;
+#[cfg(any(feature = "openai", feature = "deepseek", feature = "azure-ai"))]
+mod sse;
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "deepseek",
+    feature = "groq",
+    feature = "bedrock",
+    feature = "azure-ai"
+))]
+pub(crate) mod tool_args;
 pub mod tool_call_parser;
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "deepseek", feature = "bedrock"))]
 pub(crate) mod tool_order;
@@ -311,9 +331,12 @@ pub use ollama::{OllamaConfig, OllamaModel};
 #[cfg(feature = "openai")]
 pub use openai::{AzureConfig, AzureOpenAIClient, OpenAIClient, OpenAIConfig, ReasoningEffort};
 #[cfg(feature = "openai")]
-pub use openai_compatible::{OpenAICompatible, OpenAICompatibleConfig};
+pub use openai_compatible::{OpenAICompatible, OpenAICompatibleConfig, ReasoningReplayField};
+#[cfg(feature = "opencode")]
+pub use opencode::{OpenCodeApi, OpenCodeClient, OpenCodeConfig, OpenCodeService};
 #[cfg(feature = "openrouter")]
 pub use openrouter::{OpenRouterApiMode, OpenRouterClient, OpenRouterConfig};
+pub use pricing::PricingCatalog;
 pub use provider::ModelProvider;
 pub use retry::RetryConfig;
 pub use retry::ServerRetryHint;

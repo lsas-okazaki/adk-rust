@@ -12,16 +12,10 @@
 A production-ready Rust framework for building AI agents. Model-agnostic, type-safe
 and async, across 43 publishable crates for agent orchestration.
 
-> **v2.2.0 Released!** This API-compatible minor release completes the Gemini
-> Enterprise Agent Platform consumption path: the Gen AI Evaluation Service
-> bridge, Vertex AI RAG Engine retrieval and grounding, an Agent Retrieval
-> vector store, Agent Registry discovery and registration, Skill Registry
-> consumption with remote skill loading, and remote ReasoningEngine agents you
-> can call as sub-agents — every one opt-in and composable with any preset, and
-> all appended to `gemini-agent-platform`. Graph workflows gain native tool
-> confirmation pauses. Tracing is fixed so one invocation exports as one trace
-> rather than several disconnected ones. All 43 crates are available on
-> [crates.io](https://crates.io/crates/adk-rust/2.2.0).
+> **v3.0.0 release candidate — unpublished.** This major release carries breaking
+> API changes, starting with new Anthropic tool and response block types; see the
+> [CHANGELOG](CHANGELOG.md). The published release is 2.3.0, with all 43 crates on
+> [crates.io](https://crates.io/crates/adk-rust/2.3.0).
 >
 > **Milestone:** ADK-Rust has crossed **500K total crates.io downloads** across
 > the workspace crates.
@@ -150,8 +144,8 @@ with tool, graph, and team agents.
 
 ```toml
 [dependencies]
-adk-rust = "2.2.0"                                        # Gemini, agents, runner, sessions
-# adk-rust = { version = "2.2.0", features = ["standard"] }  # + server, auth, graph, eval
+adk-rust = "3.0.0"                                        # Gemini, agents, runner, sessions
+# adk-rust = { version = "3.0.0", features = ["standard"] }  # + server, auth, graph, eval
 ```
 
 | Tier | Includes | Use case |
@@ -211,7 +205,7 @@ environment, among those you compiled in.
 | Gemini | `gemini-3.7-flash` (default), `gemini-3.6-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-pro-preview` | (default) |
 | OpenAI | `gpt-5.6-terra` (default), `gpt-5.6-sol`, `gpt-5.6-luna` | `openai` |
 | OpenAI Responses API | `gpt-5.6-terra`, `gpt-5.6-sol`, `gpt-5.6-luna` | `openai` |
-| Anthropic | `claude-sonnet-5` (default), `claude-opus-5`, `claude-fable-5` | `anthropic` |
+| Anthropic | `claude-sonnet-5` (default), `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1` | `anthropic` |
 | DeepSeek | `deepseek-v4-flash`, `deepseek-v4-pro` | `deepseek` |
 | Groq | `openai/gpt-oss-120b`, `openai/gpt-oss-20b` | `groq` |
 | Ollama | `qwen3.6:35b-a3b`, `qwen3.5`, `llama3.2:3b` | `ollama` |
@@ -222,6 +216,7 @@ environment, among those you compiled in.
 | Cerebras | `gpt-oss-120b` | `openai` (preset) |
 | SambaNova | `gpt-oss-120b` | `openai` (preset) |
 | xAI (Grok) | `grok-4.6` | `openai` (preset) |
+| OrcaRouter | `openai/gpt-5.6-terra`, `anthropic/claude-sonnet-5` | `openai` (preset) |
 | Amazon Bedrock | `anthropic.claude-sonnet-4-20250514-v1:0` | `bedrock` |
 | Azure AI Inference | (endpoint-specific) | `azure-ai` |
 | mistral.rs | **Gemma 4**, Phi-3, Llama, Qwen 3.5, Voxtral, FLUX | `adk-mistralrs` |
@@ -338,7 +333,7 @@ checks an agent definition without building. `cargo adk templates` and
 | `adk-core` | Foundational traits and types | `Agent` trait, `Content`, `Part`, error types, streaming primitives |
 | `adk-agent` | Agent implementations | `LlmAgent`, workflow agents, and portable `TeamSpec` / `CompiledTeam` composition |
 | `adk-skill` | AgentSkills parsing and selection | Skill markdown parser, `.skills` discovery/indexing, lexical matching, prompt injection helpers |
-| `adk-model` | LLM integrations | Gemini, OpenAI, Anthropic, DeepSeek, Groq, Ollama, Bedrock, Azure AI + OpenAI-compatible presets (Fireworks, Together, Mistral, Perplexity, Cerebras, SambaNova, xAI) |
+| `adk-model` | LLM integrations | Gemini, OpenAI, Anthropic, DeepSeek, Groq, Ollama, Bedrock, Azure AI + OpenAI-compatible presets (Fireworks, Together, Mistral, Perplexity, Cerebras, SambaNova, xAI, OrcaRouter) |
 | `adk-gemini` | Gemini client | Google Gemini API client with streaming and multimodal support |
 | `adk-gcp` | Shared Google Cloud plumbing | ADC credential caching, bounded REST transport, Vertex resource names, and LRO polling |
 | `adk-anthropic` | Anthropic client | Dedicated Anthropic API client with streaming, thinking, caching, citations, vision, PDF, pricing |
@@ -365,7 +360,7 @@ checks an agent definition without building. `cargo adk templates` and
 | `adk-auth` | Access control | Role-based permissions, declarative scope-based security, SSO/OAuth, audit logging |
 | `adk-sandbox` | Sandboxed code execution | Process/WASM backends, OS-level sandbox profiles (Seatbelt on macOS, bubblewrap on Linux; Windows AppContainer not implemented) |
 | `adk-telemetry` | Observability | OpenTelemetry tracing, structured logging, and Google Cloud export |
-| `adk-managed` | Managed agent runtime (Experimental) | Provider-neutral agent execution, in-process checkpointing and event replay (state does not survive process loss) |
+| `adk-managed` | Managed agent runtime (Experimental) | Provider-neutral agent execution, event replay, custom tool calls and confirmations parked on durable runs; sessions survive process loss with durable stores |
 | `adk-enterprise` | Enterprise client SDK (Experimental) | HTTP/SSE client for managed agent service, zero runtime deps |
 | `adk-plugin` | Lifecycle hooks | `EnhancedPlugin` trait, tool and model interception, priority pipeline, shared `PluginContext` |
 | `adk-retry-reflect` | Retry and reflect plugin | Intercepts tool failures, injects reflection prompts, exponential backoff, circuit breaker |
@@ -414,7 +409,7 @@ per-platform tool matrix and the CI cost tiers.
 - [Official docs](docs/official_docs/) — guides for every capability above
 - [Wiki](https://github.com/zavora-ai/adk-rust/wiki) — tutorials and quickstarts
 - [docs.rs](https://docs.rs/adk-rust) — API reference
-- [Examples](examples/) — 110 standalone crates, plus 120+ in the
+- [Examples](examples/) — 117 standalone crates, plus 120+ in the
   [playground](https://github.com/zavora-ai/adk-playground)
 
 ## Companion projects
@@ -427,7 +422,7 @@ per-platform tool matrix and the CI cost tiers.
 
 ## Project
 
-- [ROADMAP.md](ROADMAP.md) — **v2.2.0** (current). Longer-term direction and
+- [ROADMAP.md](ROADMAP.md) — **v3.0.0** (release candidate). Longer-term direction and
   why both orchestration APIs are supported
 - [CHANGELOG.md](CHANGELOG.md) — every release
 - [CONTRIBUTORS.md](CONTRIBUTORS.md) — the people who built this

@@ -248,4 +248,57 @@ mod azure_preservation {
         assert_eq!(usage.candidates_token_count, 25);
         assert_eq!(usage.total_token_count, 40);
     }
+    /// Error codes are part of the public contract, so the shared compatible
+    /// transport reports the codes the dedicated Azure client reported.
+    #[tokio::test]
+    async fn azure_error_codes_match_the_dedicated_client() {
+        let cases = [
+            (400, "model.azure_openai.api_error"),
+            (401, "model.azure_openai.unauthorized"),
+            (404, "model.azure_openai.not_found"),
+            (408, "model.azure_openai.timeout"),
+            (429, "model.azure_openai.rate_limited"),
+            (500, "model.azure_openai.unavailable"),
+            (503, "model.azure_openai.unavailable"),
+            (529, "model.azure_openai.overloaded"),
+        ];
+        for (status, expected) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/openai/deployments/.+/chat/completions"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("failure"))
+                .mount(&server)
+                .await;
+
+            for stream in [false, true] {
+                let client = make_azure_client(&server.uri());
+                let error = match client.generate_content(make_request(), stream).await {
+                    Ok(mut responses) => responses
+                        .next()
+                        .await
+                        .expect("stream yields the error")
+                        .expect_err("the request fails"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    (error.code, error.details.upstream_status_code),
+                    (expected, Some(status)),
+                    "status {status}, stream {stream}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn azure_transport_failure_keeps_the_request_code() {
+        // Nothing listens on the discard port, so the connection is refused.
+        let client = make_azure_client("http://127.0.0.1:9");
+        let error = match client.generate_content(make_request(), false).await {
+            Ok(mut responses) => {
+                responses.next().await.expect("stream yields the error").expect_err("fails")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "model.azure_openai.request");
+    }
 }

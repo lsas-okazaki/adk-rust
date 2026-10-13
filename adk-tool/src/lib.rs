@@ -105,7 +105,7 @@ pub mod example_store;
 #[cfg(feature = "vertex-agent-registry")]
 pub mod vertex;
 
-pub use adk_core::{AdkError, Result, Tool, ToolContext, Toolset};
+pub use adk_core::{AdkError, Result, Tool, ToolContext, ToolEffect, Toolset};
 pub use adk_rust_macros::tool;
 
 // Re-export async_trait so the #[tool] macro's generated code can reference it
@@ -131,8 +131,8 @@ pub use function_tool::FunctionTool;
 #[cfg(feature = "mcp")]
 pub use mcp::{
     AutoDeclineElicitationHandler, ElicitationHandler, McpAuth, McpHttpClientBuilder,
-    McpServerManager, McpTaskConfig, McpToolset, OAuth2Config, Resource, ResourceContents,
-    ResourceNotificationHandler, ResourceTemplate,
+    McpSchemaLimits, McpServerManager, McpTaskConfig, McpToolset, OAuth2Config, Resource,
+    ResourceContents, ResourceNotificationHandler, ResourceTemplate,
 };
 pub use simple_context::SimpleToolContext;
 pub use stateful_tool::StatefulTool;

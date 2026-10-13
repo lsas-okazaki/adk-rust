@@ -29,14 +29,14 @@ HTTP server and A2A v1.0.0 protocol for Rust Agent Development Kit (ADK-Rust) ag
 
 ```toml
 [dependencies]
-adk-server = "2.2.0"
+adk-server = "3.0.0"
 ```
 
 Or use the meta-crate:
 
 ```toml
 [dependencies]
-adk-rust = { version = "2.2.0", features = ["server"] }
+adk-rust = { version = "3.0.0", features = ["server"] }
 ```
 
 ## Quick Start
@@ -189,6 +189,20 @@ The `ShutdownHandle::signal()` also responds to Ctrl+C and SIGTERM, combining al
 
 The A2A v1.0.0 implementation includes: RFC 3339 timestamps, capabilities declaration, message ID idempotency, push notification authentication, INPUT_REQUIRED multi-turn flow, input validation, `application/a2a+json` Content-Type, and Task-as-first-SSE-event. See [A2A docs](../docs/official_docs/deployment/a2a.md) for details.
 
+### Governance Kill Switch
+
+`ServerConfig::governance` is shared by every runner the server builds. Freezing it fails new
+runs and stops running ones before their next model or tool call.
+`ServerBuilder::enable_governance_endpoints()` mounts `POST /api/admin/freeze`,
+`POST /api/admin/unfreeze`, and `GET /api/admin/governance` behind the auth middleware; a
+freeze also pauses background-run and cron scheduling mounted on the same builder.
+
+```rust,ignore
+let control = adk_core::GovernanceControl::new();
+let config = ServerConfig::new(loader, sessions).with_governance(control.clone());
+let app = ServerBuilder::new(config).enable_governance_endpoints().build();
+```
+
 ### Remote Agent Client
 
 ```rust
@@ -235,49 +249,110 @@ let config = ServerConfig::new(agent_loader, session_service)
     .with_request_context(Arc::new(MyExtractor));
 ```
 
-When configured, the extracted `RequestContext` flows into `InvocationContext`, making scopes available to tools via `ToolContext::user_scopes()`. Session and artifact endpoints enforce user_id authorization against the authenticated identity.
+When configured, the extracted `RequestContext` flows into `InvocationContext`, making scopes available to tools via `ToolContext::user_scopes()`. Session and artifact endpoints enforce user_id authorization against the authenticated identity. A2A routes use the authenticated identity as the session user and the owner of every task they create, so `tasks/get` and `tasks/cancel` cannot reach another caller's task.
 
 ### Background Runs and Cron (feature: `background`)
 
-Runs a workflow without holding the request open, and schedules one on a cron
+Runs a workflow or an agent without holding the request open, and schedules one on a cron
 expression. Neither is compiled unless the feature is on.
 
-```rust
-use adk_server::background::{FileRunPersistence, RunRetention, RunStore};
+`BackgroundState` holds a `DurableRunStore` — an `InMemoryRunStore` by default — and the
+targets runs execute. A `DurableWorker` over the same store claims runs under fenced leases;
+unless disabled, one starts in this process when the router is built inside a Tokio runtime.
+
+```rust,ignore
 use std::sync::Arc;
 
-// Runs are held in memory. Attach persistence so a restart can still see them.
-let store = RunStore::new()
-    .with_persistence(Arc::new(FileRunPersistence::new("/var/lib/adk/runs.json")))
-    .with_retention(RunRetention::keep_finished(1000));
+use adk_server::background::{BackgroundState, CronState, DurableWorkerConfig, WorkflowRegistry};
 
-// At startup, report what the last stop interrupted.
-for run_id in store.restore().await? {
-    tracing::warn!(run.id = %run_id, "this run did not finish before the last restart");
-}
+let background = BackgroundState::new()
+    .with_run_store(run_store)                 // shared across replicas
+    .with_executor(Arc::new(WorkflowRegistry::new()))
+    .with_agent("support", Arc::new(runner))   // runs whose target is "support"
+    .with_worker_config(DurableWorkerConfig::default().with_queue("default"));
+let cron = CronState::new(background.clone()).with_schedule_store(schedule_store);
+adk_server::background::start_cron_scheduler(cron.clone()); // on every replica
+let app = ServerBuilder::new(config)
+    .with_background_runs(background)
+    .with_cron_jobs(cron)
+    .build();
 ```
+
+| `BackgroundState` method | Effect |
+|--------------------------|--------|
+| `with_run_store` | Uses a shared `DurableRunStore`; every replica claiming from it shares the work |
+| `with_executor` | Workflows a run may target |
+| `with_agent` | Runs whose target names the agent execute through its `Runner` |
+| `with_embedded_worker(false)` | No worker in this process (API-only replicas) |
+| `with_worker_config` | Queue, lease, poll interval, concurrency, run timeout, retention |
+| `with_governance` | Kill switch; `ServerBuilder` installs `ServerConfig::governance` when none is set |
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/runs` | POST | Start a run, returning its id immediately |
-| `/runs/{id}` | GET | Read a run's status and result |
-| `/runs/{id}` | DELETE | Cancel a run |
-| `/cron` | POST / GET / PATCH / DELETE | Manage scheduled jobs |
+| `/runs` | POST | Enqueue a run, returning its id immediately |
+| `/runs` | GET | List runs (`state`, `sessionId`, `limit`) |
+| `/runs/{id}` | GET | Read a run's status, attempts, checkpoint, and result |
+| `/runs/{id}` | DELETE | Cancel a run; a running run stops at its worker's next heartbeat, on whichever replica |
+| `/runs/{id}/wake` | POST | Make a run parked on a held tool call claimable now; the approval service calls it after a decision |
+| `/cron` | POST / GET | Create and list cron jobs |
+| `/cron/{id}` | GET / PATCH / DELETE | Read, pause or resume, and delete a cron job |
 
-Cron jobs take a concurrency policy — `skip`, `allow` or `queue` — for what happens
-when the previous run is still going.
+`POST /runs` takes `target` (or `workflowId`), `input`, `sessionId`, `idempotencyKey`,
+`concurrencyKey`, `onConflict` (`reject`, `enqueue`, `interrupt`), `notBefore`, and
+`maxRetries`. An existing idempotency key returns the existing run with `200` and
+`"existing": true`; a `reject` conflict returns `409` with `blockingRunId`; an unknown target
+returns `404`; a frozen or stale kill switch returns `503`.
 
-**What survives a restart.** With a `RunPersistence` attached, run records do. A run
-that was still going cannot still be going, so `restore` returns it as `Failed` with
-a reason and gives it a live cancellation token. The graph state behind it is
-separate: a checkpointed `adk-graph` thread can still be resumed by its id.
+A cron job is a schedule whose id is its name, evaluated in `timezone` (IANA, default `UTC`),
+with a `missedFirePolicy` for occurrences missed while the scheduler was behind.
 
-Finished runs are bounded by default — the newest 1000 — because a store that keeps
-every finished run forever is a leak that only appears after weeks.
-`RunRetention::unlimited()` opts out. A run still in flight is never discarded.
+| `concurrencyPolicy` | Run template |
+|---------------------|--------------|
+| `skip` (default) | Concurrency key `cron:{name}`, `OnConflict::Reject` |
+| `queue` | Concurrency key `cron:{name}`, `OnConflict::Enqueue` |
+| `allow` | No concurrency key |
 
-`FileRunPersistence` writes one JSON file and is enough for a single node. A
-deployment across several needs a shared store; implement `RunPersistence` for one.
+Each fire time is enqueued once however many replicas run the scheduler, and resuming a
+paused job skips the occurrences that fell inside the pause.
+
+> **Important:** the routers carry no authentication. Mount them with
+> `ServerBuilder::with_background_runs` and `ServerBuilder::with_cron_jobs`, which
+> serve `/api/runs` and `/api/cron` behind the server's auth middleware, or put a
+> standalone mount behind your own authentication layer.
+
+**What survives a restart.** With a durable run store, everything: a run whose worker stopped
+is recovered by another worker once its lease expires and resumes from its checkpoint (see
+[Durable Runtime](../docs/official_docs/core/durable-runtime.md#crash-resume)). Finished runs
+are pruned after `DurableWorkerConfig::retain_finished` (24 hours by default).
+
+**Whose identity a run uses.** The worker acts as the runner's own principal, for the run's
+user. A run's stored principal is honoured only for agent ids listed with
+`DurableWorkerConfig::with_allowed_principal` (none by default); any other fails the run with
+`identity.principal_not_allowed`, recorded on the audit trail. Runs from the scheduler, webhook
+hooks, and queue ingress act for their user as a service (see
+[Agent Identity](../docs/official_docs/security/agent-identity.md#durable-runs)).
+
+### Webhook Wake-ups (feature: `webhook-ingress`)
+
+`ServerBuilder::with_webhook_ingress` serves `POST /hooks/{name}`. Each `WebhookHook` verifies
+Standard Webhooks signatures and maps the delivery to a `NewRun` in a `DurableRunStore`, keyed
+by the `webhook-id`:
+
+| Status | Meaning |
+|--------|---------|
+| `202` | New run enqueued: `{"runId", "state", "duplicate": false}` |
+| `200` | Redelivery of a `webhook-id` that already has a run; the same run is returned |
+| `401` | Signature missing, invalid, or outside the timestamp tolerance |
+| `409` | `OnConflict::Reject` and an unfinished run holds the hook's concurrency key |
+| `422` | Body is not JSON, or a key template names a missing field |
+| `429` | The hook's `max_pending` cap is reached (`Retry-After`) |
+| `503` | The kill switch is frozen or stale, or the run store is unreachable (`Retry-After`) |
+
+Share the run store with `BackgroundState::with_run_store` and the embedded `DurableWorker` runs
+woken runs like any other. With a mirrored `GovernanceControl` as `ServerConfig::governance`, a
+freeze written by any replica refuses deliveries on every replica.
+
+See [Wake-ups and Webhooks](../docs/official_docs/core/wake-ups.md).
 
 ## API Endpoints
 
@@ -382,7 +457,8 @@ For embedded-host mappings, the additive HTTP bridge corresponds to MCP Apps hos
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/.well-known/agent.json` | GET | A2A agent card |
+| `/.well-known/agent-card.json` | GET | A2A agent card |
+| `/.well-known/agent.json` | GET | A2A agent card (pre-0.3 path) |
 | `/a2a` | POST | A2A JSON-RPC |
 | `/a2a/stream` | POST | A2A streaming |
 

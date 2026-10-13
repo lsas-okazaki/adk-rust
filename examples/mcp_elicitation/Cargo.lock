@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "a2a-protocol-types"
-version = "0.5.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47e4fe91cf2436cef079cf2f00bb208344d63a5a8030fc77c96812b304404e8b"
+checksum = "2f57bddf2515adc4c3f9b0229bdbbce379d08a9c41a208dca2e630b9d9f8ce1d"
 dependencies = [
  "serde",
  "serde_json",
@@ -14,10 +14,12 @@ dependencies = [
 
 [[package]]
 name = "adk-agent"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "adk-devtools",
+ "adk-guardrail",
+ "adk-plugin",
  "adk-skill",
  "adk-telemetry",
  "adk-tool",
@@ -37,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "adk-anthropic"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -57,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "adk-artifact"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -67,12 +69,16 @@ dependencies = [
 
 [[package]]
 name = "adk-auth"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-trait",
+ "aws-lc-rs",
+ "base64 0.22.1",
  "chrono",
  "hex",
+ "hmac",
+ "ryu-js",
  "serde",
  "serde_json",
  "sha2",
@@ -84,10 +90,11 @@ dependencies = [
 
 [[package]]
 name = "adk-cli"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-agent",
  "adk-artifact",
+ "adk-auth",
  "adk-core",
  "adk-deploy",
  "adk-devtools",
@@ -116,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "adk-computer-use"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-auth",
  "adk-core",
@@ -137,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "adk-core"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -147,12 +154,13 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
 [[package]]
 name = "adk-deploy"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -173,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "adk-devtools"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -190,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "adk-eval"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "adk-model",
@@ -208,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "adk-gemini"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-stream",
@@ -234,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "adk-graph"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-stream",
@@ -251,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "adk-guardrail"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -265,8 +273,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "adk-managed"
+version = "3.0.0"
+dependencies = [
+ "adk-agent",
+ "adk-core",
+ "adk-model",
+ "adk-runner",
+ "adk-session",
+ "adk-skill",
+ "adk-telemetry",
+ "adk-tool",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "adk-memory"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -278,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "adk-model"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-anthropic",
  "adk-core",
@@ -303,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "adk-plugin"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "serde_json",
@@ -313,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "adk-runner"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-artifact",
  "adk-core",
@@ -334,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "adk-rust"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-agent",
  "adk-anthropic",
@@ -345,6 +379,7 @@ dependencies = [
  "adk-eval",
  "adk-graph",
  "adk-guardrail",
+ "adk-managed",
  "adk-memory",
  "adk-model",
  "adk-plugin",
@@ -365,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "adk-rust-macros"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -374,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "adk-server"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "a2a-protocol-types",
  "adk-agent",
@@ -408,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "adk-session"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -421,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "adk-skill"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "adk-plugin",
@@ -437,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "adk-telemetry"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "thiserror",
  "tracing",
@@ -446,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "adk-tool"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "adk-core",
  "adk-rust-macros",
@@ -767,19 +802,20 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.3"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00bdb5da18dac48ca2cc7cd4a98e533e8635a58e2361d13a1a4ee3888e0d72f1"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
+ "untrusted 0.7.1",
  "zeroize",
 ]
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.43.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43103168cc76fe62678a375e722fc9cb3a0146159ac5828bc4f0dfd755c2224c"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
@@ -1324,9 +1360,9 @@ dependencies = [
 
 [[package]]
 name = "dirs"
-version = "6.0.0"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
 dependencies = [
  "dirs-sys",
 ]
@@ -1340,7 +1376,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1436,7 +1472,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2466,7 +2502,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2824,7 +2860,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3136,7 +3172,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.2.17",
  "libc",
- "untrusted",
+ "untrusted 0.9.0",
  "windows-sys 0.52.0",
 ]
 
@@ -3237,14 +3273,14 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "rustls"
-version = "0.23.42"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -3295,7 +3331,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3306,14 +3342,14 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
  "rustls-pki-types",
- "untrusted",
+ "untrusted 0.9.0",
 ]
 
 [[package]]
@@ -3348,6 +3384,12 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
 
 [[package]]
 name = "same-file"
@@ -3797,10 +3839,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3935,6 +3977,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -4216,6 +4259,12 @@ checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
+
+[[package]]
+name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
@@ -4487,7 +4536,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

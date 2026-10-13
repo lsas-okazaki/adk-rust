@@ -20,17 +20,17 @@ approval requests over JSON-RPC.
 | ACP agent/server | An editor or another ACP client should talk to an ADK-Rust agent | `AcpServer` with the `server` feature |
 
 Both directions implement stable ACP protocol version 1 using
-`agent-client-protocol` 1.2. Crate version 1.2 is the Rust SDK release; it does
+`agent-client-protocol` 3.3. Crate version 3.3 is the Rust SDK release; it does
 not mean ACP protocol v2.
 
 ## Installation
 
 ```toml
 [dependencies]
-adk-acp = "2.2.0"
+adk-acp = "3.0.0"
 
 # Add the server feature only when exposing an ADK-Rust agent to a client.
-adk-acp = { version = "2.2.0", features = ["server"] }
+adk-acp = { version = "3.0.0", features = ["server"] }
 ```
 
 ## Use an ACP agent as an ADK-Rust tool

@@ -1,6 +1,6 @@
 # adk-model
 
-LLM model integrations for Rust Agent Development Kit (ADK-Rust) with Gemini, OpenAI, OpenRouter, xAI, Anthropic, DeepSeek, Groq, Ollama, Fireworks AI, Together AI, Mistral AI, Perplexity, Cerebras, SambaNova, Amazon Bedrock, and Azure AI Inference.
+LLM model integrations for Rust Agent Development Kit (ADK-Rust) with Gemini, OpenAI, OpenRouter, xAI, Anthropic, DeepSeek, Groq, Ollama, Fireworks AI, Together AI, Mistral AI, Perplexity, Cerebras, SambaNova, OrcaRouter, Amazon Bedrock, and Azure AI Inference.
 
 [![Crates.io](https://img.shields.io/crates/v/adk-model.svg)](https://crates.io/crates/adk-model)
 [![Documentation](https://docs.rs/adk-model/badge.svg)](https://docs.rs/adk-model)
@@ -12,6 +12,7 @@ LLM model integrations for Rust Agent Development Kit (ADK-Rust) with Gemini, Op
 
 - **Gemini** - Google's Gemini models (3 Pro, 3 Flash, 2.5 Pro, 2.5 Flash, etc.)
 - **OpenAI** - GPT-5.1, GPT-5, GPT-5 Mini, GPT-4o (legacy)
+- **OpenCode Go and Zen** - Per-model API routing with stable conversation headers (`opencode` feature)
 - **OpenRouter** - Native chat, responses, routing, discovery, and credits APIs
 - **xAI** - Grok models through the OpenAI-compatible API
 - **Anthropic** - Claude Opus 4.8, Claude Opus 4.7, Claude Sonnet 4.6, Claude Haiku 4.5
@@ -24,6 +25,7 @@ LLM model integrations for Rust Agent Development Kit (ADK-Rust) with Gemini, Op
 - **Perplexity** - Search-augmented LLM (Sonar, etc.)
 - **Cerebras** - Ultra-fast inference (Llama 3.3, etc.)
 - **SambaNova** - Fast inference (Llama 3.3, etc.)
+- **OrcaRouter** - Models from several vendors through one OpenAI-compatible endpoint
 - **Amazon Bedrock** - AWS-hosted models via IAM auth (Claude, Llama, Mistral, etc.)
 - **Azure AI Inference** - Azure-hosted models (Cohere, Llama, Mistral, etc.)
 - **Streaming** - Real-time response streaming for all providers
@@ -31,25 +33,32 @@ LLM model integrations for Rust Agent Development Kit (ADK-Rust) with Gemini, Op
 
 The crate implements the `Llm` trait from `adk-core`, allowing models to be used interchangeably.
 
+OpenAI-compatible reasoning history is opt-in: `with_reasoning_replay(true)`
+replays `Part::Thinking` through `reasoning_content`. Endpoints using `reasoning`
+(such as newer vLLM deployments) select
+`with_reasoning_replay_field(ReasoningReplayField::Reasoning)` instead.
+The default and `with_reasoning_replay(false)` omit both fields. Thinking stays
+separate from visible message text in all cases.
+
 ## Installation
 
 ```toml
 [dependencies]
-adk-model = "2.2.0"
+adk-model = "3.0.0"
 ```
 
 Enable provider-specific features as needed:
 
 ```toml
 [dependencies]
-adk-model = { version = "2.2.0", features = ["openrouter"] }
+adk-model = { version = "3.0.0", features = ["openrouter"] }
 ```
 
 Or use the meta-crate:
 
 ```toml
 [dependencies]
-adk-rust = { version = "2.2.0", features = ["models"] }
+adk-rust = { version = "3.0.0", features = ["models"] }
 ```
 
 ## Quick Start
@@ -100,6 +109,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+Chat Completions rejects function tools on GPT-5.6 and later while reasoning is on, so
+`OpenAIClient` sends requests that declare tools for those models through the Responses
+API, with `store: false`. Other requests stay on Chat Completions.
+
+### OpenCode
+
+Enable the `opencode` feature. The client picks Chat Completions, Responses, Anthropic Messages, or
+Gemini `generateContent` from the model ID and sends the application's `User-Agent` and
+`x-opencode-session` headers with every request.
+
+```rust
+use adk_model::opencode::{OpenCodeClient, OpenCodeConfig, OpenCodeService};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let api_key = std::env::var("OPENCODE_API_KEY")?;
+    let model = OpenCodeClient::new(
+        OpenCodeConfig::new(OpenCodeService::Go, api_key, "deepseek-v4.1-flash")
+            .with_user_agent("my-coding-agent/1.0")
+            .with_session_id("conversation-42"),
+    )?;
+    println!("{:?}", model.api());
+    Ok(())
+}
+```
+
+See the [OpenCode guide](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/models/opencode.md)
+for the routing table and configuration options.
 
 ### OpenRouter
 
@@ -291,12 +328,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #### Anthropic Advanced Features
 
 ```rust
-use adk_model::anthropic::{AnthropicClient, AnthropicConfig, ThinkingMode};
+use adk_model::anthropic::{AnthropicClient, AnthropicConfig, CacheTtl, ThinkingMode};
 
 // Current Claude models use adaptive thinking rather than token budgets.
 let config = AnthropicConfig::new(api_key, "claude-sonnet-5")
     .with_thinking_mode(ThinkingMode::Adaptive)
     .with_prompt_caching(true)
+    // 1-hour cache entries for prefixes reused more than five minutes apart
+    .with_prompt_cache_ttl(CacheTtl::one_hour())
     .with_beta_feature("prompt-caching-2024-07-31");
 let client = AnthropicClient::new(config)?;
 
@@ -500,6 +539,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### OrcaRouter
+
+OrcaRouter serves models from several vendors behind one OpenAI-compatible
+endpoint; model IDs carry a vendor prefix. The preset needs only the `openai` feature.
+
+```rust
+use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
+use adk_agent::LlmAgentBuilder;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let api_key = std::env::var("ORCAROUTER_API_KEY")?;
+    let model = OpenAICompatible::new(OpenAICompatibleConfig::orcarouter(
+        api_key, "openai/gpt-5.6-terra",
+    ))?;
+
+    let agent = LlmAgentBuilder::new("assistant")
+        .model(Arc::new(model))
+        .build()?;
+
+    Ok(())
+}
+```
+
 ### Amazon Bedrock
 
 ```rust
@@ -547,6 +611,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Usage Attribution and Cost
+
+Every provider sets `LlmResponse::provider` and `LlmResponse::model` and fills
+`UsageMetadata::cost` (USD) from `pricing::PricingCatalog` when the provider did
+not report a cost. Cached prompt tokens are billed once, Anthropic cache writes
+by TTL, and long-context tiers apply where the vendor publishes them. Gemini,
+OpenAI, Anthropic, DeepSeek, Groq, xAI and Mistral list prices are included;
+local Ollama models cost zero. Unpriced models keep `cost: None`. Built-in tool uses the
+provider reports (web search, file search, Google Search grounding) land in
+`UsageMetadata::builtin_tool_uses`, and their published per-use fees are added to `cost`
+on the vendor's own API.
+
+```rust
+use adk_core::UsageMetadata;
+use adk_model::PricingCatalog;
+
+let usage = UsageMetadata { prompt_token_count: 1_000_000, ..Default::default() };
+let cost = PricingCatalog::standard().cost_usd(Some("openai"), "gpt-4.1-2025-04-14", &usage);
+assert_eq!(cost, Some(2.0));
+```
+
 ## Supported Models
 
 ### Google Gemini
@@ -575,7 +660,11 @@ See [OpenAI models documentation](https://platform.openai.com/docs/models) for t
 | Model | Description |
 |-------|-------------|
 | `claude-sonnet-5` | Balanced production default (1M context) |
-| `claude-opus-5` | Flagship autonomous-agent capability (1M context) |
+| `claude-fable-5-1` | Most capable; demanding reasoning and long-horizon work (1M context) |
+| `claude-opus-5-5` | Current Opus; long-running agentic coding (1M context) |
+| `claude-sonnet-5-5` | Current Sonnet; speed and intelligence balance (1M context) |
+| `claude-haiku-5-5` | Current Haiku; high-volume, latency-sensitive work (1M context) |
+| `claude-opus-5` | Previous Opus (1M context) |
 | `claude-fable-5` | Premium creative and long-form work (1M context) |
 | `claude-haiku-4-5` | Cost-efficient previous generation |
 
@@ -644,17 +733,36 @@ See [Ollama library](https://ollama.com/library) for all available models.
 | Perplexity | `openai` preset | `sonar-pro` | `PERPLEXITY_API_KEY` |
 | Cerebras | `openai` preset | `gpt-oss-120b` | `CEREBRAS_API_KEY` |
 | SambaNova | `openai` preset | `gpt-oss-120b` | `SAMBANOVA_API_KEY` |
+| OrcaRouter | `openai` preset | `openai/gpt-5.6-terra` | `ORCAROUTER_API_KEY` |
 | Amazon Bedrock | `bedrock` | account/region-specific | AWS IAM credentials |
 | Azure AI Inference | `azure-ai` | (endpoint-specific) | `AZURE_AI_API_KEY` |
 
 ## Features
 
 - **Streaming** - Real-time response streaming for all providers
-- **Tool Calling** - Function calling support across all providers
+- **Tool Calling** - Function calling support across all providers. Text-encoded tool calls
+  (Qwen, Llama, Mistral Nemo, DeepSeek, Gemma 4) are recognised only for tools the request
+  declares; malformed streamed arguments fail with `invalid_tool_arguments` instead of becoming `{}`
 - **Async** - Full async/await support with backpressure
-- **Retry** - Automatic retry with exponential backoff
+- **Retry** - Automatic retry with exponential backoff for 408, 429, 500, 502, 503, 504, and 529;
+  a `Retry-After` delay is honoured up to `RetryConfig::max_delay`
+- **Credential hygiene** - Provider configs redact the API key in `Debug` output and omit it when serialized
 - **Generation Config** - Temperature, top_p, top_k, max_tokens
 - **Token Usage Telemetry** - Automatic `gen_ai.usage.*` span recording for all providers via `adk-telemetry`
+
+## Native Response and Request Fidelity
+
+Provider adapters retain native search/reasoning history, citations, usage, and
+multimodal tool results without adding application-specific display text.
+Responses commentary is available as phase-tagged native messages; applications
+choose whether to display it. Consumers of a complete streaming snapshot replace
+prior deltas when `provider_metadata.content_complete` is true.
+
+OpenAI-compatible and Responses clients accept `with_request_adapter` for
+per-attempt JSON/header customization. Retry limits remain controlled by
+`RetryConfig`, including disabled retries. Explicit Anthropic/Gemini base URLs,
+Vertex endpoints, and a supplied Bedrock client avoid ambient configuration when
+the application owns authentication.
 
 ## Environment Variables
 
@@ -695,6 +803,9 @@ CEREBRAS_API_KEY=your-cerebras-api-key
 # SambaNova
 SAMBANOVA_API_KEY=your-sambanova-api-key
 
+# OrcaRouter
+ORCAROUTER_API_KEY=your-orcarouter-api-key
+
 # Azure AI Inference
 AZURE_AI_API_KEY=your-azure-ai-api-key
 
@@ -714,24 +825,24 @@ Enable specific providers with feature flags:
 ```toml
 [dependencies]
 # All providers (default)
-adk-model = { version = "2.2.0", features = ["all-providers"] }
+adk-model = { version = "3.0.0", features = ["all-providers"] }
 
 # Individual providers
-adk-model = { version = "2.2.0", features = ["gemini"] }
-adk-model = { version = "2.2.0", features = ["openai"] }
-adk-model = { version = "2.2.0", features = ["xai"] }
-adk-model = { version = "2.2.0", features = ["anthropic"] }
-adk-model = { version = "2.2.0", features = ["deepseek"] }
-adk-model = { version = "2.2.0", features = ["groq"] }
-adk-model = { version = "2.2.0", features = ["ollama"] }
-adk-model = { version = "2.2.0", features = ["fireworks"] }
-adk-model = { version = "2.2.0", features = ["together"] }
-adk-model = { version = "2.2.0", features = ["mistral"] }
-adk-model = { version = "2.2.0", features = ["perplexity"] }
-adk-model = { version = "2.2.0", features = ["cerebras"] }
-adk-model = { version = "2.2.0", features = ["sambanova"] }
-adk-model = { version = "2.2.0", features = ["bedrock"] }
-adk-model = { version = "2.2.0", features = ["azure-ai"] }
+adk-model = { version = "3.0.0", features = ["gemini"] }
+adk-model = { version = "3.0.0", features = ["openai"] }
+adk-model = { version = "3.0.0", features = ["xai"] }
+adk-model = { version = "3.0.0", features = ["anthropic"] }
+adk-model = { version = "3.0.0", features = ["deepseek"] }
+adk-model = { version = "3.0.0", features = ["groq"] }
+adk-model = { version = "3.0.0", features = ["ollama"] }
+adk-model = { version = "3.0.0", features = ["fireworks"] }
+adk-model = { version = "3.0.0", features = ["together"] }
+adk-model = { version = "3.0.0", features = ["mistral"] }
+adk-model = { version = "3.0.0", features = ["perplexity"] }
+adk-model = { version = "3.0.0", features = ["cerebras"] }
+adk-model = { version = "3.0.0", features = ["sambanova"] }
+adk-model = { version = "3.0.0", features = ["bedrock"] }
+adk-model = { version = "3.0.0", features = ["azure-ai"] }
 ```
 
 ## Related Crates

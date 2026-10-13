@@ -175,7 +175,8 @@ impl A2aServerBuilder {
 
     /// Set the bind address for the server.
     ///
-    /// Defaults to `"0.0.0.0:8080"`.
+    /// Defaults to `"127.0.0.1:8080"` (loopback only). Pass `"0.0.0.0:8080"` to
+    /// accept connections on every interface.
     pub fn bind_addr(mut self, addr: impl Into<String>) -> Self {
         self.bind_addr = addr.into();
         self
@@ -231,7 +232,7 @@ impl A2aServerBuilder {
 
     /// Expose the skills in `skill_index` on the served agent card.
     ///
-    /// The card at `/.well-known/agent.json` appends one `skills[]` entry per
+    /// The served agent card appends one `skills[]` entry per
     /// indexed skill, mapped by
     /// [`agent_skills_from_index`](crate::a2a::agent_skills_from_index).
     ///

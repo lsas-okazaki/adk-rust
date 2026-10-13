@@ -14,10 +14,13 @@ Welcome to the official documentation for ADK-Rust (Agent Development Kit for Ru
 - [Core Types](core/core.md) - Fundamental types: Content, Part, Agent trait, Tool trait, contexts
 - [Runner](core/runner.md) - Agent execution runtime and configuration
 - [Plugins](core/plugins.md) - Lifecycle hooks for tool/model interception and middleware
+- [Durable Runtime](core/durable-runtime.md) - Leases with fencing, the durable run queue, schedules, governance state, and agent identity
+- [Wake-ups and Webhooks](core/wake-ups.md) - Signed inbound webhooks and queue messages that enqueue durable runs, and signed outbound delivery
 
 ## Models
 
 - [Model Providers](models/providers.md) - LLM integrations: Gemini, OpenAI, Anthropic, DeepSeek, Groq, Ollama
+- [OpenCode Go and Zen](models/opencode.md) - Per-model routing across four wire APIs with conversation headers
 - [Ollama](models/ollama.md) - Local inference with Ollama
 - [mistral.rs Integration](models/mistralrs.md) - Native mistral.rs for high-performance local inference
 
@@ -28,6 +31,7 @@ Welcome to the official documentation for ADK-Rust (Agent Development Kit for Ru
 - [Workflow Agents](agents/workflow-agents.md) - Deterministic agents: Sequential, Parallel, Loop
 - [Multi-Agent Systems](agents/multi-agent.md) - Building agent hierarchies with sub-agents
 - [Graph Agents](agents/graph-agents.md) - LangGraph-style workflow orchestration
+- [Graph Checkpointing](agents/graph-checkpointing.md) - Checkpointer backends, the version rule, durability modes, pending writes, and the conformance suite
 - [Realtime Agents](agents/realtime-agents.md) - Voice-enabled agents with OpenAI/Gemini
 
 ## Coding Agent
@@ -58,6 +62,7 @@ A dedicated, newcomer-friendly guide to building voice + multimodal agents — a
 ## Tools
 
 - [Function Tools](tools/function-tools.md) - Create custom tools with async Rust functions
+- [Tool Effects and the Action Ledger](tools/tool-effects.md) - Retry safety, idempotency keys, delegation timeouts, and calls that must not repeat
 - [Built-in Tools](tools/built-in-tools.md) - Pre-built tools like GoogleSearchTool
 - [MCP overview and architecture](mcp/index.md) - Where MCP fits and which ADK-Rust surface to use
 - [MCP client](mcp/client.md) - Tools, resources, prompts, completion, subscriptions, elicitation, tasks, and HTTP
@@ -134,6 +139,11 @@ Long-term memory that outlives a session — the persistent counterpart to sessi
 - [Guardrails](security/guardrails.md) - PII redaction, content filtering, schema validation
 - [Memory](security/memory.md) - Long-term semantic memory for agents
 - [Payments and Commerce](security/payments.md) - Agentic commerce journeys, protocol support, and validation paths
+- [Spend Ledger](security/spend-ledger.md) - One budget for model calls and payments, with daily, monthly, and lifetime caps
+- [Approval Service](security/approval-service.md) - Approval inbox with quorum, delegation, escalation, expiry, webhooks, and server endpoints
+- [Agent Identity](security/agent-identity.md) - Stable agent ids on every policy decision, approval, spend record, and audit event; resource-scoped credential brokers
+- [Durable Stores](security/durable-stores.md) - Spend ledger, action ledger, and approval store backends, their conformance suite, and the no-duplicate guarantee
+- [Audit Log](security/audit-log.md) - Signed, Merkle-hashed audit log with checkpoints, key rotation, and offline verification
 
 ## Compliance
 

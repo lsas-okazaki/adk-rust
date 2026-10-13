@@ -34,8 +34,12 @@ This project is an **unofficial** community-maintained library. It is not affili
 
 | Model | API ID | Generation |
 |-------|--------|------------|
-| Claude Opus 5 | `claude-opus-5` | Current flagship |
-| Claude Sonnet 5 | `claude-sonnet-5` | Recommended default |
+| Claude Fable 5.1 | `claude-fable-5-1` | Most capable; demanding reasoning and long-horizon work |
+| Claude Opus 5.5 | `claude-opus-5-5` | Current Opus; fast mode supported |
+| Claude Sonnet 5.5 | `claude-sonnet-5-5` | Current Sonnet |
+| Claude Haiku 5.5 | `claude-haiku-5-5` | Current Haiku; economy |
+| Claude Opus 5 | `claude-opus-5` | Previous Opus; fast mode supported |
+| Claude Sonnet 5 | `claude-sonnet-5` | ADK default |
 | Claude Fable 5 | `claude-fable-5` | Creative and long-form |
 | Claude Opus 4.8 | `claude-opus-4-8` | Previous flagship; fast mode supported |
 | Claude Opus 4.7 | `claude-opus-4-7` | Previous generation |
@@ -120,6 +124,61 @@ println!("fallback ran: {}", response.served_by_fallback());
 # }
 ```
 
+### Base URLs and internal gateways
+
+Every request attaches the API key, so a base URL must use `https://`, or `http://`
+with a loopback host (`localhost`, `127.0.0.1`, `[::1]`). A trusted internal
+gateway that is reachable only over plain HTTP needs an explicit opt-in, which
+logs a warning naming the host when the URL is accepted:
+
+| Base URL source | Opt-in |
+|-----------------|--------|
+| `with_base_url`, `with_base_url_and_timeout` | Call `allow_insecure_http()` **before** them — they validate the URL when called |
+| `ANTHROPIC_BASE_URL` (read by `Anthropic::new`) | Set `ANTHROPIC_ALLOW_INSECURE_HTTP` to `1` or `true` |
+
+```rust
+use adk_anthropic::Anthropic;
+
+# fn example() -> Result<(), adk_anthropic::Error> {
+let client = Anthropic::new(None)?
+    .allow_insecure_http()
+    .with_base_url("http://10.60.1.20:8080/api/v1/llm/anthropic".to_string())?;
+# let _ = client;
+# Ok(())
+# }
+```
+
+### Timeouts, stream errors, and request limits
+
+| Behaviour | Rule |
+|-----------|------|
+| Non-streaming request | `with_timeout` bounds the whole request (default 10 minutes) |
+| Connecting | `with_timeout`, capped at 60 seconds |
+| Streaming request | `with_timeout` bounds the wait for response headers; the body has no total bound |
+| Stalled stream | The stream yields `Error::Timeout` and ends after 30 seconds without data |
+| Total stream bound | Opt in with `with_stream_timeout(Some(duration))` |
+| Mid-stream `error` event | `AccumulatingStream` yields it as `Err` (`overloaded_error` → `Error::ServiceUnavailable`, `rate_limit_error` → `Error::RateLimit`) and sends the error, not the partial message, through its channel |
+| Unknown SSE event type | Logged at `debug` and surfaced as `MessageStreamEvent::Unknown` with its JSON payload |
+| Unknown content block, delta, or stop reason | Deserialized to `ContentBlock::Unknown`, `ContentBlockDelta::Unknown`, or `StopReason::Unknown` with the raw value; the message still parses |
+| Request validation | Text is capped at 1 MB per message and 100 KB for the system prompt; base64 images at 5 MB and PDFs at 32 MB each; base64 media plus text at 32 MB per request |
+
+```rust
+use std::time::Duration;
+
+use adk_anthropic::Anthropic;
+
+# fn example() -> Result<(), adk_anthropic::Error> {
+let client = Anthropic::new(None)?
+    .with_timeout(Duration::from_secs(30))?
+    .with_stream_timeout(Some(Duration::from_secs(900)));
+# let _ = client;
+# Ok(())
+# }
+```
+
+`Debug` output of `Anthropic`, `ManagedAgentsClient`, and `FilesClient` redacts
+the API key, and the `x-api-key` header is marked sensitive.
+
 Run any example with `cargo run -p adk-anthropic --example <name>`:
 
 | Example | Description |
@@ -153,6 +212,39 @@ Run with `cargo run -p adk-anthropic --example <name> --features managed-agents`
 | `managed_agents_files` | Upload CSV, mount in session, agent analyzes data |
 | `managed_agents_memory` | Persistent memory across sessions (agent remembers preferences) |
 | `managed_agents_multiagent` | Coordinator delegates to researcher + writer agents in parallel |
+
+### Managed Agents Defaults and Webhooks
+
+| Helper | Sends | Widen with |
+|--------|-------|------------|
+| `CreateEnvironmentParams::cloud(name)` | `limited` networking: no hosts, package registries, or MCP servers | `cloud_limited(name, hosts)`, `cloud_unrestricted(name)` |
+| `ToolConfig::agent_toolset()` | The agent toolset with `web_fetch` and `web_search` disabled | `ToolConfig::agent_toolset_with_web()` |
+| `ToolConfig::agent_toolset_with_policy(policy)` | The same, with a permission policy | Add web entries to `configs` |
+
+The web tools run on Anthropic's servers, so an environment's networking policy does
+not restrict them.
+
+Webhook deliveries are signed with [Standard Webhooks](https://www.standardwebhooks.com/).
+Pass the raw body and the `webhook-id`, `webhook-timestamp`, and `webhook-signature`
+headers to `WebhookVerifier`:
+
+```rust
+use adk_anthropic::managed_agents::{WebhookEvent, WebhookHeaders, WebhookVerifier};
+use reqwest::header::HeaderMap;
+
+fn handle(
+    body: &str,
+    headers: &HeaderMap,
+    secret: &str,
+) -> Result<WebhookEvent, Box<dyn std::error::Error>> {
+    let verifier = WebhookVerifier::new(secret)?; // the whsec_ secret from the Console
+    Ok(verifier.verify(body, &WebhookHeaders::from_header_map(headers)?)?)
+}
+```
+
+Verification accepts any of the space-separated `v1,<base64>` signatures and rejects
+timestamps more than five minutes from the local clock in either direction
+(`with_tolerance` changes the window).
 
 **Hello World output:**
 ```

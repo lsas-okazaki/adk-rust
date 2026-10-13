@@ -118,7 +118,7 @@ agents = ["dep:adk-agent"]
 record-payloads = ["agents", "adk-agent/record-payloads"]
 models = ["dep:adk-model"]
 tools = ["dep:adk-tool", "adk-agent?/team-tools"]
-skills = ["dep:adk-skill"]
+skills = ["dep:adk-skill", "adk-agent?/skills"]
 # Google ADK-style progressive skill discovery and activation tools.
 skills-progressive-disclosure = ["skills", "adk-skill/progressive-disclosure", "adk-agent?/skills-progressive-disclosure"]
 sessions = ["dep:adk-session"]
@@ -138,16 +138,17 @@ sandbox = ["dep:adk-sandbox"]
 realtime = ["dep:adk-realtime"]
 browser = ["dep:adk-browser"]
 eval = ["dep:adk-eval"]
-guardrail = ["dep:adk-guardrail"]
+guardrail = ["dep:adk-guardrail", "adk-agent?/guardrails"]
 auth = ["dep:adk-auth"]
-plugin = ["dep:adk-plugin"]
+plugin = ["dep:adk-plugin", "adk-agent?/enhanced-plugins"]
 rag = ["dep:adk-rag"]
 payments = ["dep:adk-payments"]
 awp = ["dep:adk-awp"]
 acp = ["dep:adk-acp"]
 computer-use = ["dep:adk-computer-use", "graph", "auth", "mcp"]
 
-# Managed agent runtime (feature-gated, experimental)
+# Managed agent runtime (feature-gated, experimental). The provider features below also
+# let its `DefaultModelResolver` construct that provider's models.
 managed-runtime = ["dep:adk-managed"]
 
 # Enterprise client SDK (feature-gated, experimental)
@@ -157,15 +158,16 @@ enterprise-client = ["dep:adk-enterprise"]
 a2a = ["server", "adk-server/a2a-v1"]
 
 # Model provider features (forwarded to adk-model)
-gemini = ["models", "adk-model/gemini"]
+gemini = ["models", "adk-model/gemini", "adk-managed?/gemini"]
 gemini-vertex = ["gemini", "adk-model/gemini-vertex"]
 gemini-interactions = ["gemini", "adk-model/gemini-interactions"]
-openai = ["models", "adk-model/openai"]
+openai = ["models", "adk-model/openai", "adk-managed?/openai"]
 openrouter = ["models", "adk-model/openrouter"]
-anthropic = ["models", "adk-model/anthropic"]
+opencode = ["models", "adk-model/opencode"]
+anthropic = ["models", "adk-model/anthropic", "adk-managed?/anthropic"]
 deepseek = ["models", "adk-model/deepseek"]
 groq = ["models", "adk-model/groq"]
-ollama = ["models", "adk-model/ollama"]
+ollama = ["models", "adk-model/ollama", "adk-managed?/ollama"]
 fireworks = ["models", "adk-model/fireworks"]
 together = ["models", "adk-model/together"]
 mistral = ["models", "adk-model/mistral"]
@@ -297,6 +299,12 @@ graph-time-travel = ["graph", "adk-graph/time-travel"]
 # the other production backends.
 graph-sqlite = ["graph", "adk-graph/sqlite"]
 graph-redis-cache = ["graph", "adk-graph/redis-cache"]
+# Checkpointers for shared databases; production backends, so not in `full`.
+graph-postgres = ["graph", "adk-graph/postgres"]
+graph-redis = ["graph", "adk-graph/redis"]
+graph-mongodb = ["graph", "adk-graph/mongodb"]
+graph-neo4j = ["graph", "adk-graph/neo4j"]
+graph-firestore = ["graph", "adk-graph/firestore"]
 
 # Action node features (forwarded to adk-graph)
 action = ["graph", "dep:adk-action", "adk-graph/action"]

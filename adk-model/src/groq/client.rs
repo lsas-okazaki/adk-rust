@@ -11,7 +11,6 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
-use serde_json::Value;
 
 /// Groq client for ultra-fast LLM inference.
 ///
@@ -115,6 +114,16 @@ impl GroqClient {
 
 #[async_trait]
 impl Llm for GroqClient {
+    // Groq does not state whether reasoning counts toward `max_completion_tokens`, so the model's output limit bounds every request.
+    fn max_cost_micro_usd(&self, request: &adk_core::LlmRequest) -> Option<u64> {
+        crate::pricing::PricingCatalog::standard().max_cost_micro_usd(
+            Some("groq"),
+            self.name(),
+            request,
+            None,
+        )
+    }
+
     fn name(&self) -> &str {
         &self.config.model
     }
@@ -167,23 +176,19 @@ impl Llm for GroqClient {
                     if !response.status().is_success() {
                         let status = response.status();
                         let status_code = status.as_u16();
+                        let retry_after = response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(crate::retry::parse_retry_after);
                         let error_text = response.text().await.unwrap_or_default();
-                        let category = match status_code {
-                            401 => ErrorCategory::Unauthorized,
-                            403 => ErrorCategory::Forbidden,
-                            404 => ErrorCategory::NotFound,
-                            408 => ErrorCategory::Timeout,
-                            429 => ErrorCategory::RateLimited,
-                            503 | 529 => ErrorCategory::Unavailable,
-                            _ if status_code >= 500 => ErrorCategory::Internal,
-                            _ => ErrorCategory::InvalidInput,
-                        };
-                        return Err(AdkError::new(
+                        let error = AdkError::new(
                             ErrorComponent::Model,
-                            category,
+                            crate::retry::category_for_status_code(status_code),
                             "model.groq.api_error",
                             format!("Groq API error (HTTP {status}): {error_text}"),
-                        ).with_upstream_status(status_code).with_provider("groq"));
+                        ).with_upstream_status(status_code).with_provider("groq");
+                        return Err(crate::retry::with_retry_after(error, retry_after));
                     }
 
                     Ok(response)
@@ -266,15 +271,18 @@ impl Llm for GroqClient {
                                                     tool_call_accumulators.drain().collect();
                                                 sorted_calls.sort_by_key(|(idx, _)| *idx);
 
-                                                let tool_calls: Vec<_> = sorted_calls
+                                                let tool_calls = sorted_calls
                                                     .into_iter()
                                                     .map(|(_, (id, name, args_str))| {
-                                                        let args: Value =
-                                                            serde_json::from_str(&args_str)
-                                                                .unwrap_or(serde_json::json!({}));
-                                                        (id, name, args)
+                                                        let args = crate::tool_args::parse_streamed_tool_arguments(
+                                                            "groq",
+                                                            "model.groq.invalid_tool_arguments",
+                                                            &name,
+                                                            &args_str,
+                                                        )?;
+                                                        Ok((id, name, args))
                                                     })
-                                                    .collect();
+                                                    .collect::<Result<Vec<_>, AdkError>>()?;
 
                                                 yield convert::create_tool_call_response(
                                                     tool_calls,
@@ -325,6 +333,8 @@ impl Llm for GroqClient {
                                                 error_message: None,
                                                 provider_metadata: None,
                                                 interaction_id: None,
+                                                model: None,
+                                                provider: None,
                                             };
                                         } else {
                                             // Emit partial text content
@@ -348,6 +358,8 @@ impl Llm for GroqClient {
                                                             error_message: None,
                                                             provider_metadata: None,
                                                             interaction_id: None,
+                                                            model: None,
+                                                            provider: None,
                                                         };
                                                     }
                                         }
@@ -374,6 +386,11 @@ impl Llm for GroqClient {
             }
         };
 
-        Ok(crate::usage_tracking::with_usage_tracking(Box::pin(response_stream), usage_span))
+        Ok(crate::usage_tracking::with_priced_usage_tracking(
+            Box::pin(response_stream),
+            usage_span,
+            "groq",
+            &self.config.model,
+        ))
     }
 }

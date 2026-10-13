@@ -40,7 +40,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! adk-rust = "2.2.0"
+//! adk-rust = "3.0.0"
 //! tokio = { version = "1.40", features = ["full"] }
 //! dotenvy = "0.15"  # For loading .env files
 //! ```
@@ -49,20 +49,20 @@
 //!
 //! ```toml
 //! # Minimal (default) — agents, Gemini, runner, sessions (fastest build)
-//! adk-rust = "2.2.0"
+//! adk-rust = "3.0.0"
 //!
 //! # Standard — minimal + tools, memory, OpenAI, Anthropic, server, auth,
 //! # graph, eval, guardrails, skills, plugins, artifacts, telemetry
-//! adk-rust = { version = "2.2.0", features = ["standard"] }
+//! adk-rust = { version = "3.0.0", features = ["standard"] }
 //!
 //! # Enterprise — standard + realtime, browser, rag, payments, awp
-//! adk-rust = { version = "2.2.0", features = ["enterprise"] }
+//! adk-rust = { version = "3.0.0", features = ["enterprise"] }
 //!
 //! # Full — enterprise + experimental crates (audio, code, sandbox)
-//! adk-rust = { version = "2.2.0", features = ["full"] }
+//! adk-rust = { version = "3.0.0", features = ["full"] }
 //!
 //! # Custom — pick exactly what you need
-//! adk-rust = { version = "2.2.0", default-features = false, features = [
+//! adk-rust = { version = "3.0.0", default-features = false, features = [
 //!     "agents", "gemini", "tools", "sessions", "openai", "openrouter"
 //! ] }
 //! ```
@@ -1286,8 +1286,10 @@ pub async fn run(instructions: &str, input: &str) -> Result<String> {
     let mut stream = runner.run(UserId::new("user")?, session_id, content).await?;
 
     let mut result = String::new();
+    let mut text_deltas = adk_core::EventTextDeltas::default();
     while let Some(event) = stream.next().await {
         let event = event?;
+        let event = text_deltas.push(&event);
         if let Some(content) = &event.llm_response.content {
             for part in &content.parts {
                 if let Some(text) = part.text() {
@@ -1349,6 +1351,11 @@ pub mod prelude {
         OpenRouterApiMode, OpenRouterClient, OpenRouterConfig, OpenRouterPlugin,
         OpenRouterProviderPreferences, OpenRouterReasoningConfig, OpenRouterRequestOptions,
         OpenRouterResponseTool,
+    };
+
+    #[cfg(feature = "opencode")]
+    pub use crate::model::opencode::{
+        OpenCodeApi, OpenCodeClient, OpenCodeConfig, OpenCodeService,
     };
 
     #[cfg(feature = "anthropic")]

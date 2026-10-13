@@ -1,5 +1,7 @@
 //! Browser configuration options.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Configuration for browser sessions.
@@ -34,6 +36,17 @@ pub struct BrowserConfig {
 
     /// Additional browser arguments
     pub browser_args: Vec<String>,
+
+    /// Require the host to start the session, and to start it again after it is lost,
+    /// instead of tools starting or recreating it on first use.
+    #[serde(default)]
+    pub require_explicit_start: bool,
+
+    /// Chrome options under `goog:chromeOptions`, such as `binary` and `prefs`, supplied by
+    /// the execution host. Chrome only. Command-line flags belong in `browser_args`; an
+    /// `args` entry here is rejected when the session starts.
+    #[serde(default)]
+    pub chrome_options: BTreeMap<String, serde_json::Value>,
 }
 
 /// Supported browser types.
@@ -59,6 +72,8 @@ impl Default for BrowserConfig {
             implicit_wait_secs: 10,
             user_agent: None,
             browser_args: Vec::new(),
+            chrome_options: Default::default(),
+            require_explicit_start: false,
         }
     }
 }
@@ -109,6 +124,41 @@ impl BrowserConfig {
     /// Add a browser argument.
     pub fn add_arg(mut self, arg: impl Into<String>) -> Self {
         self.browser_args.push(arg.into());
+        self
+    }
+
+    /// Require explicit `BrowserSession::start()` calls instead of automatic startup.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_browser::BrowserConfig;
+    ///
+    /// let config = BrowserConfig::new().require_explicit_start(true);
+    /// assert!(config.require_explicit_start);
+    /// ```
+    pub fn require_explicit_start(mut self, required: bool) -> Self {
+        self.require_explicit_start = required;
+        self
+    }
+
+    /// Set a Chrome option under `goog:chromeOptions`, such as `binary` or `prefs`.
+    ///
+    /// Command-line flags belong in [`add_arg`](Self::add_arg); an `args` option is
+    /// rejected when the session starts.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_browser::BrowserConfig;
+    ///
+    /// let config = BrowserConfig::new()
+    ///     .chrome_option("binary", serde_json::json!("/opt/chromium"))
+    ///     .chrome_option("prefs", serde_json::json!({"download.default_directory": "/tmp/dl"}));
+    /// assert_eq!(config.chrome_options["binary"], "/opt/chromium");
+    /// ```
+    pub fn chrome_option(mut self, name: impl Into<String>, value: serde_json::Value) -> Self {
+        self.chrome_options.insert(name.into(), value);
         self
     }
 
