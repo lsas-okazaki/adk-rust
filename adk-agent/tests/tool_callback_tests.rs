@@ -375,3 +375,37 @@ async fn test_before_tool_callback_error_aborts_tool_execution() {
     assert!(saw_error_response, "callback error should be captured as error response");
     assert_eq!(tool_calls.load(Ordering::SeqCst), 0, "tool should not execute on callback error");
 }
+
+/// A workflow or custom agent runs its children with its own context, so
+/// `ctx.agent_name()` names the wrapper. The tool result must still be authored
+/// by the agent that called the tool, like the call itself.
+#[tokio::test]
+async fn tool_events_are_authored_by_the_agent_not_the_context() {
+    let model = Arc::new(SequencedModel::new(vec![
+        SequencedModel::function_call_response("test_tool", json!({}), "call-1"),
+        SequencedModel::text_response("done"),
+    ]));
+    let agent = LlmAgentBuilder::new("inner-agent")
+        .model(model)
+        .tool(Arc::new(CountingTool::new()))
+        .build()
+        .unwrap();
+
+    // MockContext reports "test-agent", standing in for the wrapper.
+    let mut stream = agent.run(Arc::new(MockContext::new())).await.unwrap();
+    let mut authors = Vec::new();
+    while let Some(event) = stream.next().await {
+        let event = event.unwrap();
+        let carries_tool_part = event.llm_response.content.as_ref().is_some_and(|content| {
+            content.parts.iter().any(|part| {
+                matches!(part, Part::FunctionCall { .. } | Part::FunctionResponse { .. })
+            })
+        });
+        if carries_tool_part || event.provider_metadata.contains_key("adk_tool_started") {
+            authors.push(event.author);
+        }
+    }
+
+    assert!(authors.len() >= 2, "expected the call and its result, got {authors:?}");
+    assert!(authors.iter().all(|author| author == "inner-agent"), "authors: {authors:?}");
+}
