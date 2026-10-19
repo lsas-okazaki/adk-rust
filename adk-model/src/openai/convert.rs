@@ -302,9 +302,20 @@ pub(crate) fn extract_reasoning_content(parts: &[Part]) -> Option<String> {
     if reasoning.is_empty() { None } else { Some(reasoning) }
 }
 
-/// Get text content if any exists.
+/// Get an assistant turn's text if any exists.
+///
+/// A streamed turn is stored as one part per delta, so its parts are pieces
+/// of a single string and join with nothing between them. A "\n" here turns
+/// "There" "'s" " no" into "There\n's\n no", and the model copies that
+/// pattern into its next answers.
 fn get_text_content(parts: &[Part]) -> Option<String> {
-    let text = extract_text(parts);
+    let text: String = parts
+        .iter()
+        .filter_map(|p| match p {
+            Part::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
     if text.is_empty() { None } else { Some(text) }
 }
 
@@ -641,6 +652,20 @@ mod tests {
         let message = serde_json::to_value(content_to_message(&content, false)).unwrap();
         assert_eq!(message["content"], "visible answer");
         assert!(!message.to_string().contains("private reasoning"));
+    }
+
+    #[test]
+    fn test_streamed_assistant_parts_join_without_separator() {
+        let content = Content {
+            role: "model".to_string(),
+            parts: ["There", "'s", " no built-in game", "\u{8ffd}", "\u{8de1}"]
+                .into_iter()
+                .map(|text| Part::Text { text: text.to_string() })
+                .collect(),
+        };
+
+        let message = serde_json::to_value(content_to_message(&content, false)).unwrap();
+        assert_eq!(message["content"], "There's no built-in game\u{8ffd}\u{8de1}");
     }
 
     #[test]
