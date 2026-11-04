@@ -1599,7 +1599,7 @@ impl Runner {
                         ctx.app_name(),
                         agent_to_run.name(),
                     );
-                    match scope.within(crate::compaction::apply_compaction_with_retry(cc_config, session_events)).await {
+                    match scope.within(crate::compaction::apply_reactive_compaction(cc_config, session_events)).await {
                         Ok(compacted) => {
                             ctx.mutable_session().replace_events(compacted);
                             tracing::info!("context compaction succeeded after token limit error, retrying agent");
@@ -1630,6 +1630,12 @@ impl Runner {
             let mut streamed_content = HashMap::new();
             let mut in_flight = InFlightCalls::default();
             let mut cancelled = false;
+            // A model call inside the agent's loop fails as an `Err` item in its
+            // stream, not as an `Err` from `run()`, so the stream gets its own
+            // compact-and-rerun — once per invocation, since a second overflow
+            // means compaction cannot help.
+            #[cfg(feature = "context-compaction")]
+            let mut reactive_compaction_used = false;
 
             while let Some(result) = {
                 // Race the next event against cancellation so an in-flight
@@ -1754,6 +1760,42 @@ impl Runner {
                         }
                     }
                     Err(e) => {
+                        #[cfg(feature = "context-compaction")]
+                        if !reactive_compaction_used
+                            && let Some(cc_config) = context_compaction.as_ref()
+                            && crate::compaction::is_token_limit_error(&e)
+                        {
+                            reactive_compaction_used = true;
+                            tracing::warn!(
+                                error = %e.diagnostics(),
+                                "agent stream failed with token limit error, attempting compaction"
+                            );
+                            let session_events = ctx.mutable_session().events_snapshot();
+                            let scope = adk_core::ModelCallScope::for_run(
+                                adk_core::InvocationContext::run_config(ctx.as_ref()),
+                                ctx.app_name(),
+                                agent_to_run.name(),
+                            );
+                            match scope.within(crate::compaction::apply_reactive_compaction(cc_config, session_events)).await {
+                                Ok(compacted) => {
+                                    ctx.mutable_session().replace_events(compacted);
+                                    tracing::info!("context compaction succeeded after token limit error, rerunning agent");
+                                    match agent_to_run.run(ctx.clone()).instrument(agent_span.clone()).await {
+                                        Ok(s) => {
+                                            agent_stream = s;
+                                            continue;
+                                        }
+                                        Err(retry_err) => {
+                                            yield Err(retry_err);
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(compaction_err) => {
+                                    tracing::warn!(error = %compaction_err.diagnostics(), "reactive compaction failed");
+                                }
+                            }
+                        }
                         yield Err(e);
                         return;
                     }
