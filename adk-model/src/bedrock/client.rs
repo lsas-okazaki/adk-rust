@@ -14,6 +14,7 @@ use adk_core::{AdkError, Llm, LlmRequest, LlmResponse, LlmResponseStream};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::types::ConverseStreamOutput;
+use aws_smithy_types::error::display::DisplayErrorContext;
 use tracing::{debug, info, instrument};
 
 /// Amazon Bedrock client backed by the AWS SDK Converse API.
@@ -276,25 +277,59 @@ fn timeout_config(timeouts: crate::HttpTimeouts) -> aws_smithy_types::timeout::T
         .build()
 }
 
-/// A failed Converse call, as `Timeout` when the connect or read timeout expired.
-fn send_error<E, R>(
-    error: &aws_sdk_bedrockruntime::error::SdkError<E, R>,
-    region: &str,
-    model_id: &str,
-) -> AdkError
+/// Render an `SdkError` with its whole source chain.
+///
+/// `SdkError`'s own `Display` is only a category — a rejected request prints
+/// the bare string `service error`, and the sentence that says what is wrong
+/// (`ValidationException: ...`) lives one or more levels down in `source()`.
+/// [`DisplayErrorContext`] is the AWS SDK's own wrapper for walking that chain.
+fn describe<E>(err: &E) -> String
 where
-    aws_sdk_bedrockruntime::error::SdkError<E, R>: std::fmt::Display,
+    E: std::error::Error + 'static,
 {
-    use aws_sdk_bedrockruntime::error::SdkError;
+    DisplayErrorContext(err).to_string()
+}
 
-    let message = format!("Bedrock API error for region={region}, model={model_id}: {error}");
-    let timed_out = matches!(error, SdkError::TimeoutError(_))
-        || matches!(error, SdkError::DispatchFailure(failure) if failure.is_timeout());
-    if timed_out {
+/// Phrases Bedrock-hosted models use when a request exceeds the context
+/// window, matched lowercase. OpenAI-compatible models (gpt-oss) say
+/// "Input length (N) exceeds model's maximum context length (M)"; Anthropic
+/// models say "prompt is too long: N tokens > M maximum" or "Input is too long
+/// for requested model".
+const CONTEXT_OVERFLOW_PHRASES: &[&str] = &[
+    "maximum context length",
+    "context length",
+    "context window",
+    "prompt is too long",
+    "input is too long",
+    "too many tokens",
+    "input length",
+];
+
+/// True when a rendered Converse error is a `ValidationException` saying the
+/// request is larger than the model's context window.
+///
+/// Gated on `ValidationException` so a throttling or transport error that
+/// happens to mention tokens is never mistaken for an oversized request.
+fn is_context_overflow(detail: &str) -> bool {
+    let lower = detail.to_lowercase();
+    lower.contains("validationexception")
+        && CONTEXT_OVERFLOW_PHRASES.iter().any(|phrase| lower.contains(phrase))
+}
+
+/// Map a failed Converse call (or stream) to an [`AdkError`].
+///
+/// A context overflow is `InvalidInput`, which is what the runner's
+/// `is_token_limit_error` requires before it compacts the history and retries.
+/// Everything else stays the legacy `Internal` model error. Without the
+/// distinction an oversized request was resent unchanged until the session
+/// died, because no Bedrock error ever qualified for reactive compaction.
+fn converse_error(what: &str, region: &str, model_id: &str, detail: String) -> AdkError {
+    let message = format!("Bedrock {what} error for region={region}, model={model_id}: {detail}");
+    if is_context_overflow(&detail) {
         AdkError::new(
             adk_core::ErrorComponent::Model,
-            adk_core::ErrorCategory::Timeout,
-            "model.bedrock.timeout",
+            adk_core::ErrorCategory::InvalidInput,
+            "model.bedrock.context_overflow",
             message,
         )
         .with_provider("bedrock")
@@ -303,13 +338,93 @@ where
     }
 }
 
+/// A failed Converse call, as `Timeout` when the connect or read timeout expired.
+fn send_error<E, R>(
+    error: &aws_sdk_bedrockruntime::error::SdkError<E, R>,
+    region: &str,
+    model_id: &str,
+) -> AdkError
+where
+    aws_sdk_bedrockruntime::error::SdkError<E, R>: std::error::Error + 'static,
+{
+    use aws_sdk_bedrockruntime::error::SdkError;
+
+    let detail = describe(error);
+    let timed_out = matches!(error, SdkError::TimeoutError(_))
+        || matches!(error, SdkError::DispatchFailure(failure) if failure.is_timeout());
+    if timed_out {
+        AdkError::new(
+            adk_core::ErrorComponent::Model,
+            adk_core::ErrorCategory::Timeout,
+            "model.bedrock.timeout",
+            format!("Bedrock API error for region={region}, model={model_id}: {detail}"),
+        )
+        .with_provider("bedrock")
+    } else {
+        converse_error("API", region, model_id, detail)
+    }
+}
+
+/// One-line summary of an assembled Converse message list: role, block kinds,
+/// and the ids that pair `toolUse` with `toolResult`.
+///
+/// Converse rejects a request on the *shape* of `messages` — an unpaired
+/// `toolUse` id, a blank text block — and the rejection names a message index
+/// (`messages.2: ...`) that means nothing without the shape to index into.
+/// Logging kinds and ids rather than content keeps prompts and tool payloads
+/// out of the log while still making those errors readable.
+fn describe_messages(messages: &[aws_sdk_bedrockruntime::types::Message]) -> String {
+    use aws_sdk_bedrockruntime::types::ContentBlock;
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, message)| {
+            let blocks = message
+                .content
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::Text(text) => {
+                        if text.trim().is_empty() {
+                            "text(BLANK)".to_string()
+                        } else {
+                            format!("text({})", text.len())
+                        }
+                    }
+                    ContentBlock::ToolUse(tool_use) => {
+                        format!("toolUse({}#{})", tool_use.name, tool_use.tool_use_id)
+                    }
+                    ContentBlock::ToolResult(result) => {
+                        format!("toolResult(#{})", result.tool_use_id)
+                    }
+                    ContentBlock::Image(_) => "image".to_string(),
+                    ContentBlock::Document(_) => "document".to_string(),
+                    ContentBlock::ReasoningContent(_) => "reasoning".to_string(),
+                    ContentBlock::CachePoint(_) => "cachePoint".to_string(),
+                    _ => "other".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{i}]{:?}{{{blocks}}}", message.role)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl BedrockClient {
     /// Non-streaming: call `converse` and wrap the single response in a stream.
     async fn generate_non_streaming(
         &self,
         input: super::convert::BedrockConverseInput,
     ) -> Result<LlmResponseStream, AdkError> {
-        debug!("bedrock non-streaming converse for model={}", self.model_id);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                model = %self.model_id,
+                messages = %describe_messages(&input.messages),
+                system_blocks = input.system.len(),
+                "bedrock non-streaming converse"
+            );
+        }
 
         let response = self
             .client
@@ -342,7 +457,14 @@ impl BedrockClient {
         &self,
         input: super::convert::BedrockConverseInput,
     ) -> Result<LlmResponseStream, AdkError> {
-        debug!("bedrock streaming converse for model={}", self.model_id);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                model = %self.model_id,
+                messages = %describe_messages(&input.messages),
+                system_blocks = input.system.len(),
+                "bedrock streaming converse"
+            );
+        }
 
         let mut stream_output = self
             .client
@@ -387,11 +509,9 @@ impl BedrockClient {
                     .with_provider("bedrock"))?;
                     break;
                 };
-                let Some(event) = next.map_err(|e| {
-                    AdkError::model(format!(
-                        "Bedrock stream error for region={region}, model={model_id}: {e}"
-                    ))
-                })? else {
+                let Some(event) = next
+                    .map_err(|e| converse_error("stream", &region, &model_id, describe(&e)))?
+                else {
                     break;
                 };
                 match event {
@@ -553,6 +673,52 @@ mod tests {
     fn sdk_timeouts(client: &BedrockClient) -> (Option<Duration>, Option<Duration>) {
         let config = client.client.config().timeout_config();
         config.map_or((None, None), |config| (config.connect_timeout(), config.read_timeout()))
+    }
+
+    /// Verbatim detail of the gpt-oss-120b rejection that killed the GEO
+    /// station-keeping NL run on 2026-09-28.
+    const GPT_OSS_OVERFLOW: &str = "service error: ValidationException: The model returned the \
+        following errors: {\"error\":{\"code\":\"validation_error\",\"message\":\"ErrorEvent { \
+        error: APIError { type: \\\"BadRequestError\\\", code: Some(400), message: \\\"Input \
+        length (135735) exceeds model's maximum context length (131072).\\\", param: None } }\"}}";
+
+    #[test]
+    fn a_gpt_oss_context_overflow_is_invalid_input() {
+        let err = converse_error(
+            "API",
+            "ap-northeast-1",
+            "openai.gpt-oss-120b-1:0",
+            GPT_OSS_OVERFLOW.into(),
+        );
+        assert_eq!(err.component, adk_core::ErrorComponent::Model);
+        assert_eq!(err.category, adk_core::ErrorCategory::InvalidInput);
+        assert_eq!(err.code, "model.bedrock.context_overflow");
+        assert!(err.message.contains("Input length (135735)"));
+    }
+
+    #[test]
+    fn a_claude_prompt_too_long_is_invalid_input() {
+        for detail in [
+            "service error: ValidationException: prompt is too long: 210000 tokens > 200000 maximum",
+            "service error: ValidationException: Input is too long for requested model.",
+        ] {
+            let err = converse_error("API", "us-east-1", "anthropic.claude", detail.into());
+            assert_eq!(err.category, adk_core::ErrorCategory::InvalidInput, "{detail}");
+        }
+    }
+
+    #[test]
+    fn other_validation_errors_stay_internal() {
+        let detail = "service error: ValidationException: messages.2: toolUse ids must be paired";
+        let err = converse_error("API", "us-east-1", "anthropic.claude", detail.into());
+        assert_eq!(err.category, adk_core::ErrorCategory::Internal);
+    }
+
+    #[test]
+    fn a_non_validation_error_mentioning_tokens_stays_internal() {
+        let detail = "service error: ThrottlingException: Too many tokens, please wait";
+        let err = converse_error("API", "us-east-1", "anthropic.claude", detail.into());
+        assert_eq!(err.category, adk_core::ErrorCategory::Internal);
     }
 
     #[test]
