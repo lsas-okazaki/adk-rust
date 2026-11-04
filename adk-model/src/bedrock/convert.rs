@@ -222,6 +222,24 @@ fn part_mime_type(part: &Part) -> Option<&str> {
     }
 }
 
+/// Fallback tool-call id for a `Part` that carries none.
+///
+/// Bedrock pairs `toolUse` and `toolResult` by id, and rejects any request in
+/// which a `toolUse` has no `toolResult` carrying the same id in the message
+/// immediately after — `messages.N: `tool_use` ids were found without
+/// `tool_result` blocks immediately after`. Call and response must therefore
+/// derive the *same* fallback, so it is derived from the only field both sides
+/// carry: the function name. (The response side previously fell back to the
+/// constant `"unknown"`, which never matched the call's `call_<name>` and made
+/// every id-less pair fail the request.)
+///
+/// Deriving from the name means two id-less calls to the *same* tool in one
+/// turn still collide. Nothing here can separate them — the caller has to
+/// supply ids for parallel calls, which the current ADK paths do.
+fn fallback_tool_id(name: &str) -> String {
+    format!("call_{name}")
+}
+
 fn convert_one_part(
     part: &Part,
     contains_function_call: bool,
@@ -237,7 +255,7 @@ fn convert_one_part(
         }
         Part::FunctionCall { name, args, id, .. } => {
             let tool_use = ToolUseBlock::builder()
-                .tool_use_id(id.clone().unwrap_or_else(|| format!("call_{name}")))
+                .tool_use_id(id.clone().unwrap_or_else(|| fallback_tool_id(name)))
                 .name(name.clone())
                 .input(json_value_to_document(args))
                 .build()
@@ -246,7 +264,9 @@ fn convert_one_part(
         }
         Part::FunctionResponse { function_response, id, .. } => {
             let mut tool_result = ToolResultBlock::builder()
-                .tool_use_id(id.clone().unwrap_or_else(|| "unknown".to_string()))
+                .tool_use_id(
+                    id.clone().unwrap_or_else(|| fallback_tool_id(&function_response.name)),
+                )
                 .content(ToolResultContentBlock::Text(crate::tool_result::serialize_tool_result(
                     &function_response.response,
                 )));
@@ -945,6 +965,124 @@ mod tests {
         let blocks = &result.messages[0].content;
         assert_eq!(blocks.len(), 1);
         assert!(matches!(&blocks[0], ContentBlock::ToolUse(_)));
+    }
+
+    /// Converse pairs `toolUse` with `toolResult` by id and rejects the whole
+    /// request when a call has no result carrying the same id in the next
+    /// message: ``messages.N: `tool_use` ids were found without `tool_result`
+    /// blocks immediately after``. When neither `Part` carries an id the two
+    /// sides must still derive the same fallback.
+    #[test]
+    fn id_less_call_and_response_derive_the_same_tool_use_id() {
+        let contents = vec![
+            Content {
+                role: "model".to_string(),
+                parts: vec![Part::FunctionCall {
+                    name: "get_weather".to_string(),
+                    args: serde_json::json!({"city": "Seattle"}),
+                    id: None,
+                    thought_signature: None,
+                }],
+            },
+            Content {
+                role: "user".to_string(),
+                parts: vec![Part::FunctionResponse {
+                    function_response: FunctionResponseData::new(
+                        "get_weather",
+                        serde_json::json!({"temp": 72}),
+                    ),
+                    id: None,
+                    annotations: None,
+                }],
+            },
+        ];
+
+        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+        assert_eq!(result.messages.len(), 2);
+
+        let call_id = match &result.messages[0].content[0] {
+            ContentBlock::ToolUse(tool_use) => tool_use.tool_use_id.clone(),
+            other => panic!("expected a toolUse block, got {other:?}"),
+        };
+        let result_id = match &result.messages[1].content[0] {
+            ContentBlock::ToolResult(tool_result) => tool_result.tool_use_id.clone(),
+            other => panic!("expected a toolResult block, got {other:?}"),
+        };
+
+        assert_eq!(call_id, result_id, "an unpaired id makes Bedrock reject the whole request");
+    }
+
+    /// An explicit id always wins; the fallback is only for a missing one.
+    #[test]
+    fn an_explicit_id_is_preserved_on_both_sides() {
+        let contents = vec![
+            Content {
+                role: "model".to_string(),
+                parts: vec![Part::FunctionCall {
+                    name: "get_weather".to_string(),
+                    args: serde_json::json!({}),
+                    id: Some("tooluse_abc".to_string()),
+                    thought_signature: None,
+                }],
+            },
+            Content {
+                role: "user".to_string(),
+                parts: vec![Part::FunctionResponse {
+                    function_response: FunctionResponseData::new(
+                        "get_weather",
+                        serde_json::json!({}),
+                    ),
+                    id: Some("tooluse_abc".to_string()),
+                    annotations: None,
+                }],
+            },
+        ];
+
+        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+
+        match (&result.messages[0].content[0], &result.messages[1].content[0]) {
+            (ContentBlock::ToolUse(call), ContentBlock::ToolResult(response)) => {
+                assert_eq!(call.tool_use_id, "tooluse_abc");
+                assert_eq!(response.tool_use_id, "tooluse_abc");
+            }
+            other => panic!("expected a toolUse/toolResult pair, got {other:?}"),
+        }
+    }
+
+    /// Two id-less calls to *different* tools must not collide onto one id —
+    /// that would pair both results with the same call.
+    #[test]
+    fn id_less_calls_to_different_tools_get_distinct_ids() {
+        let contents = vec![Content {
+            role: "model".to_string(),
+            parts: vec![
+                Part::FunctionCall {
+                    name: "get_weather".to_string(),
+                    args: serde_json::json!({}),
+                    id: None,
+                    thought_signature: None,
+                },
+                Part::FunctionCall {
+                    name: "get_time".to_string(),
+                    args: serde_json::json!({}),
+                    id: None,
+                    thought_signature: None,
+                },
+            ],
+        }];
+
+        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+        let ids: Vec<String> = result.messages[0]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse(tool_use) => Some(tool_use.tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
     }
 
     #[test]

@@ -17,6 +17,23 @@ use async_openai::types::chat::{
 };
 use std::collections::{HashMap, HashSet};
 
+/// Fallback tool-call id for a `Part` that carries none.
+///
+/// A `tool` message is matched to the assistant's `tool_call` by id, and a
+/// mismatch fails the request — a Bedrock-backed gateway reports it as
+/// ``messages.N: `tool_use` ids were found without `tool_result` blocks
+/// immediately after``. Call and response must therefore derive the SAME
+/// fallback, so it comes from the only field both sides carry: the function
+/// name. (The response side used to fall back to the constant `"unknown"`,
+/// which never matched the call's `call_<name>`.)
+///
+/// Deriving from the name means two id-less calls to the same tool in one turn
+/// still collide; the caller has to supply ids for parallel calls, which the
+/// current ADK paths do.
+fn fallback_tool_call_id(name: &str) -> String {
+    format!("call_{name}")
+}
+
 /// Convert one ADK content to the Chat Completions messages that carry it.
 ///
 /// A content holding function responses becomes one `tool` message per response, in order,
@@ -33,7 +50,9 @@ pub fn content_to_messages(
             .into_iter()
             .map(|(id, response)| {
                 ChatCompletionRequestToolMessageArgs::default()
-                    .tool_call_id(id.unwrap_or("unknown"))
+                    .tool_call_id(
+                        id.map_or_else(|| fallback_tool_call_id(&response.name), str::to_string),
+                    )
                     .content(crate::tool_result::serialize_tool_result(&response.response))
                     .build()
                     .unwrap()
@@ -248,9 +267,21 @@ pub(crate) fn extract_reasoning_content(parts: &[Part]) -> Option<String> {
     if reasoning.is_empty() { None } else { Some(reasoning) }
 }
 
-/// Get text content if any exists.
+/// Get an assistant turn's text if any exists.
+///
+/// A turn streamed before adk persisted streamed responses as whole parts is
+/// stored as one part per delta, so its parts are pieces of a single string
+/// and join with nothing between them. A "\n" here turns "There" "'s" " no"
+/// into "There\n's\n no", and the model copies that pattern into its next
+/// answers.
 fn get_text_content(parts: &[Part]) -> Option<String> {
-    let text = extract_text(parts);
+    let text: String = parts
+        .iter()
+        .filter_map(|p| match p {
+            Part::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
     if text.is_empty() { None } else { Some(text) }
 }
 
@@ -261,7 +292,7 @@ fn extract_tool_calls(parts: &[Part]) -> Vec<ChatCompletionMessageToolCalls> {
         .filter_map(|part| {
             if let Part::FunctionCall { name, args, id, .. } = part {
                 Some(ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
-                    id: id.clone().unwrap_or_else(|| format!("call_{}", name)),
+                    id: id.clone().unwrap_or_else(|| fallback_tool_call_id(name)),
                     function: FunctionCall {
                         name: name.clone(),
                         arguments: serde_json::to_string(args).unwrap_or_default(),
@@ -591,6 +622,51 @@ mod tests {
         let message = serde_json::to_value(content_to_message(&content, false)).unwrap();
         assert_eq!(message["content"], "visible answer");
         assert!(!message.to_string().contains("private reasoning"));
+    }
+
+    #[test]
+    fn test_streamed_assistant_parts_join_without_separator() {
+        let content = Content {
+            role: "model".to_string(),
+            parts: ["There", "'s", " no built-in game", "\u{8ffd}", "\u{8de1}"]
+                .into_iter()
+                .map(|text| Part::Text { text: text.to_string() })
+                .collect(),
+        };
+
+        let message = serde_json::to_value(content_to_message(&content, false)).unwrap();
+        assert_eq!(message["content"], "There's no built-in game\u{8ffd}\u{8de1}");
+    }
+
+    /// When neither side carries an id, the `tool` message must still name the
+    /// id the assistant's `tool_call` was given, or the request is rejected.
+    #[test]
+    fn id_less_call_and_response_derive_the_same_tool_call_id() {
+        let call = Content {
+            role: "model".to_string(),
+            parts: vec![Part::FunctionCall {
+                name: "get_weather".to_string(),
+                args: serde_json::json!({"city": "Seattle"}),
+                id: None,
+                thought_signature: None,
+            }],
+        };
+        let response = Content {
+            role: "function".to_string(),
+            parts: vec![Part::FunctionResponse {
+                function_response: adk_core::FunctionResponseData::new(
+                    "get_weather",
+                    serde_json::json!({"temp": 72}),
+                ),
+                id: None,
+                annotations: None,
+            }],
+        };
+
+        let call = serde_json::to_value(content_to_message(&call, false)).unwrap();
+        let response = serde_json::to_value(content_to_messages(&response, false)).unwrap();
+        assert_eq!(call["tool_calls"][0]["id"], "call_get_weather");
+        assert_eq!(response[0]["tool_call_id"], "call_get_weather");
     }
 
     #[test]
