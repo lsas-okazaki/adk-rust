@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tower::{BoxError, Service, ServiceExt};
 
 /// Assistant-message field accepted by an OpenAI-compatible provider for reasoning replay.
 ///
@@ -378,10 +379,54 @@ impl ErrorCodes {
     }
 }
 
+/// Boxed HTTP transport used to send requests to the provider.
+///
+/// Anything that implements `tower::Service<reqwest::Request>` and yields a
+/// `reqwest::Response` fits — a bare [`reqwest::Client`] does, and so does
+/// one wrapped in `tower` layers that rewrite each request (per-request
+/// auth headers, logging, ...). See [`OpenAICompatible::with_client`].
+pub type HttpTransport =
+    tower::util::BoxCloneSyncService<reqwest::Request, reqwest::Response, BoxError>;
+
+/// Box any compatible service into an [`HttpTransport`].
+pub fn box_transport<S>(service: S) -> HttpTransport
+where
+    S: Service<reqwest::Request, Response = reqwest::Response> + Clone + Send + Sync + 'static,
+    S::Error: Into<BoxError>,
+    S::Future: Send + 'static,
+{
+    tower::util::BoxCloneSyncService::new(service.map_err(Into::into))
+}
+
+/// One error and every distinct cause under it, joined with ` | caused by: `.
+///
+/// A transport failure's own message is only a category — `error sending
+/// request for url (...)` — and what went wrong (a TLS verification failure,
+/// a refused connection) lives in `source()`. A cause whose text is already
+/// part of its parent's is skipped.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = err.to_string();
+    let mut parent = rendered.clone();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !text.is_empty() && !parent.contains(&text) {
+            rendered.push_str(" | caused by: ");
+            rendered.push_str(&text);
+        }
+        parent = text;
+        source = cause.source();
+    }
+    rendered
+}
+
 /// Shared OpenAI-compatible client implementation.
 pub struct OpenAICompatible {
     completion_url: Option<String>,
+    /// Builds each request, and sends it unless [`Self::transport`] is set.
     http: reqwest::Client,
+    /// A caller-provided transport that sends every request instead of `http`.
+    transport: Option<HttpTransport>,
     /// Headers added to every request, kept so later calls extend rather than replace them.
     default_headers: http::HeaderMap,
     request_adapter: Option<crate::openai::RequestAdapter>,
@@ -447,6 +492,7 @@ impl OpenAICompatible {
         Ok(Self {
             completion_url: None,
             http: compatible_http_client(timeouts, &config.provider_name)?,
+            transport: None,
             default_headers: http::HeaderMap::new(),
             request_adapter: None,
             api_key: config.api_key,
@@ -460,6 +506,68 @@ impl OpenAICompatible {
             reasoning_replay_field: None,
             error_codes: ErrorCodes::COMPATIBLE,
         })
+    }
+
+    /// Build from a caller-provided HTTP client or `tower` service stack.
+    ///
+    /// Lets callers inject TLS settings (a private CA), proxies or per-request
+    /// auth. A preconfigured [`reqwest::Client`] can be passed directly. For
+    /// per-request auth schemes (e.g. DPoP) where a header value must change
+    /// with each call, wrap the client in a [`tower::Layer`] that rewrites the
+    /// [`reqwest::Request`] before handing it on; the stack only has to yield a
+    /// [`reqwest::Response`].
+    ///
+    /// The transport receives the finished request: default headers, the
+    /// bearer token and any [`request adapter`](Self::with_request_adapter)
+    /// have already been applied. Its own timeouts govern the call;
+    /// [`with_timeouts`](Self::with_timeouts) does not reach into it. A
+    /// failure is reported as `Timeout` when the transport's error is a
+    /// timed-out [`reqwest::Error`], and as `Unavailable` otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_model::openai_compatible::{OpenAICompatible, OpenAICompatibleConfig};
+    ///
+    /// // A reqwest client preconfigured with a private CA can be passed as-is ...
+    /// let http = reqwest::Client::builder().add_root_certificate(ca).build()?;
+    ///
+    /// // ... or wrapped in tower layers that rewrite each request first.
+    /// let http = tower::ServiceBuilder::new()
+    ///     .layer(my_per_request_auth_layer)
+    ///     .service(http);
+    ///
+    /// let model = OpenAICompatible::with_client(
+    ///     OpenAICompatibleConfig::new("my-api-key", "my-model"),
+    ///     http,
+    /// )?;
+    /// ```
+    pub fn with_client<S>(config: OpenAICompatibleConfig, http: S) -> Result<Self, AdkError>
+    where
+        S: Service<reqwest::Request, Response = reqwest::Response> + Clone + Send + Sync + 'static,
+        S::Error: Into<BoxError>,
+        S::Future: Send + 'static,
+    {
+        let mut client = Self::new(config)?;
+        client.transport = Some(box_transport(http));
+        Ok(client)
+    }
+
+    /// [`OpenAICompatible::with_client`] with the complete reasoning vocabulary
+    /// of [`OpenAICompatible::new_with_reasoning_effort`].
+    pub fn with_client_and_reasoning_effort<S>(
+        config: OpenAICompatibleConfig,
+        http: S,
+        reasoning_effort: Option<OpenAIReasoningEffort>,
+    ) -> Result<Self, AdkError>
+    where
+        S: Service<reqwest::Request, Response = reqwest::Response> + Clone + Send + Sync + 'static,
+        S::Error: Into<BoxError>,
+        S::Future: Send + 'static,
+    {
+        let mut client = Self::new_with_reasoning_effort(config, reasoning_effort)?;
+        client.transport = Some(box_transport(http));
+        Ok(client)
     }
 
     /// Adds default HTTP headers to every request, replacing earlier defaults with the same name.
@@ -804,6 +912,7 @@ struct RequestTarget {
     organization_id: Option<String>,
     provider_name: String,
     adapter: Option<crate::openai::RequestAdapter>,
+    transport: Option<HttpTransport>,
     error_codes: ErrorCodes,
 }
 
@@ -824,6 +933,7 @@ async fn send_request(
         organization_id,
         provider_name,
         adapter,
+        transport,
         error_codes,
     } = target;
     let request_error = |error: reqwest::Error| {
@@ -831,7 +941,7 @@ async fn send_request(
             ErrorComponent::Model,
             crate::http_timeouts::transport_category(&error),
             error_codes.request,
-            format!("{provider_name} request error: {error}"),
+            format!("{provider_name} request error: {}", error_chain(&error)),
         )
         .with_provider(provider_name)
     };
@@ -852,7 +962,21 @@ async fn send_request(
         *request.body_mut() = Some(body.to_string().into());
         request.headers_mut().remove(reqwest::header::CONTENT_LENGTH);
     }
-    let http_resp = http.execute(request).await.map_err(request_error)?;
+    let http_resp = match transport {
+        Some(transport) => transport.clone().oneshot(request).await.map_err(|error| {
+            let category = error
+                .downcast_ref::<reqwest::Error>()
+                .map_or(ErrorCategory::Unavailable, crate::http_timeouts::transport_category);
+            AdkError::new(
+                ErrorComponent::Model,
+                category,
+                error_codes.request,
+                format!("{provider_name} request error: {}", error_chain(error.as_ref())),
+            )
+            .with_provider(provider_name)
+        })?,
+        None => http.execute(request).await.map_err(request_error)?,
+    };
 
     if !http_resp.status().is_success() {
         let status = http_resp.status();
@@ -970,6 +1094,7 @@ impl Llm for OpenAICompatible {
             organization_id: self.organization_id.clone(),
             provider_name: provider_name.clone(),
             adapter: self.request_adapter.clone(),
+            transport: self.transport.clone(),
             error_codes,
         };
         // Text-encoded tool calls are honoured only for tools this request declared.
@@ -1894,5 +2019,93 @@ mod tests {
         });
         let response = convert::from_raw_openai_response("openai", &raw, &Default::default());
         assert_eq!(response.provider_metadata.unwrap()["logprobs"]["content"][0]["token"], "1");
+    }
+
+    mod transport {
+        use super::super::*;
+        use std::sync::{Arc, Mutex};
+
+        #[test]
+        fn error_chain_appends_causes_and_skips_ones_already_shown() {
+            #[derive(Debug)]
+            struct Layer(String, Option<Box<Layer>>);
+            impl std::fmt::Display for Layer {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str(&self.0)
+                }
+            }
+            impl std::error::Error for Layer {
+                fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                    self.1.as_ref().map(|s| s.as_ref() as &(dyn std::error::Error + 'static))
+                }
+            }
+
+            let deep = Layer(
+                "error sending request for url (https://gw/v1/chat/completions)".into(),
+                Some(Box::new(Layer(
+                    "invalid peer certificate: UnknownIssuer".into(),
+                    Some(Box::new(Layer("UnknownIssuer".into(), None))),
+                ))),
+            );
+            let rendered = error_chain(&deep);
+            assert!(rendered.starts_with("error sending request for url"));
+            assert!(rendered.contains("invalid peer certificate: UnknownIssuer"));
+            // The leaf repeats its parent's wording, so it is not appended twice.
+            assert_eq!(rendered.matches(" | caused by: ").count(), 1);
+        }
+
+        /// A caller's transport sends the finished request — URL, bearer token and
+        /// default headers already applied — and its failure keeps its cause.
+        #[tokio::test]
+        async fn a_custom_transport_sends_the_finished_request() {
+            let seen: Arc<Mutex<Vec<(String, http::HeaderMap)>>> = Arc::default();
+            let recorder = seen.clone();
+            let transport = tower::service_fn(move |request: reqwest::Request| {
+                recorder
+                    .lock()
+                    .unwrap()
+                    .push((request.url().to_string(), request.headers().clone()));
+                async move {
+                    Err::<reqwest::Response, BoxError>(
+                        std::io::Error::other("refused by the test transport").into(),
+                    )
+                }
+            });
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-license", http::HeaderValue::from_static("jwt"));
+            let target = RequestTarget {
+                url: "https://gw.example/v1/chat/completions".to_string(),
+                headers,
+                api_key: "key".to_string(),
+                organization_id: None,
+                provider_name: "test".to_string(),
+                adapter: None,
+                transport: Some(box_transport(transport)),
+                error_codes: ErrorCodes::COMPATIBLE,
+            };
+            let http = reqwest::Client::new();
+
+            let err = send_request(&http, &target, &serde_json::json!({"model": "m"}))
+                .await
+                .expect_err("the transport refuses");
+
+            assert_eq!(err.category, ErrorCategory::Unavailable);
+            assert!(err.message.contains("refused by the test transport"), "{}", err.message);
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].0, "https://gw.example/v1/chat/completions");
+            assert_eq!(seen[0].1["authorization"], "Bearer key");
+            assert_eq!(seen[0].1["x-license"], "jwt");
+        }
+
+        #[test]
+        fn with_client_accepts_a_bare_reqwest_client() {
+            let model = OpenAICompatible::with_client(
+                OpenAICompatibleConfig::new("key", "model"),
+                reqwest::Client::new(),
+            )
+            .unwrap();
+            assert!(model.transport.is_some());
+        }
     }
 }
