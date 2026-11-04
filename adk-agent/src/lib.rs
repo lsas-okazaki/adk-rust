@@ -112,6 +112,7 @@ pub use custom_agent::{CustomAgent, CustomAgentBuilder};
 pub use guardrails::GuardrailSet;
 pub use llm_agent::{
     DEFAULT_MAX_ITERATIONS, DEFAULT_TOOL_TIMEOUT, LlmAgent, LlmAgentBuilder, extract_typed,
+    is_continuation_note,
 };
 pub use team::{
     BlackboardHistoryPolicy, BlackboardPolicy, BlackboardSchedule, BlackboardSpec,

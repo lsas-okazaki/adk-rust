@@ -464,18 +464,11 @@ impl PromptConfig {
             .iter()
             .all(|part| matches!(part, Part::Text { text } if text.trim().is_empty()));
         if !empty_turn {
-            // The run's own message, never a steering message a run-mate took after it.
-            let own = session_history.iter().rposition(|content| content == ctx.user_content());
-            match own.or_else(|| {
-                session_history.iter().rposition(|content| {
-                    content.role == "user"
-                        && !adk_core::history::is_other_agent_context(content)
-                        && !adk_core::history::is_system_notice(content)
-                })
-            }) {
-                Some(index) => session_history[index] = current_user_content.clone(),
-                None => session_history.push(current_user_content.clone()),
-            }
+            place_current_user_content(
+                &mut session_history,
+                ctx.user_content(),
+                &current_user_content,
+            );
         }
         // An empty user turn adds nothing to the conversation, and providers such as
         // Anthropic reject empty text blocks.
@@ -555,6 +548,41 @@ impl PromptConfig {
     }
 }
 
+/// The text of a content, every text part joined, for telling two user turns apart.
+fn content_text(content: &Content) -> String {
+    content.parts.iter().filter_map(Part::text).collect::<Vec<_>>().join("")
+}
+
+/// Put the invocation's user content into the history the model will see.
+///
+/// `original` is `ctx.user_content()` as the session stored it; `current` is the
+/// same content after skill injection, which is what the request must carry.
+/// The history entry that IS the original — the run's own message, never a
+/// steering message a run-mate took after it — is replaced by `current`. Any
+/// other user turn is left alone: a wrapper agent may append one after the
+/// model's last turn — a nudge, a verifier's work order — and that turn must
+/// remain the last thing the model reads. Replacing "the last user turn"
+/// instead overwrote every such message with the original request before the
+/// model ever saw it. With no user message in the history at all the content is
+/// appended.
+fn place_current_user_content(history: &mut Vec<Content>, original: &Content, current: &Content) {
+    let original_text = content_text(original);
+    let own = history.iter().rposition(|content| content == original).or_else(|| {
+        history
+            .iter()
+            .rposition(|content| content.role == "user" && content_text(content) == original_text)
+    });
+    if let Some(index) = own {
+        history[index] = current.clone();
+    } else if !history.iter().any(|content| {
+        content.role == "user"
+            && !adk_core::history::is_other_agent_context(content)
+            && !adk_core::history::is_system_notice(content)
+    }) {
+        history.push(current.clone());
+    }
+}
+
 /// The user turn a run without user input sends when the conversation would otherwise
 /// end on a model message.
 const RESUMED_TURN_NOTE: &str =
@@ -563,6 +591,18 @@ const RESUMED_TURN_NOTE: &str =
 /// The user turn a run sends when its history ends on this agent's own answer.
 const CONTINUE_TURN_NOTE: &str =
     "(No new message from the user. Continue from the conversation above.)";
+
+/// Whether `content` is the user turn an [`LlmAgent`] appends when its request would
+/// otherwise end on a model message: no new input, only a cue to continue.
+///
+/// A model decorator that appends its own closing user turn to a request ending on the
+/// model's answer can replace this note with that turn instead of finding the request
+/// already closed.
+pub fn is_continuation_note(content: &Content) -> bool {
+    content.role == "user"
+        && matches!(content.parts.as_slice(), [Part::Text { text }]
+            if text == CONTINUE_TURN_NOTE || text == RESUMED_TURN_NOTE)
+}
 
 struct ToolSetup {
     tools: Vec<Arc<dyn Tool>>,
@@ -5528,6 +5568,78 @@ async fn recover_model_error(
 #[cfg(test)]
 mod run_helper_tests {
     use super::*;
+
+    fn turn(role: &str, text: &str) -> Content {
+        Content::new(role).with_text(text)
+    }
+
+    fn texts(history: &[Content]) -> Vec<(String, String)> {
+        history.iter().map(|c| (c.role.clone(), content_text(c))).collect()
+    }
+
+    #[test]
+    fn the_appended_notes_are_recognised_and_nothing_else_is() {
+        assert!(is_continuation_note(&turn("user", CONTINUE_TURN_NOTE)));
+        assert!(is_continuation_note(&turn("user", RESUMED_TURN_NOTE)));
+        assert!(!is_continuation_note(&turn("model", CONTINUE_TURN_NOTE)));
+        assert!(!is_continuation_note(&turn("user", "continue")));
+    }
+
+    #[test]
+    fn a_user_turn_appended_after_the_model_stays_last() {
+        // A wrapper yielded a nudge after the model's turn. Replacing the LAST user
+        // turn with the original request meant the model never read the nudge: it
+        // saw the request repeated instead.
+        let original = turn("user", "set the mask on ten cities");
+        let mut history = vec![
+            original.clone(),
+            turn("model", "done on five"),
+            turn("user", "VERIFIER ORDER: read every city back"),
+        ];
+        place_current_user_content(&mut history, &original, &original);
+        assert_eq!(
+            texts(&history),
+            vec![
+                ("user".into(), "set the mask on ten cities".into()),
+                ("model".into(), "done on five".into()),
+                ("user".into(), "VERIFIER ORDER: read every city back".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_original_turn_is_the_one_that_takes_the_injected_content() {
+        let original = turn("user", "plan the mission");
+        let injected = turn("user", "plan the mission\n\n[skill: mission planning]");
+        let mut history = vec![
+            original.clone(),
+            turn("model", "which orbit?"),
+            turn("user", "a nudge from a wrapper"),
+        ];
+        place_current_user_content(&mut history, &original, &injected);
+        assert_eq!(content_text(&history[0]), "plan the mission\n\n[skill: mission planning]");
+        assert_eq!(content_text(&history[2]), "a nudge from a wrapper");
+    }
+
+    #[test]
+    fn a_history_without_the_user_turn_gets_it_appended() {
+        let original = turn("user", "hello");
+        let mut history = vec![turn("model", "earlier answer")];
+        place_current_user_content(&mut history, &original, &original);
+        assert_eq!(texts(&history).last().unwrap().1, "hello");
+    }
+
+    #[test]
+    fn an_unmatched_user_turn_is_not_clobbered() {
+        // The stored request was rewritten (compaction, augmentation): nothing
+        // matches the original text. Leave the history as it is rather than
+        // overwrite whatever user turn happens to be last.
+        let original = turn("user", "hello");
+        let mut history = vec![turn("user", "[summary of an earlier hello]"), turn("model", "hi")];
+        let before = texts(&history);
+        place_current_user_content(&mut history, &original, &original);
+        assert_eq!(texts(&history), before);
+    }
 
     #[test]
     fn generation_config_layers_schema_and_cached_content() {
