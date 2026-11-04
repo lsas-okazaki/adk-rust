@@ -1,9 +1,11 @@
+use crate::a2a::transport::{HttpTransport, box_transport};
 use crate::a2a::{
     A2aClient, Part as A2aPart, Role, TaskArtifactUpdateEvent, TaskStatusUpdateEvent, UpdateEvent,
 };
 use adk_core::{Agent, Content, Event, EventStream, InvocationContext, Part, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
+use tower::{BoxError, Service};
 
 /// Configuration for a remote A2A agent
 #[derive(Clone)]
@@ -20,6 +22,13 @@ pub struct RemoteA2aConfig {
     /// Whether to use streaming for communication.
     /// If `None`, the agent uses streaming if the remote agent supports it.
     pub streaming: Option<bool>,
+    /// Optional caller-provided HTTP transport used for both the agent-card
+    /// fetch and the RPC requests. When `None`, a default client is
+    /// constructed per call. Use this to inject default headers (e.g. a
+    /// license JWT), TLS settings, proxy configuration, or per-request auth
+    /// (e.g. DPoP proofs) via `tower` layers; see
+    /// [`RemoteA2aAgentBuilder::with_client`].
+    pub http_client: Option<HttpTransport>,
     /// Mints the bearer token sent to the remote agent, for the running agent's
     /// [`ActingContext`](adk_core::ActingContext) and with `agent_url` as the resource.
     /// `None` sends no credential.
@@ -80,15 +89,25 @@ impl Agent for RemoteA2aAgent {
         let broker = self.config.credential_broker.clone();
         let scopes = self.config.credential_scopes.clone();
         let allowed_origins = self.config.allowed_endpoint_origins.clone();
+        let http_client = self.config.http_client.clone();
         let acting = ctx.acting_context();
 
         // Get user content from context
         let user_content = get_user_content_from_context(ctx.as_ref());
 
         let stream = async_stream::stream! {
-            // Create A2A client from a card whose endpoint is on an expected origin
-            let mut client = match A2aClient::resolve_agent_card_allowing(&url, &allowed_origins).await {
-                Ok(card) => A2aClient::new(card),
+            // Create A2A client from a card whose endpoint is on an expected origin,
+            // through the caller's transport when one was set.
+            let resolved = match &http_client {
+                Some(http) => A2aClient::resolve_agent_card_with_client(&url, &allowed_origins, http)
+                    .await
+                    .map(|card| A2aClient::from_transport(card, http.clone())),
+                None => A2aClient::resolve_agent_card_allowing(&url, &allowed_origins)
+                    .await
+                    .map(A2aClient::new),
+            };
+            let mut client = match resolved {
+                Ok(client) => client,
                 Err(e) => {
                     yield Ok(create_error_event(&invocation_id, &agent_name, &e.to_string()));
                     return;
@@ -174,6 +193,7 @@ pub struct RemoteA2aAgentBuilder {
     credential_broker: Option<Arc<dyn adk_core::CredentialBroker>>,
     credential_scopes: Vec<String>,
     allowed_endpoint_origins: Vec<String>,
+    http_client: Option<HttpTransport>,
 }
 
 impl RemoteA2aAgentBuilder {
@@ -186,6 +206,7 @@ impl RemoteA2aAgentBuilder {
             credential_broker: None,
             credential_scopes: Vec::new(),
             allowed_endpoint_origins: Vec::new(),
+            http_client: None,
         }
     }
 
@@ -228,6 +249,38 @@ impl RemoteA2aAgentBuilder {
         self
     }
 
+    /// Use a caller-provided HTTP client or `tower` service stack for both
+    /// agent-card discovery and RPC requests. Configure default headers, TLS,
+    /// timeouts, or proxies on the [`reqwest::Client`] before passing it in.
+    /// For per-request header values (e.g. DPoP proofs that change every
+    /// call) wrap the client in a [`tower::Layer`] that rewrites each
+    /// [`reqwest::Request`] before handing it on. The card's endpoint is still
+    /// checked against [`allow_endpoint_origin`](Self::allow_endpoint_origin).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_server::a2a::RemoteA2aAgent;
+    ///
+    /// let http = reqwest::Client::builder()
+    ///     .timeout(std::time::Duration::from_secs(60))
+    ///     .build()?;
+    ///
+    /// let agent = RemoteA2aAgent::builder("remote")
+    ///     .agent_url("https://agent.example.com")
+    ///     .with_client(http)
+    ///     .build()?;
+    /// ```
+    pub fn with_client<S>(mut self, client: S) -> Self
+    where
+        S: Service<reqwest::Request, Response = reqwest::Response> + Clone + Send + Sync + 'static,
+        S::Error: Into<BoxError>,
+        S::Future: Send + 'static,
+    {
+        self.http_client = Some(box_transport(client));
+        self
+    }
+
     pub fn build(self) -> Result<RemoteA2aAgent> {
         let agent_url = self
             .agent_url
@@ -241,6 +294,7 @@ impl RemoteA2aAgentBuilder {
             credential_broker: self.credential_broker,
             credential_scopes: self.credential_scopes,
             allowed_endpoint_origins: self.allowed_endpoint_origins,
+            http_client: self.http_client,
         }))
     }
 }
@@ -385,6 +439,49 @@ fn convert_task_to_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_builder_with_client() {
+        let agent = RemoteA2aAgent::builder("test")
+            .agent_url("http://localhost:8080")
+            .with_client(reqwest::Client::new())
+            .build()
+            .unwrap();
+        assert!(agent.config.http_client.is_some());
+    }
+
+    #[test]
+    fn test_builder_no_client_by_default() {
+        let agent =
+            RemoteA2aAgent::builder("test").agent_url("http://localhost:8080").build().unwrap();
+        assert!(agent.config.http_client.is_none());
+    }
+
+    /// The agent card is fetched through the caller's transport, so a sidecar that
+    /// gates the well-known path sees the same auth layers as the RPC calls.
+    #[tokio::test]
+    async fn the_card_is_fetched_through_the_callers_transport() {
+        use std::sync::Mutex;
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let recorder = seen.clone();
+        let transport = tower::service_fn(move |request: reqwest::Request| {
+            recorder.lock().unwrap().push(request.url().to_string());
+            async move { Err::<reqwest::Response, BoxError>(std::io::Error::other("refused").into()) }
+        });
+        let http = box_transport(transport);
+
+        let err =
+            A2aClient::resolve_agent_card_with_client("https://agent.example.com/", &[], &http)
+                .await
+                .expect_err("the transport refuses");
+
+        assert!(err.to_string().contains("refused"), "{err}");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["https://agent.example.com/.well-known/agent-card.json".to_string()]
+        );
+    }
 
     #[test]
     fn test_builder() {

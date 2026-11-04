@@ -570,6 +570,7 @@ async fn a_remote_member_runs_as_an_audited_a2a_delegation() {
             credential_broker: None,
             credential_scopes: Vec::new(),
             allowed_endpoint_origins: Vec::new(),
+            http_client: None,
         }),
         tools: MemberTools::ReadOnly,
         skills: false,

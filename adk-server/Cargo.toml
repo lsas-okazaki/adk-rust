@@ -42,7 +42,9 @@ anyhow.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 axum = { version = "0.8", features = ["macros"] }
-tower = { version = "0.4", features = ["util"] }
+# 0.5 for `util::BoxCloneSyncService`, the boxed transport behind the A2A
+# client (src/a2a/transport.rs); also the tower axum 0.8 already links.
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "timeout", "set-header", "limit"] }
 tracing = "0.1"
 base64 = "0.22"

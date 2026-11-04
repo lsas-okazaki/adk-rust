@@ -1,3 +1,4 @@
+use crate::a2a::transport::{self, HttpTransport, box_transport};
 use crate::a2a::{
     AgentCard, JsonRpcRequest, JsonRpcResponse, Message, MessageSendParams,
     TaskArtifactUpdateEvent, TaskStatusUpdateEvent, UpdateEvent,
@@ -6,10 +7,11 @@ use adk_core::Result;
 use futures::stream::Stream;
 use serde_json::Value;
 use std::pin::Pin;
+use tower::{BoxError, Service};
 
 /// A2A client for communicating with remote A2A agents
 pub struct A2aClient {
-    http_client: reqwest::Client,
+    http_client: HttpTransport,
     agent_card: AgentCard,
     credential: Option<adk_core::ScopedToken>,
 }
@@ -127,7 +129,25 @@ impl A2aClient {
     /// URL with [`resolve_agent_card`](Self::resolve_agent_card) or
     /// [`from_url`](Self::from_url), which check it.
     pub fn new(agent_card: AgentCard) -> Self {
-        Self { http_client: reqwest::Client::new(), agent_card, credential: None }
+        Self { http_client: transport::plain_transport(), agent_card, credential: None }
+    }
+
+    /// Create a new A2A client from an agent card with a caller-provided HTTP
+    /// client or `tower` service stack.
+    ///
+    /// Lets callers inject default headers, TLS settings, timeouts, or per-request
+    /// auth. A preconfigured [`reqwest::Client`] can be passed directly; for
+    /// per-request auth schemes (e.g. DPoP) where the header value must change
+    /// each call, wrap it in a [`tower::Layer`] that rewrites the
+    /// [`reqwest::Request`] first. Like [`new`](Self::new), the card is trusted
+    /// as given.
+    pub fn with_client<S>(agent_card: AgentCard, http_client: S) -> Self
+    where
+        S: Service<reqwest::Request, Response = reqwest::Response> + Clone + Send + Sync + 'static,
+        S::Error: Into<BoxError>,
+        S::Future: Send + 'static,
+    {
+        Self { http_client: box_transport(http_client), agent_card, credential: None }
     }
 
     /// Sends `token` as a bearer credential on every message request.
@@ -179,12 +199,32 @@ impl A2aClient {
         base_url: &str,
         allowed_origins: &[String],
     ) -> Result<AgentCard> {
+        Self::resolve_agent_card_with_client(
+            base_url,
+            allowed_origins,
+            &transport::plain_transport(),
+        )
+        .await
+    }
+
+    /// [`resolve_agent_card_allowing`](Self::resolve_agent_card_allowing) through a
+    /// caller-provided transport, for a well-known endpoint that requires the same
+    /// authentication as the agent's RPC endpoint.
+    ///
+    /// # Errors
+    ///
+    /// See [`resolve_agent_card`](Self::resolve_agent_card).
+    pub async fn resolve_agent_card_with_client(
+        base_url: &str,
+        allowed_origins: &[String],
+        client: &HttpTransport,
+    ) -> Result<AgentCard> {
         let base_url = base_url.trim_end_matches('/');
-        let client = reqwest::Client::new();
-        let fetch = |path: &'static str| client.get(format!("{base_url}{path}")).send();
-        let fetch_error = |e: reqwest::Error| {
-            adk_core::AdkError::agent(format!("Failed to fetch agent card: {e}"))
+        let fetch = |path: &'static str| {
+            transport::send(client, transport::request_builder().get(format!("{base_url}{path}")))
         };
+        let fetch_error =
+            |e: BoxError| adk_core::AdkError::agent(format!("Failed to fetch agent card: {e}"));
 
         let mut response = fetch("/.well-known/agent-card.json").await.map_err(fetch_error)?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -214,6 +254,39 @@ impl A2aClient {
         Ok(Self::new(card))
     }
 
+    /// Like [`from_url`](Self::from_url) but uses a caller-provided HTTP client or
+    /// `tower` service stack for both the agent-card fetch and later requests.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_server::a2a::A2aClient;
+    /// use reqwest::header::{HeaderMap, HeaderValue};
+    ///
+    /// // Send a license JWT as a default header on every request.
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert("X-License", HeaderValue::from_static("jwt-token"));
+    /// let http = reqwest::Client::builder().default_headers(headers).build()?;
+    ///
+    /// let client = A2aClient::from_url_with_client("https://agent.example.com", http).await?;
+    /// ```
+    pub async fn from_url_with_client<S>(base_url: &str, http_client: S) -> Result<Self>
+    where
+        S: Service<reqwest::Request, Response = reqwest::Response> + Clone + Send + Sync + 'static,
+        S::Error: Into<BoxError>,
+        S::Future: Send + 'static,
+    {
+        let http_client = box_transport(http_client);
+        let card = Self::resolve_agent_card_with_client(base_url, &[], &http_client).await?;
+        Ok(Self { http_client, agent_card: card, credential: None })
+    }
+
+    /// An A2A client that sends through `http_client`, for a card already resolved
+    /// through it.
+    pub(crate) fn from_transport(agent_card: AgentCard, http_client: HttpTransport) -> Self {
+        Self { http_client, agent_card, credential: None }
+    }
+
     /// Get the agent card
     pub fn agent_card(&self) -> &AgentCard {
         &self.agent_card
@@ -231,10 +304,9 @@ impl A2aClient {
             id: Some(Value::String(uuid::Uuid::new_v4().to_string())),
         };
 
-        let post = self.http_client.post(&self.agent_card.url);
-        let response = bearer(post, self.credential.as_ref(), &self.agent_card.url)?
-            .json(&request)
-            .send()
+        let post = transport::request_builder().post(&self.agent_card.url);
+        let post = bearer(post, self.credential.as_ref(), &self.agent_card.url)?.json(&request);
+        let response = transport::send(&self.http_client, post)
             .await
             .map_err(|e| adk_core::AdkError::agent(format!("Request failed: {e}")))?;
 
@@ -270,10 +342,9 @@ impl A2aClient {
             id: Some(Value::String(uuid::Uuid::new_v4().to_string())),
         };
 
-        let post = self.http_client.post(&stream_url);
-        let response = bearer(post, self.credential.as_ref(), &stream_url)?
-            .json(&request)
-            .send()
+        let post = transport::request_builder().post(&stream_url);
+        let post = bearer(post, self.credential.as_ref(), &stream_url)?.json(&request);
+        let response = transport::send(&self.http_client, post)
             .await
             .map_err(|e| adk_core::AdkError::agent(format!("Request failed: {e}")))?;
 
