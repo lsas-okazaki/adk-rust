@@ -5,7 +5,11 @@
  * store, the bindings and the link check.
  */
 export { DrawnView, SHOWN_ROWS } from "./DrawnView";
-export type { SendForm } from "./DrawnView";
+export type { ExtensionRenderer, ExtensionRendererProps, ExtensionRenderers, SendForm } from "./DrawnView";
+export { ChartView, compact, niceTicks } from "./ChartView";
+export { DepthView } from "./DepthView";
+export { SceneFrame, SceneText } from "./scene/SceneFrame";
+export { visible } from "../safe";
 export { RefusedNotice } from "./Refused";
 export { GenuiProtocols, refusedIn } from "./Protocols";
 export { formsPath, useFormState } from "./forms";

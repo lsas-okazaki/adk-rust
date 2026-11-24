@@ -61,7 +61,7 @@ use crate::peers::MULTIBYTE_TEXT;
 use crate::scripted::{SECRET_REASONING, ScriptedModel, THINKING_ANSWER};
 
 const GEMINI_FAST: &str = "gemini-3.5-flash-lite";
-const GEMINI_THINKING: &str = "gemini-3.7-flash";
+const GEMINI_THINKING: &str = "gemini-3.8-flash";
 const OPENAI_MODEL: &str = "gpt-5.6-terra";
 const REBIND_HOST: &str = "rebind.attacker.example";
 
@@ -572,16 +572,20 @@ async fn group_b(keys: &Keys, model: &ScriptedModel, out: &mut Vec<Outcome>) {
 
     // B1: the same request from loopback reaches the agent.
     let control = async {
-        let seeded = client
-            .post(format!("{base}/api/apps/{app}/users/alice/sessions/s-alice"))
-            .json(&json!({}))
-            .send()
-            .await?;
-        anyhow::ensure!(
-            seeded.status().is_success(),
-            "seeding alice's session: {}",
-            seeded.status()
-        );
+        // An ADK run needs an existing session. mallory's is seeded too, so B2 is refused for
+        // its Host alone.
+        for (user, session) in [("alice", "s-alice"), ("bob", "s-bob"), ("mallory", "s-mallory")] {
+            let seeded = client
+                .post(format!("{base}/api/apps/{app}/users/{user}/sessions/{session}"))
+                .json(&json!({}))
+                .send()
+                .await?;
+            anyhow::ensure!(
+                seeded.status().is_success(),
+                "seeding {user}'s session: {}",
+                seeded.status()
+            );
+        }
         let response = client
             .post(format!("{base}/api/run"))
             .json(&run_body(app, "bob", "s-bob", "Say hello."))
@@ -801,9 +805,14 @@ async fn group_c(keys: &Keys, model: &ScriptedModel, out: &mut Vec<Outcome>) {
             vec![],
             a2a_protocol_types::AgentCapabilities::none(),
         );
-        let task =
+        let reply =
             A2aV1Client::new(card).send_message(v1_text("Please delete record R-17.")).await?;
-        Ok::<_, anyhow::Error>(task.status.state)
+        match reply {
+            a2a_protocol_types::responses::SendMessageResponse::Task(task) => {
+                Ok::<_, anyhow::Error>(task.status.state)
+            }
+            other => anyhow::bail!("expected a task, got {other:?}"),
+        }
     }
     .await;
     out.push(match v1 {
@@ -1001,6 +1010,8 @@ async fn group_e(keys: &Keys, out: &mut Vec<Outcome>) {
             streaming: Some(true),
             credential_broker: None,
             credential_scopes: vec![],
+            send_configuration: None,
+            hooks: Default::default(),
         });
         run_client(Arc::new(agent), "Greet me.").await
     }
@@ -1104,6 +1115,8 @@ async fn group_f(out: &mut Vec<Outcome>) {
             streaming: Some(false),
             credential_broker: None,
             credential_scopes: vec![],
+            send_configuration: None,
+            hooks: Default::default(),
         });
         run_client(Arc::new(agent), "my account number is 12345").await?;
         Ok((sink.received(), format!("the message was sent to {}", sink.peer.base_url)))

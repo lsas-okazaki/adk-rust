@@ -81,6 +81,9 @@ pub fn activity_for_event(event: &KernelEvent) -> Option<Activity> {
                 Some(WakeOutcome::Spawned { .. }) => "spawned",
                 Some(WakeOutcome::Deduplicated { .. }) => "deduplicated",
                 Some(WakeOutcome::Expired { .. }) => "expired",
+                Some(WakeOutcome::Skipped { .. }) => "skipped",
+                Some(WakeOutcome::Coalesced { .. }) => "coalesced",
+                Some(WakeOutcome::Missed { .. }) => "missed",
                 None => "unmatched",
             };
             kernel(LedgerKind::Wake).with_effect(effect).with_subject(source.clone())
@@ -123,6 +126,9 @@ pub fn activity_for_event(event: &KernelEvent) -> Option<Activity> {
         KernelEvent::Agent { id, change, .. } => kernel(LedgerKind::Audit)
             .with_effect(format!("agent.{change}"))
             .with_subject(id.clone()),
+        KernelEvent::Subagent { id, status, .. } => kernel(LedgerKind::Audit)
+            .with_effect(format!("subagent.{status}"))
+            .with_subject(id.clone()),
         KernelEvent::Governance { frozen, .. } => {
             kernel(LedgerKind::Governance).with_effect(if *frozen { "frozen" } else { "unfrozen" })
         }
@@ -137,7 +143,8 @@ fn event_pid(event: &KernelEvent) -> Option<&str> {
         KernelEvent::Process { pid, .. }
         | KernelEvent::Held { pid, .. }
         | KernelEvent::Decided { pid, .. }
-        | KernelEvent::RuleHit { pid, .. } => Some(pid),
+        | KernelEvent::RuleHit { pid, .. }
+        | KernelEvent::Subagent { pid, .. } => Some(pid),
         KernelEvent::Wake { pid, .. } => pid.as_deref(),
         KernelEvent::Spend { .. }
         | KernelEvent::Agenda { .. }
@@ -310,6 +317,10 @@ impl AuditRecorder for LedgerAuditTap {
             tracing::warn!(error = %error, "could not write an audit record's ledger row");
         }
         Ok(())
+    }
+
+    async fn seal(&self) -> adk_core::Result<()> {
+        self.inner.seal().await
     }
 }
 
@@ -490,6 +501,7 @@ mod tests {
             args: json!({ "to": "acct-99", "amount": 10 }),
             acting: None,
             origin: None,
+            evidence: Vec::new(),
         };
         let held = activity_for_event(&KernelEvent::Held {
             pid: "run-1".into(),
@@ -551,5 +563,33 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(records.records().len(), 1);
+    }
+
+    /// A kernel stopping cleanly seals through the tap, so the signed log under it verifies.
+    #[tokio::test]
+    async fn the_tap_forwards_a_seal() {
+        #[derive(Default)]
+        struct Seals(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl AuditRecorder for Seals {
+            fn digest(&self, value: &Value) -> String {
+                adk_core::json_digest(value)
+            }
+            async fn record(&self, _draft: AuditRecordDraft) -> adk_core::Result<()> {
+                Ok(())
+            }
+            async fn seal(&self) -> adk_core::Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let inner = Arc::new(Seals::default());
+        let ledger = Ledger::new(
+            Arc::new(crate::proc::InMemoryLedgerStore::new()),
+            crate::proc::LedgerKey::from_bytes([1; 32]),
+        );
+        let tap = LedgerAuditTap::new(inner.clone(), Arc::new(ledger));
+        tap.seal().await.unwrap();
+        assert_eq!(inner.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

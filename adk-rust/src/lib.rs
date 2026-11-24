@@ -20,7 +20,7 @@
 //! #[tokio::main]
 //! async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 //!     let api_key = std::env::var("GOOGLE_API_KEY")?;
-//!     let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+//!     let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
 //!
 //!     let agent = LlmAgentBuilder::new("assistant")
 //!         .description("A helpful AI assistant")
@@ -55,11 +55,12 @@
 //! # auth, server, eval, guardrail, plugin, artifacts, tools, memory, telemetry, computer-use
 //! adk-rust = { version = "3.0.0", features = ["standard"] }
 //!
-//! # Enterprise — standard + realtime, browser, rag, payments, awp
+//! # Enterprise — standard + realtime, browser, rag, payments, awp, and autonomy: the
+//! # harness, its kernel, durable and background runs, approvals and signed audit
 //! adk-rust = { version = "3.0.0", features = ["enterprise"] }
 //!
-//! # Full — enterprise + audio, code, sandbox, code-tools, the harness and its kernel, and
-//! # the graph-functional, graph-node-cache, graph-delta, and graph-time-travel capabilities
+//! # Full — enterprise + audio, code, sandbox, code-tools, the AWP website, vision, and the
+//! # graph-functional, graph-node-cache, graph-delta, graph-time-travel, and graph-yaml capabilities
 //! adk-rust = { version = "3.0.0", features = ["full"] }
 //!
 //! # Custom — pick exactly what you need
@@ -67,6 +68,24 @@
 //!     "agents", "gemini", "tools", "sessions", "openai", "openrouter"
 //! ] }
 //! ```
+//!
+//! ## Autonomous Agents
+//!
+//! 3.0 builds agents that work on their own inside limits you set: goals that iterate until a
+//! check passes and park on a decision; wake-ups on a schedule, a file change, a webhook or a
+//! queue message; one governed tool path with tool policies, approvals across runs, run
+//! budgets, spend caps, a kill switch and a signed audit log; and durable runs that resume
+//! after a crash.
+//!
+//! | Module | Feature | What it holds |
+//! |--------|---------|---------------|
+//! | `harness` | `harness` (in `enterprise` and `full`) | The governed harness agent: modes, standing approvals, a sandboxed shell, plans and durable goals |
+//! | `kernel` | `harness-kernel` (in `enterprise` and `full`) | The agent kernel `adk-rust up` runs: processes, wake sources, the event bus and the control plane |
+//! | `surface` | `surface` (in no tier) | The surface engine and the web home, over a harness or a kernel |
+//! | `vision` | `vision` (in `full`); `vision-local` adds the on-device backends | Local-first perception: regions in source pixels, verified weights, the egress gate, cloud describers and `sam-3.1`; with `harness`, the vision pack |
+//!
+//! [Build an autonomous agent](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/autonomy/index.md)
+//! takes one agent from a scaffold to running on its own.
 //!
 //! ## Agent Types
 //!
@@ -85,7 +104,7 @@
 //! use std::sync::Arc;
 //!
 //! let api_key = std::env::var("GOOGLE_API_KEY").map_err(|e| AdkError::config(e.to_string()))?;
-//! let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+//! let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
 //!
 //! let agent = LlmAgentBuilder::new("researcher")
 //!     .description("Research assistant with web search")
@@ -445,11 +464,16 @@
 //! | `rag` | RAG pipeline | enterprise |
 //! | `payments` | Agentic commerce (ACP/AP2) | enterprise |
 //! | `awp` | Agentic Web Protocol | enterprise |
+//! | `autonomy` | An agent that runs unattended: the harness and its kernel, durable and background runs, cron and webhook wake-ups, the approvals service, SQLite stores, signed audit | enterprise |
 //! | `code`, `sandbox`, `code-tools` | Code execution and sandboxed execution | full |
 //! | `audio` | Audio processing | full |
-//! | `graph-functional`, `graph-node-cache`, `graph-delta`, `graph-time-travel` | Graph capabilities | full |
-//! | `harness` | The governed, durable harness agent (`adk-harness`) | full |
-//! | `harness-kernel` | The agent kernel, the harness's always-on form (`adk-kernel`) | full |
+//! | `graph-functional`, `graph-node-cache`, `graph-delta`, `graph-time-travel`, `graph-yaml` | Graph capabilities | full |
+//! | `harness` | The governed, durable harness agent (`adk-harness`) | enterprise |
+//! | `harness-kernel` | The agent kernel, the harness's always-on form (`adk-kernel`) | enterprise |
+//! | `website` | The AWP website product (`adk-website`, `adk-site`) | full |
+//! | `vision` | Local-first perception (`adk-vision`): regions, manifests, the egress gate, cloud describers, `sam-3.1`, the image privacy guardrail | full |
+//! | `vision-local` | `vision` + the on-device backends: RF-DETR, EfficientSAM, SAM 2.1, SigLIP 2, PP-OCRv6, PaddleOCR-VL-1.6 | opt-in |
+//! | `surface` | Agent surfaces: the engine and the web home (`adk-surface`) | opt-in |
 //! | `harness-browser`, `harness-computer-use`, `harness-payments`, `harness-voice`, `harness-managed` | Harness packs | opt-in |
 //! | `cli` | CLI launcher with serve mode | opt-in |
 //! | `managed-runtime` | Managed agent runtime (`adk-managed`) | opt-in |
@@ -705,6 +729,8 @@ pub mod computer_use {
 /// - [`AcpAgentTool`](acp::AcpAgentTool) - An external ACP agent (Claude Code, Codex,
 ///   Kiro CLI) as a tool
 /// - [`AcpSession`](acp::AcpSession) - A persistent session with an external ACP agent
+/// - [`AcpConnection`](acp::AcpConnection) - One external ACP agent shared by several
+///   sessions, with listing, loading, forking, archiving and authentication
 /// - [`agent_client_protocol`](acp::agent_client_protocol) - The official ACP SDK
 ///
 /// Exposing an ADK agent over ACP needs `adk-acp`'s `server` feature.
@@ -956,6 +982,45 @@ pub mod anthropic_client {
     pub use adk_anthropic::*;
 }
 
+/// Local inference in process through mistral.rs, with no separate model server.
+///
+/// Everything `adk-mistralrs` exports:
+/// - [`MistralRsModel`](mistralrs::MistralRsModel) - Text models implementing [`Llm`]
+/// - [`MistralRsConfig`](mistralrs::MistralRsConfig), [`ModelSource`](mistralrs::ModelSource),
+///   [`QuantizationLevel`](mistralrs::QuantizationLevel) - Loading and in-situ quantization
+/// - [`MistralRsAdapterModel`](mistralrs::MistralRsAdapterModel) - LoRA and X-LoRA adapters
+/// - [`MistralRsVisionModel`](mistralrs::MistralRsVisionModel),
+///   [`MistralRsEmbeddingModel`](mistralrs::MistralRsEmbeddingModel),
+///   [`MistralRsSpeechModel`](mistralrs::MistralRsSpeechModel),
+///   [`MistralRsDiffusionModel`](mistralrs::MistralRsDiffusionModel) - Other modalities
+/// - [`MistralRsMultiModel`](mistralrs::MistralRsMultiModel) - Several models served by name
+///
+/// GPU support comes from `adk-mistralrs`'s own `cuda` and `metal` features.
+///
+/// Available with feature: `mistralrs`
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use adk_rust::mistralrs::{MistralRsConfig, MistralRsModel, ModelSource, QuantizationLevel};
+///
+/// # #[tokio::main]
+/// # async fn main() -> adk_rust::mistralrs::Result<()> {
+/// let config = MistralRsConfig::builder()
+///     .model_source(ModelSource::huggingface("Qwen/Qwen3-4B"))
+///     .isq(QuantizationLevel::Q4K)
+///     .build();
+/// let model = MistralRsModel::new(config).await?;
+/// # let _ = model;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "mistralrs")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mistralrs")))]
+pub mod mistralrs {
+    pub use adk_mistralrs::*;
+}
+
 // ============================================================================
 // v0.7.0 Competitive Parity Feature Re-exports (opt-in only)
 // ============================================================================
@@ -984,9 +1049,9 @@ pub mod yaml_agent {
 /// - [`InMemoryAgentRegistryStore`](server::registry::InMemoryAgentRegistryStore) - In-memory storage
 /// - [`registry_router`](server::registry::registry_router) - Axum router for registry endpoints
 ///
-/// Available with feature: `agent-registry`
-#[cfg(feature = "agent-registry")]
-#[cfg_attr(docsrs, doc(cfg(feature = "agent-registry")))]
+/// Available with feature: `server`
+#[cfg(feature = "server")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server")))]
 pub mod registry {
     pub use adk_server::registry::*;
 }
@@ -1055,9 +1120,9 @@ pub mod spanner {
 /// - [`UserSimulator`](eval::personas::UserSimulator) - Generate persona-driven messages
 /// - [`PersonaRegistry`](eval::personas::PersonaRegistry) - Load personas from directory
 ///
-/// Available with feature: `personas`
-#[cfg(feature = "personas")]
-#[cfg_attr(docsrs, doc(cfg(feature = "personas")))]
+/// Available with feature: `eval`
+#[cfg(feature = "eval")]
+#[cfg_attr(docsrs, doc(cfg(feature = "eval")))]
 pub mod personas {
     pub use adk_eval::personas::*;
 }
@@ -1112,12 +1177,12 @@ pub mod managed {
 /// `ConsolePrompter`, which asks for approvals at the terminal, and the `ConsoleIo` it
 /// reads from.
 ///
-/// Available with feature: `harness` (included in `full`)
+/// Available with feature: `harness` (included in `enterprise` and `full`)
 ///
 /// # Example
 ///
 /// ```rust
-/// use adk_rust::harness::{HarnessAgent, HarnessMode, InstructionsConfig};
+/// use adk_rust::harness::{HarnessAgent, HarnessMode, InstructionsConfig, Workspace};
 /// use adk_rust::model::{ScriptedLlm, ScriptedResponse};
 /// use std::sync::Arc;
 ///
@@ -1125,7 +1190,7 @@ pub mod managed {
 /// let model = Arc::new(ScriptedLlm::new("scripted", vec![ScriptedResponse::text("done")]));
 /// let harness = HarnessAgent::builder("harness")
 ///     .model(model)
-///     .workspace(adk_devtools::Workspace::new(std::env::temp_dir()))
+///     .workspace(Workspace::new(std::env::temp_dir()))
 ///     .project_instructions(InstructionsConfig { user_file: None, ..InstructionsConfig::default() })
 ///     .mode(HarnessMode::Plan)
 ///     .build()?;
@@ -1149,7 +1214,7 @@ pub mod harness {
 /// builder, the process table, wake sources, the event bus and the
 /// [`control`](kernel::control) plane `adk-rust up` serves.
 ///
-/// Available with feature: `harness-kernel` (included in `full`)
+/// Available with feature: `harness-kernel` (included in `enterprise` and `full`)
 ///
 /// # Example
 ///
@@ -1168,6 +1233,42 @@ pub mod harness {
 #[cfg_attr(docsrs, doc(cfg(feature = "harness-kernel")))]
 pub mod kernel {
     pub use adk_kernel::*;
+}
+
+/// Local-first perception for agents (spec 3.7).
+///
+/// Everything `adk-vision` exports: artifact-backed images, regions in source pixels with
+/// their transform chains, model manifests pinned by revision and SHA-256, the perception
+/// traits and [`VisionRuntime`](vision::VisionRuntime), the [`EgressGate`](vision::EgressGate)
+/// a remote backend's every image passes, the governed [`VisionToolset`](vision::VisionToolset),
+/// the cloud describers and Meta `sam-3.1`. With `harness`, `pack_vision` gives a harness the
+/// vision pack.
+///
+/// Available with feature: `vision` (included in `full`); the on-device backends with
+/// `vision-local`
+///
+/// # Example
+///
+/// ```rust
+/// use adk_rust::vision::{BBox, DecodedImage, SourceImage, Transform, TransformChain};
+///
+/// // A 3024×1964 screenshot, cropped and downscaled before a model sees it: a box the model
+/// // answers in its own pixels maps back to the screenshot's.
+/// let chain = TransformChain::new(3024, 1964)
+///     .then(Transform::Crop { x: 1000, y: 500, width: 800, height: 600 })
+///     .unwrap()
+///     .then(Transform::Resize { width: 400, height: 300 })
+///     .unwrap();
+/// let source = chain.bbox_to_source(&BBox::new(10.0, 10.0, 110.0, 60.0));
+/// assert_eq!(source, BBox::new(1020.0, 520.0, 1220.0, 620.0));
+///
+/// let page = SourceImage::from_pixels(DecodedImage::filled(64, 64, [255; 4])).unwrap();
+/// assert!(page.digest().to_string().starts_with("sha256:"));
+/// ```
+#[cfg(feature = "vision")]
+#[cfg_attr(docsrs, doc(cfg(feature = "vision")))]
+pub mod vision {
+    pub use adk_vision::*;
 }
 
 /// Agent surfaces: the engine every surface runs on, and the web home (spec 3.3).
@@ -1350,7 +1451,10 @@ pub fn provider_from_env() -> Result<std::sync::Arc<dyn Llm>> {
 /// High-level single-turn agent invocation.
 ///
 /// Creates an agent with the given instructions, sends the input, and returns
-/// the text response. Uses [`provider_from_env`] to auto-detect the LLM provider.
+/// the text response. Detects the provider from `ANTHROPIC_API_KEY`, then
+/// `OPENAI_API_KEY`, then `GOOGLE_API_KEY` (Gemini on AI Studio), among the
+/// providers compiled in. Unlike [`provider_from_env`], it does not read the
+/// Vertex AI flags.
 ///
 /// This is the fastest way to get started with ADK — a single function call
 /// that handles provider selection, session creation, agent building, and
@@ -1504,16 +1608,17 @@ pub async fn run(instructions: &str, input: &str) -> Result<String> {
 pub mod prelude {
     // Core types (always available)
     pub use crate::{
-        AdkError, Agent, BeforeModelResult, Content, Event, EventStream, InvocationContext, Llm,
-        LlmRequest, LlmResponse, Part, Result, RunConfig, RunConfigBuilder, Session, State, Tool,
-        ToolContext, Toolset,
+        AdkError, Agent, BeforeModelResult, Choice, ChoiceOption, Content, Decider, Decision,
+        Event, EventStream, InvocationContext, Llm, LlmRequest, LlmResponse, Part, Result,
+        RunConfig, RunConfigBuilder, Session, State, Tool, ToolContext, Toolset, decide,
     };
 
     // Agents
     #[cfg(feature = "agents")]
     pub use crate::agent::{
-        ConditionalAgent, CustomAgent, CustomAgentBuilder, LlmAgent, LlmAgentBuilder,
-        LlmConditionalAgent, LlmConditionalAgentBuilder, LoopAgent, ParallelAgent, SequentialAgent,
+        ConditionalAgent, CustomAgent, CustomAgentBuilder, DecisionAgent, DecisionAgentBuilder,
+        LlmAgent, LlmAgentBuilder, LlmConditionalAgent, LlmConditionalAgentBuilder, LoopAgent,
+        ParallelAgent, SequentialAgent,
     };
 
     // Models

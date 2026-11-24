@@ -1,6 +1,6 @@
 [package]
 name = "adk-sandbox"
-description = "Isolated code execution runtime for ADK agents"
+description = "Sandboxed code execution for ADK-Rust: process, WASM and remote backends, with Seatbelt, bubblewrap and Windows restricted-token enforcers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,7 @@ homepage.workspace = true
 repository.workspace = true
 documentation = "https://docs.rs/adk-sandbox"
 readme = "README.md"
+exclude = ["tests/"]
 keywords = ["adk", "sandbox", "code-execution", "wasm", "isolation"]
 categories = ["development-tools", "asynchronous"]
 
@@ -18,14 +19,14 @@ adk-core = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["process", "time", "io-util", "fs", "rt"] }
+tokio = { workspace = true, features = ["process", "time", "io-util", "fs", "rt", "sync", "macros"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tempfile = "3.10"
 
 # Optional dependencies for wasm feature
-wasmtime = { version = "48", optional = true }
-wasmtime-wasi = { version = "48", optional = true }
+wasmtime = { version = "48.0.8", optional = true }
+wasmtime-wasi = { version = "48.0.8", optional = true }
 
 # Optional dependency for the egress proxy's audit records
 chrono = { workspace = true, optional = true }
@@ -36,6 +37,14 @@ bollard = { version = "0.18", optional = true }
 uuid = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 
+# Optional dependencies for the remote providers
+reqwest = { workspace = true, optional = true }
+base64 = { version = "0.22", optional = true }
+# Modal's gRPC API: the tonic and prost versions the workspace already resolves.
+tonic = { version = "0.14", optional = true, default-features = false, features = ["channel", "codegen", "tls-aws-lc", "tls-webpki-roots"] }
+tonic-prost = { version = "0.14", optional = true }
+prost = { version = "0.14", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -43,7 +52,7 @@ libc = "0.2"
 # restricted-token enforcer API (spec 3.2 §10 W5)
 [target.'cfg(windows)'.dependencies]
 find-msvc-tools = "0.1.9"
-windows-sys = { version = "0.59", optional = true, features = [
+windows-sys = { version = "0.61", optional = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
@@ -67,6 +76,14 @@ egress-proxy = ["dep:chrono", "adk-core/egress-dns", "tokio/net", "tokio/macros"
 workspace = ["dep:tar", "dep:uuid"]
 workspace-docker = ["workspace", "dep:bollard", "dep:futures"]
 
+# Remote sandbox providers behind `SandboxClient`, one feature each.
+# E2B: Firecracker microVMs over the REST control plane and the in-VM envd daemon.
+remote-e2b = ["workspace", "dep:reqwest", "dep:futures", "dep:base64"]
+# Daytona: sandboxes over the REST control plane and the toolbox API.
+remote-daytona = ["workspace", "dep:reqwest", "dep:futures"]
+# Modal: Sandboxes over Modal's gRPC API (vendored protobuf subset, generated code committed).
+remote-modal = ["workspace", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:base64"]
+
 # OS-level sandbox enforcers
 sandbox-macos = []       # Seatbelt via sandbox-exec (no extra deps)
 sandbox-linux = []       # Bubblewrap via bwrap binary (no extra deps)
@@ -82,6 +99,11 @@ sandbox-native = ["sandbox-macos", "sandbox-linux", "sandbox-windows"]
 
 [dev-dependencies]
 proptest = "1.4"
+wiremock = "0.6"
+# The Modal contract tests' mock gRPC server.
+tonic = { version = "0.14", default-features = false, features = ["server", "router", "codegen"] }
+tonic-prost = "0.14"
+prost = "0.14"
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 
 # Document every feature-gated API on docs.rs.

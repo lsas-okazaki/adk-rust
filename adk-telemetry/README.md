@@ -15,12 +15,18 @@ OpenTelemetry integration for Rust Agent Development Kit (ADK-Rust) agent observ
 - **Metrics** - OTLP metrics export with the `otlp` feature
 - **In-process spans** - `AdkSpanExporter` keeps recent spans for the server's debug endpoints
 - **SQLite and Google Cloud export** - behind the `sqlite` and `gcp` features
-- **GenAI Semantic Conventions** - OTel GenAI semconv v1.41.0 attributes:
-  - `GenAiSpanBuilder` — fluent API for model call spans with `gen_ai.*` attributes
-  - `GenAiResponseRecorder` — records response model, finish reasons, token usage
-  - `GenAiProvider` / `GenAiOperation` enums for all supported providers
-  - `map_finish_reason()` — provider-specific finish reason mapping
-  - `ContentEventEmitter` — opt-in prompt/completion capture
+- **GenAI Semantic Conventions** - the OpenTelemetry GenAI conventions of the
+  [`semantic-conventions-genai`](https://github.com/open-telemetry/semantic-conventions-genai)
+  repository (`main` as of 2026-11-18, schema `gen-ai-dev/1.42.0-dev`; the conventions left the
+  core repository in v1.42.0, after v1.41.0):
+  - `llm_generate_span`, `agent_run_span`, `tool_execute_span` — `chat {model}` (client),
+    `invoke_agent {agent}` and `execute_tool {tool}` (internal) spans
+  - `GenAiSpanBuilder`, `GenAiResponseRecorder`, `record_llm_usage`, `record_str_array`
+  - `GenAiProvider` / `GenAiOperation` enums and `genai_provider_name`
+  - `map_finish_reason()` — provider finish reasons as `stop`, `length`, `content_filter`,
+    `tool_call`, `error`
+  - `config::capture_content` — opt-in conversation capture, `OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT`
+  - `ContentEventEmitter` — the `gen_ai.client.inference.operation.details` event
   - Feature: `genai-semconv` (enabled by default)
 
 ## Installation
@@ -32,9 +38,8 @@ adk-telemetry = "3.0.0"
 
 | Feature | Default | Enables |
 |---------|---------|---------|
-| `genai-semconv` | yes | The `semconv`, `config`, and `events` modules |
+| `genai-semconv` | yes | The `semconv` and `events` modules |
 | `otlp` | no | `init_with_otlp`, `build_otlp_layer`, and the OpenTelemetry re-exports (`global`, `Meter`) |
-| `metrics` | no | Alias that implies `otlp` |
 | `json` | no | JSON log formatting |
 | `sqlite` | no | `init_with_sqlite`, `SqliteSpanExporter`, `SqliteTraceReader` |
 | `gcp` | no | `init_with_gcp` and `init_json_logging` (implies `otlp` and `json`) |
@@ -78,7 +83,7 @@ RUST_LOG=adk_agent=trace,adk_model=debug cargo run
 
 ## OpenTelemetry Export
 
-Configure OTLP export for distributed tracing (`otlp` feature; `adk-rust` forwards it as `telemetry-otlp`):
+Configure OTLP export for distributed tracing (`otlp` feature; `adk-rust` forwards it as `telemetry-otlp`, which no tier enables):
 
 ```rust
 use adk_telemetry::init_with_otlp;
@@ -103,7 +108,8 @@ adk-telemetry = { version = "3.0.0", features = ["sqlite"] }
 
 The exporter links the same `libsqlite3-sys` as SQLx's SQLite driver, so it shares a
 lockfile with `SqliteSessionService`, `SqliteMemoryService`, and the SQLite graph
-checkpointer.
+checkpointer. This block and the next need the `sqlite` feature, which no `adk-rust` tier
+enables:
 
 ```rust
 use adk_telemetry::init_with_sqlite;
@@ -152,6 +158,8 @@ and the `gemini-agent-platform` meta-feature includes it:
 ```toml
 adk-telemetry = { version = "3.0.0", features = ["gcp"] }
 ```
+
+This block needs the `gcp` feature, which no `adk-rust` tier enables:
 
 ```rust
 use adk_telemetry::init_with_gcp;
@@ -229,7 +237,7 @@ fn main() {
 }
 ```
 
-Recorded fields: `gen_ai.usage.input_tokens`, `output_tokens`, `total_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `thinking_tokens`, `audio_input_tokens`, `audio_output_tokens`.
+Recorded fields: `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens`, `gen_ai.usage.reasoning.output_tokens`, `gen_ai.usage.audio.input_tokens`, `gen_ai.usage.audio.output_tokens`. `total_tokens` is not recorded: the conventions define no total.
 
 ## Re-exports
 
@@ -260,6 +268,8 @@ fn main() {}
 | `shutdown_telemetry` flushes and shuts down every provider this crate built | — |
 | Child spans carry `adk.app_name` and `adk.user_id` from `agent.execute` | — |
 | Model and tool payloads stay out of spans and logs unless `RunConfig::record_payloads` is set | — |
+| The `metrics` feature is removed | Enable `otlp`, which exports metrics |
+| The implicit `google-cloud-auth`, `http`, `tokio`, and `tonic` features are removed | Enable `gcp` |
 
 See the [2.x to 3.0 migration guide](../docs/official_docs/migration/2.x-to-3.0.md) and the [changelog](../CHANGELOG.md) for the full list.
 

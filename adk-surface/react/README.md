@@ -1,6 +1,6 @@
 # @zavora-ai/adk-surface-react
 
-The renderer of [adk-surface](../README.md)'s web home for agent-drawn UI (spec 3.3 §6.1 `genui`), as a React package. It replaces `@zavora-ai/adk-ui-react`.
+The renderer of [adk-surface](../README.md)'s web home for agent-drawn UI (spec 3.3 §6.1 `genui`), as a React package. It replaces `@zavora-ai/adk-ui-react` 2; `@zavora-ai/adk-ui-react` 3 adds renderers for adk-ui's extension catalogs to its `DrawnView`.
 
 | Export | What it draws |
 |---|---|
@@ -18,7 +18,9 @@ The wire types (`DrawnSurface`, `AppView`, `AppOpen`, `AppRequest`, `AppAnswer`,
 npm install @zavora-ai/adk-surface-react
 ```
 
-React 18.3 or 19 is a peer dependency. The package has no other dependency.
+React 18.3 or 19 is a peer dependency. Its one dependency is `three` (0.185.1, pinned), which
+draws an agent's 3D scenes. It is imported only by a lazily loaded chunk, so a drawing without a
+scene never loads it, and your bundler splits it out.
 
 ## Use
 
@@ -36,6 +38,25 @@ export function Drawing({ surface, send }: { surface: DrawnSurface; send: (actio
 `tokens.css` defines the §9 colour tokens in light and dark; leave it out when the host page defines `--card`, `--border`, `--text` and the rest itself.
 
 A drawn form's **Send** never runs a tool: the host posts a `submitDrawn` command to `POST /api/surface/commands`, the drawing agent holds the call, and the person decides on its card. An app's `tools/call` is held the same way. Nothing a drawing or an app shows can approve anything (spec 3.3 §7.4 rule 5).
+
+### Extension catalogs
+
+A drawing in an extension catalog (for example `adk-ui`'s insight catalog) arrives with each extension component's home view: charts draw natively with `ChartView` in the `--chart-1` … `--chart-8` colours, and the rest as forms components. A host that wants richer drawings passes `renderers`, by catalog id and component type:
+
+```tsx
+import { DrawnView } from "@zavora-ai/adk-surface-react";
+import type { ExtensionRenderers } from "@zavora-ai/adk-surface-react";
+
+const renderers: ExtensionRenderers = {
+  "https://zavora.ai/a2ui/catalogs/adk-ui-insight/1.0/catalog.json": {
+    Metric: ({ props }) => <BigNumber label={String(props.label)} value={props.value} />,
+  },
+};
+
+<DrawnView surface={surface} onSend={send} renderers={renderers} />;
+```
+
+A renderer gets the component's properties as the server resolved and checked them, the nodes it holds and `renderChild` to draw one as the home does; it gets no way to send or change a value, because an extension component only shows. Draw from `props` alone, never from a data model of your own, so what was checked is what is shown. A component without a renderer is drawn as its home view.
 
 ## Build
 

@@ -163,17 +163,20 @@ impl A2aClient {
 
     /// Resolves an agent card from a base URL.
     ///
-    /// Fetches `/.well-known/agent-card.json`, the path A2A 0.3.0 and later define,
-    /// and falls back to `/.well-known/agent.json` when that path returns 404, so
-    /// servers that predate A2A 0.3.0 still resolve.
+    /// Fetches `/.well-known/agent-card.json`, the path A2A 0.3.0 and later define. Falls
+    /// back to `/.well-known/agent.json` when that path returns 404, so servers that
+    /// predate A2A 0.3.0 still resolve. It also falls back when that path holds a card
+    /// that is not a 0.3 card, such as the v1 card a server that speaks both versions
+    /// serves there; adk-server's [`with_a2a`](crate::ServerBuilder::with_a2a) keeps its
+    /// 0.3 card at `agent.json`.
     ///
     /// The card's endpoint must be on `base_url`'s origin; see [`check_card_endpoint`].
     ///
     /// # Errors
     ///
-    /// Returns an error when the request fails, when the card path answers with a
-    /// non-success status other than the 404 that triggers the fallback, when the
-    /// body is not an agent card, or when the card names an endpoint on another origin
+    /// Returns an error when the request fails, when a card path answers with a
+    /// non-success status other than the 404 that triggers the fallback, when neither
+    /// path holds a 0.3 agent card, or when the card names an endpoint on another origin
     /// (`a2a.card_endpoint_refused`).
     pub async fn resolve_agent_card(base_url: &str) -> Result<AgentCard> {
         Self::resolve_agent_card_allowing(base_url, &[]).await
@@ -226,22 +229,42 @@ impl A2aClient {
         let fetch_error =
             |e: BoxError| adk_core::AdkError::agent(format!("Failed to fetch agent card: {e}"));
 
-        let mut response = fetch("/.well-known/agent-card.json").await.map_err(fetch_error)?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            response = fetch("/.well-known/agent.json").await.map_err(fetch_error)?;
-        }
+        // `None` when the path does not exist; otherwise the body, if it is a 0.3 card.
+        let read = |response: reqwest::Response| async move {
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            if !response.status().is_success() {
+                return Err(adk_core::AdkError::agent(format!(
+                    "Failed to fetch agent card: HTTP {}",
+                    response.status()
+                )));
+            }
+            let body = response.bytes().await.map_err(|e| fetch_error(Box::new(e)))?;
+            Ok(Some(serde_json::from_slice::<AgentCard>(&body)))
+        };
 
-        if !response.status().is_success() {
-            return Err(adk_core::AdkError::agent(format!(
-                "Failed to fetch agent card: HTTP {}",
-                response.status()
-            )));
-        }
-
-        let card: AgentCard = response
-            .json()
-            .await
-            .map_err(|e| adk_core::AdkError::agent(format!("Failed to parse agent card: {e}")))?;
+        let current =
+            read(fetch("/.well-known/agent-card.json").await.map_err(fetch_error)?).await?;
+        let card = match current {
+            Some(Ok(card)) => card,
+            not_a_0_3_card => {
+                match read(fetch("/.well-known/agent.json").await.map_err(fetch_error)?).await? {
+                    Some(Ok(card)) => card,
+                    Some(Err(e)) => {
+                        return Err(adk_core::AdkError::agent(format!(
+                            "Failed to parse agent card: {e}"
+                        )));
+                    }
+                    None => {
+                        return Err(adk_core::AdkError::agent(match not_a_0_3_card {
+                            Some(Err(e)) => format!("Failed to parse agent card: {e}"),
+                            _ => "Failed to fetch agent card: HTTP 404 Not Found".to_string(),
+                        }));
+                    }
+                }
+            }
+        };
 
         check_card_endpoint(base_url, &card.url, allowed_origins)?;
         Ok(card)
@@ -443,8 +466,9 @@ pub(crate) fn truncated_stream_error() -> adk_core::AdkError {
 /// Splits an SSE byte stream into the data of each event.
 ///
 /// Bytes are buffered until a whole line has arrived, so a multi-byte character split
-/// across reads is decoded intact. Lines end in `\n` or `\r\n`; an event's `data:` lines
-/// are joined with `\n`; other fields and comments are ignored.
+/// across reads is decoded intact. Lines end in `\n`, `\r\n` or a lone `\r`, as the SSE
+/// specification allows; an event's `data:` lines are joined with `\n`; other fields and
+/// comments are ignored.
 #[derive(Default)]
 pub(crate) struct SseDecoder {
     buffer: Vec<u8>,
@@ -460,12 +484,18 @@ impl SseDecoder {
     pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>> {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
-        while let Some(end) = self.buffer.iter().position(|&byte| byte == b'\n') {
-            let line: Vec<u8> = self.buffer.drain(..=end).collect();
+        while let Some(end) = self.buffer.iter().position(|&byte| byte == b'\n' || byte == b'\r') {
+            // A line ends in LF, CRLF or a lone CR. A CR that ends the buffer may start a CRLF
+            // whose LF has not arrived yet.
+            let consumed = match (self.buffer[end], self.buffer.get(end + 1)) {
+                (b'\r', Some(b'\n')) => end + 2,
+                (b'\r', None) => break,
+                _ => end + 1,
+            };
+            let line: Vec<u8> = self.buffer.drain(..consumed).collect();
             let line = std::str::from_utf8(&line[..end]).map_err(|error| {
                 adk_core::AdkError::agent(format!("the A2A stream is not valid UTF-8: {error}"))
             })?;
-            let line = line.strip_suffix('\r').unwrap_or(line);
             if line.is_empty() {
                 if !self.data.is_empty() {
                     events.push(self.data.join("\n"));
@@ -482,6 +512,20 @@ impl SseDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_lines_may_end_in_a_lone_cr_even_across_reads() {
+        let mut decoder = SseDecoder::default();
+        // Lone CRs end lines; the blank line ends the event.
+        assert_eq!(
+            decoder.push(b"data: a\rdata: b\r\r:comment").unwrap(),
+            vec!["a\nb".to_string()]
+        );
+        // A CR that ends one read may be the start of a CRLF, so it waits for the next byte.
+        assert!(decoder.push(b"\rdata: c\r").unwrap().is_empty());
+        assert!(decoder.push(b"\n").unwrap().is_empty());
+        assert_eq!(decoder.push(b"\r\n").unwrap(), vec!["c".to_string()]);
+    }
 
     #[test]
     fn a_card_endpoint_on_the_card_origin_is_accepted() {
@@ -590,9 +634,14 @@ pub mod v1_client {
     //! parsing, configurable retry, and agent card caching with conditional
     //! request headers.
 
+    use a2a_protocol_types::events::StreamResponse;
     use a2a_protocol_types::jsonrpc::JsonRpcRequest;
+    use a2a_protocol_types::params::SendMessageConfiguration;
+    use a2a_protocol_types::responses::{
+        ListPushConfigsResponse, SendMessageResponse, TaskListResponse,
+    };
     use a2a_protocol_types::task::{Task, TaskState};
-    use a2a_protocol_types::{AgentCard, Message, TaskPushNotificationConfig};
+    use a2a_protocol_types::{AgentCard, AgentInterface, Message, TaskPushNotificationConfig};
     use reqwest::header::{HeaderMap, HeaderValue};
     use serde_json::Value;
     use std::time::Duration;
@@ -605,6 +654,104 @@ pub mod v1_client {
 
     /// Well-known path for v1 agent cards.
     const AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
+
+    /// JSON-RPC code of `VersionNotSupportedError` (A2A §5.4).
+    const VERSION_NOT_SUPPORTED: i64 = -32009;
+
+    /// The card's A2A v1 interface for `binding` (`JSONRPC` or `HTTP+JSON`): the first
+    /// with a `1.x` protocol version, else the first that states none. An interface for an
+    /// earlier protocol version, such as the 0.3 endpoint a card may also list, is never
+    /// chosen.
+    pub fn v1_interface<'a>(card: &'a AgentCard, binding: &str) -> Option<&'a AgentInterface> {
+        let of_binding =
+            || card.supported_interfaces.iter().filter(move |i| i.protocol_binding == binding);
+        of_binding()
+            .find(|i| i.protocol_version.split('.').next() == Some("1"))
+            .or_else(|| of_binding().find(|i| i.protocol_version.trim().is_empty()))
+    }
+
+    /// Reads a `SendMessage` result: the v1 `SendMessageResponse` oneof
+    /// (`{"task": …}` or `{"message": …}`, A2A §9.4.1 and §11.4), or a bare
+    /// `Task`, which adk-server before 3.0 returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns the oneof's decoding error when `result` is neither shape.
+    fn parse_send_message_result(result: Value) -> Result<SendMessageResponse, serde_json::Error> {
+        serde_json::from_value::<SendMessageResponse>(result.clone()).or_else(|oneof_error| {
+            serde_json::from_value::<Task>(result)
+                .map(SendMessageResponse::Task)
+                .map_err(|_| oneof_error)
+        })
+    }
+
+    /// The updates of a streamed message or a task subscription, as they arrive.
+    pub type UpdateStream =
+        futures::stream::BoxStream<'static, Result<StreamResponse, V1ClientError>>;
+
+    /// Reads one SSE payload: a `StreamResponse`, bare (HTTP+JSON binding) or as a JSON-RPC
+    /// result, or a JSON-RPC error. `None` when it is neither, or empty.
+    pub(crate) fn parse_stream_payload(
+        data: &str,
+    ) -> Option<Result<StreamResponse, V1ClientError>> {
+        if data.trim().is_empty() {
+            return None;
+        }
+        if let Ok(update) = serde_json::from_str::<StreamResponse>(data) {
+            return Some(Ok(update));
+        }
+        let value = serde_json::from_str::<Value>(data).ok()?;
+        if let Some(result) = value.get("result")
+            && let Ok(update) = serde_json::from_value::<StreamResponse>(result.clone())
+        {
+            return Some(Ok(update));
+        }
+        let error = value.get("error")?;
+        Some(Err(V1ClientError::JsonRpc {
+            code: error.get("code").and_then(Value::as_i64).unwrap_or(0) as i32,
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+                .to_string(),
+            data: error.get("data").cloned(),
+        }))
+    }
+
+    /// Reads a `ListTasks` result: the v1 `ListTasksResponse` (A2A §3.1.4), or the bare
+    /// task array adk-server before 3.0 returned, read as one complete page.
+    ///
+    /// # Errors
+    ///
+    /// Returns the response's decoding error when `result` is neither shape.
+    fn parse_task_list(result: Value) -> Result<TaskListResponse, serde_json::Error> {
+        if result.is_array() {
+            let tasks: Vec<Task> = serde_json::from_value(result)?;
+            let count = u32::try_from(tasks.len()).unwrap_or(u32::MAX);
+            return Ok(TaskListResponse {
+                tasks,
+                next_page_token: String::new(),
+                page_size: count,
+                total_size: count,
+            });
+        }
+        serde_json::from_value(result)
+    }
+
+    /// Reads a `ListTaskPushNotificationConfigs` result: the v1 `{configs, nextPageToken}`
+    /// object, or the bare array adk-server before 3.0 returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns the decoding error when `result` is neither shape.
+    fn parse_push_config_list(
+        result: Value,
+    ) -> Result<Vec<TaskPushNotificationConfig>, serde_json::Error> {
+        if result.is_array() {
+            return serde_json::from_value(result);
+        }
+        serde_json::from_value::<ListPushConfigsResponse>(result).map(|page| page.configs)
+    }
 
     /// Retry configuration for transient failures.
     #[derive(Debug, Clone)]
@@ -687,6 +834,46 @@ pub mod v1_client {
     /// via JSON-RPC (and optionally REST), parses structured error responses,
     /// caches agent cards with conditional headers, and retries transient
     /// failures.
+    /// How long a card fetch may take, as adk-go's card resolver allows.
+    const CARD_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Where an agent card comes from.
+    enum CardSource {
+        Url(String),
+        File(std::path::PathBuf),
+    }
+
+    /// Reads a card source as adk-go's card provider does: an `http(s)` URL whose path ends
+    /// in `.json` is the card's own URL; any other URL is the agent's base, under which the
+    /// card is at `/.well-known/agent-card.json`; a path (or `file://` URL) is a card file.
+    /// Any other scheme is refused.
+    fn card_source(source: &str) -> Result<CardSource, V1ClientError> {
+        let unsupported = || V1ClientError::UnexpectedStatus {
+            status: 0,
+            body: format!(
+                "unsupported agent card source {source:?}: use an http(s) URL or a file path"
+            ),
+        };
+        match source.split_once("://") {
+            None => Ok(CardSource::File(std::path::PathBuf::from(source))),
+            Some(("file", path)) => Ok(CardSource::File(std::path::PathBuf::from(path))),
+            Some((scheme, _))
+                if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+            {
+                let url = adk_core::Url::parse(source).map_err(|_| unsupported())?;
+                if url.path().ends_with(".json") {
+                    Ok(CardSource::Url(source.to_string()))
+                } else {
+                    Ok(CardSource::Url(format!(
+                        "{}{AGENT_CARD_PATH}",
+                        source.trim_end_matches('/')
+                    )))
+                }
+            }
+            Some(_) => Err(unsupported()),
+        }
+    }
+
     pub struct A2aV1Client {
         http_client: reqwest::Client,
         agent_card: AgentCard,
@@ -754,23 +941,15 @@ pub mod v1_client {
         }
 
         /// Returns the JSON-RPC endpoint URL from the agent card's
-        /// `supportedInterfaces`.
+        /// `supportedInterfaces`; see [`v1_interface`].
         fn jsonrpc_url(&self) -> Option<&str> {
-            self.agent_card
-                .supported_interfaces
-                .iter()
-                .find(|i| i.protocol_binding == "JSONRPC")
-                .map(|i| i.url.as_str())
+            v1_interface(&self.agent_card, "JSONRPC").map(|i| i.url.as_str())
         }
 
         /// Returns the REST endpoint URL from the agent card's
-        /// `supportedInterfaces`, if available.
+        /// `supportedInterfaces`, if available; see [`v1_interface`].
         fn rest_url(&self) -> Option<&str> {
-            self.agent_card
-                .supported_interfaces
-                .iter()
-                .find(|i| i.protocol_binding == "HTTP+JSON")
-                .map(|i| i.url.as_str())
+            v1_interface(&self.agent_card, "HTTP+JSON").map(|i| i.url.as_str())
         }
 
         /// Builds default headers including `A2A-Version: 1.0`.
@@ -806,8 +985,24 @@ pub mod v1_client {
             base_url: &str,
             allowed_origins: &[String],
         ) -> Result<AgentCard, V1ClientError> {
-            let url = format!("{}{AGENT_CARD_PATH}", base_url.trim_end_matches('/'));
-            let client = reqwest::Client::new();
+            let url = match card_source(base_url)? {
+                CardSource::File(path) => {
+                    let json =
+                        std::fs::read(&path).map_err(|error| V1ClientError::UnexpectedStatus {
+                            status: 0,
+                            body: format!(
+                                "cannot read the agent card file {}: {error}",
+                                path.display()
+                            ),
+                        })?;
+                    return Ok(serde_json::from_slice(&json)?);
+                }
+                CardSource::Url(url) => url,
+            };
+            let client = reqwest::Client::builder()
+                .timeout(CARD_FETCH_TIMEOUT)
+                .build()
+                .map_err(V1ClientError::from)?;
             let response = client.get(&url).headers(Self::default_headers()).send().await?;
 
             if !response.status().is_success() {
@@ -899,24 +1094,15 @@ pub mod v1_client {
             );
 
             let response = self.send_with_retry(url, &request).await?;
-            let status = response.status();
-
-            // Check for version negotiation failure
-            if status == reqwest::StatusCode::BAD_REQUEST {
-                let body: Value = response.json().await?;
-                if let Some(err) = body.get("error") {
-                    let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0) as i32;
-                    if code == -32009 {
-                        return Err(Self::parse_version_error(err));
-                    }
-                }
-                return Err(Self::parse_jsonrpc_error(&body));
-            }
-
             let body: Value = response.json().await?;
 
-            // Check for JSON-RPC error
-            if body.get("error").is_some() {
+            // A JSON-RPC error. A version negotiation failure (-32009) arrives as HTTP 200 from
+            // a conformant server, and as HTTP 400 from adk-server before 3.0, so the code
+            // decides, not the status.
+            if let Some(err) = body.get("error") {
+                if err.get("code").and_then(Value::as_i64) == Some(VERSION_NOT_SUPPORTED) {
+                    return Err(Self::parse_version_error(err));
+                }
                 return Err(Self::parse_jsonrpc_error(&body));
             }
 
@@ -1117,8 +1303,41 @@ pub mod v1_client {
         // ── 11 v1.0.0 Operations (JSON-RPC) ─────────────────────────────
 
         /// Sends a message to the remote agent (JSON-RPC `SendMessage`).
-        pub async fn send_message(&self, message: Message) -> Result<Task, V1ClientError> {
-            self.jsonrpc_call("SendMessage", serde_json::json!({ "message": message })).await
+        ///
+        /// Returns the v1 `SendMessageResponse`: the task the message created or
+        /// continued, or a message the agent answered with directly. A server that
+        /// returns a bare `Task` (adk-server before 3.0) is read as
+        /// [`SendMessageResponse::Task`].
+        ///
+        /// # Errors
+        ///
+        /// Returns [`V1ClientError::JsonRpc`] for a JSON-RPC error,
+        /// [`V1ClientError::VersionNotSupported`] when the server does not serve
+        /// A2A 1.0, and [`V1ClientError::Serde`] when the result is neither shape.
+        pub async fn send_message(
+            &self,
+            message: Message,
+        ) -> Result<SendMessageResponse, V1ClientError> {
+            self.send_message_with(message, None).await
+        }
+
+        /// Sends a message with a `SendMessageConfiguration` (JSON-RPC `SendMessage`):
+        /// `returnImmediately`, `historyLength`, accepted output modes, or a push config.
+        ///
+        /// # Errors
+        ///
+        /// See [`send_message`](Self::send_message).
+        pub async fn send_message_with(
+            &self,
+            message: Message,
+            configuration: Option<&SendMessageConfiguration>,
+        ) -> Result<SendMessageResponse, V1ClientError> {
+            let mut params = serde_json::json!({ "message": message });
+            if let Some(configuration) = configuration {
+                params["configuration"] = serde_json::to_value(configuration)?;
+            }
+            let result: Value = self.jsonrpc_call("SendMessage", params).await?;
+            Ok(parse_send_message_result(result)?)
         }
 
         /// Sends a streaming message (JSON-RPC `SendStreamingMessage`).
@@ -1175,7 +1394,7 @@ pub mod v1_client {
             status: Option<TaskState>,
             page_size: Option<u32>,
             page_token: Option<&str>,
-        ) -> Result<Vec<Task>, V1ClientError> {
+        ) -> Result<TaskListResponse, V1ClientError> {
             let mut params = serde_json::json!({});
             if let Some(cid) = context_id {
                 params["contextId"] = serde_json::json!(cid);
@@ -1189,7 +1408,8 @@ pub mod v1_client {
             if let Some(pt) = page_token {
                 params["pageToken"] = serde_json::json!(pt);
             }
-            self.jsonrpc_call("ListTasks", params).await
+            let result: Value = self.jsonrpc_call("ListTasks", params).await?;
+            Ok(parse_task_list(result)?)
         }
 
         /// Subscribes to task updates (JSON-RPC `SubscribeToTask`).
@@ -1219,6 +1439,162 @@ pub mod v1_client {
                 .await?;
 
             Ok(response)
+        }
+
+        /// Sends a streaming message and returns its updates as they arrive: the task,
+        /// then status and artifact updates, until the task ends or stops for its caller.
+        ///
+        /// Uses the JSON-RPC binding (`SendStreamingMessage`), or the HTTP+JSON binding
+        /// (`POST /message:stream`) when the card offers no JSON-RPC interface.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the request fails or the server answers with an error
+        /// instead of a stream. An error the stream carries ends it as its last item.
+        pub async fn stream_message(
+            &self,
+            message: Message,
+        ) -> Result<UpdateStream, V1ClientError> {
+            self.stream_message_with(message, None).await
+        }
+
+        /// Streams a message with a `SendMessageConfiguration`, as
+        /// [`stream_message`](Self::stream_message) does.
+        ///
+        /// # Errors
+        ///
+        /// See [`stream_message`](Self::stream_message).
+        pub async fn stream_message_with(
+            &self,
+            message: Message,
+            configuration: Option<&SendMessageConfiguration>,
+        ) -> Result<UpdateStream, V1ClientError> {
+            let mut body = serde_json::json!({ "message": message });
+            if let Some(configuration) = configuration {
+                body["configuration"] = serde_json::to_value(configuration)?;
+            }
+            match self.jsonrpc_url() {
+                Some(url) => {
+                    let request = JsonRpcRequest::with_params(
+                        serde_json::json!(uuid::Uuid::new_v4().to_string()),
+                        "SendStreamingMessage",
+                        body,
+                    );
+                    let builder =
+                        self.http_client.post(url).headers(self.headers_for(url)?).json(&request);
+                    Self::open_stream(builder).await
+                }
+                None => {
+                    let url = self.rest_endpoint("/message:stream")?;
+                    let builder = self
+                        .http_client
+                        .post(&url)
+                        .headers(self.headers_for(&url)?)
+                        .header("content-type", "application/a2a+json")
+                        .json(&body);
+                    Self::open_stream(builder).await
+                }
+            }
+        }
+
+        /// Subscribes to a task and returns its updates as they arrive (A2A §3.1.6).
+        ///
+        /// Uses the JSON-RPC binding (`SubscribeToTask`), or the HTTP+JSON binding
+        /// (`GET /tasks/{id}:subscribe`) when the card offers no JSON-RPC interface.
+        ///
+        /// # Errors
+        ///
+        /// See [`stream_message`](Self::stream_message).
+        pub async fn subscribe(&self, task_id: &str) -> Result<UpdateStream, V1ClientError> {
+            match self.jsonrpc_url() {
+                Some(url) => {
+                    let request = JsonRpcRequest::with_params(
+                        serde_json::json!(uuid::Uuid::new_v4().to_string()),
+                        "SubscribeToTask",
+                        serde_json::json!({ "id": task_id }),
+                    );
+                    let builder =
+                        self.http_client.post(url).headers(self.headers_for(url)?).json(&request);
+                    Self::open_stream(builder).await
+                }
+                None => {
+                    let url = self.rest_endpoint(&format!("/tasks/{task_id}:subscribe"))?;
+                    let builder = self.http_client.get(&url).headers(self.headers_for(&url)?);
+                    Self::open_stream(builder).await
+                }
+            }
+        }
+
+        /// The full URL of `path` on the card's HTTP+JSON interface.
+        fn rest_endpoint(&self, path: &str) -> Result<String, V1ClientError> {
+            let base = self.rest_url().ok_or_else(|| V1ClientError::UnexpectedStatus {
+                status: 0,
+                body: "no JSONRPC or HTTP+JSON interface in agent card".to_string(),
+            })?;
+            Ok(format!("{}{path}", base.trim_end_matches('/')))
+        }
+
+        /// Sends a streaming request and reads its SSE answer as updates.
+        async fn open_stream(
+            request: reqwest::RequestBuilder,
+        ) -> Result<UpdateStream, V1ClientError> {
+            use futures::StreamExt;
+
+            let response = request.send().await?;
+            let status = response.status().as_u16();
+            let is_sse = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"));
+            if !is_sse {
+                // A JSON answer to a streaming call is an error: the method's, or the
+                // version negotiation's.
+                let body = response.text().await.unwrap_or_default();
+                if let Ok(value) = serde_json::from_str::<Value>(&body)
+                    && let Some(error) = value.get("error")
+                {
+                    if error.get("code").and_then(Value::as_i64) == Some(VERSION_NOT_SUPPORTED) {
+                        return Err(Self::parse_version_error(error));
+                    }
+                    if error.get("code").and_then(Value::as_i64).is_some() {
+                        return Err(Self::parse_jsonrpc_error(&value));
+                    }
+                }
+                return Err(V1ClientError::UnexpectedStatus { status, body });
+            }
+
+            let mut bytes = response.bytes_stream();
+            let updates = async_stream::stream! {
+                let mut decoder = super::SseDecoder::default();
+                while let Some(chunk) = bytes.next().await {
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            yield Err(V1ClientError::Http(error));
+                            return;
+                        }
+                    };
+                    let payloads = match decoder.push(&chunk) {
+                        Ok(payloads) => payloads,
+                        Err(error) => {
+                            yield Err(V1ClientError::UnexpectedStatus { status, body: error.to_string() });
+                            return;
+                        }
+                    };
+                    for data in payloads {
+                        match parse_stream_payload(&data) {
+                            Some(Ok(update)) => yield Ok(update),
+                            Some(Err(error)) => {
+                                yield Err(error);
+                                return;
+                            }
+                            None => tracing::debug!("SSE data that is no A2A update: {data}"),
+                        }
+                    }
+                }
+            };
+            Ok(Box::pin(updates))
         }
 
         /// Creates a push notification config (JSON-RPC
@@ -1251,11 +1627,13 @@ pub mod v1_client {
             &self,
             task_id: &str,
         ) -> Result<Vec<TaskPushNotificationConfig>, V1ClientError> {
-            self.jsonrpc_call(
-                "ListTaskPushNotificationConfigs",
-                serde_json::json!({ "taskId": task_id }),
-            )
-            .await
+            let result: Value = self
+                .jsonrpc_call(
+                    "ListTaskPushNotificationConfigs",
+                    serde_json::json!({ "taskId": task_id }),
+                )
+                .await?;
+            Ok(parse_push_config_list(result)?)
         }
 
         /// Deletes a push notification config (JSON-RPC
@@ -1282,8 +1660,38 @@ pub mod v1_client {
         // ── REST binding operations ──────────────────────────────────────
 
         /// Sends a message via REST (`POST /message:send`).
-        pub async fn send_message_rest(&self, message: Message) -> Result<Task, V1ClientError> {
-            self.rest_post("/message:send", &serde_json::json!({ "message": message })).await
+        ///
+        /// Returns the v1 `SendMessageResponse`, read as
+        /// [`send_message`](Self::send_message) reads it.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`V1ClientError::UnexpectedStatus`] for a non-2xx answer and
+        /// [`V1ClientError::Serde`] when the body is neither shape.
+        pub async fn send_message_rest(
+            &self,
+            message: Message,
+        ) -> Result<SendMessageResponse, V1ClientError> {
+            self.send_message_rest_with(message, None).await
+        }
+
+        /// Sends a message with a `SendMessageConfiguration` via REST, as
+        /// [`send_message_rest`](Self::send_message_rest) does.
+        ///
+        /// # Errors
+        ///
+        /// See [`send_message_rest`](Self::send_message_rest).
+        pub async fn send_message_rest_with(
+            &self,
+            message: Message,
+            configuration: Option<&SendMessageConfiguration>,
+        ) -> Result<SendMessageResponse, V1ClientError> {
+            let mut request = serde_json::json!({ "message": message });
+            if let Some(configuration) = configuration {
+                request["configuration"] = serde_json::to_value(configuration)?;
+            }
+            let body: Value = self.rest_post("/message:send", &request).await?;
+            Ok(parse_send_message_result(body)?)
         }
 
         /// Gets a task via REST (`GET /tasks/{taskId}`).
@@ -1297,8 +1705,9 @@ pub mod v1_client {
         }
 
         /// Lists tasks via REST (`GET /tasks`).
-        pub async fn list_tasks_rest(&self) -> Result<Vec<Task>, V1ClientError> {
-            self.rest_get("/tasks").await
+        pub async fn list_tasks_rest(&self) -> Result<TaskListResponse, V1ClientError> {
+            let body: Value = self.rest_get("/tasks").await?;
+            Ok(parse_task_list(body)?)
         }
 
         /// Creates a push notification config via REST
@@ -1331,7 +1740,9 @@ pub mod v1_client {
             &self,
             task_id: &str,
         ) -> Result<Vec<TaskPushNotificationConfig>, V1ClientError> {
-            self.rest_get(&format!("/tasks/{task_id}/pushNotificationConfigs")).await
+            let body: Value =
+                self.rest_get(&format!("/tasks/{task_id}/pushNotificationConfigs")).await?;
+            Ok(parse_push_config_list(body)?)
         }
 
         /// Deletes a push notification config via REST
@@ -1352,6 +1763,61 @@ pub mod v1_client {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn card_sources_read_as_adk_go_reads_them() {
+            let url = |source: &str| match super::card_source(source).unwrap() {
+                super::CardSource::Url(url) => url,
+                super::CardSource::File(path) => panic!("{source} is a file: {path:?}"),
+            };
+            assert_eq!(
+                url("https://agents.example.com"),
+                "https://agents.example.com/.well-known/agent-card.json"
+            );
+            assert_eq!(
+                url("https://agents.example.com/billing/"),
+                "https://agents.example.com/billing/.well-known/agent-card.json"
+            );
+            assert_eq!(
+                url("https://agents.example.com/cards/billing.json"),
+                "https://agents.example.com/cards/billing.json"
+            );
+            assert!(matches!(
+                super::card_source("./cards/billing.json").unwrap(),
+                super::CardSource::File(_)
+            ));
+            assert!(matches!(
+                super::card_source("file:///etc/card.json").unwrap(),
+                super::CardSource::File(_)
+            ));
+            assert!(super::card_source("ftp://agents.example.com/card.json").is_err());
+        }
+
+        #[tokio::test]
+        async fn a_card_file_is_read() {
+            let dir = std::env::temp_dir().join(format!("a2a-card-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("card.json");
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "name": "file-agent",
+                    "description": "from a file",
+                    "version": "1.0.0",
+                    "supportedInterfaces": [{"url": "https://a.example/a2a/v1", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}],
+                    "capabilities": {},
+                    "defaultInputModes": ["text/plain"],
+                    "defaultOutputModes": ["text/plain"],
+                    "skills": []
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let card =
+                super::A2aV1Client::resolve_agent_card(path.to_str().unwrap()).await.unwrap();
+            assert_eq!(card.name, "file-agent");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
         use super::*;
         use a2a_protocol_types::{AgentCapabilities, AgentCard, AgentInterface, AgentSkill};
 
@@ -1508,6 +1974,56 @@ pub mod v1_client {
                     assert_eq!(supported, vec!["0.3", "1.0"]);
                 }
                 other => panic!("expected VersionNotSupported, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn send_message_results_read_the_v1_oneof() {
+            let task = serde_json::json!({
+                "id": "t-1",
+                "contextId": "c-1",
+                "status": { "state": "TASK_STATE_COMPLETED" }
+            });
+            match parse_send_message_result(serde_json::json!({ "task": task })).unwrap() {
+                SendMessageResponse::Task(task) => assert_eq!(task.id.0, "t-1"),
+                other => panic!("expected a task, got {other:?}"),
+            }
+
+            let message = serde_json::json!({
+                "messageId": "m-1",
+                "role": "ROLE_AGENT",
+                "parts": [{ "text": "hi" }]
+            });
+            match parse_send_message_result(serde_json::json!({ "message": message })).unwrap() {
+                SendMessageResponse::Message(message) => assert_eq!(message.id.0, "m-1"),
+                other => panic!("expected a message, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn send_message_results_accept_the_bare_task_older_servers_send() {
+            let bare = serde_json::json!({
+                "id": "t-2",
+                "contextId": "c-2",
+                "status": { "state": "TASK_STATE_WORKING" }
+            });
+            match parse_send_message_result(bare).unwrap() {
+                SendMessageResponse::Task(task) => {
+                    assert_eq!(task.id.0, "t-2");
+                    assert_eq!(task.status.state, TaskState::Working);
+                }
+                other => panic!("expected a task, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn send_message_results_of_another_shape_are_refused() {
+            for result in [
+                serde_json::json!(null),
+                serde_json::json!({ "status": "done" }),
+                serde_json::json!({ "task": { "id": "t-3" } }),
+            ] {
+                assert!(parse_send_message_result(result.clone()).is_err(), "{result}");
             }
         }
 

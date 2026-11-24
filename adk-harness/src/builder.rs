@@ -130,6 +130,8 @@ pub struct HarnessAgentBuilder {
     confirmation_handler: Option<Arc<dyn ToolConfirmationHandler>>,
     approval_store: Option<Arc<dyn ApprovalStore>>,
     approval_service: Option<Arc<dyn ApprovalService>>,
+    auto_review: Option<Arc<dyn adk_core::ToolReviewer>>,
+    requested_call_seal: Option<Arc<dyn adk_core::RequestedCallSeal>>,
     #[cfg(feature = "kernel")]
     kernel_approvals: Arc<crate::kernel::LateApprovalNotifier>,
     #[cfg(feature = "kernel")]
@@ -188,6 +190,7 @@ pub struct HarnessAgentBuilder {
     /// Snapshots and rewind (spec 3.1 §7.27); off until `snapshots` is set.
     snapshots: crate::snapshot::SnapshotSetup,
     goal_store: Option<Arc<dyn crate::goal::GoalStore>>,
+    goal_grader: Option<Arc<dyn Llm>>,
     #[cfg(feature = "graph")]
     goal_engine: Option<crate::goal::GoalEngine>,
     #[cfg(feature = "memory")]
@@ -206,6 +209,7 @@ pub struct HarnessAgentBuilder {
     history_max_events: Option<usize>,
     compaction: Option<EventsCompactionConfig>,
     compaction_enabled: bool,
+    intra_compaction: Option<adk_core::IntraCompactionConfig>,
     customize: Option<Customize>,
     unimplemented: Vec<String>,
     last_todos: Option<Arc<Mutex<TodoList>>>,
@@ -236,6 +240,8 @@ pub struct HarnessAgentBuilder {
     #[cfg(feature = "computer-use")]
     computer_use: Option<crate::packs::computer_use::ComputerUsePack>,
     computer_use_requested: bool,
+    #[cfg(feature = "vision")]
+    vision: Option<crate::packs::vision::VisionPack>,
     voice_requested: bool,
     take_over: Option<crate::take_over::TakeOver>,
 }
@@ -267,6 +273,8 @@ impl HarnessAgentBuilder {
             confirmation_handler: None,
             approval_store: None,
             approval_service: None,
+            auto_review: None,
+            requested_call_seal: None,
             #[cfg(feature = "kernel")]
             kernel_approvals: Arc::default(),
             #[cfg(feature = "kernel")]
@@ -311,6 +319,7 @@ impl HarnessAgentBuilder {
             plan_checkpointer: None,
             snapshots: crate::snapshot::SnapshotSetup::default(),
             goal_store: None,
+            goal_grader: None,
             #[cfg(feature = "graph")]
             goal_engine: None,
             #[cfg(feature = "memory")]
@@ -329,6 +338,7 @@ impl HarnessAgentBuilder {
             history_max_events: None,
             compaction: None,
             compaction_enabled: true,
+            intra_compaction: None,
             customize: None,
             unimplemented: Vec::new(),
             last_todos: None,
@@ -357,6 +367,8 @@ impl HarnessAgentBuilder {
             #[cfg(feature = "computer-use")]
             computer_use: None,
             computer_use_requested: false,
+            #[cfg(feature = "vision")]
+            vision: None,
             voice_requested: false,
             take_over: None,
         }
@@ -705,6 +717,7 @@ impl HarnessAgentBuilder {
         self.default_members = false;
         self.partition.coordinator = false;
         self.goal_store = None;
+        self.goal_grader = None;
         #[cfg(feature = "graph")]
         {
             self.goal_engine = None;
@@ -948,6 +961,50 @@ impl HarnessAgentBuilder {
         self
     }
 
+    /// Checks each requested call (one a person asked for through a form an agent drew)
+    /// against the seal made when the person approved it, right before it runs: a call that
+    /// changed since is refused (spec 3.3 §7.4 rule 5). `adk-surface`'s `ApprovalSeals` makes
+    /// and checks them; give it to the surface engine too.
+    pub fn requested_call_seal(mut self, seal: Arc<dyn adk_core::RequestedCallSeal>) -> Self {
+        self.requested_call_seal = Some(seal);
+        self
+    }
+
+    /// Reviews, in Auto mode, the calls the mode holds with `reviewer` before a person is
+    /// asked: it approves, denies, or escalates each one (autonomy parity item 2). Off by
+    /// default.
+    ///
+    /// It decides only a call the harness holds in Auto mode that a standing rule could
+    /// answer: a host `bash` command or an external tool. Everything Auto denies, and every
+    /// non-waivable approval — an edit of a protected path, an unsandboxed retry,
+    /// `exit_plan_mode`, memory writes, payments, computer use and partition crossings — goes
+    /// to a person as before, and so does every call in `read_only`, `plan` and `ask`. A
+    /// served harness without authenticated identity decides Auto as Ask, so its calls are
+    /// never reviewed. An escalated call is prompted or held as it would be without a
+    /// reviewer. See `adk_core::review` for the verdicts and their records.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use adk_core::{ModelApprover, ReviewScope};
+    /// use adk_harness::{HarnessAgent, HarnessMode};
+    /// use adk_model::{ScriptedLlm, ScriptedResponse};
+    ///
+    /// let responses: Vec<ScriptedResponse> = Vec::new();
+    /// let reviewer = Arc::new(ScriptedLlm::new("claude-haiku-5-5", responses));
+    /// let builder = HarnessAgent::builder("harness")
+    ///     .mode(HarnessMode::Auto)
+    ///     .auto_review(Arc::new(
+    ///         ModelApprover::new(reviewer).scope(ReviewScope::default().excluding_tools(["mcp_*"])),
+    ///     ));
+    /// # let _ = builder;
+    /// ```
+    pub fn auto_review(mut self, reviewer: Arc<dyn adk_core::ToolReviewer>) -> Self {
+        self.auto_review = Some(reviewer);
+        self
+    }
+
     /// How long a person may take to decide one call (default 300 s); a call nobody decides
     /// in time waits in the approval store for a later decision (spec 3.3 §7.3).
     pub fn confirmation_timeout(mut self, timeout: Duration) -> Self {
@@ -958,14 +1015,21 @@ impl HarnessAgentBuilder {
     /// Where `bash` runs (default host, spec 3.1 §7.9).
     ///
     /// Unless [`allow_unsandboxed_retry`](Self::allow_unsandboxed_retry) was called, the
-    /// unsandboxed retry is on for the host and the OS sandbox and off for a container.
+    /// unsandboxed retry is on for the host and the OS sandbox and off for a container and
+    /// a remote sandbox.
     pub fn shell(mut self, isolation: ShellIsolation) -> Self {
-        #[cfg(feature = "docker")]
-        let container = matches!(isolation, ShellIsolation::Container(_));
-        #[cfg(not(feature = "docker"))]
-        let container = false;
+        #[cfg(any(feature = "docker", feature = "remote-shell"))]
+        let pooled = match &isolation {
+            #[cfg(feature = "docker")]
+            ShellIsolation::Container(_) => true,
+            #[cfg(feature = "remote-shell")]
+            ShellIsolation::Remote(_) => true,
+            _ => false,
+        };
+        #[cfg(not(any(feature = "docker", feature = "remote-shell")))]
+        let pooled = false;
         if !self.retry_explicit {
-            self.shell.allow_unsandboxed_retry = !container;
+            self.shell.allow_unsandboxed_retry = !pooled;
         }
         self.shell.isolation = isolation;
         self
@@ -1051,9 +1115,11 @@ impl HarnessAgentBuilder {
     ///
     /// Turns on only under an active OS sandbox whose enforcer keeps protected paths
     /// read-only (adk-sandbox S3, checked by a conformance probe) or a container shell that
-    /// mounts them read-only, with the network denied and every root-level protected path
-    /// present; otherwise `build()` fails with `harness.auto_allow_sandboxed_unavailable`
-    /// naming the reason. No effect on the host or a degraded shell.
+    /// mounts them read-only, with the network denied. Seatbelt also keeps a root-level
+    /// protected path that does not exist or is a symbolic link from being created or
+    /// replaced; under bubblewrap and in a container every one must exist and none be a link.
+    /// Otherwise `build()` fails with `harness.auto_allow_sandboxed_unavailable` naming the
+    /// reason. No effect on the host or a degraded shell.
     pub fn auto_allow_sandboxed(mut self) -> Self {
         self.shell.auto_allow_sandboxed = true;
         self
@@ -1218,6 +1284,22 @@ impl HarnessAgentBuilder {
     /// Where session goals are kept (spec 3.1 §7.11; default in memory).
     pub fn goal_store(mut self, store: Arc<dyn crate::goal::GoalStore>) -> Self {
         self.goal_store = Some(store);
+        self
+    }
+
+    /// The model that grades goals with a [`GoalRubric`](crate::GoalRubric); the harness
+    /// model by default. The grader works in a context of its own and its calls count
+    /// against the run's budget and spend ledger.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let builder = adk_harness::HarnessAgent::builder("harness")
+    ///     .model(worker_model)
+    ///     .goal_grader(grader_model);
+    /// ```
+    pub fn goal_grader(mut self, model: Arc<dyn Llm>) -> Self {
+        self.goal_grader = Some(model);
         self
     }
 
@@ -1471,6 +1553,29 @@ impl HarnessAgentBuilder {
         self
     }
 
+    /// The vision pack (spec 3.7 X15, feature `vision`): the governed vision tools, the
+    /// egress rules of `.adk/vision.toml` and the privacy guardrail on the harness model.
+    /// A call that stays on the device is `Read`; one that sends an image off it is
+    /// `External`, held in Ask and Auto with the exact egress image as evidence unless an
+    /// `allow` rule covers its host and data class.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_harness::packs::vision::VisionPack;
+    ///
+    /// let harness = HarnessAgent::builder("desk")
+    ///     .model(model)
+    ///     .workspace(workspace)
+    ///     .pack_vision(VisionPack::new(store, |gate, store| runtime(gate, store)))
+    ///     .build()?;
+    /// ```
+    #[cfg(feature = "vision")]
+    pub fn pack_vision(mut self, pack: crate::packs::vision::VisionPack) -> Self {
+        self.vision = Some(pack);
+        self
+    }
+
     /// The computer-use pack (spec 3.1 §7.24, feature `computer-use`): `computer_use_observe`
     /// and `computer_use_preview` as `Read`, and `computer_use_execute` as class
     /// `ComputerUse` — denied in ReadOnly and Plan, held for a non-waivable one-shot approval
@@ -1563,6 +1668,31 @@ impl HarnessAgentBuilder {
     /// Turns events compaction off.
     pub fn without_compaction(mut self) -> Self {
         self.compaction_enabled = false;
+        self
+    }
+
+    /// When a run compacts the harness agent's history before a model call.
+    ///
+    /// Auto-compaction is on without this call: a request is compacted once it passes 80% of
+    /// the model's context window, or 100,000 estimated tokens when the model reports none,
+    /// and the summary is written by the harness model. Each run carries the setting in its
+    /// config, so it applies under any runner.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_core::IntraCompactionConfig;
+    ///
+    /// let builder = HarnessAgent::builder(model).intra_compaction(IntraCompactionConfig::at_window_fraction(0.6));
+    /// ```
+    pub fn intra_compaction(mut self, config: adk_core::IntraCompactionConfig) -> Self {
+        self.intra_compaction = Some(config);
+        self
+    }
+
+    /// Turns auto-compaction off for the harness's runs.
+    pub fn without_intra_compaction(mut self) -> Self {
+        self.intra_compaction = Some(adk_core::IntraCompactionConfig::disabled());
         self
     }
 
@@ -1726,6 +1856,21 @@ impl HarnessAgentBuilder {
                 ));
             }
         }
+        // The vision pack (spec 3.7 X15): the gate, the runtime and the toolset, and the egress
+        // rules as an operator policy layer, so a rule that asks holds the call.
+        #[cfg(feature = "vision")]
+        let vision = match self.vision.take() {
+            Some(pack) => Some(pack.into_runtime(workspace.root())?),
+            None => None,
+        };
+        #[cfg(feature = "vision")]
+        if let Some(vision) = &vision {
+            let layer = vision.policy();
+            self.operator_policy = Some(match self.operator_policy.take() {
+                Some(existing) => Arc::new(adk_core::StrictestPolicy::new(vec![existing, layer])),
+                None => layer,
+            });
+        }
         if self.voice_requested && cfg!(not(feature = "voice")) {
             return Err(AdkError::config(
                 "the voice surface needs adk-harness feature `voice`: packs::voice::VoiceSurface \
@@ -1752,6 +1897,13 @@ impl HarnessAgentBuilder {
             if browser.is_some() && crate::packs::browser::is_browser_tool(tool.name()) {
                 return Err(AdkError::config(format!(
                     "tool '{}' collides with a browser pack tool of the same name (spec 3.1 §7.24)",
+                    tool.name()
+                )));
+            }
+            #[cfg(feature = "vision")]
+            if vision.is_some() && adk_vision::VISION_TOOL_NAMES.contains(&tool.name()) {
+                return Err(AdkError::config(format!(
+                    "tool '{}' collides with a vision pack tool of the same name (spec 3.7 X15)",
                     tool.name()
                 )));
             }
@@ -1821,9 +1973,11 @@ impl HarnessAgentBuilder {
             &instruction_state,
         )?;
         #[cfg_attr(not(feature = "team"), allow(unused_mut))]
-        let mut registry = ToolClassRegistry::harness_defaults(&self.name).with_web_allowlist(
-            self.web.as_ref().map(|web| web.allowed_domains.clone()).unwrap_or_default(),
-        );
+        let mut registry = ToolClassRegistry::harness_defaults(&self.name)
+            .with_web_allowlist(
+                self.web.as_ref().map(|web| web.allowed_domains.clone()).unwrap_or_default(),
+            )
+            .with_fetch_domains(self.web.as_ref().and_then(|web| web.fetch_domains.clone()));
         for classes in &self.origin_classes {
             registry = registry.with_origin_classes(classes.clone());
         }
@@ -1856,6 +2010,11 @@ impl HarnessAgentBuilder {
             registry.register(crate::packs::computer_use::COMPUTER_USE_PREVIEW, ToolKind::Read);
             registry
                 .register(crate::packs::computer_use::COMPUTER_USE_EXECUTE, ToolKind::ComputerUse);
+        }
+        // The vision pack (spec 3.7 X15): each call classed by where its image goes.
+        #[cfg(feature = "vision")]
+        if let Some(vision) = &vision {
+            registry = registry.with_call_classes(vision.classes());
         }
         // The partition's policy and crossing tools (spec 3.2 §7.8).
         #[cfg(feature = "kernel")]
@@ -1893,6 +2052,10 @@ impl HarnessAgentBuilder {
                         .iter()
                         .map(|name| (*name).to_string()),
                 );
+            }
+            #[cfg(feature = "vision")]
+            if vision.is_some() {
+                reserved.extend(adk_vision::VISION_TOOL_NAMES.iter().map(|name| name.to_string()));
             }
             let plan = crate::team::TeamPlan::prepare(
                 &self.name,
@@ -1950,15 +2113,16 @@ impl HarnessAgentBuilder {
         if let Some(gate) = &file_gate {
             tools = tools.into_iter().map(|tool| gate.wrap(tool)).collect();
         }
-        // The container shell (spec 3.1 §7.9 "Container"): its containers close with the
-        // toolset.
-        // Shell credentials reach `bash` through a launcher layer, which the container shell
-        // does not have; refusing beats commands that silently run without them.
-        #[cfg(all(feature = "docker", feature = "auth"))]
-        if shell.container.is_some() && !self.identity.shell_credentials.is_empty() {
+        // The container and remote shells (spec 3.1 §7.9 "Container"): their environments
+        // close with the toolset.
+        // Shell credentials reach `bash` through a launcher layer, which these shells do not
+        // have; refusing beats commands that silently run without them.
+        #[cfg(all(any(feature = "docker", feature = "remote-shell"), feature = "auth"))]
+        if shell.pooled.is_some() && !self.identity.shell_credentials.is_empty() {
             return Err(AdkError::config(
-                "shell credentials cannot be delivered to the container shell yet; use the host \
-                 shell or the OS sandbox with shell_credential (spec 3.1 §7.14)",
+                "shell credentials cannot be delivered to the container shell or the remote \
+                 shell yet; use the host shell or the OS sandbox with shell_credential (spec \
+                 3.1 §7.14)",
             ));
         }
         // The personal preset's shell never retries on the host (spec 3.3 §10 H1), and a shell
@@ -1972,14 +2136,27 @@ impl HarnessAgentBuilder {
         let egress_policy = false;
         let allow_unsandboxed_retry =
             self.shell.allow_unsandboxed_retry && !self.isolated_shell_only && !egress_policy;
-        #[cfg(feature = "docker")]
-        let container_pool = match &shell.container {
-            Some(config) if self.shell_enabled && workspace.bash_allowed() => {
-                let bash = crate::shell::ContainerBashTool::new(
-                    workspace.clone(),
-                    config.clone(),
-                    ledger.clone(),
-                )
+        #[cfg(any(feature = "docker", feature = "remote-shell"))]
+        let container_pool = match &shell.pooled {
+            Some(source) if self.shell_enabled && workspace.bash_allowed() => {
+                let bash = match source {
+                    #[cfg(feature = "docker")]
+                    crate::shell::PoolSource::Container(config) => {
+                        crate::shell::ContainerBashTool::new(
+                            workspace.clone(),
+                            config.clone(),
+                            ledger.clone(),
+                        )
+                    }
+                    #[cfg(feature = "remote-shell")]
+                    crate::shell::PoolSource::Remote(config) => {
+                        crate::shell::ContainerBashTool::remote(
+                            workspace.clone(),
+                            config.clone(),
+                            ledger.clone(),
+                        )
+                    }
+                }
                 .allow_unsandboxed_retry(allow_unsandboxed_retry)
                 .with_file_gate(file_gate.clone())
                 .with_outputs(shells.outputs().clone());
@@ -1989,9 +2166,9 @@ impl HarnessAgentBuilder {
             }
             _ => None,
         };
-        #[cfg(feature = "docker")]
+        #[cfg(any(feature = "docker", feature = "remote-shell"))]
         let container_shell = container_pool.is_some();
-        #[cfg(not(feature = "docker"))]
+        #[cfg(not(any(feature = "docker", feature = "remote-shell")))]
         let container_shell = false;
         // The personal preset never offers a host shell (spec 3.3 §10 H1).
         let isolated_shell = matches!(status, IsolationStatus::OsSandbox { .. });
@@ -2138,7 +2315,11 @@ impl HarnessAgentBuilder {
         // Governed web tools (spec 3.1 §7.20): `web_search` only with a provider.
         #[cfg(feature = "web")]
         if let Some(config) = self.web.clone() {
-            let runtime = crate::web::WebRuntime::new(config, self.web_signer.clone());
+            let runtime = crate::web::WebRuntime::new(
+                config,
+                self.web_signer.clone(),
+                Some((mode_store.clone(), self.mode)),
+            );
             tools.push(Arc::new(crate::tools::WebFetchTool::new(runtime.clone())));
             if let Some(provider) = &self.search_provider {
                 tools.push(Arc::new(crate::tools::WebSearchTool::new(runtime, provider.clone())));
@@ -2176,7 +2357,9 @@ impl HarnessAgentBuilder {
         // The browser pack's tools join the harness tools under the harness's web
         // configuration (spec 3.1 §7.24).
         #[cfg(feature = "browser")]
-        let browser = browser.map(|pack| pack.into_runtime(self.web.clone().unwrap_or_default()));
+        let browser = browser.map(|pack| {
+            pack.into_runtime(self.web.clone().unwrap_or_default(), (mode_store.clone(), self.mode))
+        });
         #[cfg(feature = "browser")]
         if let Some(browser) = &browser {
             tools.extend(browser.tools.iter().cloned());
@@ -2186,6 +2369,11 @@ impl HarnessAgentBuilder {
         #[cfg(feature = "computer-use")]
         if let Some(computer_use) = &computer_use {
             tools.extend(computer_use.tools.iter().cloned());
+        }
+        // The vision tools join the harness tools (spec 3.7 X15).
+        #[cfg(feature = "vision")]
+        if let Some(vision) = &vision {
+            tools.extend(vision.tools());
         }
         // Take over (spec 3.3 §10 H2): every call runs in a scope a secret can reach, and
         // leaves it scrubbed before RBAC, hooks or members see the result.
@@ -2286,7 +2474,7 @@ impl HarnessAgentBuilder {
         // Under a kernel, each run's tool calls write their ledger rows (spec 3.2 §7.10).
         #[cfg(all(feature = "kernel", feature = "observe"))]
         run_trails.attach_ledger(self.kernel_ledger.clone(), &toolset.all_tools());
-        #[cfg(feature = "docker")]
+        #[cfg(any(feature = "docker", feature = "remote-shell"))]
         if let Some(pool) = container_pool {
             toolset = toolset.with_containers(pool);
         }
@@ -2368,6 +2556,7 @@ impl HarnessAgentBuilder {
                 status: status.clone(),
                 allow_unsandboxed_retry,
                 fail_if_unavailable: self.shell.fail_if_unavailable,
+                guards_protected_names: shell.guards_protected_names,
             },
             switches,
             trust_mcp_read_only_hints: self.trust_mcp_read_only_hints,
@@ -2388,6 +2577,12 @@ impl HarnessAgentBuilder {
                 policy.observe_rules(prompter.clone());
                 let handler =
                     PromptingConfirmationHandler::new(prompter, rules.clone(), policy.clone());
+                // A screen plan's steps are approved with one answer (spec 3.7 Q8).
+                #[cfg(feature = "computer-use")]
+                let handler = match &computer_use {
+                    Some(computer_use) => handler.with_screen_plans(computer_use.plans.clone()),
+                    None => handler,
+                };
                 // A crossing is put to the person with its three answers (spec 3.2 §7.8).
                 #[cfg(feature = "kernel")]
                 let handler = match &partition {
@@ -2690,6 +2885,16 @@ impl HarnessAgentBuilder {
             agent_toolsets.push(mcp.manager());
             builder = builder.toolset(mcp.manager());
         }
+        // The vision pack (spec 3.7 X15): a held remote call carries its egress image, and the
+        // privacy guardrail gates every image a request to a remote model carries (V-I4).
+        #[cfg(feature = "vision")]
+        if let Some(vision) = &vision {
+            builder = builder.before_tool_callback(vision.toolset.evidence_callback());
+            if model.data_locality().leaves_machine() {
+                let guardrail = vision.guardrail(model.as_ref(), harness_audit.clone());
+                builder = builder.before_model_callback(guardrail.before_model_callback());
+            }
+        }
         if let Some(customize) = self.customize {
             builder = customize(builder);
         }
@@ -2744,6 +2949,10 @@ impl HarnessAgentBuilder {
                 skills: &self.skills,
                 observers: &observers,
                 effort: self.effort,
+                #[cfg(feature = "vision")]
+                vision: vision.as_ref(),
+                #[cfg(feature = "vision")]
+                vision_audit: harness_audit.clone(),
             })?)),
             None => None,
         };
@@ -2768,19 +2977,20 @@ impl HarnessAgentBuilder {
             Some(launcher) => Arc::new(launcher),
             None => check_launcher,
         };
-        // The container shell has no launcher; a check never falls back to the host (I24).
-        #[cfg(feature = "docker")]
-        let check_launcher: Arc<dyn adk_devtools::CommandLauncher> = match shell.container {
+        // The container and remote shells have no launcher; a check never falls back to the
+        // host (I24).
+        #[cfg(any(feature = "docker", feature = "remote-shell"))]
+        let check_launcher: Arc<dyn adk_devtools::CommandLauncher> = match shell.pooled {
             Some(_) => Arc::new(crate::shell::ContainerCheckRefusal),
             None => check_launcher,
         };
         let goals = crate::goal::GoalRuntime {
             store: goal_store.clone(),
-            until: Arc::new(crate::goal::UntilCheckAgent::new(
-                goal_store,
-                workspace.clone(),
-                check_launcher,
-            )),
+            until: Arc::new(
+                crate::goal::UntilCheckAgent::new(goal_store, workspace.clone(), check_launcher)
+                    .with_grader(self.goal_grader.clone().unwrap_or_else(|| model.clone()))
+                    .with_worker(self.name.clone()),
+            ),
             #[cfg(feature = "graph")]
             engine: self.goal_engine.unwrap_or(if self.plan_checkpointer.is_some() {
                 crate::goal::GoalEngine::Graph
@@ -2853,6 +3063,8 @@ impl HarnessAgentBuilder {
                 ledger,
                 approval_store,
                 approval_service: self.approval_service,
+                auto_review: self.auto_review,
+                requested_call_seal: self.requested_call_seal,
                 ledgers: crate::ledger::HarnessLedgers::new(
                     self.action_ledger.unwrap_or_else(|| Arc::new(InMemoryActionLedger::new())),
                 ),
@@ -2868,6 +3080,7 @@ impl HarnessAgentBuilder {
                 }),
                 history_max_events: self.history_max_events,
                 compaction,
+                intra_compaction: self.intra_compaction,
                 toolset,
                 instructions: instruction_state,
                 non_waivable_tools: non_waivable,
@@ -2987,7 +3200,7 @@ fn build_hook_runner(
     }
     // A hook runs through the shell's launcher (spec 3.1 §9.2 I54); the container shell has
     // none, and running `inherit` hooks on the host instead would escape the isolation.
-    if matches!(status, IsolationStatus::Container { .. })
+    if matches!(status, IsolationStatus::Container { .. } | IsolationStatus::Remote { .. })
         && set.hooks.iter().any(|hook| hook.isolation == crate::hooks::HookIsolation::Inherit)
     {
         return Err(AdkError::new(

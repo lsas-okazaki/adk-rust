@@ -1,6 +1,6 @@
 # ADK-Rust
 
-**Rust Agent Development Kit (ADK-Rust)** — build AI agents in Rust with modular components for models, tools, memory, RAG, security, realtime voice, graph workflows, and more.
+**Rust Agent Development Kit (ADK-Rust)** — build AI agents in Rust, including autonomous agents that work on their own inside limits you set, with modular components for models, tools, memory, RAG, security, realtime voice, graph workflows, and more.
 
 [![Crates.io](https://img.shields.io/crates/v/adk-rust.svg)](https://crates.io/crates/adk-rust)
 [![Documentation](https://docs.rs/adk-rust/badge.svg)](https://docs.rs/adk-rust)
@@ -8,21 +8,47 @@
 
 `adk-rust` is the umbrella crate: it re-exports the ADK-Rust crates behind feature flags, grouped into four tiers. It is model-agnostic and deployment-agnostic.
 
+## Autonomous Agents
+
+3.0 builds agents that pursue a goal over many steps, wake themselves, and keep working while
+nobody watches:
+
+| Property | What you get |
+|----------|--------------|
+| **Autonomous** | Goals that iterate until a check passes and park on a decision; wake-ups on a schedule, a file change, a webhook, a queue message, an approval or a finished run |
+| **Governed** | One tool path for every agent: tool policies, approvals that hold a call across runs, run budgets and spend caps, a kill switch across replicas, an OS sandbox, a signed audit log |
+| **Durable** | Runs that resume after a crash, held calls that survive a restart, and an action ledger that keeps a non-idempotent call from running twice |
+| **Observable and steerable** | OpenTelemetry spans, the spend ledger, the kernel's process table, and messages sent to a running turn |
+
+| Module | Feature | What it holds |
+|--------|---------|---------------|
+| `adk_rust::harness` | `harness` (in `enterprise` and `full`) | The governed harness agent: modes, standing approvals, a sandboxed shell, plans and durable goals |
+| `adk_rust::kernel` | `harness-kernel` (in `enterprise` and `full`) | The agent kernel `adk-rust up` runs: processes, wake sources, the event bus and the control plane |
+| `adk_rust::surface` | `surface` (in no tier) | The surface engine and the web home, over a harness or a kernel |
+| `adk_rust::vision` | `vision` (in `full`); `vision-local` adds the on-device backends | Local-first perception: regions in source pixels, verified weights, the egress gate, cloud describers and `sam-3.1`; with `harness`, the vision pack |
+
+The `autonomy` feature (in `enterprise` and `full`) enables the harness and the kernel together
+with durable and background runs, cron and webhook wake-ups, the approvals service, SQLite
+stores and the signed audit log. [Build an autonomous agent](../docs/official_docs/autonomy/index.md)
+takes one agent from a scaffold to running on its own.
+
 ## Supported Providers
 
 | Provider | Feature | Catalog default model |
 |----------|---------|-----------------------|
-| Gemini | `gemini` (in every tier) | `gemini-3.7-flash` |
-| OpenAI | `openai` | `gpt-5.6-terra` |
-| Anthropic | `anthropic` | `claude-sonnet-5` |
+| Gemini | `gemini` (in every tier) | `gemini-3.8-flash` |
+| OpenAI | `openai` | `gpt-6.1-sol` |
+| Anthropic | `anthropic` | `claude-sonnet-5-5` |
 | DeepSeek | `deepseek` | `deepseek-flash` |
 | Groq | `groq` | `openai/gpt-oss-120b` |
 | Ollama | `ollama` | `qwen3.5` |
 | OpenRouter | `openrouter` | `qwen/qwen3.7-max` |
-| OpenCode Go and Zen | `opencode` | — |
+| OpenCode Go and Zen | `opencode` | `deepseek-v4.1-flash` |
+| Meta Muse | `muse` | `muse-spark-1.3` |
 | Amazon Bedrock | `bedrock` | account- and region-specific |
 | Azure AI Inference | `azure-ai` | endpoint-specific |
-| Fireworks, Together, Mistral, Perplexity, Cerebras, SambaNova, xAI, OrcaRouter, Cheaper Inference, API Route, and other OpenAI-compatible APIs | `openai` (`OpenAICompatibleConfig` presets) | per preset |
+| mistral.rs, in process | `mistralrs` (in no tier) | the local model you load |
+| Fireworks, Together, Mistral, Perplexity, Cerebras, SambaNova, xAI, OrcaRouter, API Route, and other OpenAI-compatible APIs | `openai` (`OpenAICompatibleConfig` presets) | per preset |
 
 The catalog defaults are `adk_rust::model::catalog` constants; every client takes any model ID.
 
@@ -59,7 +85,7 @@ use adk_rust::prelude::*;
 async fn main() -> AnyhowResult<()> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
 
     let agent = LlmAgentBuilder::new("assistant")
         .instruction("You are a helpful assistant.")
@@ -93,7 +119,7 @@ async fn main() -> AnyhowResult<()> {
 }
 ```
 
-`run()` builds an agent on `provider_from_env()`, which first honors the Vertex opt-in flags `GOOGLE_GENAI_USE_ENTERPRISE` / `GOOGLE_GENAI_USE_VERTEXAI` (with `gemini-vertex`), then checks `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `GOOGLE_API_KEY`, using the catalog default model of the first provider whose feature is compiled. The default `minimal` tier compiles only Gemini; add `openai` or `anthropic` to widen detection.
+`run()` checks `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `GOOGLE_API_KEY` and builds the agent on the catalog default model of the first provider whose feature is compiled. `provider_from_env()` returns that model on its own, and first honors the Vertex opt-in flags `GOOGLE_GENAI_USE_ENTERPRISE` / `GOOGLE_GENAI_USE_VERTEXAI` (with `gemini-vertex`). The default `minimal` tier compiles only Gemini; add `openai` or `anthropic` to widen detection.
 
 ## Adding Tools
 
@@ -163,11 +189,14 @@ fn graph() -> Result<GraphAgent> {
 | `graph-node-cache` | node result caching with content keys | yes |
 | `graph-delta` | delta checkpoints | yes |
 | `graph-time-travel` | step, fork, and state history | yes |
+| `graph-yaml` | workflows from YAML or JSON files (`graph::definition`) | yes |
 | `graph-sqlite` | the SQLite checkpointer | no — needs a database |
 | `graph-redis-cache` | Redis-backed node cache | no — needs a server |
 | `graph-postgres`, `graph-redis`, `graph-mongodb`, `graph-neo4j`, `graph-firestore` | shared-database checkpointers | no — need a server |
 
 ## Realtime Voice Agents
+
+This example needs the `openai-realtime` feature, which no tier includes:
 
 ```rust
 use adk_rust::prelude::*;
@@ -230,11 +259,15 @@ adk-rust = "3.0.0"
 # auth, server, eval, guardrail, plugin, artifacts, tools, memory, telemetry, computer-use
 adk-rust = { version = "3.0.0", features = ["standard"] }
 
-# Enterprise — standard + realtime, browser, rag, payments, awp
+# Enterprise — standard + realtime, browser, rag, payments, awp, and autonomy: the
+# harness, its kernel, durable and background runs, approvals and signed audit
 adk-rust = { version = "3.0.0", features = ["enterprise"] }
 
-# Full — enterprise + audio, code, sandbox, code-tools, the harness, and the
-# graph-functional, graph-node-cache, graph-delta, and graph-time-travel capabilities
+# Autonomy alone — an agent that runs unattended, on any tier
+adk-rust = { version = "3.0.0", features = ["minimal", "anthropic", "autonomy", "cli"] }
+
+# Full — enterprise + audio, code, sandbox, code-tools, the AWP website, vision, and the
+# graph-functional, graph-node-cache, graph-delta, graph-time-travel, and graph-yaml capabilities
 adk-rust = { version = "3.0.0", features = ["full"] }
 
 # Gemini Enterprise Agent Platform — every Vertex/EAP integration except realtime
@@ -252,23 +285,25 @@ Features outside the tiers, composable with any of them:
 
 | Group | Features |
 |-------|----------|
-| Providers | `deepseek`, `groq`, `ollama`, `openrouter`, `opencode`, `bedrock`, `azure-ai`, `gemini-vertex`, `gemini-interactions` |
-| CLI | `cli`, `cli-openai`, `cli-anthropic`, `cli-deepseek`, `cli-groq`, `cli-ollama`, `cli-all-providers`, `cli-telemetry-otlp`, `optimize` |
+| Providers | `deepseek`, `groq`, `muse`, `ollama`, `openrouter`, `opencode`, `bedrock`, `azure-ai`, `gemini-vertex`, `gemini-interactions`, `mistralrs` |
+| CLI | `cli` (with DeepSeek and Groq), `cli-openai`, `cli-anthropic`, `cli-ollama`, `cli-mistralrs`, `cli-all-providers`, `cli-telemetry-otlp`, `optimize` |
 | Production backends (need infrastructure) | `postgres-session`, `redis-session`, `mongodb-session`, `firestore-session`, `neo4j-session`, `vertex-session`, `sqlite-memory`, `database-memory`, `redis-memory`, `mongodb-memory`, `neo4j-memory`, `vertex-memory`, `auth-bridge` |
 | Managed agents | `managed-runtime` (with the `gemini`, `openai`, `anthropic`, and `ollama` features for its model resolver), `enterprise-client` |
-| Server | `a2a`, `yaml-agent`, `agent-registry`, `agent-engine`, `vertex-remote-engine` |
+| Server | `yaml-agent`, `agent-engine`, `vertex-remote-engine`; `server` (in `standard`) includes A2A and the agent registry |
 | Tools | `mcp`, `mcp-http`, `mcp-sampling`, `memory-tools`, `slack`, `bigquery`, `spanner`, `example-store`, `vertex-agent-registry`, `code-tools`, `code-embedded-js`, `code-embedded-python`, `code-docker`, `codeact`, `codeact-monty` |
 | Telemetry | `telemetry-otlp`, `telemetry-sqlite`, `gcp-telemetry`, `record-payloads` |
-| Realtime and audio | `openai-realtime`, `gemini-live`, `vertex-live`, `livekit`, `openai-webrtc`, `video-avatar`, `audio-*`, `whisper-onnx`, `distil-whisper`, `moonshine`, `kokoro`, `chatterbox`, `qwen3-tts`, `all-onnx` |
-| Harness packs | `harness-browser`, `harness-computer-use`, `harness-payments`, `harness-voice`, `harness-managed` |
-| Graph actions | `action`, `action-http`, `action-trigger`, `action-db`, `action-code`, `action-email`, `action-rss`, `action-full` |
-| Other | `acp`, `skills-progressive-disclosure`, `personas`, `sandbox-workspace`, `sandbox-docker`, `aws-secrets`, `azure-keyvault`, `gcp-secrets`, `gcs-artifacts`, `vertex-sandbox`, `vertex-eval`, `vertex-rag`, `agent-retrieval`, `vertex-skill-registry`, `gcp-deploy` |
+| Realtime and audio | `openai-realtime`, `gemini-live`, `vertex-live`, `livekit`, `openai-webrtc`, `video-avatar`, `audio-*` (`audio-onnx` covers Whisper, Distil-Whisper, Moonshine and Chatterbox), `kokoro`, `qwen3-tts`, `all-onnx` |
+| Harness packs | `harness-browser`, `harness-computer-use`, `harness-payments`, `harness-voice`, `harness-managed`, `harness-web`, `harness-mcp`, `harness-hooks`, `harness-encrypted`, `harness-memory-local` |
+| Surfaces | `surface` — the surface engine and the web home |
+| Vision | `vision` — `adk-vision` with the fetcher, cloud describers, `sam-3.1` and the privacy guardrail (in `full`); `vision-local` — the on-device backends on ONNX Runtime and Candle (in no tier) |
+| Graph actions | `action`, `action-http` (with RSS), `action-trigger`, `action-full` |
+| Other | `acp`, `skills-progressive-disclosure`, `sandbox-workspace`, `sandbox-docker`, `aws-secrets`, `azure-keyvault`, `gcp-secrets`, `gcp-model-armor`, `gcs-artifacts`, `vertex-sandbox`, `vertex-eval`, `vertex-rag`, `agent-retrieval`, `vertex-skill-registry`, `gcp-deploy` |
 
 `adk-rust/Cargo.toml` is the authoritative list.
 
 ## Modules
 
-Each enabled crate is re-exported as a module: `agent`, `model`, `tool`, `skill`, `session`, `artifact`, `memory`, `runner`, `server`, `telemetry`, `graph`, `realtime`, `browser`, `eval`, `guardrail`, `auth`, `payment`, `plugin`, `audio`, `rag`, `code`, `sandbox`, `computer_use`, `managed`, `harness`, `anthropic_client`, `deploy`, and others. `adk_core` is re-exported at the crate root, and `adk_rust::prelude` brings the common types into scope.
+Each enabled crate is re-exported as a module: `agent`, `model`, `tool`, `skill`, `session`, `artifact`, `memory`, `runner`, `server`, `telemetry`, `graph`, `realtime`, `browser`, `eval`, `guardrail`, `auth`, `payment`, `plugin`, `audio`, `rag`, `code`, `sandbox`, `computer_use`, `managed`, `harness`, `kernel`, `surface`, `awp`, `acp`, `website`, `site`, `vision`, `anthropic_client`, `deploy`, and others. `adk_core` is re-exported at the crate root, and `adk_rust::prelude` brings the common types into scope.
 
 ## Changes in 3.0
 
@@ -276,14 +311,17 @@ Each enabled crate is re-exported as a module: `agent`, `model`, `tool`, `skill`
 - Tool calls run through one governed path: tool policy, guardrails, and confirmation bound to the acting agent and the tool's origin.
 - Run budgets, a spend ledger, an action ledger, durable runs, approvals, and audit records are part of the runtime, with stores on every session backend.
 - `standard` includes `computer-use`; provider features also enable `adk-managed`'s model resolver when `managed-runtime` is on.
+- `autonomy` (in `enterprise` and `full`) turns on everything an agent needs to run unattended: the harness and its kernel, durable and background runs with cron and webhook wake-ups, the approvals service, SQLite stores, and the signed audit log.
+- The 19 features that only aliased a sibling are removed: `cerebras`, `fireworks`, `mistral`, `perplexity`, `sambanova` and `together` (use `openai`); `whisper-onnx`, `distil-whisper`, `moonshine` and `chatterbox` (use `audio-onnx`); `action-code`, `action-db` and `action-email` (use `action`); `action-rss` (use `action-http`); `a2a` and `agent-registry` (use `server`); `cli-deepseek` and `cli-groq` (use `cli`); and `personas` (use `eval`).
+- New crates: `adk-harness` (the governed harness agent), `adk-kernel` (the agent kernel behind `adk-rust up`), `adk-surface` (the web home, terminal, phone and chat surfaces), `adk-site`, `adk-drivers` and `adk-website` (the AWP website product), and `adk-vision` (local-first perception, `vision` and `vision-local`). `enterprise` and `full` include the harness and the kernel through `autonomy`, `full` also the website and vision; `surface` and `vision-local` are opt-in.
 
-See the [2.x to 3.0 migration guide](../docs/official_docs/migration/2.x-to-3.0.md) and the [changelog](../CHANGELOG.md).
+See [What's new in 3.0](../docs/official_docs/whats-new-3.0.md), the [2.x to 3.0 migration guide](../docs/official_docs/migration/2.x-to-3.0.md) and the [changelog](../CHANGELOG.md).
 
 ## Documentation
 
 - [API Reference](https://docs.rs/adk-rust)
 - [Official Guides](../docs/official_docs/index.md)
-- [Examples](../examples/README.md) — standalone example crates in this repository; more in the [playground](https://github.com/zavora-ai/adk-playground)
+- [Examples](https://github.com/zavora-ai/adk-playground) — the adk-playground repository
 
 ## License
 

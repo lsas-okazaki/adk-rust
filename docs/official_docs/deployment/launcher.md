@@ -6,7 +6,7 @@ launchers, depending on the `cli` feature:
 | Feature set | `adk_rust::Launcher` is | Modes |
 |-------------|-------------------------|-------|
 | default (`minimal`) and other tiers without `cli` | `adk_runner::Launcher` | Console only |
-| `cli` (or `cli-openai`, `cli-anthropic`, `cli-deepseek`, `cli-groq`, `cli-ollama`, `cli-all-providers`) | `adk_cli::Launcher` | Console, and an HTTP server with the REST API (`serve`) |
+| `cli` (or `cli-openai`, `cli-anthropic`, `cli-ollama`, `cli-all-providers`) | `adk_cli::Launcher` | Console, and an HTTP server with the REST API (`serve`) |
 
 No tier includes `cli`; add it to the tier you use:
 
@@ -41,7 +41,7 @@ use std::sync::Arc;
 async fn main() -> Result<()> {
     let api_key = std::env::var("GOOGLE_API_KEY")
         .map_err(|_| AdkError::config("GOOGLE_API_KEY is not set"))?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 
     let agent = LlmAgentBuilder::new("my_agent")
         .description("A helpful assistant")
@@ -279,7 +279,10 @@ You > ORDER-12345
 
 In server mode, the `cli` launcher:
 
-1. Initializes telemetry: logs to stdout, and runtime spans for the web home's developer panel
+1. Initializes telemetry: logs to stdout, and runtime spans for the web home's developer panel.
+   A process that installed its own `tracing` subscriber keeps it, and the panel shows no spans;
+   call `adk_telemetry::init_with_adk_exporter` first instead, as the `harness` and
+   `autonomous` templates of `cargo adk new` do, and the launcher reuses its exporter
 2. Uses the configured session service, or an in-memory one
 3. Starts an HTTP server with the REST API, on `127.0.0.1` by default
 4. Mounts the approval inbox (`with_approval_service`) and background runs
@@ -383,7 +386,7 @@ struct WeatherArgs {
 async fn main() -> Result<()> {
     let api_key = std::env::var("GOOGLE_API_KEY")
         .map_err(|_| AdkError::config("GOOGLE_API_KEY is not set"))?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 
     let weather_tool = FunctionTool::new(
         "get_weather",

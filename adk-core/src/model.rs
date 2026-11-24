@@ -3,7 +3,6 @@ use crate::{Result, types::Content};
 use async_trait::async_trait;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::pin::Pin;
 
 /// A pinned, boxed stream of [`LlmResponse`] results from a model.
@@ -15,10 +14,68 @@ pub type LlmResponseStream = Pin<Box<dyn Stream<Item = Result<LlmResponse>> + Se
 /// and produce a stream of responses for a given request.
 #[async_trait]
 pub trait Llm: Send + Sync {
-    /// Returns the model identifier (e.g., "gemini-3.7-flash").
+    /// Returns the model identifier (e.g., "gemini-3.8-flash").
     fn name(&self) -> &str;
     /// Generates content from the given request, optionally streaming.
     async fn generate_content(&self, req: LlmRequest, stream: bool) -> Result<LlmResponseStream>;
+
+    /// Generates content with every provider call it makes metered against `scope`.
+    ///
+    /// [`ModelCallScope::generate`](crate::ModelCallScope::generate) calls this for every
+    /// metered call, after checking the scope's kill switches. The default meters the call as
+    /// one model call ([`ModelCallScope::generate_one_call`](crate::ModelCallScope::generate_one_call)):
+    /// one hold in the spend ledger, reserved under the vendor of `req.model`, and one model
+    /// call in the run budget.
+    ///
+    /// A model that sends one request to several providers, such as a fallback chain,
+    /// overrides it to call each of them through `scope.generate`, so every provider call is
+    /// reserved, counted and committed under the provider and model that served it. A
+    /// wrapper that only changes the request or the stream keeps the default and is metered
+    /// as one call.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`ModelCallScope::generate`](crate::ModelCallScope::generate) returns.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use adk_core::{
+    ///     InMemorySpendLedger, Llm, LlmRequest, LlmResponseStream, ModelCallScope, SpendKey,
+    ///     SpendLedger, SpendPeriod,
+    /// };
+    ///
+    /// struct Local;
+    ///
+    /// #[async_trait::async_trait]
+    /// impl Llm for Local {
+    ///     fn name(&self) -> &str {
+    ///         "gemini-local"
+    ///     }
+    ///     async fn generate_content(&self, _: LlmRequest, _: bool) -> adk_core::Result<LlmResponseStream> {
+    ///         Ok(Box::pin(futures::stream::empty()))
+    ///     }
+    /// }
+    ///
+    /// # futures::executor::block_on(async {
+    /// let ledger = Arc::new(InMemorySpendLedger::default());
+    /// let scope = ModelCallScope::new().with_spend_ledger(ledger.clone(), "acme");
+    /// // The default meters the call as one; a call with no response commits nothing.
+    /// let request = LlmRequest::new("gemini-local", vec![]);
+    /// let _ = Local.generate_content_metered(&scope, request, false).await?;
+    /// assert_eq!(ledger.spent(&SpendKey::org("acme"), SpendPeriod::Day).await?, 0);
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// # }).unwrap();
+    /// ```
+    async fn generate_content_metered(
+        &self,
+        scope: &crate::ModelCallScope,
+        req: LlmRequest,
+        stream: bool,
+    ) -> Result<LlmResponseStream> {
+        scope.generate_one_call(self, req, stream).await
+    }
 
     /// Returns the schema adapter for this provider.
     ///
@@ -61,6 +118,43 @@ pub trait Llm: Send + Sync {
         None
     }
 
+    /// The most tokens a request to this model may carry, as its provider documents it, if
+    /// known.
+    ///
+    /// Auto-compaction ([`IntraCompactionConfig`](crate::IntraCompactionConfig)) compacts an
+    /// agent's history before it nears this window. `adk-model` providers read it from the
+    /// pricing catalog, which records each vendor's published figure.
+    ///
+    /// The default returns `None`, which compacts at
+    /// [`DEFAULT_TOKEN_THRESHOLD`](crate::intra_compaction::DEFAULT_TOKEN_THRESHOLD).
+    /// Wrappers forward to the model they wrap.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_core::{Llm, LlmRequest, LlmResponseStream};
+    ///
+    /// struct Local;
+    ///
+    /// #[async_trait::async_trait]
+    /// impl Llm for Local {
+    ///     fn name(&self) -> &str {
+    ///         "local-8k"
+    ///     }
+    ///     async fn generate_content(&self, _: LlmRequest, _: bool) -> adk_core::Result<LlmResponseStream> {
+    ///         unimplemented!()
+    ///     }
+    ///     fn context_window(&self) -> Option<u64> {
+    ///         Some(8_192)
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(Local.context_window(), Some(8_192));
+    /// ```
+    fn context_window(&self) -> Option<u64> {
+        None
+    }
+
     /// The provider-executed web search this model's transport serves, if any (spec 3.1
     /// §7.20 "Provider-native search and fetch").
     ///
@@ -95,6 +189,410 @@ pub trait Llm: Send + Sync {
     fn native_web_search(&self) -> Option<NativeWebSearch> {
         None
     }
+
+    /// The conversation compaction this model's provider performs itself, if any.
+    ///
+    /// The runner's auto-compaction asks such a model for the summary
+    /// ([`NativeCompactionRequest`](crate::intra_compaction::NativeCompactionRequest)) in place
+    /// of writing one with its own summarizer, and keeps the provider's signed result in the
+    /// history so the provider reads it back
+    /// ([`is_native_compaction`](crate::intra_compaction::is_native_compaction)).
+    ///
+    /// The default returns `None`. Wrappers forward to the model they wrap.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_core::{Llm, LlmRequest, LlmResponseStream, NativeCompaction};
+    ///
+    /// struct Hosted;
+    ///
+    /// #[async_trait::async_trait]
+    /// impl Llm for Hosted {
+    ///     fn name(&self) -> &str {
+    ///         "hosted"
+    ///     }
+    ///     async fn generate_content(&self, _: LlmRequest, _: bool) -> adk_core::Result<LlmResponseStream> {
+    ///         unimplemented!()
+    ///     }
+    ///     fn native_compaction(&self) -> Option<NativeCompaction> {
+    ///         Some(NativeCompaction::new("anthropic").keeping_thinking())
+    ///     }
+    /// }
+    ///
+    /// assert!(Hosted.native_compaction().unwrap().keeps_thinking);
+    /// ```
+    fn native_compaction(&self) -> Option<NativeCompaction> {
+        None
+    }
+
+    /// Opens what the first call to this model would otherwise open, such as the pooled
+    /// TLS connection to the provider, so a turn that follows soon after starts on it.
+    ///
+    /// It sends no prompt and spends no tokens. What it opens lasts as long as the client
+    /// keeps an idle connection (90 seconds for `adk-anthropic`); call it again after that.
+    /// The default does nothing. Wrappers forward to the model they wrap.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider's error when it cannot be reached; a turn would meet the same
+    /// error, so a caller may log it and carry on.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_core::{Llm, LlmRequest, LlmResponseStream};
+    ///
+    /// struct Local;
+    ///
+    /// #[async_trait::async_trait]
+    /// impl Llm for Local {
+    ///     fn name(&self) -> &str {
+    ///         "local"
+    ///     }
+    ///     async fn generate_content(&self, _: LlmRequest, _: bool) -> adk_core::Result<LlmResponseStream> {
+    ///         Ok(Box::pin(futures::stream::empty()))
+    ///     }
+    /// }
+    ///
+    /// # futures::executor::block_on(async {
+    /// Local.prewarm().await?;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// # }).unwrap();
+    /// ```
+    async fn prewarm(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Where a call's request data goes: into another machine ([`DataLocality::Remote`]),
+    /// to a server on this machine ([`DataLocality::Loopback`]), or nowhere outside this
+    /// process ([`DataLocality::InProcess`]).
+    ///
+    /// The image privacy guardrail reads it to tell which model calls leave the machine.
+    /// The default is `Remote`, so a model that does not say is treated as remote. Wrappers
+    /// forward the wrapped model's locality; a wrapper over several models answers the
+    /// least local of them ([`DataLocality::least_local`]).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_core::{DataLocality, Llm, LlmRequest, LlmResponseStream};
+    ///
+    /// struct OnDevice;
+    ///
+    /// #[async_trait::async_trait]
+    /// impl Llm for OnDevice {
+    ///     fn name(&self) -> &str {
+    ///         "qwen3-vl-2b"
+    ///     }
+    ///     async fn generate_content(&self, _: LlmRequest, _: bool) -> adk_core::Result<LlmResponseStream> {
+    ///         Ok(Box::pin(futures::stream::empty()))
+    ///     }
+    ///     fn data_locality(&self) -> DataLocality {
+    ///         DataLocality::InProcess
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(OnDevice.data_locality(), DataLocality::InProcess);
+    /// assert!(!OnDevice.data_locality().leaves_machine());
+    /// ```
+    fn data_locality(&self) -> DataLocality {
+        DataLocality::Remote
+    }
+}
+
+/// Where a model call's request data goes, from most to least local.
+///
+/// Ordered by how far data travels, so the greater of two localities is the less local one.
+///
+/// | Locality | Request data | Example |
+/// |----------|--------------|---------|
+/// | [`InProcess`](Self::InProcess) | Stays in this process | `adk-mistralrs` models |
+/// | [`Loopback`](Self::Loopback) | Leaves the process for a server on this machine | Ollama or an OpenAI-compatible server at `localhost` |
+/// | [`Remote`](Self::Remote) | Leaves the machine | Every hosted provider |
+///
+/// A loopback server can itself forward a request elsewhere; `Loopback` says only that the
+/// framework sends it no further than this machine.
+///
+/// # Example
+///
+/// ```rust
+/// use adk_core::DataLocality;
+///
+/// assert_eq!(DataLocality::of_url("http://localhost:11434"), DataLocality::Loopback);
+/// assert_eq!(DataLocality::of_url("http://[::1]:8000/v1"), DataLocality::Loopback);
+/// assert_eq!(DataLocality::of_url("https://api.openai.com/v1"), DataLocality::Remote);
+/// assert_eq!(
+///     DataLocality::least_local([DataLocality::InProcess, DataLocality::Loopback]),
+///     DataLocality::Loopback
+/// );
+/// assert_eq!(serde_json::to_value(DataLocality::InProcess).unwrap(), "inProcess");
+/// ```
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum DataLocality {
+    /// The model runs in this process; request data never leaves it.
+    InProcess,
+    /// The model is served on this machine over the loopback interface.
+    Loopback,
+    /// The model is served by another machine; request data leaves this one.
+    #[default]
+    Remote,
+}
+
+impl DataLocality {
+    /// The locality of a server at `url`: [`Loopback`](Self::Loopback) when its host is
+    /// `localhost` or a loopback address (`127.0.0.0/8`, `::1`), otherwise
+    /// [`Remote`](Self::Remote). A URL that does not parse is `Remote`.
+    pub fn of_url(url: &str) -> Self {
+        let Ok(parsed) = url::Url::parse(url.trim()) else {
+            return Self::Remote;
+        };
+        let loopback = match parsed.host() {
+            Some(url::Host::Domain(domain)) => {
+                let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+                domain == "localhost" || domain.ends_with(".localhost")
+            }
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => {
+                address.is_loopback()
+                    || address.to_ipv4_mapped().is_some_and(|mapped| mapped.is_loopback())
+            }
+            None => false,
+        };
+        if loopback { Self::Loopback } else { Self::Remote }
+    }
+
+    /// The least local of `localities`: where the data of a call that may go to any of
+    /// them can end up. [`Remote`](Self::Remote) when there are none.
+    pub fn least_local(localities: impl IntoIterator<Item = DataLocality>) -> Self {
+        localities.into_iter().max().unwrap_or(Self::Remote)
+    }
+
+    /// Whether request data leaves this machine.
+    pub fn leaves_machine(self) -> bool {
+        self == Self::Remote
+    }
+
+    /// Whether request data leaves this process.
+    pub fn leaves_process(self) -> bool {
+        self != Self::InProcess
+    }
+}
+
+/// Tool declarations keyed by tool name, in the order the agent declares them.
+///
+/// Providers send the tools in this order, so a request is the same on every run, as in
+/// adk-python and adk-go. Inserting a name already present replaces its declaration in place.
+///
+/// ```rust
+/// use adk_core::ToolDeclarations;
+/// use serde_json::json;
+///
+/// let mut tools = ToolDeclarations::new();
+/// tools.insert("search".into(), json!({"name": "search"}));
+/// tools.insert("add".into(), json!({"name": "add"}));
+/// tools.insert("search".into(), json!({"name": "search", "description": "Find pages"}));
+///
+/// let names: Vec<&str> = tools.keys().map(String::as_str).collect();
+/// assert_eq!(names, ["search", "add"]);
+/// assert_eq!(tools["search"]["description"], "Find pages");
+/// ```
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolDeclarations {
+    entries: Vec<(String, serde_json::Value)>,
+}
+
+impl ToolDeclarations {
+    /// No declarations.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The number of declarations.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether there are no declarations.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Declares `name`, at the end, or in its place when it is already declared. Returns the
+    /// declaration it replaced.
+    pub fn insert(
+        &mut self,
+        name: String,
+        declaration: serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        match self.entries.iter_mut().find(|(existing, _)| *existing == name) {
+            Some((_, slot)) => Some(std::mem::replace(slot, declaration)),
+            None => {
+                self.entries.push((name, declaration));
+                None
+            }
+        }
+    }
+
+    /// The declaration of `name`.
+    pub fn get(&self, name: &str) -> Option<&serde_json::Value> {
+        self.entries.iter().find(|(existing, _)| existing == name).map(|(_, value)| value)
+    }
+
+    /// The declaration of `name`, to change.
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut serde_json::Value> {
+        self.entries.iter_mut().find(|(existing, _)| existing == name).map(|(_, value)| value)
+    }
+
+    /// Whether `name` is declared.
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    /// Removes `name`, keeping the order of the rest. Returns its declaration.
+    pub fn remove(&mut self, name: &str) -> Option<serde_json::Value> {
+        let index = self.entries.iter().position(|(existing, _)| existing == name)?;
+        Some(self.entries.remove(index).1)
+    }
+
+    /// Keeps the declarations `keep` accepts, in order.
+    pub fn retain(&mut self, mut keep: impl FnMut(&String, &mut serde_json::Value) -> bool) {
+        self.entries.retain_mut(|(name, value)| keep(name, value));
+    }
+
+    /// Names and declarations, in declaration order.
+    pub fn iter(&self) -> ToolDeclarationsIter<'_> {
+        self.entries.iter().map(|(name, value)| (name, value))
+    }
+
+    /// Names, in declaration order.
+    pub fn keys(&self) -> ToolDeclarationsKeys<'_> {
+        ToolDeclarationsKeys { entries: self.entries.iter() }
+    }
+
+    /// Declarations, in declaration order.
+    pub fn values(&self) -> ToolDeclarationsValues<'_> {
+        ToolDeclarationsValues { entries: self.entries.iter() }
+    }
+}
+
+/// The names in [`ToolDeclarations`], in declaration order. Prints as a list of the names,
+/// as a `HashMap`'s keys do.
+#[derive(Clone)]
+pub struct ToolDeclarationsKeys<'a> {
+    entries: std::slice::Iter<'a, (String, serde_json::Value)>,
+}
+
+impl<'a> Iterator for ToolDeclarationsKeys<'a> {
+    type Item = &'a String;
+
+    fn next(&mut self) -> Option<&'a String> {
+        self.entries.next().map(|(name, _)| name)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.entries.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for ToolDeclarationsKeys<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.entries.next_back().map(|(name, _)| name)
+    }
+}
+
+impl ExactSizeIterator for ToolDeclarationsKeys<'_> {}
+
+impl std::fmt::Debug for ToolDeclarationsKeys<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+/// The declarations in [`ToolDeclarations`], in declaration order. Prints as a list of the
+/// declarations, as a `HashMap`'s values do.
+#[derive(Clone)]
+pub struct ToolDeclarationsValues<'a> {
+    entries: std::slice::Iter<'a, (String, serde_json::Value)>,
+}
+
+impl<'a> Iterator for ToolDeclarationsValues<'a> {
+    type Item = &'a serde_json::Value;
+
+    fn next(&mut self) -> Option<&'a serde_json::Value> {
+        self.entries.next().map(|(_, value)| value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.entries.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for ToolDeclarationsValues<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.entries.next_back().map(|(_, value)| value)
+    }
+}
+
+impl ExactSizeIterator for ToolDeclarationsValues<'_> {}
+
+impl std::fmt::Debug for ToolDeclarationsValues<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+/// An iterator over [`ToolDeclarations`], in declaration order.
+pub type ToolDeclarationsIter<'a> = std::iter::Map<
+    std::slice::Iter<'a, (String, serde_json::Value)>,
+    fn(&'a (String, serde_json::Value)) -> (&'a String, &'a serde_json::Value),
+>;
+
+impl std::ops::Index<&str> for ToolDeclarations {
+    type Output = serde_json::Value;
+
+    /// The declaration of `name`; panics when it is not declared.
+    fn index(&self, name: &str) -> &serde_json::Value {
+        self.get(name).unwrap_or_else(|| panic!("tool {name} is not declared"))
+    }
+}
+
+impl<'a> IntoIterator for &'a ToolDeclarations {
+    type Item = (&'a String, &'a serde_json::Value);
+    type IntoIter = ToolDeclarationsIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl IntoIterator for ToolDeclarations {
+    type Item = (String, serde_json::Value);
+    type IntoIter = std::vec::IntoIter<(String, serde_json::Value)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+impl<K: Into<String>> FromIterator<(K, serde_json::Value)> for ToolDeclarations {
+    fn from_iter<I: IntoIterator<Item = (K, serde_json::Value)>>(iter: I) -> Self {
+        let mut tools = Self::new();
+        tools.extend(iter);
+        tools
+    }
+}
+
+impl<K: Into<String>> Extend<(K, serde_json::Value)> for ToolDeclarations {
+    fn extend<I: IntoIterator<Item = (K, serde_json::Value)>>(&mut self, iter: I) {
+        for (name, declaration) in iter {
+            self.insert(name.into(), declaration);
+        }
+    }
 }
 
 /// A request to an LLM provider.
@@ -106,9 +604,9 @@ pub struct LlmRequest {
     pub contents: Vec<Content>,
     /// Optional generation configuration (temperature, tokens, etc.).
     pub config: Option<GenerateContentConfig>,
-    /// Tool declarations keyed by tool name.
+    /// Tool declarations keyed by tool name, in declaration order.
     #[serde(skip)]
-    pub tools: HashMap<String, serde_json::Value>,
+    pub tools: ToolDeclarations,
     /// Provider-neutral identifier of the previous response to continue from.
     /// The agent populates this from the most recent event's `interaction_id`.
     /// Maps to `previous_interaction_id` for the Gemini Interactions transport;
@@ -335,7 +833,7 @@ pub trait CacheCapable: Send + Sync {
     async fn create_cache(
         &self,
         system_instruction: &str,
-        tools: &HashMap<String, serde_json::Value>,
+        tools: &ToolDeclarations,
         ttl_seconds: u32,
     ) -> Result<String>;
 
@@ -589,6 +1087,41 @@ impl NativeWebSearch {
     }
 }
 
+/// The conversation compaction a model's provider performs itself, as
+/// [`Llm::native_compaction`] reports it.
+///
+/// # Example
+///
+/// ```rust
+/// use adk_core::NativeCompaction;
+///
+/// let compaction = NativeCompaction::new("anthropic").keeping_thinking();
+/// assert_eq!(compaction.provider, "anthropic");
+/// assert!(compaction.keeps_thinking);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[non_exhaustive]
+pub struct NativeCompaction {
+    /// Provider that writes the summary, such as `"anthropic"`.
+    pub provider: &'static str,
+    /// Whether the turns kept after the summary keep their thinking: the provider accepts
+    /// thinking that was produced before the summary replaced the turns it followed.
+    pub keeps_thinking: bool,
+}
+
+impl NativeCompaction {
+    /// The compaction `provider` performs; the kept turns lose their thinking.
+    pub fn new(provider: &'static str) -> Self {
+        Self { provider, keeps_thinking: false }
+    }
+
+    /// The kept turns keep their thinking after the summary.
+    pub fn keeping_thinking(mut self) -> Self {
+        self.keeps_thinking = true;
+        self
+    }
+}
+
 /// Citation metadata emitted by model providers for source attribution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -617,17 +1150,57 @@ pub struct CitationSource {
 }
 
 /// Reason the model stopped generating content.
+///
+/// The enum is `#[non_exhaustive]`: providers add stop reasons, so a `match` outside
+/// `adk-core` needs a wildcard arm. Each variant serializes as its name (`"Stop"`,
+/// `"Refusal"`, ...), and a name this version does not know deserializes as
+/// [`Other`](Self::Other), so an event written by a newer release still loads.
+///
+/// `LlmAgent` and `CodeActAgent` end the run with an error on [`Refusal`](Self::Refusal)
+/// (`model.refusal`) and [`MalformedToolCall`](Self::MalformedToolCall)
+/// (`model.malformed_tool_call`); the other reasons leave the outcome to the content.
+///
+/// # Example
+///
+/// ```
+/// use adk_core::FinishReason;
+///
+/// fn succeeded(reason: Option<FinishReason>) -> bool {
+///     match reason {
+///         Some(FinishReason::Stop) | None => true,
+///         Some(FinishReason::Refusal | FinishReason::MalformedToolCall) => false,
+///         Some(_) => false,
+///     }
+/// }
+///
+/// assert!(!succeeded(Some(FinishReason::Refusal)));
+/// assert_eq!(serde_json::to_string(&FinishReason::Refusal).unwrap(), "\"Refusal\"");
+/// assert_eq!(
+///     serde_json::from_str::<FinishReason>("\"SomeLaterReason\"").unwrap(),
+///     FinishReason::Other
+/// );
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum FinishReason {
     /// Natural stop (end of response).
     Stop,
     /// Hit the maximum token limit.
     MaxTokens,
-    /// Content filtered for safety.
+    /// A content filter blocked or cut the response, such as Gemini `SAFETY`, OpenAI
+    /// `content_filter`, or a Bedrock guardrail.
     Safety,
     /// Content blocked due to recitation/copyright.
     Recitation,
-    /// Other/unknown reason.
+    /// The model declined the request: Anthropic `stop_reason: "refusal"`, an OpenAI Chat
+    /// Completions `refusal`, or a Responses `refusal` content part. The response's text, when
+    /// present, is the refusal, not an answer.
+    Refusal,
+    /// The provider reports a tool call the model generated as invalid: Gemini
+    /// `MALFORMED_FUNCTION_CALL` or `UNEXPECTED_TOOL_CALL`, Bedrock `malformed_tool_use`.
+    MalformedToolCall,
+    /// Other/unknown reason, including a name a newer release wrote.
+    #[serde(other)]
     Other,
 }
 
@@ -638,7 +1211,7 @@ impl LlmRequest {
             model: model.into(),
             contents,
             config: None,
-            tools: HashMap::new(),
+            tools: ToolDeclarations::new(),
             previous_response_id: None,
         }
     }
@@ -681,6 +1254,89 @@ impl LlmResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_loopback_host_is_loopback_and_every_other_host_remote() {
+        for url in [
+            "http://localhost:11434",
+            "http://LOCALHOST.:8000/v1",
+            "http://vllm.localhost/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://127.8.9.10",
+            "http://[::1]:8080",
+            "http://[::ffff:127.0.0.1]:8080",
+            " https://localhost/v1/ ",
+        ] {
+            assert_eq!(DataLocality::of_url(url), DataLocality::Loopback, "{url}");
+        }
+        for url in [
+            "https://api.openai.com/v1",
+            "http://localhost.example.com",
+            "http://0.0.0.0:11434",
+            "http://10.0.0.5:11434",
+            "http://[::2]",
+            "localhost:11434",
+            "not a url",
+            "",
+        ] {
+            assert_eq!(DataLocality::of_url(url), DataLocality::Remote, "{url}");
+        }
+    }
+
+    #[test]
+    fn the_least_local_of_several_localities_wins() {
+        use DataLocality::{InProcess, Loopback, Remote};
+        assert_eq!(DataLocality::least_local([InProcess, InProcess]), InProcess);
+        assert_eq!(DataLocality::least_local([InProcess, Loopback]), Loopback);
+        assert_eq!(DataLocality::least_local([Loopback, Remote, InProcess]), Remote);
+        assert_eq!(DataLocality::least_local([]), Remote);
+        assert_eq!(DataLocality::default(), Remote);
+        assert!(Remote.leaves_machine() && Remote.leaves_process());
+        assert!(!Loopback.leaves_machine() && Loopback.leaves_process());
+        assert!(!InProcess.leaves_machine() && !InProcess.leaves_process());
+        for locality in [InProcess, Loopback, Remote] {
+            let wire = serde_json::to_value(locality).unwrap();
+            assert_eq!(serde_json::from_value::<DataLocality>(wire).unwrap(), locality);
+        }
+    }
+
+    #[test]
+    fn a_metered_model_reports_the_wrapped_models_locality() {
+        struct Local;
+
+        #[async_trait]
+        impl Llm for Local {
+            fn name(&self) -> &str {
+                "local"
+            }
+            async fn generate_content(&self, _: LlmRequest, _: bool) -> Result<LlmResponseStream> {
+                Ok(Box::pin(futures::stream::empty()))
+            }
+            fn data_locality(&self) -> DataLocality {
+                DataLocality::InProcess
+            }
+        }
+
+        let metered = crate::MeteredLlm::new(std::sync::Arc::new(Local));
+        assert_eq!(metered.data_locality(), DataLocality::InProcess);
+    }
+
+    #[test]
+    fn tool_names_and_declarations_print_as_lists() {
+        let tools: ToolDeclarations = [
+            ("search", serde_json::json!({"name": "search"})),
+            ("add", serde_json::json!({"name": "add"})),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(format!("{:?}", tools.keys()), r#"["search", "add"]"#);
+        assert_eq!(
+            format!("{:?}", tools.values()),
+            r#"[Object {"name": String("search")}, Object {"name": String("add")}]"#
+        );
+        assert_eq!(tools.keys().len(), 2);
+        assert_eq!(tools.keys().next_back().map(String::as_str), Some("add"));
+    }
 
     #[test]
     fn test_llm_request_creation() {
@@ -928,5 +1584,48 @@ mod tests {
     fn test_finish_reason() {
         assert_eq!(FinishReason::Stop, FinishReason::Stop);
         assert_ne!(FinishReason::Stop, FinishReason::MaxTokens);
+    }
+
+    /// Events and sessions store the finish reason by name, so the names are a wire format.
+    #[test]
+    fn finish_reason_wire_names_are_stable() {
+        let names = [
+            (FinishReason::Stop, "Stop"),
+            (FinishReason::MaxTokens, "MaxTokens"),
+            (FinishReason::Safety, "Safety"),
+            (FinishReason::Recitation, "Recitation"),
+            (FinishReason::Refusal, "Refusal"),
+            (FinishReason::MalformedToolCall, "MalformedToolCall"),
+            (FinishReason::Other, "Other"),
+        ];
+        for (reason, name) in names {
+            assert_eq!(serde_json::to_value(reason).unwrap(), serde_json::json!(name));
+            assert_eq!(
+                serde_json::from_value::<FinishReason>(serde_json::json!(name)).unwrap(),
+                reason
+            );
+        }
+        assert_eq!(
+            serde_json::from_value::<FinishReason>(serde_json::json!("ReasonFromALaterRelease"))
+                .unwrap(),
+            FinishReason::Other
+        );
+    }
+
+    /// A response persisted before 3.0 still loads.
+    #[test]
+    fn a_persisted_response_still_loads() {
+        let stored = serde_json::json!({
+            "content": null,
+            "usage_metadata": null,
+            "finish_reason": "Safety",
+            "partial": false,
+            "turn_complete": true,
+            "interrupted": false,
+            "error_code": null,
+            "error_message": null
+        });
+        let response: LlmResponse = serde_json::from_value(stored).unwrap();
+        assert_eq!(response.finish_reason, Some(FinishReason::Safety));
     }
 }

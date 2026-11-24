@@ -17,6 +17,9 @@ name: CI Nightly
 #   • site-hosts, site-generators — adk-site's host adapters against MinIO, Azurite
 #     and an SSH server, the CalDAV driver against Radicale, and the real site
 #     generators under bubblewrap and the Windows restricted token (spec 3.5 §11).
+#   • vision-bench — every local adk-vision backend's latency, accuracy and cost on
+#     Apple Silicon and Linux CPU, published as an artifact, and each backend's eval
+#     scores gated against its committed baseline (spec 3.7 §7.17, Q10).
 #
 # This is an INFORMATIONAL tier: per the spec's required-check policy these jobs
 # are NOT branch-protection-required. A nightly failure is a signal to triage,
@@ -37,7 +40,7 @@ on:
         description: The job to run; `all` runs every job
         type: choice
         default: all
-        options: [all, feature-combinations, feature-coverage-isolated, supply-chain, durable-stores, integration-tests, harness-eval-live, site-soak, website-wordpress, website-soak, site-hosts, site-generators]
+        options: [all, feature-combinations, feature-coverage-isolated, supply-chain, durable-stores, integration-tests, harness-eval-live, site-soak, website-wordpress, website-soak, site-hosts, site-generators, vision-bench]
 
 permissions:
   contents: read
@@ -201,7 +204,7 @@ jobs:
       timeout-minutes: 10
       uses: ./.github/actions/apt-install
       with:
-        packages: protobuf-compiler libdbus-1-dev libasound2-dev libudev-dev
+        packages: protobuf-compiler libasound2-dev libudev-dev
 
     - name: Install cargo-nextest
       uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
@@ -252,10 +255,10 @@ jobs:
   # Every SpendLedger, ActionLedger, and ApprovalStore backend in adk-session runs the
   # adk-core conformance suites, and the kernel's process, agenda, driver, ledger, partition
   # and cron watermark stores run theirs on MongoDB, Neo4j and Firestore (spec 3.2 §13 Q8).
-  # SQLite runs on every PR (feature-coverage shard 5); the
+  # SQLite runs on every PR (the `adk-session` feature-coverage pairs); the
   # server-backed suites are #[ignore]d and run here against service containers. The
   # multi-process durability gates (adk-durability-gates) run here on every server
-  # backend; their SQLite gates run on every PR in feature-coverage shard 2 (the
+  # backend; their SQLite gates run on every PR in feature-coverage (the
   # `adk-durability-gates sqlite` pair). Needs no secrets.
   durable-stores:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.job == 'all' || inputs.job == 'durable-stores' }}
@@ -360,6 +363,16 @@ jobs:
         --test store_conformance_firestore
         --test spend_ledger_postgres
 
+    # Replicas starting together migrate at once. The session and memory services' MongoDB
+    # and Neo4j schemas are still new here; the suites below migrate them.
+    - name: Run concurrent migrate on MongoDB and Neo4j
+      if: ${{ !cancelled() }}
+      run: >-
+        cargo nextest run -p adk-session -p adk-memory
+        --features adk-session/mongodb,adk-session/neo4j,adk-memory/mongodb-memory,adk-memory/neo4j-memory
+        --run-ignored all --no-fail-fast
+        --test concurrent_migrate_tests
+
     # The memory services' subject data suite on the backends the PR tier does not reach
     # (PostgreSQL's runs in the PR tier's postgres job).
     - name: Run the memory subject data suite on every backend
@@ -396,6 +409,22 @@ jobs:
         --features all-backends
         --run-ignored all --no-fail-fast
 
+    # The session history contract (fork, rewind, edit, import) and the integrity contract on
+    # the backends the PR tier does not reach (PostgreSQL's run in the PR tier's postgres job);
+    # MongoDB on its replica set here and on the standalone server below. One test at a time,
+    # since parallel transactions time out on the Firestore emulator's locks.
+    - name: Run the session history contract on every backend
+      if: ${{ !cancelled() }}
+      run: >-
+        cargo nextest run -p adk-session
+        --features sqlite,postgres,redis,mongodb,neo4j,firestore
+        --run-ignored all --no-fail-fast --test-threads 1
+        --test session_contract_redis
+        --test mongodb_state_tests
+        --test neo4j_state_tests
+        --test session_contract_firestore
+        -E 'test(/history_contract|integrity_contract/) and not test(/cluster/)'
+
     - name: Run MongoDB store suites on a standalone server
       if: ${{ !cancelled() }}
       env:
@@ -406,6 +435,18 @@ jobs:
         --features sqlite,postgres,redis,mongodb,neo4j,firestore
         --run-ignored all --no-fail-fast
         --test store_conformance_mongodb
+
+    - name: Run the MongoDB session history contract on a standalone server
+      if: ${{ !cancelled() }}
+      env:
+        MONGODB_URL: mongodb://localhost:27018
+        MONGODB_REQUIRE_TRANSACTIONS: "0"
+      run: >-
+        cargo nextest run -p adk-session
+        --features mongodb
+        --run-ignored all --no-fail-fast --test-threads 1
+        --test mongodb_state_tests
+        -E 'test(/history_contract|integrity_contract/)'
 
     # The kernel's stores on MongoDB, Firestore and Neo4j (spec 3.2 §7.1, §13 Q8). They need no
     # multi-document transaction, so the standalone server runs the MongoDB suite as well.
@@ -847,3 +888,77 @@ jobs:
       run: |
         echo "### ⏭️ harness eval (${{ matrix.provider }}) skipped" >> "$GITHUB_STEP_SUMMARY"
         echo "No ${{ matrix.secret }} configured." >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Vision benchmark ──────────────────────────────────────────
+  # Spec 3.7 §7.17 and Q10: every local adk-vision backend's cold load, latency at three
+  # input sizes, throughput, peak RSS, accuracy on the committed vision eval sets and cost,
+  # beside the recorded cloud rows, on Apple Silicon and Linux CPU. The table and its JSON
+  # are published as an artifact with the machine and versions; CUDA joins when a runner
+  # exists. Weights come through the fetcher, verified against the built-in manifest.
+  # Each local backend then runs its eval set through `cargo adk eval` against the
+  # baseline committed in adk-vision/tests/fixtures/eval/baselines.
+  vision-bench:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.job == 'all' || inputs.job == 'vision-bench' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: apple-silicon
+            os: macos-latest
+            neutralize-wild: 'false'
+          - name: linux-cpu
+            os: ubuntu-24.04
+            neutralize-wild: 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      HF_HUB_CACHE: ${{ github.workspace }}/.hf-cache
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+    - name: Setup Rust
+      uses: ./.github/actions/setup-rust
+      with:
+        cache-key: vision-bench-${{ matrix.name }}
+        neutralize-wild: ${{ matrix.neutralize-wild }}
+
+    - name: Build the benchmark and cargo-adk
+      run: |
+        cargo build --locked -p adk-bench --profile ci --features vision-onnx,vision-ocr,vision-cloud --example vision_bench
+        cargo build --locked -p cargo-adk --profile ci
+
+    - name: Benchmark every local backend and the recorded cloud rows
+      run: target/ci/examples/vision_bench run --out vision-bench-${{ matrix.name }}.md --json vision-bench-${{ matrix.name }}.json
+
+    - name: Gate each local backend against its baseline
+      shell: bash
+      run: |
+        eval_dir=adk-vision/tests/fixtures/eval
+        status=0
+        for row in rf-detr-n:generated-detect:detect rf-detr-n-q4f16:generated-detect:detect \
+                   efficientsam-ti:shapes-segment:segment sam2.1-hiera-tiny-q4:shapes-segment:segment \
+                   pp-ocrv6-tiny:documents-read:read pp-ocrv6-small:documents-read:read; do
+          IFS=: read -r backend set criteria <<< "$row"
+          target/ci/cargo-adk adk eval "$eval_dir/$set.test.json" \
+            --criteria "$eval_dir/criteria/$criteria.json" \
+            --agent-cmd "target/ci/examples/vision_bench serve $backend" \
+            --baseline "$eval_dir/baselines/$backend.$set.json" \
+            --check-regression --tolerance 0.02 || status=1
+        done
+        exit $status
+
+    - name: Publish the table
+      if: always()
+      shell: bash
+      run: |
+        if [ -f vision-bench-${{ matrix.name }}.md ]; then
+          { echo "### Vision benchmark (${{ matrix.name }})"; cat vision-bench-${{ matrix.name }}.md; } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Upload the table
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      with:
+        name: vision-bench-${{ matrix.name }}
+        path: vision-bench-${{ matrix.name }}.*
+        if-no-files-found: ignore

@@ -19,6 +19,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::scene::{DrawnDepth, DrawnScene};
 use crate::model::AgentRef;
 
 /// What a drawing is: a form a person fills in and sends, a card or table to read, or a
@@ -120,7 +121,11 @@ pub struct DrawnSurface {
 /// | `Divider` | — | `axis` | — |
 /// | `Button` | Its label | `primary`, `default`, `borderless` | `action` |
 /// | `TextField`, `DateTimeInput`, `CheckBox`, `ChoicePicker`, `Slider` | The label | the catalog's variant | `field` |
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// | `Chart` | — | — | `chart`: a chart an extension component's home view draws |
+/// | `Scene` | — | — | `scene`: a 3D scene an extension component's home view draws; its children are its panels, then its text view |
+/// | `Depth` | — | — | `depth`: the children an extension component's home view holds, presented with CSS 3D |
+/// | An extension component, such as `Metric` | — | — | `extension`, and one child: what the home shows for it |
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DrawnNode {
     /// Unique within the drawing: the component's id, and for a template's copy the list
@@ -149,6 +154,165 @@ pub struct DrawnNode {
     /// Its children, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<DrawnNode>,
+    /// A chart the home draws natively, from an extension component's home view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chart: Option<DrawnChart>,
+    /// A 3D scene the home draws natively, from an extension component's home view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<DrawnScene>,
+    /// How the home presents this node's children in depth, from an extension component's
+    /// home view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<DrawnDepth>,
+    /// The extension component this node draws, for a host that draws it with its own
+    /// renderer; every other surface draws its one child, what the home shows for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension: Option<DrawnExtension>,
+    /// What assistive technology reads for it (A2UI 1.0 `@accessibility`), resolved and
+    /// checked by rule 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accessibility: Option<DrawnAccessibility>,
+}
+
+/// What assistive technology reads for a drawn node (A2UI 1.0 `AccessibilityAttributes`): its
+/// label and description resolved and checked like any shown text, how its changes are
+/// announced, and whether it is hidden from screen readers (never a field or a button).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DrawnAccessibility {
+    /// A short name, read instead of its visible text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// More it reads after the name: instructions, a format, a result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// How its changes are announced: `polite` or `assertive`; absent is `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<String>,
+    /// Hidden from screen readers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+}
+
+/// A component of an extension catalog as a host renderer reads it (spec 3.3 §6.1 `genui`,
+/// extension catalogs): its properties with every binding and text function resolved and
+/// every string already checked by rule 5. A renderer draws it from these and nothing else,
+/// and draws no control: the component only shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DrawnExtension {
+    /// The catalog's id.
+    pub catalog: String,
+    /// The component's type, such as `Metric`.
+    pub component: String,
+    /// Its properties, resolved and checked.
+    pub props: Value,
+    /// The keys of the nodes its slots hold, in slot order: each is in the subtree of the
+    /// node's child.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<String>,
+}
+
+/// A chart a component of an extension catalog shows in the home (spec 3.3 §6.1 `genui`,
+/// extension catalogs): numbers and words the server already checked by rule 5, never
+/// colours, links or markup. The home draws it in its own chart colours.
+///
+/// # Example
+///
+/// ```rust
+/// use adk_surface::genui::{ChartAxis, ChartKind, ChartSeries, DrawnChart};
+///
+/// let chart = DrawnChart {
+///     kind: ChartKind::Bar,
+///     x: ChartAxis::Category { labels: vec!["Q1".into(), "Q2".into()] },
+///     x_label: None,
+///     y_label: Some("Revenue".into()),
+///     ticks: Vec::new(),
+///     series: vec![ChartSeries { name: "2026".into(), x: Vec::new(), y: vec![4.into(), 7.into()] }],
+///     summary: String::new(),
+/// };
+/// let wire = serde_json::to_value(&chart).unwrap();
+/// assert_eq!(wire["x"]["type"], "category");
+/// assert_eq!(wire["series"][0]["y"][1], 7);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DrawnChart {
+    /// How it is drawn.
+    pub kind: ChartKind,
+    /// What the horizontal axis holds.
+    pub x: ChartAxis,
+    /// The horizontal axis's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_label: Option<String>,
+    /// The vertical axis's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y_label: Option<String>,
+    /// Labelled points on a number or time axis, such as "10:00" at its epoch milliseconds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ticks: Vec<ChartTick>,
+    /// The series, at most eight: one per chart colour.
+    pub series: Vec<ChartSeries>,
+    /// One sentence that says what the chart shows, for screen readers and the terminal,
+    /// written by the server: "Line chart of Revenue, 12 points, from 3100 to 9800".
+    #[serde(default)]
+    pub summary: String,
+}
+
+/// How a chart is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum ChartKind {
+    /// Points joined by lines.
+    Line,
+    /// Lines with the area under them filled.
+    Area,
+    /// Bars side by side.
+    Bar,
+    /// Points only.
+    Scatter,
+    /// Slices of one whole: one series of at most eight values, none negative.
+    Pie,
+    /// One small line, no axes.
+    Sparkline,
+}
+
+/// What a chart's horizontal axis holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ChartAxis {
+    /// Named categories, one value per category in every series.
+    Category {
+        /// The categories' names, in order.
+        labels: Vec<String>,
+    },
+    /// Numbers: every series carries its `x` values.
+    Number,
+    /// Times as epoch milliseconds: every series carries its `x` values.
+    Time,
+}
+
+/// One series of a chart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChartSeries {
+    /// Its name, in the legend.
+    pub name: String,
+    /// Its horizontal values on a number or time axis; empty on a category axis.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub x: Vec<serde_json::Number>,
+    /// Its values.
+    pub y: Vec<serde_json::Number>,
+}
+
+/// A labelled point on a number or time axis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChartTick {
+    /// Where, in the axis's values.
+    pub at: serde_json::Number,
+    /// What it reads.
+    pub text: String,
 }
 
 /// The kind of value a drawn field takes.

@@ -175,6 +175,8 @@ fn collect_function_calls(content: &Content, invocation_id: &str) -> Vec<Pending
         .collect()
 }
 
+/// The calls in `content` to long-running tools, by call id, as adk-python and adk-go list
+/// them; a call without an id is listed by its tool's name.
 fn collect_long_running_tool_ids(
     tool_map: &HashMap<String, Arc<dyn Tool>>,
     content: &Content,
@@ -183,10 +185,10 @@ fn collect_long_running_tool_ids(
         .parts
         .iter()
         .filter_map(|part| {
-            if let Part::FunctionCall { name, .. } = part
+            if let Part::FunctionCall { name, id, .. } = part
                 && tool_map.get(name).is_some_and(|tool| tool.is_long_running())
             {
-                return Some(name.clone());
+                return Some(id.clone().unwrap_or_else(|| name.clone()));
             }
             None
         })
@@ -307,6 +309,7 @@ pub struct LlmAgent {
     model: Arc<dyn Llm>,
     instruction: Option<String>,
     instruction_provider: Option<Arc<InstructionProvider>>,
+    static_instruction: Option<String>,
     global_instruction: Option<String>,
     global_instruction_provider: Option<Arc<GlobalInstructionProvider>>,
     skills_index: Option<Arc<SkillIndex>>,
@@ -374,6 +377,7 @@ pub struct LlmAgent {
 struct PromptConfig {
     instruction: Option<String>,
     instruction_provider: Option<Arc<InstructionProvider>>,
+    static_instruction: Option<String>,
     global_instruction: Option<String>,
     global_instruction_provider: Option<Arc<GlobalInstructionProvider>>,
     skills_index: Option<Arc<SkillIndex>>,
@@ -388,6 +392,7 @@ impl PromptConfig {
         Self {
             instruction: agent.instruction.clone(),
             instruction_provider: agent.instruction_provider.clone(),
+            static_instruction: agent.static_instruction.clone(),
             global_instruction: agent.global_instruction.clone(),
             global_instruction_provider: agent.global_instruction_provider.clone(),
             skills_index: agent.skills_index.clone(),
@@ -406,6 +411,11 @@ impl PromptConfig {
         // Instructions travel as `system` contents so providers place them in their
         // native system prompt instead of guessing from leading user turns.
         let mut preamble = Vec::new();
+
+        // Sent first and never templated, so a provider can cache it across sessions.
+        if let Some(text) = self.static_instruction.as_ref().filter(|text| !text.is_empty()) {
+            preamble.push(Content::new("system").with_text(text.clone()));
+        }
 
         if let Some(provider) = &self.global_instruction_provider {
             let instruction = provider(ctx.clone() as Arc<dyn ReadonlyContext>).await?;
@@ -463,11 +473,20 @@ impl PromptConfig {
             .parts
             .iter()
             .all(|part| matches!(part, Part::Text { text } if text.trim().is_empty()));
+        // A turn of function responses alone answers calls, as a caller resuming a
+        // long-running call sends. The session history already holds those responses after
+        // their calls, so the turn never stands in for the person's message.
+        let answers_only = !current_user_content.parts.is_empty()
+            && current_user_content
+                .parts
+                .iter()
+                .all(|part| matches!(part, Part::FunctionResponse { .. }));
         if !empty_turn {
             place_current_user_content(
                 &mut session_history,
                 ctx.user_content(),
                 &current_user_content,
+                answers_only,
             );
         }
         // An empty user turn adds nothing to the conversation, and providers such as
@@ -564,8 +583,14 @@ fn content_text(content: &Content) -> String {
 /// remain the last thing the model reads. Replacing "the last user turn"
 /// instead overwrote every such message with the original request before the
 /// model ever saw it. With no user message in the history at all the content is
-/// appended.
-fn place_current_user_content(history: &mut Vec<Content>, original: &Content, current: &Content) {
+/// appended — unless the turn only answers calls (`answers_only`): the history already
+/// holds those responses after their calls.
+fn place_current_user_content(
+    history: &mut Vec<Content>,
+    original: &Content,
+    current: &Content,
+    answers_only: bool,
+) {
     let original_text = content_text(original);
     let own = history.iter().rposition(|content| content == original).or_else(|| {
         history
@@ -574,13 +599,41 @@ fn place_current_user_content(history: &mut Vec<Content>, original: &Content, cu
     });
     if let Some(index) = own {
         history[index] = current.clone();
-    } else if !history.iter().any(|content| {
-        content.role == "user"
-            && !adk_core::history::is_other_agent_context(content)
-            && !adk_core::history::is_system_notice(content)
-    }) {
+    } else if !answers_only
+        && !history.iter().any(|content| {
+            content.role == "user"
+                && !adk_core::history::is_other_agent_context(content)
+                && !adk_core::history::is_system_notice(content)
+        })
+    {
         history.push(current.clone());
     }
+}
+
+/// The system text that tells the model when to hand the conversation to another agent:
+/// each agent it can transfer to, with that agent's description, the rule to answer itself
+/// or transfer, and the parent to fall back to. adk-python gives its models the same
+/// guidance; without the descriptions a model chooses a target by its name alone.
+fn transfer_instruction(targets: &[(&str, &str)], parent: Option<&str>) -> String {
+    let mut text = String::from("You can transfer the conversation to these agents:\n");
+    for (name, description) in targets {
+        text.push_str(&format!("\nAgent name: {name}\n"));
+        if !description.trim().is_empty() {
+            text.push_str(&format!("Agent description: {description}\n"));
+        }
+    }
+    text.push_str(
+        "\nIf you are the best agent to answer according to your own description, answer. If \
+         another agent fits the request better according to its description, call \
+         `transfer_to_agent` with its name, and write no text other than the function call.",
+    );
+    if let Some(parent) = parent {
+        text.push_str(&format!(
+            "\n\nYour parent agent is {parent}. If neither you nor the other agents fit the \
+             request, transfer to {parent}."
+        ));
+    }
+    text
 }
 
 /// The user turn a run without user input sends when the conversation would otherwise
@@ -615,8 +668,10 @@ struct ToolSetup {
 
 struct ResolvedTools {
     map: HashMap<String, Arc<dyn Tool>>,
-    declarations: HashMap<String, serde_json::Value>,
+    declarations: adk_core::ToolDeclarations,
     transfer_targets: Vec<String>,
+    /// When to transfer and to whom, for the system instruction; see [`transfer_instruction`].
+    transfer_guidance: Option<String>,
 }
 
 impl ToolSetup {
@@ -681,7 +736,7 @@ impl ToolSetup {
         let mut declarations = tools
             .iter()
             .map(|tool| (tool.name().to_string(), tool.declaration()))
-            .collect::<std::collections::HashMap<_, _>>();
+            .collect::<adk_core::ToolDeclarations>();
         let mut transfer_targets: Vec<String> = if ctx.authoritative_transfer_targets() {
             Vec::new()
         } else {
@@ -728,7 +783,26 @@ impl ToolSetup {
             );
         }
 
-        Ok(ResolvedTools { map, declarations, transfer_targets })
+        let transfer_guidance = (!transfer_targets.is_empty()).then(|| {
+            let descriptions = &ctx.run_config().transfer_target_descriptions;
+            let described: Vec<(&str, &str)> = transfer_targets
+                .iter()
+                .map(|name| {
+                    let description = self
+                        .sub_agents
+                        .iter()
+                        .find(|agent| agent.name() == name)
+                        .map(|agent| agent.description())
+                        .or_else(|| descriptions.get(name).map(String::as_str))
+                        .unwrap_or("");
+                    (name.as_str(), description)
+                })
+                .collect();
+            let parent = parent_name.filter(|parent| transfer_targets.iter().any(|t| t == parent));
+            transfer_instruction(&described, parent)
+        });
+
+        Ok(ResolvedTools { map, declarations, transfer_targets, transfer_guidance })
     }
 
     /// Lets static and invocation-scoped toolsets enrich each LLM request.
@@ -934,6 +1008,60 @@ fn empty_response_error(finish_reason: Option<adk_core::FinishReason>) -> adk_co
     .with_details(details)
 }
 
+/// The error that ends a run whose model turn finished with [`FinishReason::Refusal`] or
+/// [`FinishReason::MalformedToolCall`], or `None` for any other finish.
+///
+/// A refusal's text is the model declining, not an answer, and a malformed tool call names
+/// no call that can run, so neither may read as a finished turn. `description` is the
+/// provider's own message when it sent one, otherwise the turn's text; `provider_code` is the
+/// provider's `error_code`, kept in `details.metadata["provider_error_code"]`.
+///
+/// [`FinishReason::Refusal`]: adk_core::FinishReason::Refusal
+/// [`FinishReason::MalformedToolCall`]: adk_core::FinishReason::MalformedToolCall
+pub(crate) fn finish_error(
+    finish_reason: Option<adk_core::FinishReason>,
+    description: Option<&str>,
+    provider_code: Option<&str>,
+) -> Option<adk_core::AdkError> {
+    let reason = finish_reason?;
+    let description = description
+        .map(|text| adk_core::upstream_excerpt(text).trim_end_matches('.'))
+        .filter(|text| !text.is_empty())
+        .map(|text| format!(": {text}"))
+        .unwrap_or_default();
+    let (category, code, message) = match reason {
+        adk_core::FinishReason::Refusal => (
+            adk_core::ErrorCategory::Forbidden,
+            "model.refusal",
+            format!(
+                "the model declined the request{description}. Rephrase the request, or retry \
+                 it on another model"
+            ),
+        ),
+        adk_core::FinishReason::MalformedToolCall => (
+            adk_core::ErrorCategory::Internal,
+            "model.malformed_tool_call",
+            format!(
+                "the model produced a tool call the provider reports as invalid{description}. \
+                 Retry the run; if it recurs, simplify the tool's parameter schema or offer \
+                 fewer tools"
+            ),
+        ),
+        _ => return None,
+    };
+    let mut details = adk_core::ErrorDetails::default();
+    details.metadata.insert("finish_reason".to_string(), serde_json::json!(format!("{reason:?}")));
+    if let Some(provider_code) = provider_code {
+        details
+            .metadata
+            .insert("provider_error_code".to_string(), serde_json::json!(provider_code));
+    }
+    Some(
+        adk_core::AdkError::new(adk_core::ErrorComponent::Model, category, code, message)
+            .with_details(details),
+    )
+}
+
 /// Extract the text content from a series of events.
 ///
 /// Scans events in reverse order for the last non-empty text content
@@ -996,6 +1124,7 @@ pub struct LlmAgentBuilder {
     model: Option<Arc<dyn Llm>>,
     instruction: Option<String>,
     instruction_provider: Option<Arc<InstructionProvider>>,
+    static_instruction: Option<String>,
     global_instruction: Option<String>,
     global_instruction_provider: Option<Arc<GlobalInstructionProvider>>,
     skills_index: Option<Arc<SkillIndex>>,
@@ -1051,6 +1180,7 @@ impl LlmAgentBuilder {
             model: None,
             instruction: None,
             instruction_provider: None,
+            static_instruction: None,
             global_instruction: None,
             global_instruction_provider: None,
             skills_index: None,
@@ -1109,14 +1239,56 @@ impl LlmAgentBuilder {
     }
 
     /// Set the system instruction for this agent.
+    ///
+    /// `{key}` is replaced with the session state value under `key` (an error when it is
+    /// missing), `{key?}` with the value or nothing, `{app:key}`, `{user:key}`, and
+    /// `{temp:key}` with prefixed state, and `{artifact.name}` with the artifact's text. See
+    /// [`adk_core::inject_session_state`]. Text whose braces are not placeholders, such as a
+    /// skill file quoting `set_target {window_id}`, belongs in
+    /// [`static_instruction`](Self::static_instruction), which sends it as written.
     pub fn instruction(mut self, instruction: impl Into<String>) -> Self {
         self.instruction = Some(instruction.into());
         self
     }
 
     /// Set a dynamic instruction provider evaluated per invocation.
+    ///
+    /// Takes precedence over [`instruction`](Self::instruction). Its result is sent as
+    /// written, without `{key}` templating.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_agent::LlmAgentBuilder;
+    ///
+    /// let skill = "Call set_target {window_id} before the first click.";
+    /// let builder = LlmAgentBuilder::new("trainer").instruction_provider(Box::new(move |_ctx| {
+    ///     Box::pin(async move { Ok(skill.to_string()) })
+    /// }));
+    /// ```
     pub fn instruction_provider(mut self, provider: InstructionProvider) -> Self {
         self.instruction_provider = Some(Arc::new(provider));
+        self
+    }
+
+    /// Set an instruction sent exactly as written, before the global instruction and
+    /// [`instruction`](Self::instruction).
+    ///
+    /// No `{key}` placeholder is read, so text you do not control — a skill file, a tool's
+    /// documentation — keeps its braces. The text is the same in every request, which keeps
+    /// it cacheable; combine it with `instruction` for the parts that read session state.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_agent::LlmAgentBuilder;
+    ///
+    /// let builder = LlmAgentBuilder::new("trainer")
+    ///     .static_instruction("Call set_target {window_id} before the first click.")
+    ///     .instruction("The learner is {learner_name}.");
+    /// ```
+    pub fn static_instruction(mut self, instruction: impl Into<String>) -> Self {
+        self.static_instruction = Some(instruction.into());
         self
     }
 
@@ -1170,7 +1342,25 @@ impl LlmAgentBuilder {
         self
     }
 
-    /// Set a JSON schema for validating user input.
+    /// Records a JSON Schema describing the input this agent expects.
+    ///
+    /// The schema is descriptive: `LlmAgent` does not check user messages against it. To
+    /// give a model a schema for calling this agent as a tool, set it on the `AgentTool`
+    /// that wraps the agent (`adk_tool::AgentTool::input_schema`), which declares it as
+    /// the tool's parameters.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let agent = LlmAgentBuilder::new("lookup")
+    ///     .model(model)
+    ///     .input_schema(serde_json::json!({
+    ///         "type": "object",
+    ///         "properties": { "order_id": { "type": "string" } },
+    ///         "required": ["order_id"]
+    ///     }))
+    ///     .build()?;
+    /// ```
     pub fn input_schema(mut self, schema: serde_json::Value) -> Self {
         self.input_schema = Some(schema);
         self
@@ -1840,6 +2030,7 @@ impl LlmAgentBuilder {
             model,
             instruction: self.instruction,
             instruction_provider: self.instruction_provider,
+            static_instruction: self.static_instruction,
             global_instruction: self.global_instruction,
             global_instruction_provider: self.global_instruction_provider,
             skills_index: self.skills_index,
@@ -2532,6 +2723,16 @@ fn callback_tool_response(
     Content { role: "function".to_string(), parts: vec![response] }
 }
 
+/// Whether a call ran and returned its result: not held, refused, skipped, failed, of
+/// unknown outcome, or withheld.
+fn completed(result: &ToolExecutionResult) -> bool {
+    result.pending.is_none()
+        && result.content.parts.iter().all(|part| {
+            part.tool_result_status()
+                .is_none_or(|status| matches!(status, ToolResultStatus::Succeeded))
+        })
+}
+
 #[derive(Clone, Copy)]
 enum ToolDispatchMode {
     Sequential,
@@ -2580,6 +2781,9 @@ struct ToolExecutor<'a> {
     expose_tool_error_messages: bool,
     /// Set when an approval fails, so calls still waiting for theirs stop waiting.
     approval_failed: tokio::sync::watch::Sender<bool>,
+    /// The ordered batches ([`Tool::batch_group`]) a call in this dispatch did not complete;
+    /// their later calls are answered with the halt text instead of running.
+    halted_batches: std::sync::Mutex<std::collections::HashSet<String>>,
     #[cfg(feature = "enhanced-plugins")]
     enhanced_plugin_manager: &'a Option<Arc<EnhancedPluginManager>>,
 }
@@ -2591,6 +2795,15 @@ impl ToolExecutor<'_> {
         strategy: ToolDispatchMode,
         fc_parts: Vec<PendingToolCall>,
     ) -> Result<Vec<ToolExecutionResult>> {
+        // An ordered batch runs in the model's order, so no strategy may overlap its calls.
+        let strategy = match strategy {
+            ToolDispatchMode::Parallel
+                if fc_parts.iter().any(|call| self.batch_of(&call.name).is_some()) =>
+            {
+                ToolDispatchMode::Sequential
+            }
+            other => other,
+        };
         let results: Vec<ToolExecutionResult> = match strategy {
             ToolDispatchMode::Sequential => {
                 let mut results = Vec::with_capacity(fc_parts.len());
@@ -2662,9 +2875,11 @@ impl ToolExecutor<'_> {
                 // call runs alone, in the model's order, so it starts only after every call
                 // listed before it has finished.
                 let is_concurrent = |call: &PendingToolCall| {
-                    self.tool_map
-                        .get(&call.name)
-                        .is_some_and(|tool| tool.is_read_only() && tool.is_concurrency_safe())
+                    self.tool_map.get(&call.name).is_some_and(|tool| {
+                        tool.is_read_only()
+                            && tool.is_concurrency_safe()
+                            && tool.batch_group().is_none()
+                    })
                 };
                 let mut all_results = Vec::with_capacity(fc_parts.len());
                 let mut calls = fc_parts.into_iter().peekable();
@@ -2710,7 +2925,26 @@ impl ToolExecutor<'_> {
             .requested_call
             .as_ref()
             .filter(|requested| requested.function_call_id == call.function_call_id);
-        let mut result = self.execute_inner(call).await?;
+        let batch = self.batch_of(&call.name);
+        let halted = batch.as_ref().is_some_and(|batch| {
+            self.halted_batches
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(batch.name.as_ref())
+        });
+        let mut result = match &batch {
+            Some(batch) if halted => self.halted_call(call, batch).await?,
+            _ => self.execute_inner(call).await?,
+        };
+        // A call of an ordered batch that did not complete stops the rest of the batch.
+        if let Some(batch) = &batch
+            && !completed(&result)
+        {
+            self.halted_batches
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(batch.name.to_string());
+        }
         // Tool guardrails see the result the model is about to be sent, after every after-tool
         // stage. A held call's pending response is not a result.
         if let Some((name, args)) = screened_call
@@ -2756,6 +2990,38 @@ impl ToolExecutor<'_> {
         // Runner commits each result while other calls are still awaiting approval.
         let _ = self.progress_tx.send(event).await;
         Ok(result)
+    }
+
+    /// The ordered batch a call to `name` belongs to.
+    fn batch_of(&self, name: &str) -> Option<adk_core::BatchGroup> {
+        self.tool_map.get(name).and_then(|tool| tool.batch_group())
+    }
+
+    /// Answers a call of a halted batch with the batch's halt text, without running it.
+    async fn halted_call(
+        &self,
+        call: PendingToolCall,
+        batch: &adk_core::BatchGroup,
+    ) -> Result<ToolExecutionResult> {
+        self.record_short_circuit(&call.name, &call.function_call_id, &call.args, "batch_halt")
+            .await?;
+        let mut part = Part::FunctionResponse {
+            function_response: FunctionResponseData::new(
+                call.name,
+                serde_json::Value::String(batch.halt_text.to_string()),
+            ),
+            id: call.id,
+            annotations: None,
+        };
+        part.set_tool_result_status(ToolResultStatus::NotRun, None);
+        Ok(ToolExecutionResult {
+            index: call.index,
+            content: Content { role: "function".to_string(), parts: vec![part] },
+            actions: EventActions::default(),
+            escalate_or_skip: false,
+            pending: None,
+            executed: false,
+        })
     }
 
     /// The text logged for an error message, see [`traced_message`].
@@ -2953,7 +3219,13 @@ impl ToolExecutor<'_> {
                 .chain(self.before_tool_callbacks.iter())
                 .enumerate()
             {
-                match callback(tool_ctx.clone() as Arc<dyn CallbackContext>).await {
+                // A panic fails the call closed, as an error does.
+                let decided = adk_core::guard_callback(
+                    "before-tool callback",
+                    callback(tool_ctx.clone() as Arc<dyn CallbackContext>),
+                )
+                .await;
+                match decided {
                     Ok(Some(c)) => {
                         let answered_by = if position < hooks {
                             SHORT_CIRCUIT_BY_INVOCATION_HOOK
@@ -3211,16 +3483,38 @@ impl ToolExecutor<'_> {
                     });
                 }
 
+                // The GenAI `execute_tool` span; `tool.name` and the `gcp.vertex.agent.*`
+                // fields stay for the in-process debug exporter.
                 let span_name = format!("execute_tool {name}");
                 let tool_span = tracing::info_span!(
                     "",
                     otel.name = %span_name,
+                    otel.kind = "internal",
+                    "gen_ai.operation.name" = "execute_tool",
+                    "gen_ai.tool.name" = %name,
+                    "gen_ai.tool.type" = "function",
+                    "gen_ai.tool.call.id" = tracing::field::Empty,
+                    "gen_ai.tool.description" = %tool.description(),
+                    "gen_ai.agent.name" = %self.agent_name,
+                    "gen_ai.tool.call.arguments" = tracing::field::Empty,
+                    "gen_ai.tool.call.result" = tracing::field::Empty,
+                    "error.type" = tracing::field::Empty,
                     tool.name = %name,
                     "gcp.vertex.agent.event_id" = %format!("{}_{}", self.invocation_id, name),
                     "gcp.vertex.agent.invocation_id" = %self.invocation_id,
                     "gcp.vertex.agent.session_id" = %self.ctx.session_id(),
                     "gen_ai.conversation.id" = %self.ctx.session_id()
                 );
+                // Conditionally required: only an id the model supplied.
+                if let Some(call_id) =
+                    id.as_deref().filter(|id| !id.starts_with(adk_core::GENERATED_CALL_ID_PREFIX))
+                {
+                    tool_span.record("gen_ai.tool.call.id", call_id);
+                }
+                let capture_on_span = adk_telemetry::config::capture_content().on_spans();
+                if capture_on_span {
+                    tool_span.record("gen_ai.tool.call.arguments", final_args.to_string().as_str());
+                }
 
                 // Only a call that cannot repeat a side effect is retried.
                 let budget = self
@@ -3322,6 +3616,10 @@ impl ToolExecutor<'_> {
                                 self.ctx.run_config().trace_payload_max_bytes,
                             );
                             tracing::debug!(tool.name = %name, tool.result = %result_payload, "tool_result");
+                            if capture_on_span {
+                                tool_span
+                                    .record("gen_ai.tool.call.result", value.to_string().as_str());
+                            }
                             retry_result = Some(value);
                             break;
                         }
@@ -3338,6 +3636,9 @@ impl ToolExecutor<'_> {
                                 tracing::warn!(tool.name = %name, error.code = %error.code, error.category = %error.category, error.message = %message, "tool_error");
                             }
                             let retry = retryable && attempt + 1 < max_attempts;
+                            if !retry {
+                                tool_span.record("error.type", error.code);
+                            }
                             last_error = Some(Arc::new(error));
                             if !retry {
                                 break;
@@ -3692,6 +3993,22 @@ impl Agent for LlmAgent {
         &self.description
     }
 
+    fn profile(&self) -> adk_core::AgentProfile {
+        adk_core::AgentProfile {
+            kind: adk_core::AgentKind::Llm,
+            instruction: self.instruction.clone().filter(|text| !text.is_empty()),
+            global_instruction: self.global_instruction.clone().filter(|text| !text.is_empty()),
+            tools: self
+                .tools
+                .iter()
+                .map(|tool| adk_core::ToolProfile {
+                    name: tool.name().to_string(),
+                    description: tool.description().to_string(),
+                })
+                .collect(),
+        }
+    }
+
     fn sub_agents(&self) -> &[Arc<dyn Agent>] {
         &self.sub_agents
     }
@@ -3715,6 +4032,16 @@ impl Agent for LlmAgent {
         for agent in &self.sub_agents {
             agent.close().await;
         }
+    }
+
+    /// Opens the model's connection, then prewarms the sub-agents. Toolsets resolve their
+    /// tools against a turn's context, so they are left to the turn.
+    async fn prewarm(&self) -> Result<()> {
+        self.model.prewarm().await?;
+        for agent in &self.sub_agents {
+            agent.prewarm().await?;
+        }
+        Ok(())
     }
 
     fn capabilities(&self) -> adk_core::AgentCapabilities {
@@ -3831,6 +4158,14 @@ impl Agent for LlmAgent {
             let mut tool_map = resolved_tools.map;
             let mut tool_declarations = resolved_tools.declarations;
             let mut valid_transfer_targets = resolved_tools.transfer_targets;
+            // The transfer guidance joins the instructions, after the leading system contents.
+            if let Some(guidance) = resolved_tools.transfer_guidance {
+                let at = conversation_history
+                    .iter()
+                    .position(|content| content.role != "system")
+                    .unwrap_or(conversation_history.len());
+                conversation_history.insert(at, Content::new("system").with_text(guidance));
+            }
 
             // ===== CIRCUIT BREAKER STATE =====
             // Created fresh per invocation so it resets between runs.
@@ -3946,6 +4281,7 @@ impl Agent for LlmAgent {
                     tool_timeout,
                     expose_tool_error_messages,
                     approval_failed: tokio::sync::watch::channel(false).0,
+                    halted_batches: Default::default(),
                     #[cfg(feature = "enhanced-plugins")]
                     enhanced_plugin_manager: &enhanced_plugin_manager,
                 };
@@ -4091,6 +4427,7 @@ impl Agent for LlmAgent {
                     tool_timeout,
                     expose_tool_error_messages,
                     approval_failed: tokio::sync::watch::channel(false).0,
+                    halted_batches: Default::default(),
                     #[cfg(feature = "enhanced-plugins")]
                     enhanced_plugin_manager: &enhanced_plugin_manager,
                 };
@@ -4147,8 +4484,15 @@ impl Agent for LlmAgent {
             // Multi-turn loop with max iterations
             let mut iteration = 0;
             let mut schema_retry_count: usize = 0;
+            // The prompt tokens the provider reported for the last request, which the
+            // compactor weighs against its threshold until the history is compacted.
+            let mut reported_prompt_tokens: Option<u64> = None;
+            // A request the model rejected as longer than its context window, which the next
+            // pass compacts for and sends once more; set once per model call.
+            let mut rejected_as_too_long: Option<adk_core::AdkError> = None;
+            let mut resent_after_compaction = false;
 
-            loop {
+            'model_calls: loop {
                 // Cooperative cancellation: exit before starting another turn
                 // if the invocation was cancelled (e.g. Runner::interrupt()).
                 if ctx.is_cancelled() {
@@ -4219,6 +4563,51 @@ impl Agent for LlmAgent {
                     );
                 }
 
+                // ===== AUTO-COMPACTION =====
+                // Before every model call, and once more after the model rejected a request as
+                // too long; the instructions at the head of the history are never compacted.
+                let rejected = rejected_as_too_long.take();
+                if let Some(compactor) = ctx.run_config().history_compactor.clone() {
+                    let preamble = conversation_history
+                        .iter()
+                        .take_while(|content| content.role == "system")
+                        .count();
+                    let trigger = if rejected.is_some() {
+                        adk_core::CompactionTrigger::ContextLimitExceeded
+                    } else {
+                        adk_core::CompactionTrigger::BeforeModelCall
+                    };
+                    let request = adk_core::HistoryCompactionRequest::new(
+                        &conversation_history[preamble..],
+                        trigger,
+                    )
+                    .with_preamble(&conversation_history[..preamble])
+                    .with_reported_prompt_tokens(reported_prompt_tokens)
+                    .with_tools(&tool_declarations)
+                    .with_config(config.as_ref());
+                    match compactor.compact(ctx.clone(), model.clone(), request).await {
+                        Ok(Some(compacted)) => {
+                            conversation_history.truncate(preamble);
+                            conversation_history.extend(compacted.history);
+                            reported_prompt_tokens = None;
+                            if let Some(event) = compacted.event {
+                                yield Ok(event);
+                            }
+                        }
+                        Ok(None) => {
+                            // Sending the same request again would be rejected again.
+                            if let Some(error) = rejected {
+                                yield Err(error);
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    }
+                }
+
                 // Call IDs the agent generated for a provider that sent none stay out of
                 // what the provider receives.
                 let mut contents = crate::requested_call::for_model(conversation_history.clone());
@@ -4279,16 +4668,26 @@ impl Agent for LlmAgent {
                 let mut current_request = request;
                 let mut model_response_override = model_response_override_from_plugin;
                 if model_response_override.is_none() {
+                    // Each callback takes the request; the event of a skipped call records the
+                    // request it skipped only when the run records payloads, so only then is
+                    // the request copied before a callback sees it.
+                    let record_payloads = ctx.run_config().record_payloads;
                     for callback in
                         hook_callbacks.before_model.iter().chain(before_model_callbacks.iter())
                     {
-                        match callback(ctx.clone() as Arc<dyn CallbackContext>, current_request.clone()).await {
+                        let skipped_request = record_payloads.then(|| current_request.clone());
+                        let request =
+                            std::mem::replace(&mut current_request, LlmRequest::new("", vec![]));
+                        match callback(ctx.clone() as Arc<dyn CallbackContext>, request).await {
                             Ok(BeforeModelResult::Continue(modified_request)) => {
                                 // Callback may have modified the request, continue with it
                                 current_request = modified_request;
                             }
                             Ok(BeforeModelResult::Skip(response)) => {
                                 // Callback returned a response - skip model call
+                                if let Some(skipped_request) = skipped_request {
+                                    current_request = skipped_request;
+                                }
                                 model_response_override = Some(response);
                                 break;
                             }
@@ -4438,11 +4837,19 @@ impl Agent for LlmAgent {
                     );
                     let call_metered = call_scope.budget().is_some();
                     // Kept for the run's `on_model_error` hooks, which see what the model was sent.
-                    let failed_request = (!ctx.run_config().invocation_hooks.is_empty())
+                    let failed_request = ctx
+                        .run_config()
+                        .invocation_hooks
+                        .iter()
+                        .any(|hook| hook.handles_model_errors())
                         .then(|| request.clone());
-                    // Always use streaming internally for LLM calls
+                    // A run without streaming asks the model for one complete response
+                    // (Gemini's `generateContent`, as adk-python and adk-go do); otherwise
+                    // the model streams, even when output guardrails hold the chunks back.
+                    let stream_model =
+                        matches!(streaming_mode, StreamingMode::SSE | StreamingMode::Bidi);
                     let mut response_stream = match call_scope
-                        .generate(model.as_ref(), request, true)
+                        .generate(model.as_ref(), request, stream_model)
                         .instrument(llm_span.clone())
                         .await
                     {
@@ -4458,6 +4865,15 @@ impl Agent for LlmAgent {
                                     "model call failed"
                                 )
                             });
+                            // A request too long for the model is compacted and sent once more.
+                            if ctx.run_config().history_compactor.is_some()
+                                && adk_core::intra_compaction::is_context_limit_error(&error)
+                                && !std::mem::replace(&mut resent_after_compaction, true)
+                            {
+                                rejected_as_too_long = Some(error);
+                                iteration -= 1;
+                                continue 'model_calls;
+                            }
                             // A hook's response, from a fallback model for example, answers
                             // the turn in the failed call's place.
                             match recover_model_error(&ctx, failed_request.as_ref(), &error).await {
@@ -4506,6 +4922,17 @@ impl Agent for LlmAgent {
                                         "model stream failed"
                                     )
                                 });
+                                // A request too long for the model fails before any output;
+                                // it is compacted and sent once more.
+                                if last_chunk.is_none()
+                                    && ctx.run_config().history_compactor.is_some()
+                                    && adk_core::intra_compaction::is_context_limit_error(&e)
+                                    && !std::mem::replace(&mut resent_after_compaction, true)
+                                {
+                                    rejected_as_too_long = Some(e);
+                                    iteration -= 1;
+                                    continue 'model_calls;
+                                }
                                 // A hook's response replaces the whole failed response, so
                                 // the deltas already received are dropped.
                                 match recover_model_error(&ctx, failed_request.as_ref(), &e).await {
@@ -4622,6 +5049,11 @@ impl Agent for LlmAgent {
                             last_interaction_id = chunk.interaction_id.clone();
                         }
 
+                        if let Some(usage) = &chunk.usage_metadata
+                            && usage.prompt_token_count > 0
+                        {
+                            reported_prompt_tokens = Some(usage.prompt_token_count as u64);
+                        }
                         if chunk.finish_reason.is_some() {
                             last_turn_finish_reason = chunk.finish_reason;
                         }
@@ -4637,6 +5069,7 @@ impl Agent for LlmAgent {
                     if let Some(last) = &last_chunk {
                         final_provider_metadata = last.provider_metadata.clone();
                     }
+                    resent_after_compaction = false;
                     normalize_option_content(&mut accumulated_content);
 
                     // A stream whose last chunk is partial never produced the complete event
@@ -4782,6 +5215,34 @@ impl Agent for LlmAgent {
                     // In this workspace `error_code` marks a genuine failure —
                     // truncation is reported through `finish_reason`
                     // (`FinishReason::MaxTokens`), not through `error_code`.
+                    //
+                    // A refusal or a malformed tool call ends the turn the same way, with
+                    // or without an `error_code`: the event above keeps the refusal text
+                    // and finish reason, and no tool call of the turn runs.
+                    let finish_failure = finish_error(
+                        last_turn_finish_reason,
+                        last_chunk
+                            .as_ref()
+                            .and_then(|last| last.error_message.clone())
+                            .or_else(|| {
+                                accumulated_content.as_ref().map(|content| {
+                                    content.parts.iter().filter_map(Part::text).collect::<String>()
+                                })
+                            })
+                            .as_deref(),
+                        last_chunk.as_ref().and_then(|last| last.error_code.as_deref()),
+                    );
+                    if let Some(error) = finish_failure {
+                        llm_span.in_scope(|| {
+                            tracing::error!(
+                                error = %error.diagnostics(),
+                                agent = %agent_name,
+                                "model turn ended without an answer it can act on"
+                            )
+                        });
+                        yield Err(error);
+                        return;
+                    }
                     if let Some(ref last) = last_chunk
                         && let Some(ref code) = last.error_code
                     {
@@ -5205,6 +5666,7 @@ impl Agent for LlmAgent {
                         tool_timeout,
                         expose_tool_error_messages,
                         approval_failed: tokio::sync::watch::channel(false).0,
+                        halted_batches: Default::default(),
                         #[cfg(feature = "enhanced-plugins")]
                         enhanced_plugin_manager: &enhanced_plugin_manager,
                     };
@@ -5596,7 +6058,7 @@ mod run_helper_tests {
             turn("model", "done on five"),
             turn("user", "VERIFIER ORDER: read every city back"),
         ];
-        place_current_user_content(&mut history, &original, &original);
+        place_current_user_content(&mut history, &original, &original, false);
         assert_eq!(
             texts(&history),
             vec![
@@ -5616,7 +6078,7 @@ mod run_helper_tests {
             turn("model", "which orbit?"),
             turn("user", "a nudge from a wrapper"),
         ];
-        place_current_user_content(&mut history, &original, &injected);
+        place_current_user_content(&mut history, &original, &injected, false);
         assert_eq!(content_text(&history[0]), "plan the mission\n\n[skill: mission planning]");
         assert_eq!(content_text(&history[2]), "a nudge from a wrapper");
     }
@@ -5625,8 +6087,19 @@ mod run_helper_tests {
     fn a_history_without_the_user_turn_gets_it_appended() {
         let original = turn("user", "hello");
         let mut history = vec![turn("model", "earlier answer")];
-        place_current_user_content(&mut history, &original, &original);
+        place_current_user_content(&mut history, &original, &original, false);
         assert_eq!(texts(&history).last().unwrap().1, "hello");
+    }
+
+    #[test]
+    fn a_turn_that_only_answers_calls_is_not_appended() {
+        // A resumed long-running call: the responses are already in the history
+        // after their calls, so the answering turn must not be added again.
+        let original = turn("user", "tool answers");
+        let mut history = vec![turn("model", "calling a tool")];
+        let before = texts(&history);
+        place_current_user_content(&mut history, &original, &original, true);
+        assert_eq!(texts(&history), before);
     }
 
     #[test]
@@ -5637,7 +6110,7 @@ mod run_helper_tests {
         let original = turn("user", "hello");
         let mut history = vec![turn("user", "[summary of an earlier hello]"), turn("model", "hi")];
         let before = texts(&history);
-        place_current_user_content(&mut history, &original, &original);
+        place_current_user_content(&mut history, &original, &original, false);
         assert_eq!(texts(&history), before);
     }
 

@@ -3,7 +3,8 @@
 //!
 //! | Part | What | Feature |
 //! |---|---|---|
-//! | `A2uiMessage` and the rest of the A2UI v0.9.1 model | The wire format an agent draws in | `genui` |
+//! | `A2uiMessage` and the rest of the A2UI v0.9.1 model | The internal form a drawing is stored and checked in | `genui` |
+//! | `A2uiVersion`, `to_wire`, `from_wire` | A2UI 1.0 (the default) and v0.9.1 on the wire | `genui` |
 //! | `Catalog::forms` | The `forms` 1.0 catalog: the A2UI basic catalog without images, icons, media and modals, embedded | `genui` |
 //! | `Validator` | Rule 5: the catalog, no secrets, no links, declared actions only, and no decision's words in any string a person reads, resolved on the server | `genui` |
 //! | `DrawToolset` | `render_form`, `render_card`, `render_table`, `render_screen`, `patch_surface`, `delete_surface` | `genui` |
@@ -34,12 +35,21 @@ mod capabilities_wire;
 #[cfg(feature = "genui")]
 mod catalog;
 #[cfg(feature = "genui")]
+mod chat_cards;
+#[cfg(feature = "genui")]
 mod draw;
 mod drawn;
+#[cfg(feature = "genui")]
+mod functions;
 #[cfg(feature = "genui")]
 mod hints;
 #[cfg(feature = "genui-apps")]
 mod mcp_apps;
+#[cfg(feature = "genui")]
+mod patterns;
+mod scene;
+#[cfg(feature = "genui")]
+mod seal;
 mod status;
 #[cfg(feature = "genui")]
 mod submit;
@@ -47,6 +57,8 @@ mod submit;
 mod validate;
 #[cfg(feature = "genui")]
 mod view;
+#[cfg(feature = "genui")]
+mod wire;
 
 #[cfg(feature = "genui")]
 pub use a2ui::{
@@ -61,36 +73,72 @@ pub use app_view::{
     AppAnswer, AppBlockReason, AppError, AppMessageRequest, AppOpen, AppPrompt, AppRequest, AppView,
 };
 #[cfg(feature = "genui")]
-pub use capabilities::{GenuiWiring, capabilities, capabilities_wired};
+pub use capabilities::{GenuiWiring, capabilities, capabilities_wired, capabilities_with};
 pub use capabilities_wire::{
     CatalogView, Claim, ClaimScope, ClaimStatus, GenuiCapabilities, ProtocolClaims,
 };
 #[cfg(feature = "genui")]
-pub use catalog::{Catalog, FORMS_CATALOG_ID};
+pub use catalog::{
+    Catalog, CatalogError, Catalogs, ChildSlot, ExtensionComponent, ExtensionSpec,
+    FORMS_CATALOG_ID, HomeNode, HomePanel, HomeScene, HomeText, ResolvedComponent,
+};
 #[cfg(feature = "genui")]
-pub use draw::{DRAWN_STATE_KEY, DrawToolset, DrawnEnvelope, DrawnRecord, REFUSED_STATE_KEY};
+pub use chat_cards::{
+    DRAWN_ACTION_KEY, adaptive_card, slack_blocks, slack_pressed, submit_from_slack,
+    submit_from_teams, teams_pressed,
+};
+#[cfg(feature = "genui")]
+pub use draw::{
+    DRAWN_STATE_KEY, DrawToolset, DrawnEnvelope, DrawnRecord, MAX_PATCHES_PER_MINUTE,
+    REFUSED_STATE_KEY,
+};
 pub use drawn::{
-    DrawnActionView, DrawnArg, DrawnCheck, DrawnField, DrawnInput, DrawnKind, DrawnNode,
+    ChartAxis, ChartKind, ChartSeries, ChartTick, DrawnAccessibility, DrawnActionView, DrawnArg,
+    DrawnChart, DrawnCheck, DrawnExtension, DrawnField, DrawnInput, DrawnKind, DrawnNode,
     DrawnOption, DrawnSent, DrawnSurface, FormState, FormStatus, RefusalKind, RefusedDrawing,
     SentVia,
 };
+#[cfg(feature = "genui")]
+pub use functions::{
+    FunctionCaller, FunctionError, FunctionInvocation, FunctionMessage, FunctionResponse,
+    INVALID_FUNCTION_CALL, read_function_message,
+};
 #[cfg(feature = "genui-apps")]
 pub use mcp_apps::{
-    AppServers, McpAppsHost, McpAppsHostBuilder, SURFACE_AUDIT_APP_BLOCKED,
+    AppConsent, AppServers, McpAppsHost, McpAppsHostBuilder, SURFACE_AUDIT_APP_BLOCKED,
     SURFACE_AUDIT_APP_CALL_ASKED, SURFACE_AUDIT_APP_CALL_HELD, SURFACE_AUDIT_APP_CALL_REFUSED,
     SURFACE_AUDIT_APP_MESSAGE_SENT, SURFACE_AUDIT_APP_ORIGIN_REFUSED,
 };
+#[cfg(feature = "genui")]
+pub use patterns::dark_patterns;
+pub use scene::{
+    Axis, CameraPreset, DepthEffect, DrawnDepth, DrawnScene, LabelSize, LightKind, LineEnds,
+    MotionKind, SceneAxes, SceneCamera, SceneColor, SceneFinish, SceneKind, SceneLight,
+    SceneLighting, SceneLook, SceneMotion, SceneObject, ScenePanel, SceneSelect, SceneShape,
+    SceneState, SceneTick, SceneValues, Xyz,
+};
+#[cfg(feature = "genui")]
+pub use seal::{ApprovalSeals, SEAL_LIFETIME, SealInput};
 pub use status::form_states;
 #[cfg(feature = "genui")]
 pub use submit::DRAWN_CHANGED_CODE;
 #[cfg(feature = "genui")]
 pub use validate::{
     ActionArg, ComponentRef, DrawRefusal, DrawnAction, FieldArg, MAX_ACTIONS, MAX_COMPONENTS,
-    MAX_DEPTH, MAX_DRAWING_BYTES, MAX_LIST_ITEMS, MAX_SHOWN, MAX_TEXT_CHARS, RESERVED_LABELS,
-    RESERVED_PHRASES, ResolvedText, SurfaceDraft, ValidatedSurface, Validator, reserved,
+    MAX_DEPTH, MAX_DEPTH_CHILDREN, MAX_DRAWING_BYTES, MAX_LIST_ITEMS, MAX_RESOLVED_BYTES,
+    MAX_SCENE_BYTES, MAX_SCENE_GRID_SIDE, MAX_SCENE_GROUP_DEPTH, MAX_SCENE_INSTANCES,
+    MAX_SCENE_LIGHTS, MAX_SCENE_LINE_POINTS, MAX_SCENE_MOTIONS, MAX_SCENE_OBJECTS,
+    MAX_SCENE_PANELS, MAX_SCENE_TEXT_CHARS, MAX_SCENE_TEXTS, MAX_SCENES, MAX_SHOWN, MAX_TEXT_CHARS,
+    RESERVED_LABELS, RESERVED_PHRASES, ResolvedText, Severity, SurfaceDraft, ValidatedSurface,
+    ValidationResult, Validator, reserved,
 };
 #[cfg(feature = "genui")]
-pub use view::SHOWN_ROWS;
+pub use view::{SHOWN_ROWS, drawn_tree};
+#[cfg(feature = "genui")]
+pub use wire::{
+    A2uiVersion, DISPLAY_ONLY_EXTENSION, DISPLAY_ONLY_EXTENSION_VERSION, WireError,
+    component_to_v1_0, components_in, from_wire, is_v1_0_syntax, to_wire,
+};
 
 #[cfg(feature = "genui")]
 pub(crate) use app_view::app_name;

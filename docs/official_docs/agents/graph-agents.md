@@ -12,6 +12,8 @@ GraphAgent allows you to define workflows as directed graphs with nodes and edge
 - **State Management**: Typed state with reducers (overwrite, append, sum, custom)
 - **Checkpointing**: Persistent state for fault tolerance and human-in-the-loop
 - **Streaming**: Multiple stream modes (values, updates, messages, custom, debug)
+- **Workflow files**: the same graph declared in YAML or JSON and built against a registry — see
+  [YAML Workflows](./graph-workflows-yaml.md)
 
 The `adk-graph` crate provides LangGraph-style workflow orchestration for building complex, stateful agent workflows. It brings graph-based workflow capabilities to the ADK-Rust ecosystem while maintaining full compatibility with ADK's agent system.
 
@@ -193,7 +195,7 @@ use std::sync::Arc;
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 
     // Create specialized LLM agents
     let translator_agent = Arc::new(
@@ -434,7 +436,7 @@ use std::sync::Arc;
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 
     // Create classifier agent
     let classifier_agent = Arc::new(
@@ -619,7 +621,7 @@ use std::sync::Arc;
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 
     // Create tools
     let weather_tool = Arc::new(FunctionTool::new(
@@ -785,7 +787,24 @@ Under a `GraphAgent`, the turn fails with that error: a rate-limited model is st
 message. An agent node inside a subgraph is named by its path, such as
 `drafting.writer`.
 
+#### What the node writes
 
+Without mappers, the node's input is the last `messages` entry, or else the `input`
+channel, and its output is a `messages` update with one entry per response the agent
+completes:
+
+```json
+[{"role": "assistant", "content": "Your refund is approved."}]
+```
+
+A streamed response arrives as partial chunks followed by one non-partial event that
+carries its complete content. The default output mapper reads the non-partial events,
+as the runner persists them, so a streamed and an unstreamed run write the same entry
+and the next node's input is the whole reply, not its last chunk.
+
+A custom output mapper receives every event the agent yielded, streamed chunks and
+tool progress included. Skip the events whose `llm_response.partial` is set to read
+each response once, whole:
 
 ```rust
 let node = AgentNode::new(llm_agent)
@@ -797,7 +816,7 @@ let node = AgentNode::new(llm_agent)
     .with_output_mapper(|events| {
         // Transform agent events to state updates
         let mut updates = std::collections::HashMap::new();
-        for event in events {
+        for event in events.iter().filter(|event| !event.llm_response.partial) {
             if let Some(content) = event.content() {
                 let text: String = content.parts.iter()
                     .filter_map(|p| p.text())
@@ -915,6 +934,52 @@ use adk_graph::edge::Router;
     (END, END),
 ])
 ```
+
+### Decision Nodes
+
+`DecisionNode` is a router node a model decides: it reads its input from a state key, asks
+for a typed decision with structured output (a `choice` among its options, a `rationale` and a
+`confidence`), and writes the option's name to its output key for `Router::by_field`:
+
+```rust,no_run
+use std::sync::Arc;
+
+use adk_graph::node::FunctionNode;
+use adk_graph::{CompiledGraph, DecisionNode, END, NodeOutput, Router, START, StateGraph, StateSchema};
+
+fn triage_graph(model: Arc<dyn adk_core::Llm>) -> adk_graph::Result<CompiledGraph> {
+    let triage = DecisionNode::new("triage", model)
+        .instruction("Route the support ticket.")
+        .option("billing", "Invoices, refunds and payment problems")
+        .option("technical", "Errors, outages and how-to questions")
+        .input_key("ticket")
+        .output_key("route");
+    StateGraph::new(StateSchema::simple(&["ticket", "route"]))
+        .add_node(triage)
+        .add_node(FunctionNode::new("billing", |_| async { Ok(NodeOutput::new()) }))
+        .add_node(FunctionNode::new("technical", |_| async { Ok(NodeOutput::new()) }))
+        .add_edge(START, "triage")
+        .add_conditional_edges(
+            "triage",
+            Router::by_field("route"),
+            [("billing", "billing"), ("technical", "technical")],
+        )
+        .add_edge("billing", END)
+        .add_edge("technical", END)
+        .compile()
+}
+```
+
+| Setting | Effect |
+|---|---|
+| `option(name, description)`, or `DecisionNode::for_choice::<T>` | The options the model sees |
+| `input_key(key)` | The state key decided about (default `input`); a non-string value is sent as JSON |
+| `output_key(key)` | The state key the option's name goes to (default `route`); `<key>_decision` holds `{option, rationale, confidence, followed}` |
+| `min_confidence(x)`, `fallback(route)` | Below `x` the node writes `fallback`, or fails without one |
+
+With a `RunConfig` (a graph agent under a runner, or `invoke_with_run_config`), the call runs in
+the run's `ModelCallScope` and counts against its budget and spend ledger. A model error, such
+as a refused budget, fails the node as `GraphError::AgentFailed` with the model's code.
 
 ## Parallel Execution
 
@@ -1336,7 +1401,80 @@ it treats every later pause as already answered.
 
 When several nodes of one step pause, `InterruptedExecution::interrupts` holds
 every pause in node-name order; `interrupt` is the first. Supply an answer under
-each paused node's name.
+each paused node's name, or each pause's id.
+
+### Interrupt Ids, Typed Answers and Strict Resume
+
+Every dynamic pause has an id, `Interrupt::id()`: `int_` and 32 hex characters of a
+SHA-256 over the thread, the step, the node, the message, the data and the answer schema.
+The same pause, re-raised because the run resumed without an answer, keeps its id; the
+node's next pause — a later pass of a loop, or the same step asking about other data — gets
+another. The id is on `InterruptedExecution::interrupts`, on `StreamEvent::Interrupted`
+(`interrupt_id`) and on `GraphInterruptPayload` (`interrupt_id`), and the checkpoint keeps it
+with the pause, so another process can resume it.
+
+A node declares the shape of the answer with `NodeOutput::with_response_schema` (or
+`Interrupt::with_response_schema`): a JSON Schema the answer must satisfy. The answer is
+checked when the run resumes, before any node runs; one that does not fit is refused with
+`GraphError::ResumeRejected` (`graph.resume_rejected`), the checkpoint is unchanged, and a
+valid answer still resumes the pause.
+
+```rust
+use adk_graph::checkpoint::MemoryCheckpointer;
+use adk_graph::edge::{END, START};
+use adk_graph::error::GraphError;
+use adk_graph::graph::StateGraph;
+use adk_graph::node::{ExecutionConfig, NodeOutput};
+use adk_graph::state::State;
+use serde_json::json;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let graph = StateGraph::with_channels(&["decision"])
+        .add_node_fn("review", |ctx| async move {
+            match ctx.resume_value() {
+                Some(answer) => Ok(NodeOutput::new().with_update("decision", answer.clone())),
+                None => Ok(NodeOutput::interrupt("approve this refund?").with_response_schema(json!({
+                    "type": "object",
+                    "properties": { "approved": { "type": "boolean" } },
+                    "required": ["approved"]
+                }))),
+            }
+        })
+        .add_edge(START, "review")
+        .add_edge("review", END)
+        .compile()?
+        .with_checkpointer(MemoryCheckpointer::new());
+
+    let Err(GraphError::Interrupted(paused)) =
+        graph.invoke(State::new(), ExecutionConfig::new("refund-7")).await
+    else {
+        panic!("the review pauses");
+    };
+    let id = paused.interrupt.id().expect("a dynamic pause has an id").to_string();
+
+    // Refused before anything runs: `approved` must be a boolean.
+    let wrong = ExecutionConfig::new("refund-7").with_resume_value(&id, json!({ "approved": "yes" }));
+    assert!(matches!(graph.invoke(State::new(), wrong).await, Err(GraphError::ResumeRejected { .. })));
+
+    // Strict resume: only the id of a pending pause answers it.
+    let config = ExecutionConfig::new("refund-7")
+        .strict_resume()
+        .with_resume_value(&id, json!({ "approved": true }));
+    let state = graph.invoke(State::new(), config).await?;
+    assert_eq!(state.get("decision"), Some(&json!({ "approved": true })));
+    Ok(())
+}
+```
+
+| Resume | An answer under the pause's id | An answer under the node's name | An answer under any other key |
+|---|---|---|---|
+| Default | Answers the pause | Answers the pause, when no id-keyed answer does | Ignored |
+| `ExecutionConfig::strict_resume()` | Answers the pause | Refused: `ResumeRejected` | Refused: `ResumeRejected` — an id already answered, or the id of a question the node no longer asks, is stale |
+
+Strict resume is LangGraph's: an answer binds to the pause it was given for, as an approval
+binds to its call's fingerprint, so replaying an earlier approval cannot approve the next
+request. It is opt-in per run.
 
 ### Static Interrupts
 
@@ -1736,9 +1874,13 @@ let graph = graph
 ```
 
 Pruning happens after each save, so the cost stays proportional to the run and no
-external job is needed. **The newest checkpoint is never discarded**, whatever the
-policy says, because it is the one a resume loads — `keep_last(0)` is raised to
-one, and a thread whose every checkpoint is past the age limit keeps one.
+external job is needed. **A checkpoint a resume still needs is never discarded**,
+whatever the policy says: the newest, which a resume loads (`keep_last(0)` is raised
+to one, and a thread whose every checkpoint is past the age limit keeps one); each
+pause no run has resumed, whose ID a caller holds; and each effect-log entry.
+Resuming from an ID retention has removed fails before any node runs. See
+[Graph Checkpointing](graph-checkpointing.md#retention-and-deletion) for pins,
+on-demand sweeps and whole-thread deletion.
 
 Off by default, so an existing thread keeps its whole history and time travel can
 still reach every step. Set a policy when a thread is long-lived and you do not

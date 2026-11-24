@@ -1,4 +1,4 @@
-//! Run budgets: limits on model calls, tokens, cost, wall time and tool calls.
+//! Run budgets: limits on model calls, tokens, cost, wall time, tool calls and units.
 //!
 //! A [`RunBudget`] states the limits for one run. A [`BudgetTracker`] holds the
 //! shared counters for those limits. `Runner` creates one tracker per run from
@@ -13,6 +13,7 @@
 //! |------------|----------------|
 //! | Before every model call ([`BudgetTracker::begin_model_call`]) | model calls, total tokens, cost, wall time; tool calls already over the limit |
 //! | Before every tool dispatch ([`BudgetTracker::begin_tool_calls`]) | tool calls, total tokens, cost, wall time |
+//! | Before every call billed in units ([`ModelCallScope::meter`](crate::ModelCallScope::meter)) | total tokens, cost, wall time; the per-unit caps of the units the call declares |
 //! | After every non-partial event ([`BudgetTracker::record_event`]) | usage the call sites did not meter |
 //!
 //! A limit is *reached* when usage equals or exceeds it; a reached limit blocks
@@ -41,6 +42,16 @@
 //! in [`BudgetTracker::units`]. They are not model calls. A unit call with no known price
 //! is refused before it is sent when a cost cap applies.
 //!
+//! # Per-unit caps
+//!
+//! [`RunBudget::max_units`] caps a unit — images, frames, pages — across the run. A call
+//! billed in units declares the most it can use ([`UsageCall::with_units`](crate::UsageCall::with_units)),
+//! and the tracker holds that amount before the call starts, as it reserves a model call:
+//! a hold that would take a unit past its cap refuses the call with `budget.units`, before
+//! any request, naming the unit and the cap. The call commits what it used and returns the
+//! rest of its hold; a call that fails returns all of it. A call that declares no units is
+//! not held, and its units count once it commits.
+//!
 //! # Example
 //!
 //! ```
@@ -66,6 +77,7 @@ use crate::{
     LlmResponseStream, Result, UsageMetadata, UsageUnit, UsageVector,
 };
 use futures::Stream;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -106,25 +118,70 @@ pub const BUDGET_LIMIT_KEY: &str = "adk.budget.limit";
 /// assert_eq!(budget.max_tool_calls, Some(25));
 /// assert!(!budget.allow_unpriced_models);
 /// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// A budget serializes in camelCase with the wall time in milliseconds and the per-unit caps
+/// keyed by unit, so it travels in a durable run's input
+/// (`{"runLimits": {"budget": {"maxModelCalls": 10, "maxWallTimeMs": 120000, "maxUnits": {"images": 20}}}}`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 #[non_exhaustive]
 pub struct RunBudget {
     /// Maximum model calls started in the run.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_model_calls: Option<u64>,
     /// Maximum input plus output tokens reported by the models.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_total_tokens: Option<u64>,
     /// Maximum cost in millionths of a US dollar.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_cost_micro_usd: Option<u64>,
     /// Maximum wall-clock time since the tracker was created.
+    #[serde(
+        rename = "maxWallTimeMs",
+        with = "optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_wall_time: Option<Duration>,
     /// Maximum tool calls dispatched in the run.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tool_calls: Option<u64>,
     /// Count responses with no known cost as zero cost instead of stopping.
     ///
     /// Only consulted when [`max_cost_micro_usd`](Self::max_cost_micro_usd) is
     /// set. The default `false` stops the run, because an unpriced model would
     /// otherwise spend without limit under a cost cap.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub allow_unpriced_models: bool,
+    /// Maximum usage of each capped unit across the calls billed in units, such as
+    /// `{images: 20}`. A unit with no entry is unlimited. See the
+    /// [module documentation](self#per-unit-caps).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub max_units: BTreeMap<UsageUnit, u64>,
+}
+
+/// `Option<Duration>` as whole milliseconds.
+mod optional_millis {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<Duration>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(duration) => {
+                serializer.serialize_u64(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Duration>, D::Error> {
+        Ok(Option::<u64>::deserialize(deserializer)?.map(Duration::from_millis))
+    }
 }
 
 impl RunBudget {
@@ -178,6 +235,28 @@ impl RunBudget {
         self
     }
 
+    /// Limits the usage of `unit` across the run's calls billed in units.
+    ///
+    /// A call that declares it would take the unit past `max` is refused with
+    /// `budget.units` before it starts.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_core::{RunBudget, UsageUnit};
+    ///
+    /// let budget = RunBudget::new().max_units(UsageUnit::Images, 20).max_units(UsageUnit::Frames, 600);
+    /// assert_eq!(budget.max_units.get(&UsageUnit::Images), Some(&20));
+    /// assert_eq!(
+    ///     serde_json::to_value(&budget).unwrap(),
+    ///     serde_json::json!({ "maxUnits": { "images": 20, "frames": 600 } })
+    /// );
+    /// ```
+    pub fn max_units(mut self, unit: UsageUnit, max: u64) -> Self {
+        self.max_units.insert(unit, max);
+        self
+    }
+
     /// Returns `true` when no limit is set.
     pub fn is_unlimited(&self) -> bool {
         self.max_model_calls.is_none()
@@ -185,6 +264,60 @@ impl RunBudget {
             && self.max_cost_micro_usd.is_none()
             && self.max_wall_time.is_none()
             && self.max_tool_calls.is_none()
+            && self.max_units.is_empty()
+    }
+
+    /// The stricter of `self` and `other`: each limit is the smaller of the two, a limit
+    /// only one of them sets applies, and unpriced models count as free only when every
+    /// budget that caps cost allows it. A budget a run's input carries narrows the runner's this way, so it can
+    /// only take resources away.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use adk_core::RunBudget;
+    ///
+    /// let runner = RunBudget::new().max_model_calls(50).max_wall_time(Duration::from_secs(600));
+    /// let run = RunBudget::new().max_model_calls(10).max_cost_micro_usd(500_000);
+    /// let narrowed = runner.narrowed(&run);
+    /// assert_eq!(narrowed.max_model_calls, Some(10));
+    /// assert_eq!(narrowed.max_cost_micro_usd, Some(500_000));
+    /// assert_eq!(narrowed.max_wall_time, Some(Duration::from_secs(600)));
+    /// ```
+    #[must_use]
+    pub fn narrowed(&self, other: &RunBudget) -> RunBudget {
+        fn min<T: Ord + Copy>(a: Option<T>, b: Option<T>) -> Option<T> {
+            match (a, b) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }
+        }
+        RunBudget {
+            max_model_calls: min(self.max_model_calls, other.max_model_calls),
+            max_total_tokens: min(self.max_total_tokens, other.max_total_tokens),
+            max_cost_micro_usd: min(self.max_cost_micro_usd, other.max_cost_micro_usd),
+            max_wall_time: min(self.max_wall_time, other.max_wall_time),
+            max_tool_calls: min(self.max_tool_calls, other.max_tool_calls),
+            max_units: UsageUnit::ALL
+                .into_iter()
+                .filter_map(|unit| {
+                    min(self.max_units.get(&unit).copied(), other.max_units.get(&unit).copied())
+                        .map(|max| (unit, max))
+                })
+                .collect(),
+            // The flag means something only under a cost cap, so the cap's own budget sets it.
+            allow_unpriced_models: match (
+                self.max_cost_micro_usd.is_some(),
+                other.max_cost_micro_usd.is_some(),
+            ) {
+                (true, false) => self.allow_unpriced_models,
+                (false, true) => other.allow_unpriced_models,
+                (true, true) | (false, false) => {
+                    self.allow_unpriced_models && other.allow_unpriced_models
+                }
+            },
+        }
     }
 }
 
@@ -202,6 +335,8 @@ pub enum BudgetLimit {
     WallTime,
     /// [`RunBudget::max_tool_calls`].
     ToolCalls,
+    /// The unit's entry in [`RunBudget::max_units`].
+    Units(UsageUnit),
 }
 
 impl BudgetLimit {
@@ -213,6 +348,17 @@ impl BudgetLimit {
             Self::Cost => "cost_micro_usd",
             Self::WallTime => "wall_time_ms",
             Self::ToolCalls => "tool_calls",
+            Self::Units(unit) => match unit {
+                UsageUnit::InputTokens => "units.inputTokens",
+                UsageUnit::OutputTokens => "units.outputTokens",
+                UsageUnit::Images => "units.images",
+                UsageUnit::AudioMillis => "units.audioMillis",
+                UsageUnit::VideoMillis => "units.videoMillis",
+                UsageUnit::Characters => "units.characters",
+                UsageUnit::Pages => "units.pages",
+                UsageUnit::Requests => "units.requests",
+                UsageUnit::Frames => "units.frames",
+            },
         }
     }
 }
@@ -261,8 +407,26 @@ impl BudgetExceeded {
             BudgetLimit::ToolCalls => {
                 ("budget.tool_calls", format!("budget exhausted: {used} of {max} tool calls used"))
             }
+            BudgetLimit::Units(unit) => {
+                ("budget.units", format!("budget exhausted: {used} of {max} {unit} used"))
+            }
         };
         Self { limit, used, max, code, message }
+    }
+
+    fn units(unit: UsageUnit, used: u64, requested: u64, max: u64) -> Self {
+        Self {
+            limit: BudgetLimit::Units(unit),
+            used,
+            max,
+            code: "budget.units",
+            message: format!(
+                "budget exhausted: the call would bring {unit} to {}, past the run's cap of \
+                 {max} {unit}, so it was not sent; raise RunBudget::max_units for {unit} or \
+                 start a new run",
+                used.saturating_add(requested)
+            ),
+        }
     }
 
     fn tool_batch(used: u64, requested: u64, max: u64) -> Self {
@@ -355,6 +519,9 @@ impl From<BudgetExceeded> for AdkError {
         details.metadata.insert("limit".to_string(), exceeded.limit.as_str().into());
         details.metadata.insert("used".to_string(), exceeded.used.into());
         details.metadata.insert("max".to_string(), exceeded.max.into());
+        if let BudgetLimit::Units(unit) = exceeded.limit {
+            details.metadata.insert("unit".to_string(), unit.as_str().into());
+        }
         AdkError::new(
             ErrorComponent::Agent,
             ErrorCategory::ResourceExhausted,
@@ -394,10 +561,10 @@ pub struct BudgetUsage {
 /// use adk_core::{BudgetLimit, BudgetTracker, RunBudget};
 ///
 /// let tracker = Arc::new(BudgetTracker::new(RunBudget::new().max_model_calls(1)));
-/// let meter = tracker.begin_model_call("gemini-3.7-flash").unwrap();
+/// let meter = tracker.begin_model_call("gemini-3.8-flash").unwrap();
 /// drop(meter);
 ///
-/// let exceeded = tracker.begin_model_call("gemini-3.7-flash").unwrap_err();
+/// let exceeded = tracker.begin_model_call("gemini-3.8-flash").unwrap_err();
 /// assert_eq!(exceeded.limit(), BudgetLimit::ModelCalls);
 /// assert_eq!(tracker.usage().model_calls, 1);
 /// ```
@@ -409,9 +576,17 @@ pub struct BudgetTracker {
     total_tokens: AtomicU64,
     cost_micro_usd: AtomicU64,
     tool_calls: AtomicU64,
-    units: Mutex<UsageVector>,
+    units: Mutex<UnitCounts>,
     exceeded: Mutex<Option<BudgetExceeded>>,
     parent: Option<Arc<BudgetTracker>>,
+}
+
+/// Units counted by a [`BudgetTracker`]: what calls used, and what open calls and carved
+/// slices hold against the per-unit caps.
+#[derive(Debug, Default)]
+struct UnitCounts {
+    used: UsageVector,
+    held: UsageVector,
 }
 
 impl BudgetTracker {
@@ -442,7 +617,7 @@ impl BudgetTracker {
             total_tokens: AtomicU64::new(usage.total_tokens),
             cost_micro_usd: AtomicU64::new(usage.cost_micro_usd),
             tool_calls: AtomicU64::new(usage.tool_calls),
-            units: Mutex::new(UsageVector::new()),
+            units: Mutex::new(UnitCounts::default()),
             exceeded: Mutex::new(None),
             parent,
         }
@@ -473,7 +648,8 @@ impl BudgetTracker {
     /// model calls, and every unit of the calls metered through
     /// [`ModelCallScope::meter`](crate::ModelCallScope::meter).
     ///
-    /// A tracker created with [`resume`](Self::resume) starts with no units.
+    /// A tracker created with [`resume`](Self::resume) starts with no units, so its
+    /// per-unit caps count from the resume.
     ///
     /// # Example
     ///
@@ -484,7 +660,7 @@ impl BudgetTracker {
     /// };
     ///
     /// let tracker = Arc::new(BudgetTracker::new(RunBudget::new()));
-    /// let mut meter = tracker.begin_model_call("gemini-3.7-flash").unwrap();
+    /// let mut meter = tracker.begin_model_call("gemini-3.8-flash").unwrap();
     /// let mut response = LlmResponse::default();
     /// response.usage_metadata = Some(UsageMetadata {
     ///     prompt_token_count: 120,
@@ -499,7 +675,7 @@ impl BudgetTracker {
     /// );
     /// ```
     pub fn units(&self) -> UsageVector {
-        self.units.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.units.lock().unwrap_or_else(|e| e.into_inner()).used.clone()
     }
 
     /// The first unknown-usage violation recorded by this tracker or an ancestor.
@@ -550,23 +726,65 @@ impl BudgetTracker {
         })
     }
 
-    /// Checks the limits that gate a call billed in units ([`ModelCallScope::meter`](crate::ModelCallScope::meter)).
+    /// Checks the limits that gate a call billed in units ([`ModelCallScope::meter`](crate::ModelCallScope::meter))
+    /// and holds the `units` it declares against the per-unit caps.
     ///
-    /// The call is not a model call and reserves nothing. `priced` is `false` when no price
-    /// is known for the call: a cost cap that does not
+    /// The call is not a model call. `priced` is `false` when no price is known for the
+    /// call: a cost cap that does not
     /// [`allow_unpriced_models`](RunBudget::allow_unpriced_models) then refuses it, before
-    /// it is sent.
+    /// it is sent. Settle the hold with [`record_units`](Self::record_units) or
+    /// [`release_units`](Self::release_units).
     pub(crate) fn begin_usage(
         &self,
         model: &str,
         priced: bool,
+        units: &UsageVector,
     ) -> std::result::Result<(), BudgetExceeded> {
         self.check()?;
         self.check_chain(Strictness::Exceeded)?;
         if !priced {
             self.refuse_unpriced(model)?;
         }
+        self.hold_units(units)
+    }
+
+    /// Holds `units` in this tracker and its ancestors, all or nothing: a unit that the hold
+    /// would take past its cap anywhere in the chain refuses the whole hold.
+    fn hold_units(&self, units: &UsageVector) -> std::result::Result<(), BudgetExceeded> {
+        if units.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut counts = self.units.lock().unwrap_or_else(|e| e.into_inner());
+            for (unit, amount) in units.iter() {
+                if let Some(&max) = self.budget.max_units.get(&unit) {
+                    let used = counts.used.get(unit).saturating_add(counts.held.get(unit));
+                    if used.saturating_add(amount) > max {
+                        return Err(BudgetExceeded::units(unit, used, amount, max));
+                    }
+                }
+            }
+            counts.held.merge(units);
+        }
+        if let Some(parent) = &self.parent
+            && let Err(violation) = parent.hold_units(units)
+        {
+            self.units.lock().unwrap_or_else(|e| e.into_inner()).held.subtract(units);
+            return Err(violation);
+        }
         Ok(())
+    }
+
+    /// Returns `held` units of a call that did not complete, in this tracker and its
+    /// ancestors.
+    pub(crate) fn release_units(&self, held: &UsageVector) {
+        if held.is_empty() {
+            return;
+        }
+        self.units.lock().unwrap_or_else(|e| e.into_inner()).held.subtract(held);
+        if let Some(parent) = &self.parent {
+            parent.release_units(held);
+        }
     }
 
     fn refuse_unpriced(&self, model: &str) -> std::result::Result<(), BudgetExceeded> {
@@ -582,23 +800,36 @@ impl BudgetTracker {
         }
     }
 
-    /// Counts what a call billed in units used: its cost, its tokens, and every unit.
-    pub(crate) fn record_units(&self, model: &str, units: &UsageVector, cost: Option<u64>) {
+    /// Counts what a call billed in units used — its cost, its tokens, and every unit — in
+    /// place of the `held` units it declared.
+    pub(crate) fn record_units(
+        &self,
+        model: &str,
+        held: &UsageVector,
+        units: &UsageVector,
+        cost: Option<u64>,
+    ) {
         self.add(Counter::TotalTokens, units.tokens());
         match cost {
             Some(cost) => self.add(Counter::Cost, cost),
             None => self.flag_unpriced(model),
         }
-        self.add_units(units);
+        self.settle_units(held, units);
     }
 
-    fn add_units(&self, units: &UsageVector) {
-        if units.is_empty() {
+    /// Replaces `held` units with `used` ones, in this tracker and its ancestors, under one
+    /// lock per tracker so a concurrent hold never sees both or neither.
+    fn settle_units(&self, held: &UsageVector, used: &UsageVector) {
+        if held.is_empty() && used.is_empty() {
             return;
         }
-        self.units.lock().unwrap_or_else(|e| e.into_inner()).merge(units);
+        {
+            let mut counts = self.units.lock().unwrap_or_else(|e| e.into_inner());
+            counts.held.subtract(held);
+            counts.used.merge(used);
+        }
         if let Some(parent) = &self.parent {
-            parent.add_units(units);
+            parent.settle_units(held, used);
         }
     }
 
@@ -671,6 +902,193 @@ impl BudgetTracker {
             (Some(own), Some(parent)) => Some(own.min(parent)),
             (own, parent) => own.or(parent),
         }
+    }
+
+    /// What is left of each limit across this tracker and its ancestors: for every limit
+    /// the chain sets, the smallest of `max − used`; `None` where no tracker limits it. A
+    /// unit's units held by open calls count as used. `allow_unpriced_models` is this
+    /// tracker's own.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use adk_core::{BudgetTracker, RunBudget};
+    ///
+    /// let run = Arc::new(BudgetTracker::new(RunBudget::new().max_tool_calls(10)));
+    /// let team = BudgetTracker::with_parent(RunBudget::new().max_model_calls(4), run);
+    /// team.begin_tool_calls(3).unwrap();
+    /// let left = team.remaining();
+    /// assert_eq!((left.max_tool_calls, left.max_model_calls), (Some(7), Some(4)));
+    /// assert_eq!(left.max_cost_micro_usd, None);
+    /// ```
+    pub fn remaining(&self) -> RunBudget {
+        let usage = self.usage();
+        let left = |max: Option<u64>, used: u64| max.map(|max| max.saturating_sub(used));
+        let own = RunBudget {
+            max_model_calls: left(self.budget.max_model_calls, usage.model_calls),
+            max_total_tokens: left(self.budget.max_total_tokens, usage.total_tokens),
+            max_cost_micro_usd: left(self.budget.max_cost_micro_usd, usage.cost_micro_usd),
+            max_wall_time: self.budget.max_wall_time.map(|max| max.saturating_sub(usage.elapsed)),
+            max_tool_calls: left(self.budget.max_tool_calls, usage.tool_calls),
+            allow_unpriced_models: self.budget.allow_unpriced_models,
+            max_units: {
+                let counts = self.units.lock().unwrap_or_else(|e| e.into_inner());
+                self.budget
+                    .max_units
+                    .iter()
+                    .map(|(&unit, &max)| {
+                        let used = counts.used.get(unit).saturating_add(counts.held.get(unit));
+                        (unit, max.saturating_sub(used))
+                    })
+                    .collect()
+            },
+        };
+        match &self.parent {
+            Some(parent) => {
+                let mut chain = own.narrowed(&parent.remaining());
+                chain.allow_unpriced_models = self.budget.allow_unpriced_models;
+                chain
+            }
+            None => own,
+        }
+    }
+
+    /// Carves a budget for work that spends on counters of its own — a background
+    /// sub-agent's durable run — out of what this tracker and its ancestors have left, so
+    /// the two together never spend more than the chain allows.
+    ///
+    /// | Limit | The slice |
+    /// |-------|-----------|
+    /// | Asked for and limited by the chain | The smaller of the ask and what is left |
+    /// | Asked for, not limited by the chain | The ask |
+    /// | Not asked for, limited by the chain | Half of what is left |
+    /// | Neither | Unlimited |
+    /// | Wall time | The smaller of the ask and what is left; not reserved, since it is not spent |
+    ///
+    /// Each unit of [`RunBudget::max_units`] is carved the same way. Model calls, tokens,
+    /// cost, tool calls and units of the slice that the chain limits count as used by this
+    /// tracker and its ancestors from now on, whether the work spends them or not. Unpriced models count as free in the slice only when the chain allows it under a
+    /// cost cap, or when no tracker in the chain caps cost and the ask allows it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exhausted limit when the chain has nothing left of a limit it sets, or
+    /// a violation was recorded; nothing is reserved then.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_core::{BudgetTracker, RunBudget};
+    ///
+    /// let parent = BudgetTracker::new(RunBudget::new().max_model_calls(30).max_cost_micro_usd(1_000_000));
+    /// let slice = parent.carve(&RunBudget::new().max_model_calls(10)).unwrap();
+    /// assert_eq!(slice.max_model_calls, Some(10));
+    /// assert_eq!(slice.max_cost_micro_usd, Some(500_000), "half of what is left");
+    /// assert_eq!(parent.remaining().max_model_calls, Some(20));
+    /// assert_eq!(parent.remaining().max_cost_micro_usd, Some(500_000));
+    /// ```
+    pub fn carve(&self, ask: &RunBudget) -> std::result::Result<RunBudget, BudgetExceeded> {
+        self.check()?;
+        let left = self.remaining();
+        let pick = |ask: Option<u64>, left: Option<u64>| match (ask, left) {
+            (Some(ask), Some(left)) => Some(ask.min(left)),
+            (Some(ask), None) => Some(ask),
+            (None, Some(left)) => Some(left.div_ceil(2)),
+            (None, None) => None,
+        };
+        let capped = left.max_cost_micro_usd.is_some();
+        let slice = RunBudget {
+            max_model_calls: pick(ask.max_model_calls, left.max_model_calls),
+            max_total_tokens: pick(ask.max_total_tokens, left.max_total_tokens),
+            max_cost_micro_usd: pick(ask.max_cost_micro_usd, left.max_cost_micro_usd),
+            max_wall_time: match (ask.max_wall_time, left.max_wall_time) {
+                (Some(ask), Some(left)) => Some(ask.min(left)),
+                (ask, left) => ask.or(left),
+            },
+            max_tool_calls: pick(ask.max_tool_calls, left.max_tool_calls),
+            allow_unpriced_models: if capped {
+                self.unpriced_allowed_in_chain()
+            } else {
+                ask.allow_unpriced_models
+            },
+            max_units: UsageUnit::ALL
+                .into_iter()
+                .filter_map(|unit| {
+                    pick(ask.max_units.get(&unit).copied(), left.max_units.get(&unit).copied())
+                        .map(|max| (unit, max))
+                })
+                .collect(),
+        };
+        let usage = self.usage();
+        let exhausted = |limit: BudgetLimit, slice: Option<u64>, used: u64| {
+            (slice == Some(0)).then(|| BudgetExceeded::reached(limit, used, used))
+        };
+        if let Some(violation) = exhausted(
+            BudgetLimit::ModelCalls,
+            slice.max_model_calls.filter(|_| left.max_model_calls.is_some()),
+            usage.model_calls,
+        )
+        .or_else(|| {
+            exhausted(
+                BudgetLimit::TotalTokens,
+                slice.max_total_tokens.filter(|_| left.max_total_tokens.is_some()),
+                usage.total_tokens,
+            )
+        })
+        .or_else(|| {
+            exhausted(
+                BudgetLimit::Cost,
+                slice.max_cost_micro_usd.filter(|_| left.max_cost_micro_usd.is_some()),
+                usage.cost_micro_usd,
+            )
+        })
+        .or_else(|| {
+            exhausted(
+                BudgetLimit::ToolCalls,
+                slice.max_tool_calls.filter(|_| left.max_tool_calls.is_some()),
+                usage.tool_calls,
+            )
+        })
+        .or_else(|| {
+            (slice.max_wall_time == Some(Duration::ZERO)).then(|| {
+                let elapsed = duration_ms(usage.elapsed);
+                BudgetExceeded::reached(BudgetLimit::WallTime, elapsed, elapsed)
+            })
+        })
+        .or_else(|| {
+            left.max_units.keys().find(|unit| slice.max_units.get(unit) == Some(&0)).map(|&unit| {
+                let used = self.units().get(unit);
+                BudgetExceeded::reached(BudgetLimit::Units(unit), used, used)
+            })
+        }) {
+            return Err(violation);
+        }
+        // The unit hold comes first: it is the one reservation a concurrent call can refuse.
+        self.hold_units(
+            &slice
+                .max_units
+                .iter()
+                .filter(|(unit, _)| left.max_units.contains_key(unit))
+                .map(|(&unit, &max)| (unit, max))
+                .collect(),
+        )?;
+        let reserve = |counter: Counter, slice: Option<u64>, limited: Option<u64>| {
+            if let (Some(amount), Some(_)) = (slice, limited) {
+                self.add(counter, amount);
+            }
+        };
+        reserve(Counter::ModelCalls, slice.max_model_calls, left.max_model_calls);
+        reserve(Counter::TotalTokens, slice.max_total_tokens, left.max_total_tokens);
+        reserve(Counter::Cost, slice.max_cost_micro_usd, left.max_cost_micro_usd);
+        reserve(Counter::ToolCalls, slice.max_tool_calls, left.max_tool_calls);
+        Ok(slice)
+    }
+
+    /// Whether every tracker in the chain that caps cost counts unpriced models as free.
+    fn unpriced_allowed_in_chain(&self) -> bool {
+        let own = self.budget.max_cost_micro_usd.is_none() || self.budget.allow_unpriced_models;
+        own && self.parent.as_ref().is_none_or(|parent| parent.unpriced_allowed_in_chain())
     }
 
     /// Counts usage carried by an event that no call site metered.
@@ -836,7 +1254,8 @@ impl BudgetTracker {
                 self.add(Counter::TotalTokens, u64::try_from(usage.total_token_count).unwrap_or(0));
                 self.add(Counter::ToolCalls, usage.builtin_tool_use_count());
                 let count = |tokens: i32| u64::try_from(tokens).unwrap_or(0);
-                self.add_units(
+                self.settle_units(
+                    &UsageVector::new(),
                     &UsageVector::new()
                         .with(UsageUnit::InputTokens, count(usage.prompt_token_count))
                         .with(UsageUnit::OutputTokens, count(usage.candidates_token_count)),
@@ -1293,5 +1712,143 @@ mod tests {
         assert_eq!(collected.len(), 2);
         assert_eq!(tracker.usage().total_tokens, 10);
         assert_eq!(tracker.usage().cost_micro_usd, 1_000);
+    }
+
+    #[test]
+    fn a_carved_slice_never_takes_the_chain_past_its_limits() {
+        let run = Arc::new(BudgetTracker::new(RunBudget::new().max_model_calls(10)));
+        let team = BudgetTracker::with_parent(RunBudget::new().max_tool_calls(6), Arc::clone(&run));
+        let slice = team.carve(&RunBudget::new().max_model_calls(4).max_tool_calls(100)).unwrap();
+        assert_eq!(slice.max_model_calls, Some(4));
+        assert_eq!(slice.max_tool_calls, Some(6), "the team's tool limit caps the ask");
+        // The slice counts in every tracker of the chain.
+        assert_eq!(run.usage().model_calls, 4);
+        assert_eq!(team.remaining().max_tool_calls, Some(0));
+        assert_eq!(team.remaining().max_model_calls, Some(6));
+        // Nothing of a limited resource left: the carve fails and reserves nothing.
+        let refused = team.carve(&RunBudget::new()).unwrap_err();
+        assert_eq!(refused.limit(), BudgetLimit::ToolCalls);
+        assert_eq!(run.usage().model_calls, 4);
+    }
+
+    #[test]
+    fn a_slice_counts_unpriced_models_as_free_only_where_the_chain_does() {
+        let capped = BudgetTracker::new(RunBudget::new().max_cost_micro_usd(1_000));
+        let ask = RunBudget::new().allow_unpriced_models();
+        assert!(!capped.carve(&ask).unwrap().allow_unpriced_models);
+        let lenient =
+            BudgetTracker::new(RunBudget::new().max_cost_micro_usd(1_000).allow_unpriced_models());
+        assert!(lenient.carve(&RunBudget::new()).unwrap().allow_unpriced_models);
+        let open = BudgetTracker::new(RunBudget::new());
+        assert!(open.carve(&ask).unwrap().allow_unpriced_models);
+        assert_eq!(open.carve(&RunBudget::new()).unwrap(), RunBudget::new());
+    }
+
+    #[test]
+    fn a_budget_round_trips_with_its_wall_time_in_milliseconds() {
+        let budget =
+            RunBudget::new().max_model_calls(3).max_wall_time(Duration::from_millis(1_500));
+        let json = serde_json::to_value(&budget).unwrap();
+        assert_eq!(json, serde_json::json!({ "maxModelCalls": 3, "maxWallTimeMs": 1500 }));
+        assert_eq!(serde_json::from_value::<RunBudget>(json).unwrap(), budget);
+        assert_eq!(
+            serde_json::from_value::<RunBudget>(serde_json::json!({})).unwrap(),
+            RunBudget::new()
+        );
+    }
+
+    fn images(count: u64) -> UsageVector {
+        UsageVector::new().with(UsageUnit::Images, count)
+    }
+
+    #[test]
+    fn a_unit_hold_past_its_cap_is_refused_naming_the_unit_and_the_cap() {
+        let tracker = BudgetTracker::new(RunBudget::new().max_units(UsageUnit::Images, 2));
+        tracker.begin_usage("sam-3.1", true, &images(1)).unwrap();
+        tracker.record_units("sam-3.1", &images(1), &images(1), Some(2_500));
+        tracker.begin_usage("sam-3.1", true, &images(1)).unwrap();
+        let refused = tracker.begin_usage("sam-3.1", true, &images(1)).unwrap_err();
+        assert_eq!(refused.limit(), BudgetLimit::Units(UsageUnit::Images));
+        assert_eq!((refused.used(), refused.max()), (2, 2));
+        assert_eq!(refused.code(), "budget.units");
+        assert!(refused.message().contains("cap of 2 images"), "{}", refused.message());
+        let error = AdkError::from(refused);
+        assert_eq!(error.details.metadata["limit"], "units.images");
+        assert_eq!(error.details.metadata["unit"], "images");
+        // The open hold counts against the cap; returning it frees the room.
+        tracker.release_units(&images(1));
+        assert!(tracker.begin_usage("sam-3.1", true, &images(1)).is_ok());
+        assert_eq!(tracker.units(), images(1), "only committed units are usage");
+    }
+
+    #[test]
+    fn a_commit_replaces_the_hold_with_what_the_call_used() {
+        let tracker = BudgetTracker::new(RunBudget::new().max_units(UsageUnit::Frames, 100));
+        let frames = |count| UsageVector::new().with(UsageUnit::Frames, count);
+        tracker.begin_usage("sam-3.1", true, &frames(80)).unwrap();
+        assert_eq!(tracker.remaining().max_units[&UsageUnit::Frames], 20);
+        tracker.record_units("sam-3.1", &frames(80), &frames(30), Some(6_000));
+        assert_eq!(tracker.remaining().max_units[&UsageUnit::Frames], 70);
+        assert_eq!(tracker.units(), frames(30));
+    }
+
+    #[test]
+    fn uncapped_units_and_undeclared_calls_are_never_held_back() {
+        let tracker = BudgetTracker::new(RunBudget::new().max_units(UsageUnit::Images, 1));
+        tracker
+            .begin_usage("tts", true, &UsageVector::new().with(UsageUnit::Characters, 9_000))
+            .unwrap();
+        tracker.record_units("sam-3.1", &UsageVector::new(), &images(3), Some(0));
+        // Undeclared usage still counts, so the next declaring call sees the cap reached.
+        assert!(tracker.begin_usage("sam-3.1", true, &UsageVector::new()).is_ok());
+        assert_eq!(
+            tracker.begin_usage("sam-3.1", true, &images(1)).unwrap_err().limit(),
+            BudgetLimit::Units(UsageUnit::Images)
+        );
+    }
+
+    #[test]
+    fn a_child_hold_is_refused_by_its_parents_cap_and_holds_nothing() {
+        let run = Arc::new(BudgetTracker::new(RunBudget::new().max_units(UsageUnit::Pages, 5)));
+        let team = BudgetTracker::with_parent(
+            RunBudget::new().max_units(UsageUnit::Pages, 10),
+            Arc::clone(&run),
+        );
+        let pages = |count| UsageVector::new().with(UsageUnit::Pages, count);
+        team.begin_usage("ocr", true, &pages(4)).unwrap();
+        let refused = team.begin_usage("ocr", true, &pages(2)).unwrap_err();
+        assert_eq!((refused.limit(), refused.max()), (BudgetLimit::Units(UsageUnit::Pages), 5));
+        assert_eq!(team.remaining().max_units[&UsageUnit::Pages], 1);
+        team.record_units("ocr", &pages(4), &pages(4), Some(0));
+        assert_eq!((team.units(), run.units()), (pages(4), pages(4)));
+    }
+
+    #[test]
+    fn unit_caps_narrow_carve_and_round_trip() {
+        let runner = RunBudget::new().max_units(UsageUnit::Images, 50);
+        let run =
+            RunBudget::new().max_units(UsageUnit::Images, 20).max_units(UsageUnit::Frames, 600);
+        let narrowed = runner.narrowed(&run);
+        assert_eq!(
+            narrowed,
+            RunBudget::new().max_units(UsageUnit::Images, 20).max_units(UsageUnit::Frames, 600)
+        );
+        assert!(!narrowed.is_unlimited());
+
+        let parent = BudgetTracker::new(narrowed.clone());
+        let slice = parent.carve(&RunBudget::new().max_units(UsageUnit::Images, 8)).unwrap();
+        assert_eq!(slice.max_units[&UsageUnit::Images], 8);
+        assert_eq!(slice.max_units[&UsageUnit::Frames], 300, "half of what is left");
+        assert_eq!(parent.remaining().max_units[&UsageUnit::Images], 12);
+        assert_eq!(parent.units(), UsageVector::new(), "a carved slice is held, not used");
+        let exhausted = BudgetTracker::new(RunBudget::new().max_units(UsageUnit::Images, 0));
+        assert_eq!(
+            exhausted.carve(&RunBudget::new()).unwrap_err().limit(),
+            BudgetLimit::Units(UsageUnit::Images)
+        );
+
+        let json = serde_json::to_value(&narrowed).unwrap();
+        assert_eq!(json, serde_json::json!({ "maxUnits": { "images": 20, "frames": 600 } }));
+        assert_eq!(serde_json::from_value::<RunBudget>(json).unwrap(), narrowed);
     }
 }

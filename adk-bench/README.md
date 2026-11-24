@@ -40,13 +40,42 @@ APIs and compares ADK-Rust with other agent frameworks through a subprocess prot
 | Memory | `BenchRunner` | Peak process RSS during the measurement phase, sampled every `memory_sample_interval_ms`, and the growth per concurrent agent; Linux and macOS only |
 | Peak RSS, token overhead | External harnesses (EBP) | Reported by the harness in its JSON output |
 
+## Vision benchmarks
+
+Feature `vision` measures `adk-vision` backends (spec 3.7 §7.17): cold load, p50 and p95 per
+image at three input sizes, throughput, peak RSS, accuracy on the vision eval sets (scored by
+`adk-eval`'s vision criteria) and cost per 1,000 images, published with the machine, OS, CPU
+and runtime versions. `adapters::vision::VisionAdapter` reports a backend's pass rate on an
+eval set beside the τ²-bench and BFCL adapters.
+
+| Feature | Backends |
+|---------|----------|
+| `vision-onnx` (`vision-coreml`) | RF-DETR Nano fp32 and q4f16, EfficientSAM-Ti, SAM 2.1 Tiny q4, SigLIP 2 base |
+| `vision-ocr` | PP-OCRv6 tiny and small |
+| `vision-ocr-vl` (`vision-ocr-vl-metal`) | PaddleOCR-VL-1.6 on the CPU (and Metal) |
+| `vision-cloud` | Claude, Nemotron, Gemma 4 and Muse describers and Meta `sam-3.1`, from recorded responses or one live call each |
+
+```bash
+HF_HUB_CACHE=/path/to/models cargo run -p adk-bench --profile ci \
+    --features vision-onnx,vision-ocr,vision-cloud --example vision_bench -- \
+    run --out vision-bench.md --json vision-bench.json
+```
+
+`vision_bench serve <backend>` answers the `cargo adk eval` agent protocol with one local
+backend. Results are on [Vision Benchmarks](../docs/official_docs/vision/benchmarks.md).
+
 `memory::current_rss_bytes` and `memory::spawn_memory_sampler` read the RSS from
 `/proc/self/statm` on Linux and `mach_task_basic_info` on macOS. `BenchmarkResult::model` is
 the model the run called (`BenchConfig::model`).
 
 ## Usage
 
-`cargo adk bench` (from `cargo-adk`) drives this crate.
+`cargo adk bench` (from `cargo-adk`) drives this crate. It needs `cargo-adk`'s `bench` feature,
+off by default:
+
+```bash
+cargo install cargo-adk --features bench
+```
 
 ### Basic run
 
@@ -104,7 +133,7 @@ cargo adk bench --format table --confirm-cost                         # terminal
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model` | `gemini-3.7-flash` | LLM model identifier |
+| `--model` | `gemini-3.8-flash` | LLM model identifier |
 | `--runs` | `5` | Measurement iterations per workload |
 | `--warmup` | `3` | Warm-up iterations (discarded) |
 | `--concurrency` | `1` | Agent concurrency level |
@@ -134,7 +163,40 @@ cargo adk bench --format table --confirm-cost                         # terminal
 | `parallel_tool_invocation` | Concurrent tool calls (stock price, news, rating) | 2 | 3 |
 | `multi_agent_delegation` | Coordinator delegates to specialist agents; needs `--experimental` | 5 | 2 |
 
+## Long history (no API key)
+
+`long_history` measures the framework's own cost as a session grows, with a scripted model
+that answers instantly, an in-memory session, and no API key. A step is one turn
+(`turns`: a user message, a tool call and the answer) or one tool iteration inside a single
+autonomous run (`loop`). Work that copies or rescans the whole history shows as a per-step cost
+that rises with the step number.
+
+```bash
+cargo run -p adk-bench --release --example long_history -- turns 1000
+cargo run -p adk-bench --release --example long_history -- turns 1000 --window 50
+cargo run -p adk-bench --release --example long_history -- loop 2000 --payload 4096 --json
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `turns` / `loop` | required | What a step is |
+| `<steps>` | required | Number of turns, or tool iterations of the one run |
+| `--window` | none | `RunConfig::history_max_events` |
+| `--payload` | `200` | Bytes of text each tool result carries |
+| `--json` | off | Print the `LongHistoryReport` as JSON |
+
+The report gives the mean, median and p95 process CPU time per step for the first and last
+tenth of the run, their ratio (`growth`), the total process CPU time, and the peak RSS.
+`tests/long_history_allocations.rs` runs it in every pull request's test suite: it counts the
+bytes each turn allocates, and fails when a `history_max_events` window stops bounding a turn's
+work or when a turn copies the history more often than it did.
+
 ## Library use
+
+```toml
+[dependencies]
+adk-bench = "3.0.0"
+```
 
 ```rust
 use adk_bench::{BenchConfig, BenchRunner};
@@ -154,6 +216,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+### Features
+
+| Feature | Default | Adds |
+|---------|---------|------|
+| `tau2` | no | `adapters::tau2::Tau2Adapter`, a τ²-bench task-quality adapter |
+| `bfcl` | no | `adapters::bfcl::BfclAdapter`, a Berkeley Function Calling Leaderboard adapter |
 
 ## External Benchmark Protocol (EBP)
 

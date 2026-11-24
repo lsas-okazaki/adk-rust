@@ -26,11 +26,11 @@ adk-rust = { version = "3.0.0", features = ["action"] }
 
 | Feature (`adk-graph` / `adk-rust`) | Adds |
 |------------------------------------|------|
-| `action` | `ActionNodeExecutor`, `WorkflowSchema`, every node without an external backend |
-| `action-http` | HTTP and Notification nodes |
-| `action-rss` | RSS node (implies `action-http`) |
+| `action` | `ActionNodeExecutor`, `WorkflowSchema`, every node without an external backend; on `adk-rust` also the database and email placeholders |
+| `action-http` | HTTP and Notification nodes; on `adk-rust` also the RSS node |
+| `action-rss` (`adk-graph` only) | RSS node (implies `action-http`) |
 | `action-trigger` | `TriggerRuntime` for webhook, schedule, and event triggers |
-| `action-db`, `action-email`, `action-code` | Placeholders only; see below |
+| `action-db`, `action-email` (`adk-graph` only) | Placeholders only; see below |
 | `action-full` | All of the above |
 
 ## Node Types (14)
@@ -75,9 +75,8 @@ write `null`.
 Implement `Node::validate` on a custom node to take part in the same check.
 
 A node that bypasses the build-time check and executes anyway fails with an error
-saying its node type is not implemented. Enabling `action-db`, `action-email`, or
-`action-code` does not change that: those features compile the placeholders, not a
-backend.
+saying its node type is not implemented. Enabling `action-db` or `action-email` does not
+change that: those features compile the placeholders, not a backend.
 
 ## Untrusted Paths and URLs
 
@@ -221,6 +220,10 @@ file roots and the HTTP policy keep their defaults; build the graph yourself to 
 `trigger_configs()` and `build_trigger_runtime(...)` (`action-trigger`) expose the workflow's
 triggers.
 
+A hand-written workflow file uses the [YAML workflow format](../agents/graph-workflows-yaml.md)
+instead: its `action:` nodes take the same configurations, with the standard properties
+defaulted from the node, beside agent, LLM, interrupt and `set` nodes.
+
 ## Defining Custom Node Types
 
 The node types are a closed enum. For custom logic, implement `adk_graph::Node` (or use
@@ -230,8 +233,9 @@ nodes; implement `Node::validate` to take part in the build-time check.
 ## Related
 
 - [Graph Agents](../agents/graph-agents.md) — Graph workflow orchestration
-- [Studio Action Nodes](../studio/action-nodes.md) — Visual node editor in ADK Studio
-- [Triggers](../studio/triggers.md) — Workflow trigger types
+- [YAML Workflows](../agents/graph-workflows-yaml.md) — `action:` nodes in a workflow file, run with `adk-rust graph run`
+- [The Workflow Observer](../surfaces/workflow.md) — A graph agent's runs, steps and forks
+- [Cron wakes](../kernel/scheduling.md#cron-wakes-and-missed-occurrences) — Starting work on a schedule, a file change or a webhook (`adk-rust wake`)
 
 ---
 

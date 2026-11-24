@@ -4,16 +4,15 @@
 # alongside `cargo audit`. Run locally with `cargo deny check`.
 #
 # The accepted-advisory list is the subset of `.cargo/audit.toml` that cargo-deny
-# actually reaches: it resolves the feature graph (so lockfile-only crates such as
-# rkyv 0.7 never appear) and `unmaintained = "workspace"` leaves transitive
-# unmaintained crates to upstream. Every entry is justified in
+# actually reaches: it resolves the feature graph (so lockfile-only crates never
+# appear) and `unmaintained = "workspace"` leaves transitive unmaintained crates
+# to upstream. Every entry is justified in
 # `docs/security/DEPENDENCY-ADVISORIES.md`; add the rationale there before adding
 # an ID here, and remove an ID as soon as `cargo deny check advisories` reports it
 # as `advisory-not-detected`.
 
 [graph]
-# Optional backends (surrealdb, lancedb, the ONNX audio models, mistral.rs,
-# LiveKit) carry most of the dependency surface. Resolving every feature keeps
+# Optional backends (lancedb, the ONNX audio models, mistral.rs, LiveKit) carry most of the dependency surface. Resolving every feature keeps
 # the crates a production deployment actually enables under the gate.
 all-features = true
 
@@ -41,25 +40,59 @@ ignore = [
     "RUSTSEC-2026-0195",
 
     # zip < 9 — SUID/SGID bits kept, symlink targets and permissions applied
-    # outside the destination, all in `ZipArchive::extract` /
-    # `ZipStreamReader::extract`. Reached only through third-party wrappers with
-    # no release on zip >= 9:
-    #   * zip 0.6.6 — adk-realtime -> webrtc-sys -> (build) webrtc-sys-build,
-    #     feature `adk-realtime/livekit`. Extracts LiveKit's pinned libwebrtc
-    #     archive at build time only; `LK_CUSTOM_WEBRTC` skips it.
-    #   * zip 6.0.0 — adk-audio -> ndarray-npy (`npz`), feature `adk-audio/kokoro`.
-    #     Reads entries by name; never extracts.
-    #   * zip 7.2.0 — adk-audio -> candle-core 0.9 (`adk-audio/qwen3-tts`) and
-    #     adk-mistralrs -> mistralrs -> candle-core 0.10. Reads entries by name;
-    #     never extracts.
-    # The crates this workspace declares require zip 9, and the `[[bans.deny]]`
-    # entry below keeps that floor enforced.
+    # outside the destination, and an abort on a symlink entry with a huge
+    # declared size, all in `ZipArchive::extract` / `ZipStreamReader::extract`
+    # (0367, 0368, 0369, 0429, 0546); WinZip AES entries returned unauthenticated
+    # (0545, `aes-crypto` feature, password reads only); legacy Shrink, Reduce and
+    # Implode decoders preallocating a declared size (0547, `legacy-zip` feature);
+    # `ZipStreamReader` naming entries by local header (0548).
+    # Reached only through third-party wrappers with no release on zip >= 9, both
+    # built without `aes-crypto` and `legacy-zip`:
+    #   * zip 7.4.0 — adk-audio -> candle-core 0.9 (`adk-audio/qwen3-tts`) and
+    #     adk-mistralrs -> mistralrs -> candle-core 0.10. Reads entries by name with
+    #     `ZipArchive`; never extracts or streams.
+    #   * zip 0.6.6 — adk-realtime -> webrtc-sys-build 0.3.18 (`adk-realtime/livekit`),
+    #     pinned because 0.3.21's libwebrtc breaks webrtc-sys 0.3.40. Its build
+    #     script extracts LiveKit's own libwebrtc release archive, fetched over HTTPS,
+    #     with `ZipArchive`.
+    # The crates this workspace declares require zip 9.0.5, and the `[[bans.deny]]`
+    # entry below keeps zip 9 enforced.
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
+    "RUSTSEC-2026-0545",
+    "RUSTSEC-2026-0546",
+    "RUSTSEC-2026-0547",
+    "RUSTSEC-2026-0548",
 
-    # rsa — Marvin timing side-channel. No upstream fix exists.
-    "RUSTSEC-2023-0071",
+    # libsqlite3-sys 0.37 — bundled SQLite 3.53 returns uninitialised page-cache
+    # memory for a database opened with a crafted `-wal` file; only files a less
+    # trusted local party wrote are a risk. sqlx-sqlite 0.9.0 (the latest) caps
+    # libsqlite3-sys below 0.38, so no fixed copy can be selected. Remove when a
+    # sqlx release accepts libsqlite3-sys >= 0.39.
+    "RUSTSEC-2026-0459",
+
+    # crypto-bigint 0.5.5 — timing variability in constant-time operations.
+    # Reached only through p256 0.13 behind the opt-in `adk-surface/mobile`
+    # feature; web-push-native 0.5.0, the latest, requires p256 0.13. Remove when
+    # web-push-native releases on p256 0.14.
+    "RUSTSEC-2026-0387",
+
+    # ocipkg 0.2.9 — path traversal unpacking a crafted OCI archive. Reached only
+    # through intel-mkl-src 0.8.1 (the latest) behind the opt-in
+    # `adk-mistralrs/mkl` feature, at build time. Remove when intel-mkl-src
+    # releases on ocipkg >= 0.4.1.
+    "RUSTSEC-2026-0450",
+
+    # --- Unmaintained crates this workspace declares ---
+
+    # chrono and chrono-tz — marked unmaintained upstream (chronotope/chrono#1768);
+    # no release fixes it and the advisories name no vulnerability. `DateTime<Utc>`
+    # is in the public API of most crates here, so moving to `jiff` or `time` is a
+    # breaking change of its own. Remove when the workspace moves off chrono.
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
 
     # --- Unsoundness and notices: reviewed, no ADK-reachable path ---
     # http-types: ASCII invariant in Authorization value. Reached only through
@@ -104,40 +137,6 @@ crate = "intel-mkl-src"
 expression = "LicenseRef-Intel-Simplified-Software-License"
 license-files = [{ path = "License.txt", hash = 0x3bf8c2d0 }]
 
-# Non-OSI licenses, reached only through opt-in features. Allowed per-crate so
-# that enabling those features is a visible decision rather than a silent one:
-#   * surrealdb and its sub-crates (Business Source License 1.1)
-#     — `adk-rag/surrealdb`
-#   * intel-mkl-src (Intel Simplified Software License) — `adk-mistralrs/mkl`
-# See docs/security/DEPENDENCY-ADVISORIES.md ("Non-OSI dependency licenses").
-[[licenses.exceptions]]
-crate = "surrealdb"
-allow = ["BUSL-1.1"]
-
-[[licenses.exceptions]]
-crate = "surrealdb-core"
-allow = ["BUSL-1.1"]
-
-[[licenses.exceptions]]
-crate = "surrealdb-types"
-allow = ["BUSL-1.1"]
-
-[[licenses.exceptions]]
-crate = "surrealdb-types-derive"
-allow = ["BUSL-1.1"]
-
-[[licenses.exceptions]]
-crate = "surrealdb-strand"
-allow = ["BUSL-1.1"]
-
-[[licenses.exceptions]]
-crate = "surrealdb-collections"
-allow = ["BUSL-1.1"]
-
-[[licenses.exceptions]]
-crate = "surrealdb-protocol"
-allow = ["BUSL-1.1"]
-
 # `inferno` renders flamegraph SVG inside lance-testing's profiler, reached only
 # through the optional `adk-rag/lancedb` feature. CDDL-1.0 is OSI-approved,
 # file-level copyleft and imposes no obligation on this workspace's own sources.
@@ -145,9 +144,27 @@ allow = ["BUSL-1.1"]
 crate = "inferno"
 allow = ["CDDL-1.0"]
 
+# A non-OSI license, reached only through the opt-in `adk-mistralrs/mkl` feature.
+# Allowed per-crate so that enabling the feature is a visible decision rather than
+# a silent one. See docs/security/DEPENDENCY-ADVISORIES.md ("Non-OSI dependency
+# licenses").
 [[licenses.exceptions]]
 crate = "intel-mkl-src"
 allow = ["LicenseRef-Intel-Simplified-Software-License"]
+
+# `adk-vision-sam-codec` is this workspace's port of the mask codec in Meta's
+# `@meta-sam/parser`, a derivative of SAM Materials that clause 1.b.i of the SAM License
+# requires to be distributed under that licence. It is the only crate allowed it, reached only
+# through the opt-in `adk-vision/sam-codec` feature, which is in no adk-rust tier. See
+# docs/security/DEPENDENCY-ADVISORIES.md ("Non-OSI dependency licenses").
+[[licenses.clarify]]
+crate = "adk-vision-sam-codec"
+expression = "LicenseRef-SAM"
+license-files = [{ path = "LICENSE", hash = 0x83483f00 }]
+
+[[licenses.exceptions]]
+crate = "adk-vision-sam-codec"
+allow = ["LicenseRef-SAM"]
 
 [licenses.private]
 # `xtask` is the repo-internal task runner (`publish = false`) and carries no
@@ -174,7 +191,7 @@ wrappers = ["inferno"]
 # Keep declared zip usage on the patched line. The wrappers are the third-party
 # crates named in the zip advisory ignore above.
 crate = "zip:<9"
-wrappers = ["webrtc-sys-build", "ndarray-npy", "candle-core"]
+wrappers = ["candle-core", "webrtc-sys-build"]
 
 [sources]
 unknown-registry = "deny"

@@ -5,6 +5,7 @@ Two paths publish an MCP server:
 | You have | Use | Feature |
 |---|---|---|
 | ADK-Rust `Tool`s, such as `FunctionTool`, `#[tool]` functions or AWP capabilities | `adk_tool::mcp::server::McpServer` with `McpRouterBuilder` | `mcp-server` (experimental) |
+| A whole agent, each call a durable run followed as an MCP task | `adk_server::mcp::McpAgentHost` ([Serve an agent over MCP](agent-server.md)) | `adk-server` `mcp` (experimental) |
 | A hand-written server with resources, prompts or custom handlers | The official `rmcp` SDK, re-exported as `adk_tool::mcp::rmcp` | `mcp` |
 
 ## Publish ADK-Rust tools (`mcp-server`)
@@ -73,6 +74,16 @@ can correct them, and never reach the tool.
 | `McpCallerResolver` | `AnonymousCallers` | Runs for every request to the endpoint and returns the `McpCaller` (an id, whether it authenticated, typed extensions); an error refuses the request with its HTTP status, and `401` carries `WWW-Authenticate: Bearer` |
 | `McpCallExecutor::execute` | `DirectExecutor`: `Tool::execute` with a `SimpleToolContext` | Receives every call to a visible tool with valid arguments, with its caller, JSON-RPC request id and session; returns `Completed(value)`, `Failed(error)` or a refusal |
 | `McpCallExecutor::is_visible` | Every tool | Filters `tools/list` per caller; a call to a hidden tool is answered as a call to an unknown tool |
+| `McpTaskHost` | None | Set with `task_host`: declares the tasks extension (SEP-2663) and answers `tasks/get`, `tasks/update` and `tasks/cancel` with the resolved caller |
+| `local_caller` | `McpCaller::anonymous()` | The caller of requests without an HTTP request, such as over stdio |
+
+An executor may also answer `Task(task)` to a call whose `accepts_task` is set (the client
+declared the tasks extension), and `InputRequired { input_requests, request_state }` to one
+whose `accepts_input_required` is set (MCP `2026-07-28` or later); the retried call carries
+`input_responses` and the echoed `request_state`, which the executor treats as untrusted. Any
+other client receives JSON-RPC `-32603` for such an answer. `McpToolCall::peer` sends
+`notifications/progress` when the request carried a `progressToken`, and asks a client before
+`2026-07-28` with `elicitation/create`.
 
 An executor is where calls enter a governed path, such as `adk_core::authorize_tool_call`
 and the action ledger. The JSON-RPC request id is unique only within its session, so an
@@ -158,7 +169,7 @@ also appropriate:
 
 ```toml
 [dependencies]
-rmcp = { version = "3.4", features = ["transport-io", "schemars"] }
+rmcp = { version = "3.9", features = ["transport-io", "schemars"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 ```
@@ -195,7 +206,7 @@ impl OrderServer {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for OrderServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
@@ -203,18 +214,24 @@ impl ServerHandler for OrderServer {
     }
 }
 
-let service = rmcp::ServiceExt::serve(
-    OrderServer { tool_router: OrderServer::tool_router() },
-    rmcp::transport::io::stdio(),
-).await?;
-service.waiting().await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let service = rmcp::ServiceExt::serve(
+        OrderServer { tool_router: OrderServer::tool_router() },
+        rmcp::transport::io::stdio(),
+    )
+    .await?;
+    service.waiting().await?;
+    Ok(())
+}
 ```
 
-The deterministic `examples/mcp_manager` fixture uses this server shape. CI
-compiles it with the other standalone examples; run it with
-`cargo run --manifest-path examples/mcp_manager/Cargo.toml`. `ServerConfig` is the name
+The deterministic `mcp_manager` fixture in
+[adk-playground](https://github.com/zavora-ai/adk-playground) uses this server shape. `ServerConfig` is the name
 rmcp 3.4 gives the initialize result; earlier releases call it `ServerInfo`,
-which rmcp 3.4 and later keep as a deprecated alias.
+which rmcp 3.4 and later keep as a deprecated alias. `#[tool_handler]` routes calls through
+`Self::tool_router()` unless `router` names another; `router = self.tool_router` uses the
+router the server built once.
 
 ### Publish honest capabilities
 
@@ -226,8 +243,8 @@ To run a slow call as an SEP-2663 task, declare the
 `io.modelcontextprotocol/tasks` extension in the server's capabilities
 (`ServerCapabilities::builder().enable_tools().enable_tasks()`), and answer
 `tools/call` with a task only when the client declared the extension too
-(`ClientCapabilities::supports_tasks()`). `examples/mcp_protocol_revisions`
-contains a server that does both.
+(`ClientCapabilities::supports_tasks()`). The `mcp_protocol_revisions` example in
+[adk-playground](https://github.com/zavora-ai/adk-playground) contains a server that does both.
 
 ### Tools are security boundaries
 
@@ -249,6 +266,6 @@ the server is an independently deployed service. Remote deployments also need
 authentication, request limits, session policy, observability, and an
 application-level health probe.
 
-See the official [`rmcp` documentation](https://docs.rs/rmcp/3.5.1/rmcp/) for
+See the official [`rmcp` documentation](https://docs.rs/rmcp/3.9/rmcp/) for
 server routers, resources, prompts, custom handlers, transports, authorization,
 and extension APIs.

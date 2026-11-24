@@ -78,6 +78,7 @@ pub struct RunnerConfigBuilder<A, G, S> {
     context_compaction: Option<crate::compaction::CompactionConfig>,
     budget: Option<RunBudget>,
     tool_policy: Option<Arc<dyn ToolPolicy>>,
+    session_activity: Option<crate::history::SessionActivity>,
     egress_policy: Option<adk_core::egress::EgressPolicy>,
     governance: Option<GovernanceControl>,
     action_ledger: Option<Arc<dyn ActionLedger>>,
@@ -115,6 +116,7 @@ impl RunnerConfigBuilder<NoAppName, NoAgent, NoSessionService> {
             context_compaction: None,
             budget: None,
             tool_policy: None,
+            session_activity: None,
             egress_policy: None,
             governance: None,
             action_ledger: None,
@@ -164,6 +166,7 @@ impl<A, G, S> RunnerConfigBuilder<A, G, S> {
             context_compaction: self.context_compaction,
             budget: self.budget,
             tool_policy: self.tool_policy,
+            session_activity: self.session_activity,
             egress_policy: self.egress_policy,
             governance: self.governance,
             action_ledger: self.action_ledger,
@@ -201,6 +204,7 @@ impl<A, G, S> RunnerConfigBuilder<A, G, S> {
             context_compaction: self.context_compaction,
             budget: self.budget,
             tool_policy: self.tool_policy,
+            session_activity: self.session_activity,
             egress_policy: self.egress_policy,
             governance: self.governance,
             action_ledger: self.action_ledger,
@@ -241,6 +245,7 @@ impl<A, G, S> RunnerConfigBuilder<A, G, S> {
             context_compaction: self.context_compaction,
             budget: self.budget,
             tool_policy: self.tool_policy,
+            session_activity: self.session_activity,
             egress_policy: self.egress_policy,
             governance: self.governance,
             action_ledger: self.action_ledger,
@@ -344,13 +349,34 @@ impl<A, G, S> RunnerConfigBuilder<A, G, S> {
         self
     }
 
-    /// Set the intra-invocation compaction configuration (optional).
+    /// Sets when agents compact their history before a model call (auto-compaction).
+    ///
+    /// Auto-compaction is on without this call: a request is compacted once it passes 80%
+    /// of the model's context window, or 100,000 estimated tokens when the model reports none.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_core::IntraCompactionConfig;
+    ///
+    /// // Compact past 60% of the window, keeping the 6 most recent entries.
+    /// let builder = Runner::builder()
+    ///     .intra_compaction_config(IntraCompactionConfig::at_window_fraction(0.6).with_overlap_event_count(6));
+    /// ```
     pub fn intra_compaction_config(mut self, config: adk_core::IntraCompactionConfig) -> Self {
         self.intra_compaction_config = Some(config);
         self
     }
 
-    /// Set the summarizer for intra-invocation compaction (optional).
+    /// Turns auto-compaction off: agents send their history as it is until the model rejects
+    /// it.
+    pub fn without_intra_compaction(mut self) -> Self {
+        self.intra_compaction_config = Some(adk_core::IntraCompactionConfig::disabled());
+        self
+    }
+
+    /// Sets the summarizer auto-compaction uses, in place of a summary by the model the agent
+    /// is calling.
     pub fn intra_compaction_summarizer(
         mut self,
         summarizer: Arc<dyn adk_core::BaseEventsSummarizer>,
@@ -380,6 +406,27 @@ impl<A, G, S> RunnerConfigBuilder<A, G, S> {
     /// ```
     pub fn tool_policy(mut self, policy: Arc<dyn ToolPolicy>) -> Self {
         self.tool_policy = Some(policy);
+        self
+    }
+
+    /// Record this runner's runs in `activity`, shared with the other runners and the
+    /// [`HistoryControl`](crate::HistoryControl) a host builds (optional).
+    ///
+    /// Without one, the runner keeps a registry of its own.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let activity = adk_runner::SessionActivity::new();
+    /// let runner = Runner::builder()
+    ///     .app_name("ops")
+    ///     .agent(agent)
+    ///     .session_service(sessions)
+    ///     .session_activity(activity.clone())
+    ///     .build()?;
+    /// ```
+    pub fn session_activity(mut self, activity: crate::history::SessionActivity) -> Self {
+        self.session_activity = Some(activity);
         self
     }
 
@@ -590,10 +637,12 @@ impl<A, G, S> RunnerConfigBuilder<A, G, S> {
         self
     }
 
-    /// Set the context compaction configuration for token-budget overflow handling (optional).
+    /// Sets a compaction strategy auto-compaction applies in place of a summary.
     ///
-    /// When configured, the runner applies the given [`CompactionStrategy`](crate::compaction::CompactionStrategy)
-    /// to shrink the event history when the context exceeds the token budget.
+    /// Before any model call whose request passes `config.context_budget` estimated tokens,
+    /// the agent's history is shortened with the given
+    /// [`CompactionStrategy`](crate::compaction::CompactionStrategy), up to
+    /// `config.max_retries` times.
     #[cfg(feature = "context-compaction")]
     pub fn context_compaction(mut self, config: crate::compaction::CompactionConfig) -> Self {
         self.context_compaction = Some(config);
@@ -691,7 +740,11 @@ impl RunnerConfigBuilder<HasAppName, HasAgent, HasSessionService> {
             identity_source: self.identity_source,
             subject_delegation: self.subject_delegation,
         };
-        Runner::new(config)
+        let runner = Runner::new(config)?;
+        Ok(match self.session_activity {
+            Some(activity) => runner.with_session_activity(activity),
+            None => runner,
+        })
     }
 }
 

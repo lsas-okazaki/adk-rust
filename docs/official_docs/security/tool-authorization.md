@@ -1,6 +1,6 @@
 # Tool Authorization
 
-Control which tools an agent can execute and when human approval is required. ADK-Rust provides five mechanisms — from a run-wide default-deny policy to full RBAC — that work across the CLI, web server, and A2A protocol, plus an organisation-wide kill switch.
+Control which tools an agent can execute and when human approval is required. ADK-Rust provides five mechanisms — from a run-wide default-deny policy to full RBAC — that work across the CLI, web server, and A2A protocol, an opt-in model reviewer that decides held calls before a person, and an organisation-wide kill switch.
 
 ## Quick Comparison
 
@@ -8,6 +8,7 @@ Control which tools an agent can execute and when human approval is required. AD
 |-----------|----------|-------------|---------|
 | [Tool Policy](#tool-policy) | Run-wide allow, deny, or require approval | Per tool name and argument | Decides before execution; for [built-in tools](#built-in-tools), before the request |
 | [Tool Confirmation Policy](#tool-confirmation-policy) | Interactive approval in CLI/web | Per-tool or all tools | Pauses execution, emits event |
+| [Model Reviewer](#model-reviewer) | A model approves, denies or escalates held calls (opt-in) | Per app, partition class, agent and tool | Decides before the person; never overrides a deny |
 | [BeforeToolCallback](#beforetoolcallback) | Programmatic gate / audit | Custom logic per call | Sync decision, no pause |
 | [Access Control (RBAC)](#access-control) | Role-based enterprise security | Per-user, per-tool | Deny before execution |
 | [Graph Interrupts](#graph-interrupts) | Complex approval workflows | Per-node checkpoint | Persists state, resumes later |
@@ -383,6 +384,11 @@ that has a decision. The decision does not depend on the model issuing the call 
   is saved but not answered rather than silently dropped. Run again with an empty message to
   answer it, or resume held calls with an empty message before sending a new one.
 
+- **Grouped decisions.** A change set or a screen plan is decided by a live prompter during the
+  run. A held call that parks instead — on a surface without a live prompter — is decided and
+  resumed on its own like any held call. A parked step of a screen plan resumes without the
+  plan's binding, so it runs as a single approved action, never as a step of the plan.
+
 `CodeActAgent` resumes a held call from its checkpoint (`Disposition::AwaitingConfirmation`),
 which already re-dispatches the call through the governed path. The event that records the
 call's result answers the held call with a function response under its ID, as `LlmAgent`'s
@@ -506,6 +512,7 @@ narrows what the decision authorizes:
 | Tool origin | `ToolOrigin::source`, from `Tool::origin()` — `static` for a tool attached to the agent, `mcp:{toolset name}` for an MCP tool; `realtime` for a native handler on a `RealtimeRunner` (`ToolDefinition::handler_origin`) | A tool of the same name another MCP server or toolset publishes is not authorized, and neither is a native handler of a `Tool`'s name |
 | Declaration digest | `ToolOrigin::declaration_digest` — SHA-256 of the tool's declaration and annotations; for a native handler, of its `ToolDefinition` | A tool redefined after the approval (new description, parameters, or annotations) is not authorized |
 | Tool name and arguments | `tool_call_fingerprint(tool_name, args)`, canonical over key order | A call with other arguments needs its own decision |
+| Evidence digests | `ToolConfirmationRequest::evidence`, from `Tool::approval_evidence` — present only when the call is held with evidence | A call whose image changed between the hold and the run is held again; see [Approving with Evidence](#approving-with-evidence) |
 
 Keying by tool name would make one approval authorize every call of that tool, so an
 approval for `delete_file` on a scratch path would also authorize a call targeting
@@ -555,6 +562,65 @@ looks a decision up under names that agent. A fingerprint built without one
 | `RunConfigBuilder::tool_confirmation_fingerprints` | Kept, so the call-ID decision it binds is never applied; `tracing::warn!` names the call ID |
 | `ApprovalStore::decide`, `ApprovalService` | Kept, since the store and the service also hold decisions that are not tool calls, but never taken by a governed call |
 
+### Approving with Evidence
+
+A call that sends, keeps or acts on an image is held with the exact image, so the approver
+decides on what will happen rather than on a description of it. A tool declares the
+evidence for a call with `Tool::approval_evidence`; `GovernedCall::for_tool` records it, and
+the held `ToolConfirmationRequest`, its `PendingApproval` and its `ApprovalRequest` carry it.
+Evidence travels by reference and digest, never as pixels:
+
+| Field | Holds |
+|-------|-------|
+| `Evidence::Image(ImageEvidence)` | `digest` (`sha256:` of the encoded bytes), `artifact` (an `ArtifactLocator`: app, user, session, file name and version), `mime_type`, `width`, `height`, optional `regions` (a `RegionSet` as JSON) and `caption` |
+
+```rust
+use std::sync::Arc;
+
+use adk_core::{ArtifactLocator, Evidence, ImageEvidence, Result, Tool, ToolContext};
+use serde_json::{Value, json};
+
+struct SendCrop;
+
+#[async_trait::async_trait]
+impl Tool for SendCrop {
+    fn name(&self) -> &str {
+        "send_crop"
+    }
+
+    fn description(&self) -> &str {
+        "Sends a redacted crop to a cloud model"
+    }
+
+    fn approval_evidence(&self, args: &Value) -> Vec<Evidence> {
+        let digest = args["digest"].as_str().unwrap_or_default();
+        let file = args["file"].as_str().unwrap_or_default();
+        let crop = ArtifactLocator::new("desk", "ana", "s1", file, 1);
+        vec![ImageEvidence::new(digest, crop, "image/png", 640, 180).into()]
+    }
+
+    async fn execute(&self, _ctx: Arc<dyn ToolContext>, args: Value) -> Result<Value> {
+        Ok(json!({ "sent": args["digest"] }))
+    }
+}
+```
+
+| Behaviour | Detail |
+|-----------|--------|
+| Binding | The evidence digests are part of the call's fingerprint, so a decision applies only to the call with the same images. A call without evidence keeps the fingerprint it had before evidence existed |
+| A changed image | A call whose evidence changed between the hold and the run is a different call: it is held again, and the earlier decision stays unspent until it expires |
+| Route evidence | `ApprovalRoute::with_evidence` shows approvers more images after the call's own, such as an overlay; only the call's own evidence is part of the fingerprint |
+| Audit | Every governed record of the call, and every decision the `ApprovalService` records, carries `evidenceDigests` — the digests, never the pixels |
+| Storage | Every `ApprovalStore` keeps the evidence of pending calls and requests (conformance case `evidence_round_trips`) |
+| Wrappers | A tool wrapper forwards `approval_evidence` with the other declarations, so a wrapped tool is held with its evidence |
+
+Surfaces load an evidence image through the artifact service with the viewer's own
+authorisation; a channel that cannot show an image shows the digest.
+
+`adk-vision`'s `VisionToolset` is the reference user: a call that would send an image to a
+remote backend is held with the redacted copy that would leave, stored as an artifact, and
+approval releases exactly that digest — see [Governed Vision Tools](../vision/governed-tools.md).
+
 ### Approval Store
 
 An `ApprovalStore` keeps held requests and decisions between runs, scoped to the app,
@@ -602,6 +668,76 @@ written to the store, where the next run takes it. An approver may edit the argu
 edited call is a new call and passes the `ToolPolicy` and the tool screen again before it
 executes. A rejection or response is reported to the model as the call's refusal. See
 [Approval Service](approval-service.md).
+
+### Model Reviewer
+
+`RunConfig::tool_reviewer` adds one more approver before a person: a `ToolReviewer` that
+approves, denies, or escalates a call the `ToolPolicy` holds for approval. `ModelApprover` is
+the reviewer backed by a model — ADK-Rust's counterpart to OpenAI's `auto_review` and the
+`auto` permission policy of Claude Managed Agents. It is off by default.
+
+```rust
+use std::sync::Arc;
+
+use adk_core::{ModelApprover, ReviewScope, RunConfig};
+use adk_model::anthropic::{AnthropicClient, AnthropicConfig};
+
+fn main() -> adk_core::Result<()> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    let reviewer = AnthropicClient::new(AnthropicConfig::new(api_key, "claude-haiku-5-5"))?;
+    let approver = ModelApprover::new(Arc::new(reviewer))
+        // Money and deletions stay with a person.
+        .scope(ReviewScope::default().excluding_tools(["pay_*", "delete_*"]))
+        .min_confidence(0.9)
+        .guidance("This agent maintains a Rust workspace; builds and tests are routine.");
+    let config = RunConfig::builder().tool_reviewer(Arc::new(approver)).build();
+    assert!(config.tool_reviewer.is_some());
+    Ok(())
+}
+```
+
+| Verdict | Effect |
+|---------|--------|
+| Approve | The call runs, as if an approver approved it |
+| Deny | The call is refused; the model is told `<reviewer>: <rationale>` |
+| Escalate | The handler asks a person or, without one, the call is held for the approval inbox, with the reviewer's note in its reason |
+
+What the reviewer never decides:
+
+| Call | Why |
+|------|-----|
+| One the policy, the egress policy, the consent gate or a guardrail refuses | Refused before any approver is asked; nothing a model says overrides a deny |
+| One a `ToolConfirmationPolicy` holds | That policy asks a person by definition |
+| One a person asked for, and a held call being resumed | Only a person's decision answers it |
+| One already pending for a person in the `ApprovalStore` | An escalated call stays the person's; the same call again is not reviewed again |
+| One outside its `ReviewScope` (apps, partition classes, agents, tool globs) | Left to a person, with no verdict recorded |
+
+A reviewer that fails, answers late (`ToolReviewer::timeout`, 60 seconds by default), or
+answers anything but a verdict escalates; it never approves by default. A freeze of the kill
+switch while it decides refuses the call. Every verdict is recorded in the run's audit trail
+before it takes effect, with the reviewer (`model:<model id>`) as the actor, the verdict and a
+digest of its rationale; an approval or a denial is also filed in the run's approval inbox as
+a request the reviewer decided (`ApprovalService::record_review`), so the inbox's history shows
+`decided by model:<model id>`.
+
+`ModelApprover` sends one request per held call in a context of its own: a fixed system prompt,
+then the call, its fingerprint digest, the policy's reason and the user's three most recent
+messages, cut to `max_context_chars`. It declares no tools and sees no session history or tool
+results. It approves or denies only at `min_confidence` (0.8 by default) and escalates below
+it; `deny_only()` removes approval altogether. Its model call goes through the run's
+`ModelCallScope`, so it counts against the run budget and the spend ledger, and a budget that
+refuses it escalates the call.
+
+> **Important:** A model reviewer is one more surface a prompt injection can aim at: text the
+> agent read can steer it into a harmful call and then try to talk the reviewer into approving
+> it. The mitigations are structural — only held calls, no tool results, the arguments and
+> messages wrapped as untrusted data, a strict JSON verdict, a confidence floor, fingerprint
+> binding, an audited verdict, and a scope that keeps tools moving money or deleting data
+> with a person. None makes the reviewer immune; a deployment that cannot accept a wrong
+> approval keeps those tools out of its scope or uses `deny_only()`.
+
+The harness applies a reviewer only to what Auto mode holds; see
+[Auto review](../harness/modes-and-approvals.md#auto-review).
 
 ### Decisions Keyed by Call ID
 
@@ -819,7 +955,7 @@ impl ToolConfirmationHandler for TerminalApprover {
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
 
     let agent = LlmAgentBuilder::new("file-manager")
         .model(Arc::new(model))
@@ -1295,7 +1431,8 @@ Order of evaluation in `LlmAgent` and `CodeActAgent`:
    is answered with `not run` responses and the run ends with a `ResourceExhausted` error
 2. Enhanced plugins (`before_tool_call`) — may rewrite the arguments
 3. The runner's plugin `before_tool` callbacks, then the agent's `BeforeToolCallback`s — the
-   first to return content skips the tool
+   first to return content skips the tool; one that errs or panics answers the call `not run`
+   (`callback.panicked` for a panic), so a broken authorization callback fails closed
 4. Circuit breaker
 5. The governed path (`adk_core::authorize_tool_call`) on the final arguments:
    1. Kill switch — a frozen run's call is answered `not run` and the run ends with a
@@ -1317,7 +1454,10 @@ Order of evaluation in `LlmAgent` and `CodeActAgent`:
    6. Tool guardrails (`ToolGuardrailSet`) — a denial becomes the call's result; a revision is
       checked against the policy again
    7. Confirmation, when the agent or the policy requires it — a call-ID decision, a fingerprint
-      approval, the `ApprovalStore`, the `ToolConfirmationHandler`, or a hold
+      approval, the `ApprovalStore`, the run's `ToolReviewer` for a call the policy holds (see
+      [Model Reviewer](#model-reviewer)), the `ToolConfirmationHandler`, or a hold. The
+      harness's handler answers the calls of a change set, and the steps of a screen plan,
+      from one decision of the person (see [Decisions for a Group of Calls](#decisions-for-a-group-of-calls))
 6. Action ledger (`ToolEffect::NonIdempotent` tools, `RunConfig::action_ledger`) — a recorded
    call is answered from its record without executing (`CodeActAgent` raises the answer into
    the script); otherwise the call is begun under its `ToolContext::idempotency_key()`. The kill
@@ -1348,6 +1488,24 @@ Order of evaluation in `LlmAgent` and `CodeActAgent`:
 
 > **Note:** An `on_tool_error` callback that returns a fallback value replaces the error,
 > including an access denial. Keep fallbacks to tools whose failures are safe to paper over.
+
+### Decisions for a Group of Calls
+
+Two harness mechanisms let a person decide several held calls at once. Both live in the
+`ToolConfirmationHandler` at step 5.7, so `LlmAgent`, `CodeActAgent` and the realtime runners
+reach them through the same governed path, and both answer each call with its own arguments
+plus a binding to what the person saw, which the governed path checks against the policy again.
+
+| Mechanism | Group | Binding added to each call | Checked again when the call runs |
+|-----------|-------|----------------------------|----------------------------------|
+| Change set (spec 3.1 §7.26) | Two or more held edits of one model turn | `expect_sha256`: the file's hash at that point of the reviewed diff | The write refuses a file whose content differs (`devtools.stale`) |
+| Screen plan (spec 3.7 Q8) | Up to N previewed desktop actions in one window | `plan: { digest, step }`: the plan's fingerprint over its window, steps and targets, and the step number | The step is previewed again on a fresh observation; a target that moved, changed label or left the window runs nothing, ends the plan, and is held for a fresh approval |
+
+Neither is a standing rule: each decision answers only the exact calls it showed, each once.
+A call whose arguments differ from the shown ones, a step out of order, and a call of another
+plan, window or target are asked about on their own. `computer_use_execute` stays outside every
+standing rule, `tool_approvals` entry and hook decision. See
+[Screen plans](../harness/packs.md#screen-plans-one-approval-per-plan).
 
 ## Answer Status
 
@@ -1442,7 +1600,8 @@ kill switch), or held for approval, and each approval decision with its source. 
 record cannot be written is not executed under the default `AuditFailureMode::Block`.
 `freeze_recorded` and `unfreeze_recorded` record kill-switch changes with the acting
 administrator. Each governed record carries the tool's `toolSource` and `declarationDigest`
-when the call's tool is known, and a call a callback or plugin answered before the governed
+when the call's tool is known, and `evidenceDigests` when the call is held with
+[evidence](#approving-with-evidence), and a call a callback or plugin answered before the governed
 path is recorded as `tool.short_circuit`. See
 [Audit Log](audit-log.md#what-the-runtime-records).
 

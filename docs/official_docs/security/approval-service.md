@@ -103,6 +103,14 @@ async fn configure() -> adk_core::Result<RunConfig> {
 `RunConfigBuilder::approval_service` also installs the service's store as the run's
 `approval_store`, so decisions reach the governed path.
 
+Without a router, a held call stays in the store only. A host that decides calls in an inbox
+gives such a service a router of its own with `ApprovalService::route_unrouted`, and adds a
+notifier to a built service with `ApprovalService::add_notifier`: the
+[agent kernel](../kernel/index.md#using-the-kernel-from-code) routes every unrouted call to the
+`operator` group and publishes `held` and `decided` on its bus. A router the service was built
+with keeps deciding, including to leave a call in the store only. Both methods answer whether
+the service took what it was given; their defaults take nothing, so a wrapper forwards them.
+
 ## Policy
 
 | Field | Default | Meaning |
@@ -195,6 +203,20 @@ fn service() -> StoreApprovalService {
 | `approval.delegation_inactive` | 403 | The only matching delegation is outside its window |
 | `approval.self_approval` | 403 | Self-approval is forbidden |
 | `approval.action_not_allowed` | 400 | The request does not allow the action, or an edit or response lacks its content |
+
+### Decisions a Reviewer Made
+
+A run with a `ToolReviewer` ([Model Reviewer](tool-authorization.md#model-reviewer)) decides
+some held calls before they reach the inbox. When it approves or denies one, the governed path
+files it with `ApprovalService::record_review`: the service routes the call as it would a held
+call and stores a request already resolved — `Approved` or `Rejected`, one decision by the
+reviewer (`SubjectRef::service("model:<model id>")`) carrying its rationale, and
+`outcome_applied` set, because the run applied the verdict itself. Nothing is written to the
+store and no run is woken. Notifiers hear `Decided` and `Resolved`, so the kernel publishes
+`decided` naming the reviewer, and the service's audit trail records the decision with source
+`reviewer`. A call the reviewer escalates is submitted as a pending request like any other
+held call, with the reviewer's note in its summary. The trait's default files nothing;
+a wrapper forwards it to the service it wraps.
 
 ## Expiry and Escalation
 

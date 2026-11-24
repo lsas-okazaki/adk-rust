@@ -247,11 +247,11 @@ fn content_to_input_items(content: &Content) -> Vec<InputItem> {
 /// Function tools are sent with `strict: false`, since ADK schemas may keep optional
 /// properties that strict mode rejects. A native declaration's explicit boolean `strict`
 /// is kept, including on the function-tool fallback.
-pub fn convert_tools(tools: &HashMap<String, serde_json::Value>) -> Result<Vec<Tool>, AdkError> {
-    let mut tools = tools.iter().collect::<Vec<_>>();
-    tools.sort_unstable_by_key(|(name, _)| *name);
+///
+/// Tools keep their declaration order.
+pub fn convert_tools(tools: &adk_core::ToolDeclarations) -> Result<Vec<Tool>, AdkError> {
     tools
-        .into_iter()
+        .iter()
         .map(|(name, decl)| {
             if let Some(provider_tool) = decl.get("x-adk-openai-tool") {
                 convert_native_tool(name, decl, provider_tool)
@@ -925,8 +925,17 @@ fn convert_usage(usage: &serde_json::Value) -> Option<UsageMetadata> {
 }
 
 /// Map response status to ADK `FinishReason`.
+///
+/// A completed response whose message carries a `refusal` content part finishes with
+/// `Refusal` (https://developers.openai.com/api/docs/guides/structured-outputs#refusals-with-structured-outputs).
 fn map_finish_reason(response: &Projection) -> Option<FinishReason> {
+    let refused = response.output.iter().any(|item| {
+        matches!(item, OutputItem::Message(message) if message.content.iter().any(|content| {
+            matches!(content, OutputMessageContent::Refusal(refusal) if !refusal.refusal.is_empty())
+        }))
+    });
     match &response.status {
+        Status::Completed if refused => Some(FinishReason::Refusal),
         Status::Completed => Some(FinishReason::Stop),
         Status::Incomplete => {
             if let Some(details) = &response.incomplete_details {
@@ -1166,7 +1175,7 @@ mod tests {
 
     #[test]
     fn test_convert_tools_supports_native_openai_tool_declarations() {
-        let mut tools = HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "local_shell".to_string(),
             serde_json::json!({
@@ -1184,7 +1193,7 @@ mod tests {
 
     #[test]
     fn ordinary_functions_disable_strict_defaults() {
-        let tools = HashMap::from([(
+        let tools = adk_core::ToolDeclarations::from_iter([(
             "lookup".to_string(),
             serde_json::json!({"description": "Find a record"}),
         )]);
@@ -1207,7 +1216,7 @@ mod tests {
             },
             "required": ["query"]
         });
-        let tools = HashMap::from([(
+        let tools = adk_core::ToolDeclarations::from_iter([(
             "search".to_string(),
             serde_json::json!({"parameters": parameters.clone()}),
         )]);
@@ -1221,7 +1230,7 @@ mod tests {
     #[test]
     fn native_functions_keep_explicit_strictness() {
         for strict in [true, false] {
-            let tools = HashMap::from([(
+            let tools = adk_core::ToolDeclarations::from_iter([(
                 "native".to_string(),
                 serde_json::json!({
                     "x-adk-openai-tool": {
@@ -1242,7 +1251,7 @@ mod tests {
 
     #[test]
     fn fallback_functions_disable_strict_defaults() {
-        let tools = HashMap::from([(
+        let tools = adk_core::ToolDeclarations::from_iter([(
             "lookup".to_string(),
             serde_json::json!({
                 "parameters": {"type": "object", "properties": {}},
@@ -1259,7 +1268,7 @@ mod tests {
 
     #[test]
     fn fallback_functions_keep_explicit_strictness() {
-        let tools = HashMap::from([(
+        let tools = adk_core::ToolDeclarations::from_iter([(
             "lookup".to_string(),
             serde_json::json!({
                 "parameters": {"type": "object", "properties": {}},
@@ -1274,26 +1283,24 @@ mod tests {
     }
 
     #[test]
-    fn convert_tools_has_deterministic_name_order() {
-        for _ in 0..32 {
-            let tools = HashMap::from([
-                ("zeta".to_string(), serde_json::json!({})),
-                ("alpha".to_string(), serde_json::json!({})),
-                ("middle".to_string(), serde_json::json!({})),
-            ]);
-            let names = convert_tools(&tools)
-                .expect("tool conversion should succeed")
-                .into_iter()
-                .map(|tool| {
-                    serde_json::to_value(tool).expect("tool should serialize")["name"]
-                        .as_str()
-                        .expect("function tool should have a name")
-                        .to_string()
-                })
-                .collect::<Vec<_>>();
+    fn convert_tools_keeps_declaration_order() {
+        let tools = adk_core::ToolDeclarations::from_iter([
+            ("zeta".to_string(), serde_json::json!({})),
+            ("alpha".to_string(), serde_json::json!({})),
+            ("middle".to_string(), serde_json::json!({})),
+        ]);
+        let names = convert_tools(&tools)
+            .expect("tool conversion should succeed")
+            .into_iter()
+            .map(|tool| {
+                serde_json::to_value(tool).expect("tool should serialize")["name"]
+                    .as_str()
+                    .expect("function tool should have a name")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
 
-            assert_eq!(names, ["alpha", "middle", "zeta"]);
-        }
+        assert_eq!(names, ["zeta", "alpha", "middle"]);
     }
 
     #[test]
@@ -1402,7 +1409,7 @@ mod tests {
             model: "gpt-5".to_string(),
             contents: vec![],
             config: Some(GenerateContentConfig { extensions, ..Default::default() }),
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
 
@@ -1414,7 +1421,7 @@ mod tests {
 
     #[test]
     fn test_request_uses_native_tools_detects_native_declarations() {
-        let mut tools = HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "openai_web_search".to_string(),
             serde_json::json!({
@@ -1437,7 +1444,7 @@ mod tests {
 
     #[test]
     fn test_build_create_response_sets_auto_truncation_for_computer_use() {
-        let mut tools = HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "openai_computer_use".to_string(),
             serde_json::json!({
@@ -1516,7 +1523,7 @@ mod tests {
             model: "gpt-5".to_string(),
             contents: vec![],
             config: Some(GenerateContentConfig { extensions, ..Default::default() }),
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
 
@@ -1531,7 +1538,7 @@ mod tests {
             model: "o3-deep-research".to_string(),
             contents: vec![],
             config: None,
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
 
@@ -1559,7 +1566,7 @@ mod tests {
             model: "gpt-5".to_string(),
             contents: vec![],
             config: Some(GenerateContentConfig { extensions, ..Default::default() }),
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
 
@@ -1583,7 +1590,7 @@ mod tests {
             model: "gpt-5".to_string(),
             contents: vec![],
             config: Some(GenerateContentConfig { extensions, ..Default::default() }),
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
 
@@ -1607,7 +1614,7 @@ mod tests {
             model: "gpt-5".to_string(),
             contents: vec![],
             config: Some(GenerateContentConfig { extensions, ..Default::default() }),
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
 
@@ -1633,7 +1640,7 @@ mod tests {
             model: "gpt-5".to_string(),
             contents: vec![],
             config: Some(GenerateContentConfig { extensions, ..Default::default() }),
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
 
@@ -1659,7 +1666,7 @@ mod tests {
             model: "gpt-5".to_string(),
             contents: vec![],
             config: Some(GenerateContentConfig { extensions, ..Default::default() }),
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
 
@@ -1680,7 +1687,7 @@ mod tests {
             model: "gpt-5".to_string(),
             contents: vec![],
             config: Some(GenerateContentConfig { extensions: extensions2, ..Default::default() }),
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
 
@@ -1703,7 +1710,7 @@ mod tests {
             model: "gpt-5".to_string(),
             contents: vec![],
             config: Some(GenerateContentConfig { extensions, ..Default::default() }),
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
 
@@ -1729,7 +1736,7 @@ mod tests {
             model: "gpt-5".to_string(),
             contents: vec![],
             config: Some(GenerateContentConfig { extensions, ..Default::default() }),
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
 
@@ -1745,7 +1752,7 @@ mod tests {
             model: "gpt-5".to_string(),
             contents: vec![],
             config: None,
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
 
@@ -1782,7 +1789,7 @@ mod tests {
             model: "gpt-5".to_string(),
             contents: vec![],
             config: Some(GenerateContentConfig { extensions, ..Default::default() }),
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
 

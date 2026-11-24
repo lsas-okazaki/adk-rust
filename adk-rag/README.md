@@ -8,7 +8,7 @@ Give your AI agents a knowledge base. `adk-rag` adds Retrieval-Augmented Generat
 
 
 ## ADK RAG
-The `adk-rag` crate provides Retrieval-Augmented Generation capabilities for the ADK-Rust workspace. It offers a modular, trait-based architecture for document chunking, embedding generation, vector storage, similarity search, reranking, and agentic retrieval. The crate follows the ADK-Rust conventions of feature-gated backends, async-trait interfaces, and builder-pattern configuration. It integrates with existing ADK crates (`adk-gemini` for embeddings, `adk-core` for the Tool trait) and supports multiple vector store backends (in-memory, Qdrant, LanceDB, pgvector, SurrealDB, Agent Retrieval), plus managed retrieval from Vertex AI RAG Engine corpora.
+The `adk-rag` crate provides Retrieval-Augmented Generation capabilities for the ADK-Rust workspace. It offers a modular, trait-based architecture for document chunking, embedding generation, vector storage, similarity search, reranking, and agentic retrieval. The crate follows the ADK-Rust conventions of feature-gated backends, async-trait interfaces, and builder-pattern configuration. It integrates with existing ADK crates (`adk-gemini` for embeddings, `adk-core` for the Tool trait) and supports multiple vector store backends (in-memory, Qdrant, LanceDB, pgvector, Agent Retrieval), plus managed retrieval from Vertex AI RAG Engine corpora.
 
 ## What is RAG?
 
@@ -20,7 +20,7 @@ RAG stands for Retrieval-Augmented Generation. Instead of relying only on what a
 
 ## Quick Start
 
-The fastest way to get a working RAG pipeline. Uses Gemini for embeddings (free API key from [Google AI Studio](https://aistudio.google.com/apikey)).
+A RAG pipeline with Gemini embeddings and the in-memory vector store. The program needs a `GOOGLE_API_KEY` from [Google AI Studio](https://aistudio.google.com/apikey).
 
 ```toml
 [dependencies]
@@ -125,7 +125,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let agent = LlmAgentBuilder::new("support_agent")
         .instruction("Answer questions using the rag_search tool.")
-        .model(Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?))
+        .model(Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?))
         .tool(Arc::new(RagTool::new(pipeline, "kb")))
         .build()?;
 
@@ -180,17 +180,17 @@ Query → [EmbeddingProvider] → [VectorStore search] → [Reranker] → Result
 | Component | What it does | Built-in options |
 |-----------|-------------|-----------------|
 | **Chunker** | Splits documents into smaller pieces | `FixedSizeChunker`, `RecursiveChunker`, `MarkdownChunker` |
-| **EmbeddingProvider** | Converts text to vector embeddings | `GeminiEmbeddingProvider`¹, `OpenAIEmbeddingProvider`² |
-| **VectorStore** | Stores and searches embeddings | `InMemoryVectorStore`, `QdrantVectorStore`³, `LanceDBVectorStore`⁴, `PgVectorStore`⁵, `SurrealVectorStore`⁶ |
+| **EmbeddingProvider** | Converts text to vector embeddings | `GeminiEmbeddingProvider`¹, `OpenAIEmbeddingProvider`², `OnnxEmbeddingProvider`⁶ |
+| **VectorStore** | Stores and searches embeddings | `InMemoryVectorStore`, `QdrantVectorStore`³, `LanceDBVectorStore`⁴, `PgVectorStore`⁵, `AgentRetrievalStore`⁷ |
 | **Reranker** | Re-scores results after search | `NoOpReranker` (default), or write your own |
 
-¹ `gemini` feature  ² `openai` feature  ³ `qdrant` feature  ⁴ `lancedb` feature  ⁵ `pgvector` feature  ⁶ `surrealdb` feature
+¹ `gemini` feature  ² `openai` feature  ³ `qdrant` feature  ⁴ `lancedb` feature  ⁵ `pgvector` feature  ⁶ `onnx` feature  ⁷ `agent-retrieval` feature
 
-The `RagPipeline` wires these together. The `RagTool` wraps the pipeline as an `adk_core::Tool` so any ADK agent can call it. `AgentRetrievalStore` (`agent-retrieval` feature) is a managed `VectorStore` on Google's Agent Retrieval service.
+The `RagPipeline` wires these together. The `RagTool` wraps the pipeline as an `adk_core::Tool` so any ADK agent can call it. `AgentRetrievalStore` is a managed `VectorStore` on Google's Agent Retrieval service.
 
 ## Embedding Providers
 
-### Gemini (recommended)
+### Gemini
 
 Uses Google's `gemini-embedding-2` model (3072 dimensions).
 
@@ -281,7 +281,7 @@ fn main() {
 
 ### Qdrant
 
-Production-ready vector database with filtering, snapshots, and clustering.
+Connects to a Qdrant server over gRPC (`QdrantVectorStore::default_url()` uses `http://localhost:6334`).
 
 ```toml
 adk-rag = { version = "3.0.0", features = ["qdrant"] }
@@ -311,7 +311,8 @@ adk-rag = { version = "3.0.0", features = ["lancedb"] }
 
 > Requires `protoc` installed: `brew install protobuf` (macOS), `apt install protobuf-compiler` (Ubuntu).
 
-```rust
+<!-- ignore: the `lancedb` feature needs `protoc` at build time -->
+```rust,ignore
 use adk_rag::LanceDBVectorStore;
 
 #[tokio::main]
@@ -352,34 +353,6 @@ to 59 bytes of ASCII lowercase letters, digits and underscores, so the table nam
 fits PostgreSQL's 63-byte identifier limit. Any other name returns
 `RagError::VectorStoreError` instead of being rewritten, so two distinct names
 never share a table.
-
-### SurrealDB
-
-Embedded or remote multi-model database with built-in vector search.
-
-```toml
-adk-rag = { version = "3.0.0", features = ["surrealdb"] }
-```
-
-```rust
-use adk_rag::SurrealVectorStore;
-
-#[tokio::main]
-async fn main() -> adk_rag::Result<()> {
-    let in_memory = SurrealVectorStore::in_memory().await?;
-    let on_disk = SurrealVectorStore::rocksdb("/tmp/surreal-data").await?;
-    let _ = (in_memory, on_disk);
-    Ok(())
-}
-```
-
-`SurrealVectorStore::remote(url)` connects to a SurrealDB server.
-
-Each collection is stored in the table of the same name. A collection name must be one or more
-ASCII letters, digits, or underscores; any other name returns `RagError::VectorStoreError`
-instead of being rewritten, so two distinct names never share a table. Table names are case
-sensitive and quoted in queries, so `Docs`, `docs`, and SurrealQL keywords such as `select` are
-distinct, valid names.
 
 ### Agent Retrieval
 
@@ -458,7 +431,7 @@ async fn main() -> adk_rag::Result<()> {
 ```
 
 See [docs/official_docs/rag/vertex-rag-engine.md](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/rag/vertex-rag-engine.md)
-and the [`examples/vertex_rag`](https://github.com/zavora-ai/adk-rust/tree/main/examples/vertex_rag) example.
+and the `vertex_rag` example in [adk-playground](https://github.com/zavora-ai/adk-playground).
 
 ## Choosing a Chunker
 
@@ -592,7 +565,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 # Core only (in-memory store, all chunkers, no external deps)
 adk-rag = "3.0.0"
 
-# With Gemini embeddings (recommended)
+# With Gemini embeddings
 adk-rag = { version = "3.0.0", features = ["gemini"] }
 
 # With OpenAI embeddings
@@ -611,13 +584,12 @@ adk-rag = { version = "3.0.0", features = ["full"] }
 | `gemini` | `GeminiEmbeddingProvider` | `adk-gemini` |
 | `openai` | `OpenAIEmbeddingProvider` | `reqwest` |
 | `onnx` | `OnnxEmbeddingProvider`: a sentence-transformer ONNX model (default `BAAI/bge-small-en-v1.5`, 384 dimensions) run in process, fetched once into the Hugging Face hub cache; `ort` downloads the onnxruntime binary at build time | `ort`, `tokenizers`, `hf-hub` |
-| `qdrant` | `QdrantVectorStore` | `qdrant-client` |
-| `lancedb` | `LanceDBVectorStore` | `lancedb`, `arrow` |
+| `qdrant` | `QdrantVectorStore` | `qdrant-client`, `uuid` |
+| `lancedb` | `LanceDBVectorStore` | `lancedb` (arrow types come from its re-exports), `futures` |
 | `pgvector` | `PgVectorStore` | `sqlx` |
-| `surrealdb` | `SurrealVectorStore` | `surrealdb` |
-| `agent-retrieval` | `AgentRetrievalStore` (Agent Retrieval, formerly Vector Search 2.0) | `adk-gcp`, `google-cloud-auth` |
-| `vertex-rag` | `VertexRagEngineClient`, `VertexAiRagRetrievalTool` | `adk-gcp`, `google-cloud-auth` |
-| `full` | `gemini`, `openai`, `qdrant`, `lancedb`, `pgvector`, `surrealdb` | all of those |
+| `agent-retrieval` | `AgentRetrievalStore` (Agent Retrieval, formerly Vector Search 2.0) | `adk-gcp`, `google-cloud-auth`, `reqwest`, `uuid` |
+| `vertex-rag` | `VertexRagEngineClient`, `VertexAiRagRetrievalTool` | `adk-gcp`, `google-cloud-auth`, `reqwest` |
+| `full` | `gemini`, `openai`, `qdrant`, `lancedb`, `pgvector` | all of those |
 
 ## Testing Without API Keys
 
@@ -658,9 +630,9 @@ This produces stable vectors so your tests are reproducible, but the similarity 
 
 | Example | What it shows |
 |---------|---------------|
-| [`examples/vertex_rag`](https://github.com/zavora-ai/adk-rust/tree/main/examples/vertex_rag) | Vertex AI RAG Engine retrieval |
+| `vertex_rag` in [adk-playground](https://github.com/zavora-ai/adk-playground) | Vertex AI RAG Engine retrieval |
 
-The [adk-playground](https://github.com/zavora-ai/adk-playground) repository has more RAG
+The adk-playground repository has more RAG
 examples, such as a custom embedder and multi-collection search.
 
 ## API Reference
@@ -690,7 +662,6 @@ verbatim with no reserved keys, so provenance never collides with a metadata ent
 | pgvector | `source_uri` and `title` columns | `create_collection` adds the columns in place |
 | LanceDB | `source_uri` and `title` columns | re-create the table and re-ingest; `upsert` into an old table fails with that guidance |
 | Qdrant | `source_uri` and `title` payload fields | old points return `None` until re-ingested |
-| SurrealDB | `source_uri` and `title` fields | `create_collection` defines the fields; old rows return `None` |
 | Agent Retrieval | `sourceUri` and `title` data fields | old data objects return `None` until re-ingested |
 
 ### Scopes
@@ -737,7 +708,6 @@ document without chunks. A document with empty text removes the document.
 | pgvector | `scope` column, primary key `(scope, id)` | `create_collection` migrates in place; existing rows join `Scope::single_tenant()` |
 | LanceDB | `scope` column, merge-insert on `scope` and `id` | re-create and re-ingest; `upsert` fails with that guidance |
 | Qdrant | `scope` payload field, tenant index; point ID from scope and chunk ID | re-ingest |
-| SurrealDB | `scope` and `chunk_id` fields, index on `scope`; record ID from scope and chunk ID | re-ingest |
 | Agent Retrieval | `scope` data field; Data Object ID from scope and chunk ID; declared data schema | re-create and re-ingest |
 
 ### Filters
@@ -780,7 +750,6 @@ trees.
 | pgvector | `WHERE` conditions; keys and values are bound parameters, leaves wrapped in `COALESCE(.., false)` | — |
 | LanceDB | Typed DataFusion expressions, prefiltered | Nullable `m_<key>` columns |
 | Qdrant | Nested `must` / `should` / `must_not` filters on `metadata.<key>` | Keyword payload indexes |
-| SurrealDB | A condition beside the KNN operator; values are bound parameters | — |
 | Agent Retrieval | `$eq`, `$in`, `$and`, `$or`; `$ne`/`$nin` for `!` around `Eq`/`In` on the document or chunk ID | `m_<key>` data fields in the schema |
 
 Agent Retrieval refuses `Exists`, other negations, and nesting deeper than two levels (the
@@ -813,14 +782,18 @@ The scope and policy filter are configuration, never model arguments, so the mod
 results but never reach another scope or widen past the policy. Keys of the policy filter and
 model-filterable keys must be declared filterable on the collection.
 
-```rust,ignore
-use adk_rag::{Field, Filter, RagTool};
+```rust
+use std::sync::Arc;
 
-let tool = RagTool::new(pipeline, "kb")
-    .with_scope_per_user()
-    .with_policy_filter(Filter::eq(Field::metadata("visibility"), "public"))
-    .with_model_filterable(["section"]);
-// The model may call: {"query": "refund window", "filter": {"section": ["billing", "refunds"]}}
+use adk_rag::{Field, Filter, RagPipeline, RagTool};
+
+fn support_search(pipeline: Arc<RagPipeline>) -> RagTool {
+    // The model may call: {"query": "refund window", "filter": {"section": ["billing", "refunds"]}}
+    RagTool::new(pipeline, "kb")
+        .with_scope_per_user()
+        .with_policy_filter(Filter::eq(Field::metadata("visibility"), "public"))
+        .with_model_filterable(["section"])
+}
 ```
 
 Each result with a `source_uri` is recorded as an `adk_core::GroundingSource` on the call's

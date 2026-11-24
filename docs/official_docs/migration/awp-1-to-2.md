@@ -6,8 +6,8 @@ you move it. This page maps each 1.x element to its 2.0 counterpart, converts a
 `business.toml`, and keeps the 1.x reference for the deployments that still serve it.
 
 > **Note:** for the Rust API changes to the 1.x types in 3.0.0 — access levels and schemas in
-> the manifest, `AwpConfigError::Serialize`, event delivery over HTTP — see
-> [Migrating 2.x → 3.0](2.x-to-3.0.md#adk-awp).
+> the manifest, `AwpConfigError::Serialize`, the deprecated HMAC helpers, event delivery over
+> HTTP — see [Migrating 2.x → 3.0](2.x-to-3.0.md#adk-awp).
 
 ## What changes
 
@@ -421,15 +421,9 @@ workspace executes a `PaymentIntent`; `adk-gateway`, a separate repository, uses
 
 ### The 1.x example
 
-`examples/awp_agent` loads a `business.toml`, builds an agent from it, installs authenticated
-A2A dispatch, mounts the management routes behind a separate credential and exercises every
-endpoint:
-
-```bash
-cd examples/awp_agent
-cp .env.example .env   # add your GOOGLE_API_KEY
-cargo run
-```
+The `awp_agent` example in [adk-playground](https://github.com/zavora-ai/adk-playground) loads a `business.toml`,
+builds an agent from it, installs authenticated A2A dispatch, mounts the management routes behind a
+separate credential and exercises every endpoint. It reads `GOOGLE_API_KEY`.
 
 ## Related
 

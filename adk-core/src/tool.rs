@@ -297,6 +297,51 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// The ordered batch this tool's calls belong to, if any.
+    ///
+    /// Calls to tools that name the same group run in the order the model listed them, one
+    /// at a time. The first call in the group that does not succeed — it fails, is refused,
+    /// does not run, or is held for approval — stops the group for the rest of the model's
+    /// turn: every later call in the group is answered with the group's
+    /// [`halt_text`](BatchGroup::halt_text) instead of running, because the model planned it
+    /// assuming the earlier calls succeeded. Computer use and browser use actions need this.
+    /// `None` by default.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_core::{BatchGroup, Result, Tool, ToolContext};
+    /// use async_trait::async_trait;
+    /// use serde_json::Value;
+    /// use std::sync::Arc;
+    ///
+    /// struct Click;
+    ///
+    /// #[async_trait]
+    /// impl Tool for Click {
+    ///     fn name(&self) -> &str {
+    ///         "click"
+    ///     }
+    ///
+    ///     fn description(&self) -> &str {
+    ///         "Clicks at a position"
+    ///     }
+    ///
+    ///     fn batch_group(&self) -> Option<BatchGroup> {
+    ///         Some(BatchGroup::new("desktop", "Not executed: an earlier action failed."))
+    ///     }
+    ///
+    ///     async fn execute(&self, _ctx: Arc<dyn ToolContext>, _args: Value) -> Result<Value> {
+    ///         Ok(Value::Null)
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(Click.batch_group().unwrap().name, "desktop");
+    /// ```
+    fn batch_group(&self) -> Option<BatchGroup> {
+        None
+    }
+
     /// Indicates whether this tool delegates work to another agent.
     ///
     /// Agent implementations can use this marker to overlap consecutive
@@ -348,8 +393,73 @@ pub trait Tool: Send + Sync {
         crate::egress::ToolEgress::Undeclared
     }
 
+    /// What an approver sees with a call with `args` when it is held, such as the exact image
+    /// it would send ([`Evidence`](crate::Evidence)).
+    ///
+    /// [`GovernedCall::for_tool`](crate::GovernedCall::for_tool) records it on the call, the
+    /// held request carries it, and its digests are part of the call's
+    /// [fingerprint](crate::ToolConfirmationRequest::fingerprint): a decision applies only to
+    /// a call with the same evidence, so an image that changes before the call runs holds it
+    /// again. The default is no evidence. A wrapper forwards its inner tool's evidence.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    ///
+    /// use adk_core::{ArtifactLocator, Evidence, ImageEvidence, Result, Tool, ToolContext};
+    /// use serde_json::{Value, json};
+    ///
+    /// struct SendCrop;
+    ///
+    /// #[async_trait::async_trait]
+    /// impl Tool for SendCrop {
+    ///     fn name(&self) -> &str {
+    ///         "send_crop"
+    ///     }
+    ///     fn description(&self) -> &str {
+    ///         "Sends a redacted crop to a cloud model"
+    ///     }
+    ///     fn approval_evidence(&self, args: &Value) -> Vec<Evidence> {
+    ///         let digest = args["digest"].as_str().unwrap_or_default();
+    ///         let file = args["file"].as_str().unwrap_or_default();
+    ///         let locator = ArtifactLocator::new("desk", "ana", "s1", file, 1);
+    ///         vec![ImageEvidence::new(digest, locator, "image/png", 640, 180).into()]
+    ///     }
+    ///     async fn execute(&self, _ctx: Arc<dyn ToolContext>, args: Value) -> Result<Value> {
+    ///         Ok(json!({ "sent": args["digest"] }))
+    ///     }
+    /// }
+    ///
+    /// let evidence = SendCrop.approval_evidence(&json!({ "digest": "sha256:aa", "file": "crop.png" }));
+    /// assert_eq!(evidence[0].digest(), "sha256:aa");
+    /// ```
+    fn approval_evidence(&self, _args: &Value) -> Vec<crate::Evidence> {
+        Vec::new()
+    }
+
     /// Executes the tool with the given context and arguments.
     async fn execute(&self, ctx: Arc<dyn ToolContext>, args: Value) -> Result<Value>;
+}
+
+/// An ordered batch of tool calls that stops at its first failure; see
+/// [`Tool::batch_group`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchGroup {
+    /// The group's name; tools that return the same name share one batch.
+    pub name: std::borrow::Cow<'static, str>,
+    /// The exact result text for each call skipped after a failure.
+    pub halt_text: std::borrow::Cow<'static, str>,
+}
+
+impl BatchGroup {
+    /// A group called `name` that answers skipped calls with `halt_text`.
+    pub fn new(
+        name: impl Into<std::borrow::Cow<'static, str>>,
+        halt_text: impl Into<std::borrow::Cow<'static, str>>,
+    ) -> Self {
+        Self { name: name.into(), halt_text: halt_text.into() }
+    }
 }
 
 /// Context available to tools during execution.

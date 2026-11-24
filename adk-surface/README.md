@@ -20,19 +20,22 @@ with `default-features = false` to leave it out.
 |---|---|---|
 | Feed | A session's events numbered by their position in the session store, as a snapshot then a live tail; reconnecting after the last `seq` seen never skips or repeats an event | `SurfaceEngine::feed`, `SurfaceEngine::thread` |
 | Projection | Decision cards (§7.1), thread items, agent rows, the status line and the "While you were away" briefing, in the plain words of §8 | `model`, `words` |
-| Commands | Decide at the version seen, send, queue, stop all, resume all, change the mode — each with the caller's subject and how the input was given, written to the audit log | `SurfaceEngine::execute`, `Command` |
+| Commands | Decide at the version seen, send, steer a running turn, queue, stop all, resume all, change the mode — each with the caller's subject and how the input was given, written to the audit log | `SurfaceEngine::execute`, `Command` |
 | Rules | What each surface may decide (§7.2) and the rules on every surface (§7.4), enforced by the engine | `rules` |
 | `web` | The web home: its HTTP API under `/api/surface`, its OpenAPI document and generated TypeScript types, and the page itself at `/ui/` — Threads, Today and Memory & rules, in light and dark (spec 3.3 §5.1) | `web::router`, `web::home` |
 | `channels` | Chat: the Telegram adapter over the kernel's channel contract — cards with Allow once and Deny, never the call's arguments, pairing, "stop all" (spec 3.3 §5.3) | `channels::TelegramAdapter` |
-| `whatsapp`, `slack`, `discord`, `matrix` | Experimental chat adapters on the same contract (spec 3.5 §10 X12): WhatsApp's signed Cloud API webhook, Slack's Socket Mode, Discord's Gateway, Matrix's `/sync` with reactions as answers | `channels::WhatsAppAdapter`, `SlackAdapter`, `DiscordAdapter`, `MatrixAdapter` |
+| `whatsapp`, `slack`, `discord`, `matrix`, `teams` | Experimental chat adapters on the same contract (spec 3.5 §10 X12): WhatsApp's signed Cloud API webhook, Slack's Socket Mode, Discord's Gateway, Matrix's `/sync` with reactions as answers, Microsoft Teams' Bot Framework endpoint with every Bot Connector token checked and Adaptive Card answers | `channels::WhatsAppAdapter`, `SlackAdapter`, `DiscordAdapter`, `MatrixAdapter`, `TeamsAdapter` |
 | `mobile` | The phone: the web home installed on a phone, woken by Web Push from the person's own kernel with a wake-up that says nothing, and "Confirm it's you" with a passkey on the phone or the computer before a high-risk approval (spec 3.3 §5.4, §8.2). Links OpenSSL through webauthn-rs | `mobile::Phone`, `mobile::router` |
 | Desktop tray | Experimental and not a feature: an unpublished Tauri 2 app in `desktop/` whose windows load the web home and its tray panel at `/ui/tray`, with the decisions badge on a tray icon (spec 3.3 §5.5) | `desktop/README.md` |
 | `voice` | Voice and video: spoken "allow once" and "deny" through the engine with a cancel window, a transcript digest on record and never the recording; the camera and the screen while their switches are on; with `web`, the voice view at `/ui/voice` and its socket; with `tui`, the terminal's voice line (spec 3.3 §5.6) | `voice::VoiceHub`, `voice::router`, `SurfaceEngine::decide_spoken` |
+| `vision-camera` | The live camera surface on adk-vision's frame pipeline: each camera through `StreamPipeline` — frame governor, privacy, detector, tracker, watch conditions and zones — reporting what it measured; a stream camera switched off closes its source (a local camera's ffmpeg exits); the web home's own camera through `SurfaceCameraSource`, from the voice screen or the camera page; Stop all pauses every camera (spec 3.7 §7.13, §8.2, V-I17) | `camera::PipelineCameras`, `camera::LiveCamera` |
 | `website` | Experimental, implies `web`: a prebuilt website's setup code, onboarding, charter cards, site view, weekly review and web editor at `/ui/website`, over `adk-website`'s desk (spec 3.5 §8.2) | `web::website::router`, `web::website::setup_router` |
 | `verb-ui` | Experimental: screen actions people and agents share — Snooze in Coming up from the home, the terminal, voice and an agent, always through the governed path; an agent's request waits for the person every time (spec 3.3 §2 item 7) | `verbs::VerbRegistry`, `verbs::VerbGate`, `web::verbs::router` |
 | `workflow` | Beta: the workflow observer — a graph agent's runs, steps and forks, card hints and a money route for its governed nodes, the fork command; with `web`, the developer panel's Runs tab and its routes under `/api/surface/workflow` (spec 3.3 §12) | `workflow::Workflows`, `web::workflow::router` |
-| `genui` | Agent-drawn UI: forms, cards, tables and screens an agent draws in a thread (A2UI v0.9.1 on the `forms` 1.0 catalog), checked so they never contain approval controls; a form's Send asks the drawing agent for the call, held for the person (spec 3.3 §6.1, §7.4 rule 5) | `genui::DrawToolset`, `genui::Validator`, `web::genui::router` |
+| `genui` | Agent-drawn UI: forms, cards, tables and screens an agent draws in a thread (A2UI v0.9.1 on the `forms` 1.0 catalog), checked so they never contain approval controls; a form's Send asks the drawing agent for the call, held for the person; charts; extension catalogs that add another crate's display-only components under their own id, including 3D scenes the home draws in WebGL and cards with depth, registered with `SurfaceEngineBuilder::with_catalog` (spec 3.3 §6.1, §7.4 rule 5) | `genui::DrawToolset`, `genui::Validator`, `genui::Catalog::extend`, `web::genui::router` |
 | `genui-apps` | Apps from MCP servers in a thread, implies `genui` and `web`: framed sandboxed on their own origin, blocked when they show a decision's words or reach this computer, and their tool calls held for the person; also the React package `@zavora-ai/adk-surface-react` in `react/` (spec 3.3 §6.1) | `genui::McpAppsHost`, `web::genui::apps_router`, `web::genui::refuse_apps_origin` |
+
+`genui` replaces `adk-ui` 2, and `workflow` the retired `adk-studio` app. `adk-ui` 3 builds on `genui`: it adds charts, metrics, pages and scenes as extension catalogs ([Agent-Drawn UI](../docs/official_docs/surfaces/genui.md#extension-catalogs)).
 
 ## Sources
 
@@ -50,38 +53,42 @@ adk-surface = { version = "3.0.0", features = ["web"] }
 
 ```rust,no_run
 use std::sync::Arc;
+
+use adk_core::ApprovalService;
+use adk_kernel::Kernel;
+use adk_server::ServerBuilder;
+use adk_session::SessionService;
 use adk_surface::{Caller, LocalSource, Origin, Place, SurfaceEngine, SurfaceKind};
 
-# async fn example(
-#     kernel: adk_kernel::Kernel,
-#     sessions: Arc<dyn adk_session::SessionService>,
-#     approvals: Arc<dyn adk_core::ApprovalService>,
-#     builder: adk_server::ServerBuilder,
-# ) -> adk_surface::Result<()> {
-let source = LocalSource::builder("adk-rust")
-    .sessions(sessions)
-    .approvals(approvals)
-    .kernel(kernel.clone(), "adk-rust")
-    .build()?;
-let engine = SurfaceEngine::builder(Arc::new(source))
-    .places([Place::phone(), Place::chat("Telegram")])
-    .build();
+async fn mount(
+    kernel: Kernel,
+    sessions: Arc<dyn SessionService>,
+    approvals: Arc<dyn ApprovalService>,
+    builder: ServerBuilder,
+) -> adk_surface::Result<ServerBuilder> {
+    let source = LocalSource::builder("adk-rust")
+        .sessions(sessions)
+        .approvals(approvals)
+        .kernel(kernel.clone(), "adk-rust")
+        .build()?;
+    let engine = SurfaceEngine::builder(Arc::new(source))
+        .places([Place::phone(), Place::chat("Telegram")])
+        .build();
 
-// The web home's API beside the kernel's own routes, behind the server's auth middleware,
-// and its page at `/ui/`.
-let builder = builder
-    .add_api_routes(adk_kernel::control::router(kernel))
-    .add_api_routes(adk_surface::web::router(engine.clone()))
-    .add_root_routes(adk_surface::web::home());
+    // The web home's API beside the kernel's own routes, behind the server's auth middleware,
+    // and its page at `/ui/`.
+    let builder = builder
+        .add_api_routes(adk_kernel::control::router(kernel))
+        .add_api_routes(adk_surface::web::router(engine.clone()))
+        .add_root_routes(adk_surface::web::home());
 
-// A chat adapter answers in process, with its channel as the origin.
-let me = Caller::human("ana", SurfaceKind::Chat, Origin::Chat { channel: "Telegram".into() });
-for card in engine.decisions(&me).await? {
-    println!("{} · {} · {}", card.heading, card.agent.display_name, card.risk_text);
+    // A chat adapter answers in process, with its channel as the origin.
+    let me = Caller::human("ana", SurfaceKind::Chat, Origin::Chat { channel: "Telegram".into() });
+    for card in engine.decisions(&me).await? {
+        println!("{} · {} · {}", card.heading, card.agent.display_name, card.risk_text);
+    }
+    Ok(builder)
 }
-# let _ = builder;
-# Ok(())
-# }
 ```
 
 ## What each surface may decide (spec 3.3 §7.2)
@@ -99,7 +106,11 @@ A decision answered on one surface is shown on every other as "Decided — You s
 Telegram at 07:31": a second answer gets `approval.version_conflict` from the approval
 service and the engine never retries it (S-I2). Input typed while a decision is open, or a
 turn runs, is queued as the next message, never an answer, and sent oldest first once the
-session is free, whichever surface answered (S-I4). "Stop all" works from every surface; "Resume all"
+session is free, whichever surface answered (S-I4). A message queued behind a running turn is
+offered to that turn through `Source::steer` (spec 3.3 §6 "steer"): the runtime screens it as
+it screens a turn's own message, the agent takes it after its current tool step, and it leaves
+the queue; a turn that ends first hands it back, and it goes as the next message, once.
+`Command::Steer` does the same and answers with what became of the message. "Stop all" works from every surface; "Resume all"
 only from the web home or a paired local terminal (S-I10). No agent answers a decision (§7.4).
 A chat card carries the agent, the risk and a short summary, never the call's arguments (S-I5).
 
@@ -116,6 +127,16 @@ under "On this home it can also:" (§5.7).
 |---|---|
 | `GET /surface/decisions` | The caller's open decisions as cards; `?session=` for one session's |
 | `GET /surface/decisions/{id}` | One decision, waiting or decided |
+| `GET /surface/decisions/{id}/evidence/{index}` | One image a decision holds as evidence, served only when its bytes match the card's digest (spec 3.7 §8.2, [Approve with the Image](../docs/official_docs/surfaces/approve-with-image.md)) |
+| `GET /surface/vision/{session}/images/{image}/view` | The annotated viewer of one image: every answer the vision tools gave for it, each region's backend, frame and transform chain (spec 3.7 §8.2, [The Annotated Viewer](../docs/official_docs/surfaces/annotated-viewer.md)) |
+| `GET /surface/vision/{session}/images/{image}` | One image of the session, served only when its bytes match its digest |
+| `GET /surface/vision/{session}/answers/{answer}/regions` | One answer's `RegionSet` as a file; `?with=` exports two |
+| `POST /surface/vision/{session}/examples` | Saves a corrected region as an `adk-eval` case under `LocalSourceBuilder::eval_fixtures`; closed to paired devices |
+| `GET /surface/cameras`, `GET /surface/cameras/{camera}` | The live camera surface (spec 3.7 §8.2, [The Live Camera Surface](../docs/official_docs/surfaces/live-camera.md)): every camera of the caller's sessions, or one with its picture, decisions, watches, frame budget, tracks and sources; served with `SurfaceEngineBuilder::cameras` |
+| `GET /surface/cameras/{camera}/frames/{frame}`, `GET …/feed` | A frame the server holds in memory, digest checked and never cached; the picture after each frame as server-sent events |
+| `POST /surface/cameras/{camera}/on`, `/off`, `/stop`, `/retry` | Switching a camera off drops its frames on the server from then on and stops its source capturing; each act recorded |
+| `POST /surface/cameras/{camera}/frames` | One frame this browser's camera captured, for a camera that takes a screen's frames: through the gate to its pipeline, or dropped with the reason while the camera is off; JPEG, PNG or WebP up to 2 MiB, at most 10 a second |
+| `PUT /surface/cameras/{camera}/zones/{zone}`, `POST …/freeze`, `POST …/cards` | Edit a zone (not from a paired device); freeze the frame on screen; raise a card that keeps only that frame, covered first, and sends it to the agent |
 | `GET /surface/sessions/{session}/thread` | The session's entries |
 | `GET /surface/sessions/{session}/feed` | Server-sent events, resumable with `Last-Event-ID` |
 | `GET /surface/sessions/{session}/queued` | What the caller typed while a decision of the session was open or a turn ran, not yet sent |
@@ -173,11 +194,14 @@ See [The Web Home](../docs/official_docs/surfaces/web-home.md).
 | `slack` | Slack (`channels::SlackAdapter`): Socket Mode, no inbound port; implies `channels` | Experimental |
 | `discord` | Discord (`channels::DiscordAdapter`): the Gateway with heartbeat and resume, no inbound port; implies `channels` | Experimental |
 | `matrix` | Matrix (`channels::MatrixAdapter`): `/sync` long polling, reactions as answers, unencrypted direct chats only; implies `channels` | Experimental |
+| `teams` | Microsoft Teams (`channels::TeamsAdapter`): the Bot Framework messaging endpoint the host serves, each request's Bot Connector JWT checked first; Adaptive Card `Action.Execute` answers; one-on-one chats only; implies `channels` | Experimental |
 | `mobile` | The phone: its routes, Web Push from the person's own kernel and "Confirm it's you" (`adk_surface::mobile`); implies `web` and links OpenSSL through webauthn-rs | Beta |
 | `voice` | Voice and video (`adk_surface::voice`): the voice view with `web`, the voice line with `tui`; `voice-live` adds Gemini Live and the OpenAI Realtime API for the live test and the `voice_home` example | Beta |
 | `workflow` | The workflow observer (`adk_surface::workflow`): a graph agent's runs, steps and forks; the Runs tab and its routes with `web` | Beta |
 | `genui` | Agent-drawn UI (`adk_surface::genui`): the render tools, the validator, the routes with `web`, the box and fill-in pane with `tui` | Beta |
-| `genui-apps` | Apps from MCP servers (`adk_surface::genui::McpAppsHost`), with `adk-harness/mcp` and `adk-tool/mcp-apps` | Beta |
+| `genui-apps` | Apps from MCP servers (`adk_surface::genui::McpAppsHost`), with `adk-harness/mcp` and `adk-tool/mcp-apps`; implies `genui` and `web` | Beta |
+| `verb-ui` | Screen actions (`adk_surface::verbs`): Snooze in Coming up, through the governed path; its web, terminal and voice parts compile with `web`, `tui` and `voice` | Experimental |
+| `website` | A prebuilt website's views on the web home over `adk-website`'s desk; implies `web` | Experimental |
 
 The desktop tray is a separate, unpublished app in `desktop/`, not a feature. See
 [the terminal](../docs/official_docs/surfaces/terminal.md) for its keys, modes and exit codes,
@@ -188,24 +212,31 @@ and [the phone](../docs/official_docs/surfaces/phone.md) for serving it.
 `TelegramAdapter` is a Telegram bot as the person's chat thread with their agents (spec 3.3
 §5.3). It is the kernel's `ChannelSink` for the channel `telegram` and reads the bot's
 updates by long polling, handing each to `ChannelGateway::receive`; the gateway pairs
-accounts, starts turns, answers decisions and stops everything.
+accounts, starts turns, answers decisions and stops everything. It needs the `channels`
+feature.
 
 ```rust,no_run
 use std::sync::Arc;
+
+use adk_kernel::Kernel;
 use adk_kernel::channels::{ChannelDoorbell, ChannelGateway, InMemoryChannelBindingStore};
 use adk_surface::channels::TelegramAdapter;
 
-# async fn example(kernel: adk_kernel::Kernel, doorbell: Arc<ChannelDoorbell>) -> Result<(), Box<dyn std::error::Error>> {
-let telegram = TelegramAdapter::builder(std::env::var("TELEGRAM_BOT_TOKEN")?).build()?;
-let gateway = ChannelGateway::builder(Arc::new(kernel), Arc::new(InMemoryChannelBindingStore::new()))
-    .sink(Arc::new(telegram.clone()))
-    .home_url("http://127.0.0.1:8080/ui/")
-    .doorbell(doorbell)
-    .build();
-gateway.start().await?;
-telegram.start(gateway).join().await?;
-# Ok(())
-# }
+async fn telegram(
+    kernel: Kernel,
+    doorbell: Arc<ChannelDoorbell>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let telegram = TelegramAdapter::builder(std::env::var("TELEGRAM_BOT_TOKEN")?).build()?;
+    let gateway =
+        ChannelGateway::builder(Arc::new(kernel), Arc::new(InMemoryChannelBindingStore::new()))
+            .sink(Arc::new(telegram.clone()))
+            .home_url("http://127.0.0.1:8080/ui/")
+            .doorbell(doorbell)
+            .build();
+    gateway.start().await?;
+    telegram.start(gateway).join().await?;
+    Ok(())
+}
 ```
 
 A card carries "Waiting for you · since 18:00", the call in plain words ("Write file", as the
@@ -218,13 +249,16 @@ other surface says "You said yes in Telegram". See
 [chat](../docs/official_docs/surfaces/chat.md). `adk-rust up` starts it when
 `TELEGRAM_BOT_TOKEN` is set.
 
-`WhatsAppAdapter`, `SlackAdapter`, `DiscordAdapter` and `MatrixAdapter` (features `whatsapp`,
-`slack`, `discord`, `matrix`; Experimental) keep the same rules on their platforms, each with
-its own transport, escaping and answers: reply buttons, Block Kit buttons, button components,
-and Matrix reactions. `adk-rust up` starts Slack, Discord and Matrix when their variables are
-set; WhatsApp's webhook needs a public address, so the host mounts
-`WhatsAppWebhook::router()`. See
-[chat](../docs/official_docs/surfaces/chat.md#whatsapp-slack-discord-and-matrix).
+`WhatsAppAdapter`, `SlackAdapter`, `DiscordAdapter`, `MatrixAdapter` and `TeamsAdapter`
+(features `whatsapp`, `slack`, `discord`, `matrix`, `teams`; Experimental) keep the same rules
+on their platforms, each with its own transport, escaping and answers: reply buttons, Block Kit
+buttons, button components, Matrix reactions and Adaptive Card `Action.Execute` buttons. The
+Teams adapter checks every activity's Bot Connector JWT against the connector's OpenID keys
+before reading it and posts through the Bot Connector with a Microsoft Entra ID token.
+`adk-rust up` starts Slack, Discord, Matrix and Teams when their variables are set, Teams'
+messaging endpoint on a listener of its own; WhatsApp's webhook belongs to a host with a public
+address, which mounts `WhatsAppWebhook::router()`. See
+[chat](../docs/official_docs/surfaces/chat.md#whatsapp-slack-discord-matrix-and-microsoft-teams).
 
 ## License
 

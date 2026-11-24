@@ -169,7 +169,7 @@ Declarative agent definition with a builder API:
 use adk_managed::types::{ManagedAgentDef, ModelRef, ToolConfig};
 
 fn main() {
-    let def = ManagedAgentDef::new("my-agent", ModelRef::Shorthand("gemini-3.7-flash".into()))
+    let def = ManagedAgentDef::new("my-agent", ModelRef::Shorthand("gemini-3.8-flash".into()))
         .with_system("You are a helpful assistant.")
         .with_description("Research agent with web search")
         .with_tools(vec![ToolConfig::WebSearch {}]);
@@ -211,15 +211,15 @@ use adk_managed::types::{ModelConfig, ModelRef, Provider};
 
 fn main() {
     // Shorthand: the provider is inferred from the name prefix
-    let _gemini = ModelRef::Shorthand("gemini-3.7-flash".into()); // → Gemini
+    let _gemini = ModelRef::Shorthand("gemini-3.8-flash".into()); // → Gemini
     let _openai = ModelRef::Shorthand("gpt-5.6-terra".into()); // → OpenAI
-    let _anthropic = ModelRef::Shorthand("claude-sonnet-4-6".into()); // → Anthropic
+    let _anthropic = ModelRef::Shorthand("claude-sonnet-5-5".into()); // → Anthropic
 
     // Structured: an explicit provider
     let _compatible = ModelRef::Structured {
         provider: Provider::OpenaiCompatible,
         model: ModelConfig::Compatible {
-            model: "deepseek-v4-flash".into(),
+            model: "deepseek-flash".into(),
             base_url: "https://api.deepseek.com/v1".into(),
             api_key: "sk-...".into(),
         },
@@ -329,20 +329,20 @@ use adk_managed::testing::{ScriptedLlm, ScriptedToolCall, ScriptedTurn};
 use serde_json::json;
 
 fn main() {
-let _llm = ScriptedLlm::new("test", vec![
-    ScriptedTurn {
-        text: Some("I'll search for that.".into()),
-        tool_calls: vec![ScriptedToolCall {
-            name: "web_search".into(),
-            input: json!({"query": "rust agents"}),
-            id: Some("tc_1".into()),
-        }],
-    },
-    ScriptedTurn {
-        text: Some("Here are the results...".into()),
-        tool_calls: vec![],
-    },
-]);
+    let _llm = ScriptedLlm::new("test", vec![
+        ScriptedTurn {
+            text: Some("I'll search for that.".into()),
+            tool_calls: vec![ScriptedToolCall {
+                name: "web_search".into(),
+                input: json!({"query": "rust agents"}),
+                id: Some("tc_1".into()),
+            }],
+        },
+        ScriptedTurn {
+            text: Some("Here are the results...".into()),
+            tool_calls: vec![],
+        },
+    ]);
 }
 ```
 
@@ -404,10 +404,13 @@ adk-managed/src/
 | Flag | Description |
 |------|-------------|
 | `sandbox` | Enable `adk-sandbox` integration for isolated tool execution |
-| `memory` | Enable `adk-memory` integration for cross-session memory |
+| `memory` | Cross-session memory through an `adk_core::Memory` service (`with_memory`); links no extra crate |
 | `full` | `sandbox` and `memory` |
 | `gemini`, `openai`, `anthropic`, `ollama` | Let `DefaultModelResolver` build that provider's models |
 | `all-providers` | Every provider feature |
+
+No feature is enabled by default. On the umbrella crate, `managed-runtime` enables this crate, and
+its `gemini`, `openai`, `anthropic` and `ollama` features also enable the matching provider here.
 
 ## Smoke Test Example
 
@@ -427,6 +430,7 @@ Runs fixture F-1 end-to-end with `ScriptedLlm` (no API key required). Platform t
 | `ToolParkingLot` and the `parking` module are removed; `SessionLoop::new` no longer takes a parking lot | — |
 | `ManagedSessionState` gains `record`, `pending`, and `durable_run_id` | Build it with `ManagedSessionState::new` |
 | `ScriptedLlm` is `adk_model::ScriptedLlm`; a call past the last turn fails with `model.scripted.exhausted`; `requests()` and `remaining()` replace `turns_consumed()` and `total_turns()` | — |
+| `DefaultModelResolver` is no longer a unit struct | Build it with `DefaultModelResolver::new()` |
 | `ManagedStores`, `DurableConfig`, `SessionServiceStateStore`, and provider features for `DefaultModelResolver` are new | — |
 
 See the [2.x to 3.0 migration guide](../docs/official_docs/migration/2.x-to-3.0.md) and the [changelog](../CHANGELOG.md) for the full list.

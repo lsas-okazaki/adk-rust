@@ -2,11 +2,11 @@
 //!
 //! Run with a server at `NEO4J_URI` (default `bolt://localhost:7687`), authenticating as
 //! `NEO4J_USER` (default `neo4j`) with `NEO4J_PASSWORD`; each test uses a fresh app name
-//! per run. The first run migrates the schema, so run the tests one at a time:
+//! per run:
 //!
 //! ```bash
 //! NEO4J_PASSWORD=secret \
-//!   cargo nextest run -p adk-session --features neo4j --run-ignored only -j 1 neo4j_state
+//!   cargo nextest run -p adk-session --features neo4j --run-ignored only neo4j_state
 //! ```
 
 #![cfg(feature = "neo4j")]
@@ -114,7 +114,13 @@ async fn neo4j_session_integrity_contract() {
     common::integrity_contract::assert_event_order_contract(&service, &app).await;
     common::integrity_contract::assert_nul_round_trip_contract(&service, &app).await;
     common::integrity_contract::assert_list_order_contract(&service, &app).await;
-    common::integrity_contract::assert_rewind_unsupported(&service, &app).await;
+    common::integrity_contract::assert_rewind_contract(&service, &app).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a Neo4j server at NEO4J_URI"]
+async fn neo4j_session_history_contract() {
+    common::history_contract::assert_history_contract(&service().await, &run_app("history")).await;
 }
 
 #[tokio::test]
@@ -144,4 +150,10 @@ mod subject_data {
         #[ignore = "requires a Neo4j server at NEO4J_URI"]
         harness = crate::common::subject_data::SessionData(super::Backend),
     );
+}
+
+#[tokio::test]
+#[ignore = "requires a Neo4j server at NEO4J_URI"]
+async fn neo4j_archive_contract() {
+    common::archive_contract::assert_archive_contract(&service().await, &run_app("archive")).await;
 }

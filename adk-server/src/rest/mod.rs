@@ -140,8 +140,9 @@ fn forbidden(error: &str, hint: &str) -> Response {
 /// Whether `path` names a route that runs an agent, which takes
 /// [`SecurityConfig::run_timeout`] instead of the request timeout.
 fn runs_an_agent(path: &str) -> bool {
-    matches!(path, "/api/run" | "/api/run_sse" | "/a2a" | "/a2a/stream")
+    matches!(path, "/api/run" | "/api/run_sse" | "/a2a" | "/a2a/stream" | "/a2a/v1")
         || path.starts_with("/api/run/")
+        || path.starts_with("/a2a/v1/rest/message:")
 }
 
 /// Answers `408` when the response has not started within the route's timeout: the run
@@ -184,12 +185,55 @@ async fn host_guard(
 ///
 /// CORS stops a browser from reading the response, but a simple cross-origin request still
 /// executes; this stops it before it reaches a handler.
+/// Whether `path` serves an A2A agent card, which any page may read.
+fn is_agent_card_path(path: &str) -> bool {
+    matches!(path, "/.well-known/agent-card.json" | "/.well-known/agent.json")
+}
+
+/// Serves the agent card to any origin, as a2a-go does: answers its CORS preflight
+/// (`GET`, `OPTIONS` with `Content-Type`, for a day) and lets the requesting page read the
+/// card (its `Origin` echoed with credentials, or `*`). The card is public metadata, and
+/// the host guard still refuses a rebinding `Host`.
+async fn agent_card_cors(request: Request<Body>, next: Next) -> Response {
+    if !is_agent_card_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+    let origin = request.headers().get(header::ORIGIN).cloned();
+    let mut response = if request.method() == Method::OPTIONS {
+        let mut preflight = StatusCode::OK.into_response();
+        let headers = preflight.headers_mut();
+        headers
+            .insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, OPTIONS"));
+        headers
+            .insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Content-Type"));
+        headers.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+        preflight
+    } else {
+        next.run(request).await
+    };
+    let headers = response.headers_mut();
+    match origin {
+        Some(origin) => {
+            headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+            headers
+                .insert(header::ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true"));
+            headers.append(header::VARY, HeaderValue::from_static("Origin"));
+        }
+        None => {
+            headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+        }
+    }
+    response
+}
+
 async fn origin_guard(
     State(security): State<Arc<SecurityConfig>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if let Some(origin) = request.headers().get(header::ORIGIN) {
+    let reads_card = is_agent_card_path(request.uri().path())
+        && matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    if !reads_card && let Some(origin) = request.headers().get(header::ORIGIN) {
         let origin = String::from_utf8_lossy(origin.as_bytes());
         let same_origin = origin.split_once("://").is_some_and(|(_, authority)| {
             request_authority(&request)
@@ -281,6 +325,14 @@ async fn auth_middleware(
 
     parts.extensions.insert::<Option<RequestContext>>(request_context);
     next.run(Request::from_parts(parts, body)).await
+}
+
+/// `GET /api/version`: the server's version, as adk-python and adk-go serve it.
+async fn version() -> impl IntoResponse {
+    axum::Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "language": "rust",
+    }))
 }
 
 async fn health_check(State(controller): State<HealthController>) -> impl IntoResponse {
@@ -405,15 +457,21 @@ impl crate::yaml_agent::ModelFactory for NoOpModelFactory {
     }
 }
 
-/// Public A2A discovery routes.
-///
-/// The card is served at `/.well-known/agent-card.json`, the well-known path since
-/// A2A 0.3.0 and the one the bundled v1 client fetches, and at the earlier
-/// `/.well-known/agent.json` that existing peers use.
-fn a2a_discovery_router(controller: A2aController) -> Router {
-    Router::new()
-        .route("/.well-known/agent-card.json", get(controllers::a2a::get_agent_card))
-        .route("/.well-known/agent.json", get(controllers::a2a::get_agent_card))
+/// The A2A 0.3 card path that predates `/.well-known/agent-card.json`.
+const A2A_LEGACY_CARD_PATH: &str = "/.well-known/agent.json";
+
+/// Where the A2A 0.3 card is served when it is the only A2A version: the well-known path
+/// since A2A 0.3.0, and the earlier path that existing peers use.
+#[cfg(not(feature = "a2a-v1"))]
+const A2A_CARD_PATHS: &[&str] = &["/.well-known/agent-card.json", A2A_LEGACY_CARD_PATH];
+
+/// Public routes serving the A2A 0.3 card at each of `paths`.
+fn a2a_card_routes(controller: A2aController, paths: &[&str]) -> Router {
+    paths
+        .iter()
+        .fold(Router::new(), |router, path| {
+            router.route(path, get(controllers::a2a::get_agent_card))
+        })
         .with_state(controller)
 }
 
@@ -486,6 +544,8 @@ pub struct ServerBuilder {
     cron_state: Option<crate::background::CronState>,
     #[cfg(feature = "webhook-ingress")]
     webhook_ingress: Option<crate::webhooks::WebhookIngress>,
+    #[cfg(feature = "google-triggers")]
+    google_push: Option<crate::google_triggers::GooglePushIngress>,
     #[cfg(feature = "approvals")]
     approval_service: Option<Arc<dyn adk_core::ApprovalService>>,
     #[cfg(feature = "awp")]
@@ -515,6 +575,8 @@ impl ServerBuilder {
             cron_state: None,
             #[cfg(feature = "webhook-ingress")]
             webhook_ingress: None,
+            #[cfg(feature = "google-triggers")]
+            google_push: None,
             #[cfg(feature = "approvals")]
             approval_service: None,
             #[cfg(feature = "awp")]
@@ -591,7 +653,21 @@ impl ServerBuilder {
 
     /// Enable A2A protocol support at the specified base URL.
     ///
-    /// The base URL is used to construct the agent card's endpoint URL.
+    /// The base URL is used to construct the agent card's endpoint URLs.
+    ///
+    /// With the `a2a-v1` feature, the root agent is served over A2A v1
+    /// (`a2a::v1::server::A2aV1Server`):
+    ///
+    /// - the JSON-RPC binding at `/a2a/v1`;
+    /// - the HTTP+JSON binding under `/a2a/v1/rest`;
+    /// - the v1 card at `/.well-known/agent-card.json`.
+    ///
+    /// The A2A 0.3 endpoint stays at `/a2a` (and `/a2a/stream`), with its card at
+    /// `/.well-known/agent.json`. The v1 card also lists it, as its last interface with
+    /// `protocolVersion` `0.3`; a v1 card has no top-level `url`, so a 0.3 peer reads the
+    /// 0.3 card.
+    ///
+    /// Without `a2a-v1`, only A2A 0.3 is served, and its card is at both paths.
     pub fn with_a2a(mut self, base_url: impl Into<String>) -> Self {
         self.a2a_base_url = Some(base_url.into());
         self
@@ -717,6 +793,30 @@ impl ServerBuilder {
     #[cfg(feature = "webhook-ingress")]
     pub fn with_webhook_ingress(mut self, ingress: crate::webhooks::WebhookIngress) -> Self {
         self.webhook_ingress = Some(ingress);
+        self
+    }
+
+    /// Mount Google push triggers: `POST /triggers/pubsub/{name}` and
+    /// `POST /triggers/eventarc/{name}` at the root, outside `/api`, so Pub/Sub and Eventarc
+    /// reach them with their own OIDC tokens rather than the server's auth middleware
+    /// ([`google_triggers`](crate::google_triggers)).
+    ///
+    /// An ingress built without a kill switch takes
+    /// [`ServerConfig::governance`](crate::ServerConfig::governance), so a frozen server
+    /// answers `503` and the source redelivers. The routes are host-checked like every other:
+    /// add the service's hostname to `SecurityConfig::allowed_hosts`.
+    ///
+    /// ```rust,ignore
+    /// use adk_server::google_triggers::{GoogleOidcVerifier, GooglePushIngress, PushTrigger};
+    ///
+    /// let verifier = GoogleOidcVerifier::new(audience, ["push@my-project.iam.gserviceaccount.com"])?;
+    /// let ingress = GooglePushIngress::new(run_store.clone())
+    ///     .with_trigger(PushTrigger::pubsub("orders", verifier, "shop", "order_agent"));
+    /// let app = ServerBuilder::new(config).with_google_push(ingress).build();
+    /// ```
+    #[cfg(feature = "google-triggers")]
+    pub fn with_google_push(mut self, ingress: crate::google_triggers::GooglePushIngress) -> Self {
+        self.google_push = Some(ingress);
         self
     }
 
@@ -878,6 +978,7 @@ impl ServerBuilder {
     fn build_inner(self) -> (Router, Option<ShutdownHandle>) {
         let config = &self.config;
         let session_controller = SessionController::new(config.session_service.clone());
+        let history_controller = controllers::session_history::HistoryController::new(config);
         let runtime_controller = RuntimeController::new(config.clone());
         #[cfg(feature = "approvals")]
         let runtime_controller = match &self.approval_service {
@@ -920,8 +1021,10 @@ impl ServerBuilder {
             }
         });
 
-        let health_router =
-            Router::new().route("/health", get(health_check)).with_state(health_controller);
+        let health_router = Router::new()
+            .route("/health", get(health_check))
+            .with_state(health_controller)
+            .route("/version", get(version));
 
         let ui_api_router = Router::new()
             .route("/apps", get(controllers::apps::list_apps))
@@ -969,6 +1072,27 @@ impl ServerBuilder {
                     .delete(controllers::session::delete_session_from_path),
             )
             .with_state(session_controller)
+            .layer(auth_layer.clone());
+
+        // Fork, rewind, and edit carry the session routes' authentication.
+        let history_router = Router::new()
+            .route(
+                "/apps/{app_name}/users/{user_id}/sessions/{session_id}/history",
+                get(controllers::session_history::get_history),
+            )
+            .route(
+                "/apps/{app_name}/users/{user_id}/sessions/{session_id}/history/edit",
+                post(controllers::session_history::edit_history),
+            )
+            .route(
+                "/apps/{app_name}/users/{user_id}/sessions/{session_id}/fork",
+                post(controllers::session_history::fork_session),
+            )
+            .route(
+                "/apps/{app_name}/users/{user_id}/sessions/{session_id}/rewind",
+                post(controllers::session_history::rewind_session),
+            )
+            .with_state(history_controller)
             .layer(auth_layer.clone());
 
         let runtime_router = Router::new()
@@ -1021,6 +1145,7 @@ impl ServerBuilder {
             .merge(health_router)
             .merge(ui_api_router)
             .merge(session_router)
+            .merge(history_router)
             .merge(runtime_router)
             .merge(artifacts_router)
             .merge(debug_router);
@@ -1117,6 +1242,16 @@ impl ServerBuilder {
             app = app.merge(crate::webhooks::webhook_ingress_router(ingress));
         }
 
+        #[cfg(feature = "google-triggers")]
+        if let Some(ingress) = self.google_push {
+            let ingress = if ingress.has_governance() {
+                ingress
+            } else {
+                ingress.with_governance(config.governance.clone())
+            };
+            app = app.merge(crate::google_triggers::google_push_router(ingress));
+        }
+
         // Merge custom root routes
         for custom_routes in self.root_routes {
             app = app.merge(custom_routes);
@@ -1134,15 +1269,46 @@ impl ServerBuilder {
                 None => a2a_controller,
             };
             // Same split as `create_app_with_a2a`: discovery is public, RPC is authenticated.
-            let a2a_discovery = a2a_discovery_router(a2a_controller.clone());
-            // The AWP edge serves the site's signed card at the same path.
-            #[cfg(feature = "awp")]
-            let a2a_discovery = if self.awp_edge { Router::new() } else { a2a_discovery };
+            // `route_layer`, as these routes are merged at the root: `layer` would also wrap
+            // the app's fallback and answer every unknown path with `401`.
             let a2a_rpc = Router::new()
                 .route("/a2a", post(controllers::a2a::handle_jsonrpc_for_caller))
                 .route("/a2a/stream", post(controllers::a2a::handle_jsonrpc_stream_for_caller))
-                .with_state(a2a_controller)
-                .layer(auth_layer.clone());
+                .with_state(a2a_controller.clone())
+                .route_layer(auth_layer.clone());
+
+            #[cfg(not(feature = "a2a-v1"))]
+            let a2a_discovery = a2a_card_routes(a2a_controller, A2A_CARD_PATHS);
+
+            // A2A v1 is the protocol `/.well-known/agent-card.json` advertises. 0.3 keeps its
+            // `/a2a` endpoint and `/.well-known/agent.json` card, and the v1 card lists the
+            // 0.3 endpoint too, so peers on either version find theirs.
+            #[cfg(feature = "a2a-v1")]
+            let (a2a_discovery, a2a_rpc) = {
+                let root_agent = config.agent_loader.root_agent();
+                let runner_config =
+                    controllers::a2a::runner_config_for(config, root_agent, None, None);
+                let base = base_url.trim_end_matches('/');
+                let mut v1 = crate::a2a::v1::server::A2aV1Server::builder(runner_config, base)
+                    .legacy_jsonrpc_url(format!("{base}/a2a"));
+                if let Some(skill_index) = &self.skill_index {
+                    v1 = v1.skills(
+                        crate::a2a::agent_skills_from_index(skill_index)
+                            .into_iter()
+                            .map(crate::a2a::v1::card::v1_skill),
+                    );
+                }
+                let v1 = v1.build();
+                (
+                    a2a_card_routes(a2a_controller, &[A2A_LEGACY_CARD_PATH])
+                        .merge(v1.card_router()),
+                    a2a_rpc.merge(v1.rpc_router().route_layer(auth_layer.clone())),
+                )
+            };
+
+            // The AWP edge serves the site's signed card at the same path.
+            #[cfg(feature = "awp")]
+            let a2a_discovery = if self.awp_edge { Router::new() } else { a2a_discovery };
             app = app.merge(a2a_discovery).merge(a2a_rpc);
         }
 
@@ -1196,6 +1362,7 @@ impl ServerBuilder {
                     .layer(trace_layer)
                     .layer(middleware::from_fn_with_state(Arc::clone(&security), request_timeout))
                     .layer(DefaultBodyLimit::max(config.security.max_body_size))
+                    .layer(middleware::from_fn(agent_card_cors))
                     .layer(cors_layer)
                     .layer(middleware::from_fn_with_state(Arc::clone(&security), origin_guard))
                     .layer(SetResponseHeaderLayer::if_not_present(

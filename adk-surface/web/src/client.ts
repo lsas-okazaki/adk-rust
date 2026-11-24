@@ -5,6 +5,8 @@
  * (§11).
  */
 import type {
+  AnswerSummary,
+  AgentThreads,
   AgentRow,
   AgentsResponse,
   AppAnswer,
@@ -16,16 +18,28 @@ import type {
   DecisionCard,
   DecisionsResponse,
   FeedEntry,
+  LabelledExample,
   Origin,
   PhoneDevicesResponse,
   QueuedResponse,
+  SavedExample,
   StatusLine,
   SurfaceKind,
   TakeOverRequest,
   VoiceModels,
   VoiceTicket,
   VoiceTicketRequest,
+  ViewerView,
+  CameraView,
+  CamerasView,
+  FrameTaken,
+  CardRaised,
+  StageView,
+  ZoneSaved,
 } from "./generated/api";
+import type { ViewerClient } from "./viewer/Viewer";
+import type { CameraClient, CameraFeedMessage } from "./camera/client";
+import type { ViewerPlace } from "./viewer/route";
 import type { AgentsSeam } from "./agents/client";
 import { httpAgents } from "./agents/client";
 import type { AppsSeam } from "./genui/apps";
@@ -124,6 +138,8 @@ export interface HomeClient {
   agents(): Promise<AgentRow[]>;
   decisions(): Promise<DecisionCard[]>;
   decision(id: string): Promise<DecisionCard>;
+  /** An image a decision holds, at the `href` its card names, read as the signed-in viewer (spec 3.7 §8.2). */
+  image?(href: string): Promise<Blob>;
   briefing(since?: string): Promise<Briefing>;
   command(command: Command, origin: Origin): Promise<CommandOutcome>;
   /** The session's feed from just after `after`, until `signal` aborts or the server closes. */
@@ -164,8 +180,16 @@ export interface HomeClient {
   confirmAgentChange?(command: AgentCommand): Promise<AgentOutcome>;
   /** The roster with the primary agent and whether agents can be added here. */
   agentsWithPrimary?(): Promise<AgentsResponse>;
+  /** The caller's threads with `agent`, newest first; undefined where the server has no such route. */
+  agentThreads?(agent: string): Promise<AgentThreads | undefined>;
+  /** How the caller answered since `since` (default the last 7 days); undefined where the server has no such route. */
+  answers?(since?: string): Promise<AnswerSummary | undefined>;
   /** Apps from MCP servers in a thread (spec 3.3 §6.1 `genui-apps`): opening them and relaying what they ask. */
   apps?(): AppsSeam;
+  /** The annotated viewer's routes (spec 3.7 §8.2, §8.3). */
+  viewerClient?(): ViewerClient;
+  /** The live camera surface's routes (spec 3.7 §8.2). */
+  cameraClient?(): CameraClient;
 }
 
 async function problem(response: Response): Promise<ApiError> {
@@ -262,6 +286,15 @@ export class HttpClient implements HomeClient {
     return this.request<AgentsResponse>(`/surface/agents?surface=${this.surface}`);
   }
 
+  answers(since?: string) {
+    const from = since ? `&since=${encodeURIComponent(since)}` : "";
+    return this.optional<AnswerSummary>(`/surface/answers?surface=${this.surface}${from}`);
+  }
+
+  agentThreads(agent: string) {
+    return this.optional<AgentThreads>(`/surface/agents/${encodeURIComponent(agent)}/threads?surface=${this.surface}`);
+  }
+
   /** "Confirm it's you" for an agent change at high risk (spec 3.3 §7.2). */
   confirmAgentChange(command: AgentCommand): Promise<AgentOutcome> {
     return confirmAgentChange(this.post.bind(this), command);
@@ -292,6 +325,86 @@ export class HttpClient implements HomeClient {
 
   decision(id: string) {
     return this.request<DecisionCard>(`/surface/decisions/${encodeURIComponent(id)}?surface=${this.surface}`);
+  }
+
+  async image(href: string) {
+    // Only the engine's own image routes on this server: a card or a viewer never names another address.
+    if (
+      !href.startsWith(`${this.base}/surface/decisions/`) &&
+      !href.startsWith(`${this.base}/surface/vision/`) &&
+      !href.startsWith(`${this.base}/surface/cameras/`)
+    ) {
+      throw new ApiError(400, labels.cantReach);
+    }
+    const response = await fetch(`${href}?surface=${this.surface}`, {
+      credentials: "same-origin",
+      headers: this.headers({ accept: "image/*" }),
+    });
+    if (!response.ok) throw await problem(response);
+    return response.blob();
+  }
+
+  viewerClient(): ViewerClient {
+    const segment = encodeURIComponent;
+    return {
+      viewer: (place: ViewerPlace) => {
+        const query = new URLSearchParams({ surface: this.surface });
+        if (place.answer) query.set("answer", place.answer);
+        if (place.compare) query.set("compare", place.compare);
+        return this.request<ViewerView>(
+          `/surface/vision/${segment(place.session)}/images/${segment(place.image)}/view?${query.toString()}`,
+        );
+      },
+      regions: (session: string, answer: string, other?: string) => {
+        const query = new URLSearchParams({ surface: this.surface });
+        if (other) query.set("with", other);
+        return this.request<unknown>(`/surface/vision/${segment(session)}/answers/${segment(answer)}/regions?${query.toString()}`);
+      },
+      saveExample: (session: string, example: LabelledExample) =>
+        this.post<SavedExample>(`/surface/vision/${segment(session)}/examples`, example),
+    };
+  }
+
+  cameraClient(): CameraClient {
+    const camera = (id: string) => `/surface/cameras/${encodeURIComponent(id)}`;
+    const query = `surface=${this.surface}`;
+    return {
+      cameras: () => this.request<CamerasView>(`/surface/cameras?${query}`),
+      camera: (id) => this.request<CameraView>(`${camera(id)}?${query}`),
+      feed: (id, signal) => this.cameraFeed(camera(id), signal),
+      switchTo: (id, on) => this.request<CameraView>(`${camera(id)}/${on ? "on" : "off"}?${query}`, { method: "POST" }),
+      sendFrame: (id, frame) =>
+        this.request<FrameTaken>(`${camera(id)}/frames?${query}`, {
+          method: "POST",
+          body: frame,
+          headers: { "content-type": frame.type || "image/jpeg" },
+        }),
+      stop: (id) => this.request<CameraView>(`${camera(id)}/stop?${query}`, { method: "POST" }),
+      retry: (id) => this.request<CameraView>(`${camera(id)}/retry?${query}`, { method: "POST" }),
+      saveZone: (id, zone, change) =>
+        this.request<ZoneSaved>(`${camera(id)}/zones/${encodeURIComponent(zone)}`, {
+          method: "PUT",
+          body: JSON.stringify(change),
+        }),
+      freeze: (id, frame) => this.post<StageView>(`${camera(id)}/freeze?${query}`, { frame }),
+      raiseCard: (id, card) => this.post<CardRaised>(`${camera(id)}/cards?${query}`, card),
+      decide: (command, origin) => this.command(command, origin),
+    };
+  }
+
+  /** A camera's picture after each frame (spec 3.7 §8.2), until `signal` aborts. */
+  private async *cameraFeed(path: string, signal: AbortSignal): AsyncIterable<CameraFeedMessage> {
+    const response = await fetch(`${this.base}${path}/feed?surface=${this.surface}`, {
+      headers: this.headers({ accept: "text/event-stream" }),
+      signal,
+      credentials: "same-origin",
+    });
+    if (!response.ok) throw await problem(response);
+    if (!response.body) throw new ApiError(response.status, "the feed sent no stream");
+    for await (const frame of parseSse(response.body)) {
+      if (frame.event === "frame" && frame.data) yield { type: "frame", stage: JSON.parse(frame.data) as StageView };
+      else if (frame.event === "changed") yield { type: "changed" };
+    }
   }
 
   briefing(since?: string) {

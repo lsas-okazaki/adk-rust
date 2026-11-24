@@ -1221,6 +1221,14 @@ pub struct ToolConfirmationRequest {
     /// origins were, and in requests for calls the governed path saw without their tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<ToolOrigin>,
+    /// What the approver sees with the call, such as the exact image it would send
+    /// ([`Tool::approval_evidence`](crate::Tool::approval_evidence)).
+    ///
+    /// The digests are part of the [`fingerprint`](Self::fingerprint), so a decision binds
+    /// to these images. Empty for a call held without evidence, and in requests recorded
+    /// before evidence was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<crate::Evidence>,
 }
 
 impl ToolConfirmationRequest {
@@ -1243,6 +1251,7 @@ impl ToolConfirmationRequest {
             args,
             acting: None,
             origin: None,
+            evidence: Vec::new(),
         }
     }
 
@@ -1308,6 +1317,36 @@ impl ToolConfirmationRequest {
         self
     }
 
+    /// Holds the call with `evidence`, whose digests become part of its
+    /// [`fingerprint`](Self::fingerprint).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_core::{ArtifactLocator, Evidence, ImageEvidence, ToolConfirmationRequest};
+    /// use serde_json::json;
+    ///
+    /// let image = |digest: &str| {
+    ///     Evidence::from(ImageEvidence::new(
+    ///         digest,
+    ///         ArtifactLocator::new("desk", "ana", "s1", "egress/crop.png", 1),
+    ///         "image/png",
+    ///         320,
+    ///         200,
+    ///     ))
+    /// };
+    /// let call = ToolConfirmationRequest::new("vision_describe", json!({ "question": "Total?" }));
+    /// let held = call.clone().with_evidence([image("sha256:aa")]);
+    /// let swapped = call.clone().with_evidence([image("sha256:bb")]);
+    /// assert_ne!(held.fingerprint(), call.fingerprint());
+    /// assert_ne!(held.fingerprint(), swapped.fingerprint());
+    /// ```
+    #[must_use]
+    pub fn with_evidence(mut self, evidence: impl IntoIterator<Item = crate::Evidence>) -> Self {
+        self.evidence.extend(evidence);
+        self
+    }
+
     /// The call's fingerprint: the acting agent's id, the tool's [`ToolOrigin`], the tool
     /// name, and the canonical arguments.
     ///
@@ -1315,9 +1354,14 @@ impl ToolConfirmationRequest {
     /// [`RunConfig::tool_confirmation_fingerprints`], and in an
     /// [`ApprovalStore`](crate::ApprovalStore), so the decision applies to the same call
     /// re-issued under a new call ID by the same agent to the same tool. It never applies to
-    /// another agent's call, to a tool of the same name another publisher answers, or to a
-    /// tool whose declaration changed. The parts are separated by U+001F; a missing agent or
-    /// origin leaves its part empty.
+    /// another agent's call, to a tool of the same name another publisher answers, to a
+    /// tool whose declaration changed, or to a call held with different evidence. The parts
+    /// are separated by U+001F; a missing agent or origin leaves its part empty.
+    ///
+    /// A call held with [`evidence`](Self::evidence) adds the evidence digests, in order, to
+    /// the declaration part: U+001E, `evidence:`, then the digests as a JSON array. The five
+    /// parts and their order stay as they are, and a call without evidence keeps the
+    /// fingerprint it had before evidence existed.
     ///
     /// The governed path records the acting agent on every request it builds, so a
     /// fingerprint without one never matches a governed call.
@@ -1355,6 +1399,13 @@ impl ToolConfirmationRequest {
             push_clean(&mut out, &origin.declaration_digest);
         } else {
             out.push('\u{1f}');
+        }
+        if !self.evidence.is_empty() {
+            // JSON escapes every control character, so no digest can forge a separator.
+            let digests: Vec<&str> = self.evidence.iter().map(crate::Evidence::digest).collect();
+            out.push('\u{1e}');
+            out.push_str("evidence:");
+            out.push_str(&serde_json::to_string(&digests).unwrap_or_default());
         }
         out.push('\u{1f}');
         out.push_str(&call);
@@ -1655,6 +1706,16 @@ pub struct RunConfig {
     /// Optional live decision source for confirmations that have no static
     /// entry in [`tool_confirmation_decisions`](Self::tool_confirmation_decisions).
     pub tool_confirmation_handler: Option<Arc<dyn ToolConfirmationHandler>>,
+    /// The reviewer asked about a call the [`tool_policy`](Self::tool_policy) holds for
+    /// approval, before the confirmation handler and the approval inbox: it approves,
+    /// denies, or escalates the call to a person. `None` (the default) asks a person about
+    /// every held call. See [`ToolReviewer`](crate::ToolReviewer).
+    pub tool_reviewer: Option<Arc<dyn crate::ToolReviewer>>,
+    /// Checks each requested call (one a person asked for through something an agent drew)
+    /// against the seal made when the person approved it, right before it runs; `None`
+    /// checks nothing beyond the approval itself. See
+    /// [`RequestedCallSeal`](crate::RequestedCallSeal).
+    pub requested_call_seal: Option<Arc<dyn crate::RequestedCallSeal>>,
     /// Toolsets made available only for this invocation.
     pub runtime_toolsets: Vec<RuntimeToolset>,
     /// Optional cached content name for automatic prompt caching.
@@ -1667,6 +1728,11 @@ pub struct RunConfig {
     /// When non-empty, the `transfer_to_agent` tool is injected and validation
     /// uses this list instead of only checking `sub_agents`.
     pub transfer_targets: Vec<String>,
+    /// The description of each agent in
+    /// [`transfer_targets`](Self::transfer_targets), by name, set by the runner from the
+    /// agent tree. An agent tells its model what each target does, so the model can choose
+    /// where to transfer.
+    pub transfer_target_descriptions: HashMap<String, String>,
     /// The name of the parent agent, if this agent was invoked via transfer.
     /// Used by the agent to apply `disallow_transfer_to_parent` filtering.
     pub parent_agent: Option<String>,
@@ -1861,6 +1927,22 @@ pub struct RunConfig {
     /// agents, teams and `GraphAgent` do; another [`Agent`] answers it with
     /// [`RequestedCall::refusal_events`](crate::RequestedCall::refusal_events).
     pub requested_call: Option<crate::RequestedCall>,
+    /// When the run's agents compact their history before a model call.
+    ///
+    /// `None` uses the runner's setting, which is on by default
+    /// ([`IntraCompactionConfig::default`](crate::IntraCompactionConfig)): a request is
+    /// compacted once it nears the model's context window.
+    /// `Some(IntraCompactionConfig::disabled())` turns it off for this run.
+    pub intra_compaction: Option<crate::IntraCompactionConfig>,
+    /// The compactor the run's agents call before each model call, and once after a model
+    /// rejects a request as longer than its context window.
+    ///
+    /// At the start of each run the runner installs its own, built from
+    /// [`intra_compaction`](Self::intra_compaction) or the runner's setting, when this is
+    /// `None` and compaction is enabled. A compactor already set is kept, so a caller can
+    /// supply its own. Transfer targets, workflow sub-agents and agent tools inherit it with
+    /// the config. See [`HistoryCompactor`](crate::HistoryCompactor).
+    pub history_compactor: Option<Arc<dyn crate::HistoryCompactor>>,
 }
 
 impl Default for RunConfig {
@@ -1870,9 +1952,12 @@ impl Default for RunConfig {
             tool_confirmation_decisions: HashMap::new(),
             tool_confirmation_fingerprints: HashMap::new(),
             tool_confirmation_handler: None,
+            tool_reviewer: None,
+            requested_call_seal: None,
             runtime_toolsets: Vec::new(),
             cached_content: None,
             transfer_targets: Vec::new(),
+            transfer_target_descriptions: HashMap::new(),
             parent_agent: None,
             auto_cache: true,
             history_max_events: None,
@@ -1901,6 +1986,8 @@ impl Default for RunConfig {
             acting: crate::ActingConfig::default(),
             deny_on_confirmation_timeout: false,
             requested_call: None,
+            intra_compaction: None,
+            history_compactor: None,
         }
     }
 }
@@ -2067,6 +2154,37 @@ impl RunConfigBuilder {
         self
     }
 
+    /// Sets the reviewer that decides held calls before a person is asked. See
+    /// [`RunConfig::tool_reviewer`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use adk_core::principal::SubjectRef;
+    /// use adk_core::{Result, ReviewVerdict, RunConfig, ToolReview, ToolReviewer, async_trait};
+    ///
+    /// #[derive(Debug)]
+    /// struct Escalates;
+    ///
+    /// #[async_trait]
+    /// impl ToolReviewer for Escalates {
+    ///     fn reviewer(&self) -> SubjectRef {
+    ///         SubjectRef::service("rules:escalate")
+    ///     }
+    ///     async fn review(&self, _review: &ToolReview) -> Result<ReviewVerdict> {
+    ///         Ok(ReviewVerdict::escalate("a person decides"))
+    ///     }
+    /// }
+    ///
+    /// let config = RunConfig::builder().tool_reviewer(Arc::new(Escalates)).build();
+    /// assert!(config.tool_reviewer.is_some());
+    /// ```
+    pub fn tool_reviewer(mut self, reviewer: Arc<dyn crate::ToolReviewer>) -> Self {
+        self.config.tool_reviewer = Some(reviewer);
+        self
+    }
+
     /// Adds a toolset that is resolved only for this runner invocation.
     pub fn runtime_toolset(mut self, toolset: Arc<dyn Toolset>) -> Self {
         self.config.runtime_toolsets.push(RuntimeToolset::new(toolset));
@@ -2135,6 +2253,31 @@ impl RunConfigBuilder {
     /// Prevents infinite transfer loops. Defaults to 10 when `None`.
     pub fn max_transfer_depth(mut self, depth: u32) -> Self {
         self.config.max_transfer_depth = Some(depth);
+        self
+    }
+
+    /// Sets when the run's agents compact their history, in place of the runner's setting.
+    ///
+    /// See [`RunConfig::intra_compaction`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_core::{IntraCompactionConfig, RunConfig};
+    ///
+    /// let config = RunConfig::builder().intra_compaction(IntraCompactionConfig::disabled()).build();
+    /// assert_eq!(config.intra_compaction, Some(IntraCompactionConfig::disabled()));
+    /// ```
+    pub fn intra_compaction(mut self, config: crate::IntraCompactionConfig) -> Self {
+        self.config.intra_compaction = Some(config);
+        self
+    }
+
+    /// Sets the compactor the run's agents call before each model call.
+    ///
+    /// See [`RunConfig::history_compactor`].
+    pub fn history_compactor(mut self, compactor: Arc<dyn crate::HistoryCompactor>) -> Self {
+        self.config.history_compactor = Some(compactor);
         self
     }
 

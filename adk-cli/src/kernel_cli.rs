@@ -264,6 +264,34 @@ pub async fn act(target: &KernelTarget, pid: &str, action: Action) -> Result<()>
     Ok(())
 }
 
+/// `adk-rust run-now`: runs a cron sleeper, or with `trigger` a standing cron trigger, now,
+/// outside its schedule.
+pub async fn run_now(
+    target: &KernelTarget,
+    pid: Option<&str>,
+    trigger: Option<&str>,
+    request_id: Option<&str>,
+) -> Result<()> {
+    let client = client(target).await?;
+    let (named, run_now) = match (pid, trigger) {
+        (Some(pid), None) => {
+            let pid = resolve_pid(&client, pid).await?;
+            let run_now = client.run_now(&pid, request_id).await?;
+            (pid, run_now)
+        }
+        (None, Some(trigger)) => {
+            (format!("trigger {trigger}"), client.run_trigger_now(trigger, request_id).await?)
+        }
+        _ => bail!("give a process id or --trigger NAME"),
+    };
+    let queued = if run_now.existing { "already queued" } else { "queued" };
+    println!(
+        "{queued} a run now of {named} ({}); the next scheduled tick still fires. `adk-rust events` shows the wake.",
+        run_now.key
+    );
+    Ok(())
+}
+
 /// `adk-rust nice`: moves a queued or sleeping process to `queue`. The run store has no
 /// queue change, so the moved process has a new pid.
 pub async fn nice(target: &KernelTarget, pid: &str, queue: QueueClass) -> Result<()> {
@@ -843,7 +871,7 @@ pub async fn repl(client: ControlClient, session: Option<String>) -> Result<()> 
             render(&attached.transcript, true);
             cursor = attached.cursor;
             if attached.process.is_some() {
-                report(follow(&client, Some(&console), &session, &mut cursor, None).await?);
+                report(follow(&client, Some(&console), None, &session, &mut cursor, None).await?);
             }
         }
         // A new session: the first turn creates it.
@@ -871,8 +899,8 @@ pub async fn repl(client: ControlClient, session: Option<String>) -> Result<()> 
             .with_session_id(&session);
         let process = client.spawn(&request).await?;
         println!();
-        let followed =
-            follow(&client, Some(&console), &session, &mut cursor, Some(&process.meta.pid)).await?;
+        let pid = Some(process.meta.pid.as_str());
+        let followed = follow(&client, Some(&console), None, &session, &mut cursor, pid).await?;
         report(followed);
     }
     println!(
@@ -903,7 +931,8 @@ fn report(followed: Followed) {
         }
         Followed::Done(_) => println!(),
         Followed::Held(calls) => println!(
-            "\n{calls} call(s) wait for a decision: `adk-rust approvals --server …` or the inbox.\n"
+            "\n{calls} call(s) wait for a decision: `adk-rust approvals list`, then `approve ID` \
+             or `deny ID`, or any other surface.\n"
         ),
         Followed::Detached => {
             println!("\nDetached from the turn; it carries on in the kernel.\n");
@@ -912,11 +941,14 @@ fn report(followed: Followed) {
 }
 
 /// Reads `session` from `cursor` until nothing runs in it, printing what it records and,
-/// with a terminal `console`, asking for each held call (spec 3.2 §7.11, K5). Without one,
-/// a held call ends the follow with [`Followed::Held`].
+/// with a terminal `console`, asking for each held call (spec 3.2 §7.11, K5). `unattended`
+/// is `--yes`, `Some(allow_unsandboxed)`: each held call of the session is approved through
+/// the inbox without asking, as in process. Without either, a held call ends the follow
+/// with [`Followed::Held`].
 pub async fn follow(
     client: &ControlClient,
     console: Option<&ConsoleIo>,
+    unattended: Option<bool>,
     session: &str,
     cursor: &mut Option<DateTime<Utc>>,
     pid: Option<&str>,
@@ -962,13 +994,15 @@ pub async fn follow(
                 said_frozen = true;
             }
             if !attached.pending.is_empty() {
-                let Some(console) = console.filter(|console| console.is_terminal()) else {
-                    return Ok(Followed::Held(attached.pending.len()));
+                let answer = match (unattended, console.filter(|console| console.is_terminal())) {
+                    (Some(allow_unsandboxed), _) => Answer::Unattended { allow_unsandboxed },
+                    (None, Some(console)) => Answer::Ask(console),
+                    (None, None) => return Ok(Followed::Held(attached.pending.len())),
                 };
-                if let Some(ended) = decide_pending(client, console, session, &mut asked).await? {
+                if let Some(ended) = decide_pending(client, answer, session, &mut asked).await? {
                     return Ok(ended);
                 }
-                if !said_waiting {
+                if !said_waiting && unattended.is_none() {
                     println!("(waiting for a decision; any surface may give it — Ctrl-C detaches)");
                     said_waiting = true;
                 }
@@ -987,11 +1021,20 @@ async fn process_of(client: &ControlClient, pid: &str) -> Result<Option<Process>
     Ok(processes.into_iter().find(|process| process.meta.pid == pid))
 }
 
-/// Asks at `console` about each pending call of `session` not asked about yet, and decides
-/// it through the approvals inbox. `Some` when the follow ends here.
+/// Who answers a held call a following surface sees.
+enum Answer<'a> {
+    /// The person at this terminal.
+    Ask(&'a ConsoleIo),
+    /// `--yes`: approved without asking, except an unsandboxed retry without
+    /// `--allow-unsandboxed`.
+    Unattended { allow_unsandboxed: bool },
+}
+
+/// Answers each pending call of `session` not answered yet, as `answer` says, and decides it
+/// through the approvals inbox. `Some` when the follow ends here.
 async fn decide_pending(
     client: &ControlClient,
-    console: &ConsoleIo,
+    answer: Answer<'_>,
     session: &str,
     asked: &mut HashSet<String>,
 ) -> Result<Option<Followed>> {
@@ -1018,17 +1061,46 @@ async fn decide_pending(
         if !item.summary.trim().is_empty() {
             println!("  {}", escape_control(&item.summary));
         }
-        let answer = console.read_line("Approve? [y]es, [n]o, or a reason to refuse > ").await;
-        let (action, reason) = match answer {
-            ConsoleInput::Line(line) => match line.trim() {
-                "y" | "yes" => (ApprovalAction::Approve, None),
-                "" | "n" | "no" => (ApprovalAction::Reject, None),
-                reason => (ApprovalAction::Reject, Some(reason.to_string())),
-            },
-            ConsoleInput::Interrupted | ConsoleInput::Eof => return Ok(Some(Followed::Detached)),
+        let (action, reason) = match &answer {
+            Answer::Unattended { allow_unsandboxed } => {
+                let unsandboxed = item.tool_name == "bash"
+                    && item.args_redacted.get("unsandboxed").and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                if unsandboxed && !allow_unsandboxed {
+                    let reason = "--yes does not approve unsandboxed retries without \
+                                  --allow-unsandboxed";
+                    (ApprovalAction::Reject, Some(reason.to_string()))
+                } else {
+                    (ApprovalAction::Approve, None)
+                }
+            }
+            Answer::Ask(console) => {
+                let line =
+                    console.read_line("Approve? [y]es, [n]o, or a reason to refuse > ").await;
+                match line {
+                    ConsoleInput::Line(line) => match line.trim() {
+                        "y" | "yes" => (ApprovalAction::Approve, None),
+                        "" | "n" | "no" => (ApprovalAction::Reject, None),
+                        reason => (ApprovalAction::Reject, Some(reason.to_string())),
+                    },
+                    ConsoleInput::Interrupted | ConsoleInput::Eof => {
+                        return Ok(Some(Followed::Detached));
+                    }
+                }
+            }
         };
         client.decide(&item.id, item.version, action, reason.as_deref()).await?;
-        println!("{}", if action == ApprovalAction::Approve { "approved" } else { "refused" });
+        println!(
+            "{}",
+            match (action, &answer) {
+                (ApprovalAction::Approve, Answer::Unattended { .. }) => "approved by --yes",
+                (ApprovalAction::Approve, Answer::Ask(_)) => "approved",
+                (_, Answer::Unattended { .. }) => {
+                    "refused: --yes does not approve an unsandboxed retry; add --allow-unsandboxed"
+                }
+                (_, Answer::Ask(_)) => "refused",
+            }
+        );
     }
     Ok(None)
 }
@@ -1116,12 +1188,43 @@ fn row(process: &Process) -> String {
 /// What `ps` says about a process beyond its columns: suspension, sleep, goal, loop guard.
 fn note(process: &Process) -> String {
     let mut notes = Vec::new();
+    if process.meta.kind == adk_kernel::ProcessKind::Subagent {
+        let name = process
+            .meta
+            .labels
+            .get(adk_kernel::SUBAGENT_NAME_LABEL)
+            .or_else(|| process.meta.labels.get(adk_kernel::SUBAGENT_LABEL))
+            .map_or("sub-agent", String::as_str);
+        match &process.meta.parent {
+            Some(parent) => notes
+                .push(format!("{name}, started by {}", parent.chars().take(8).collect::<String>())),
+            None => notes.push(name.to_string()),
+        }
+    }
     if let Some(suspension) = &process.meta.suspended_by {
         notes.push(format!("suspended: {suspension}"));
+    } else if process.run.state == RunState::Waiting
+        && matches!(
+            process.run.checkpoint,
+            Some(adk_core::RunCheckpointRef::AwaitingApproval { .. })
+        )
+    {
+        notes.push("waiting for a human".to_string());
     } else if let Some(wake) = &process.meta.wake
         && process.run.state == RunState::Waiting
     {
         notes.push(format!("asleep on {} wake(s)", wake.any_of.len()));
+    }
+    let count = |label: &str| {
+        process.meta.labels.get(label).and_then(|count| count.parse::<u64>().ok()).unwrap_or(0)
+    };
+    match count(adk_kernel::SKIPPED_LABEL) {
+        0 => {}
+        skipped => notes.push(format!("{skipped} later firing(s) skipped")),
+    }
+    match count(adk_kernel::COALESCED_LABEL) {
+        0 => {}
+        coalesced => notes.push(format!("{coalesced} later firing(s) coalesced into it")),
     }
     if let Some(goal) = &process.view.goal {
         let mut text = format!("goal {}/{}", goal.iteration, goal.max_iterations);
@@ -1155,6 +1258,9 @@ fn event_line(record: &EventRecord) -> String {
                 Some(adk_kernel::WakeOutcome::Spawned { .. }) => " (spawned)",
                 Some(adk_kernel::WakeOutcome::Deduplicated { .. }) => " (already used)",
                 Some(adk_kernel::WakeOutcome::Expired { .. }) => " (expired)",
+                Some(adk_kernel::WakeOutcome::Skipped { .. }) => " (skipped: still unfinished)",
+                Some(adk_kernel::WakeOutcome::Coalesced { .. }) => " (coalesced into it)",
+                Some(adk_kernel::WakeOutcome::Missed { .. }) => " (missed: too late)",
                 _ => "",
             };
             format!("{source} {key} → {}{what}", pid.as_deref().unwrap_or("nothing"))
@@ -1192,6 +1298,10 @@ fn event_line(record: &EventRecord) -> String {
             "{id} {}{}",
             state.as_str(),
             reason.as_deref().map(|reason| format!(" ({reason})")).unwrap_or_default()
+        ),
+        KernelEvent::Subagent { pid, id, name, parent, status } => format!(
+            "sub-agent {name} ({id}) {status} · run {pid}{}",
+            parent.as_deref().map(|parent| format!(" · started by {parent}")).unwrap_or_default()
         ),
         other => other.name().to_string(),
     };
@@ -1352,6 +1462,160 @@ mod tests {
         assert!(shown.starts_with("run-1"), "{shown}");
         assert!(shown.contains("suspended: freeze · goal 3/10, check exit 1"), "{shown}");
         assert!(shown.contains("background"), "{shown}");
+    }
+
+    /// LIVE on Anthropic `claude-haiku-5-5`: a kernel agent woken by a jittered cron tick, then
+    /// by `adk-rust run-now` over the control socket. The tick's wake is keyed by its scheduled
+    /// time and routed no earlier than its offset; the run now wakes a cron sleeper without
+    /// moving the expression's schedule.
+    ///
+    /// ```text
+    /// ANTHROPIC_API_KEY=... cargo test -p adk-cli --bin adk-rust live_a_kernel_agent -- --ignored --nocapture
+    /// ```
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "live: needs ANTHROPIC_API_KEY"]
+    async fn live_a_kernel_agent_wakes_on_a_jittered_tick_and_on_run_now() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use adk_core::schedule::{Jitter, ScheduleSpec};
+        use adk_core::{
+            DurableRunStore, InMemoryRunStore, Llm, MissedFirePolicy, NewRun, RunFilter, RunState,
+        };
+        use adk_kernel::control::ControlPlaneConfig;
+        use adk_kernel::{Kernel, KernelConfig, ProcessSpec, Trigger, Wake, WakeEvent};
+
+        let key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY");
+        let model: Arc<dyn Llm> = Arc::new(
+            adk_model::anthropic::AnthropicClient::new(adk_model::anthropic::AnthropicConfig::new(
+                key,
+                "claude-haiku-5-5",
+            ))
+            .unwrap(),
+        );
+        let agent = adk_agent::LlmAgentBuilder::new("cron_agent")
+            .instruction("You run on a schedule. Answer in one short sentence that says what woke you, read from the kernel wake notice.")
+            .model(model)
+            .build()
+            .unwrap();
+        let runner = Arc::new(
+            adk_runner::Runner::builder()
+                .app_name("adk-rust")
+                .agent(Arc::new(agent))
+                .session_service(Arc::new(adk_session::InMemorySessionService::new()))
+                .build()
+                .unwrap(),
+        );
+        let home = tempfile::tempdir().unwrap();
+        let runs: Arc<dyn DurableRunStore> = Arc::new(InMemoryRunStore::new());
+        let jitter = Jitter::new(50, Duration::from_secs(9 * 60));
+        let pulse = "*/20 * * * * *";
+        let kernel = Kernel::builder()
+            .config(
+                KernelConfig::default()
+                    .with_home(home.path())
+                    .with_scheduler_tick(Duration::from_millis(200))
+                    .with_cron_jitter(jitter)
+                    .with_control(ControlPlaneConfig::default()),
+            )
+            .run_store(Arc::clone(&runs))
+            .agent(APP_TARGET, runner)
+            .trigger(Trigger::new(
+                "pulse",
+                Wake::Cron { expr: pulse.into(), missed: MissedFirePolicy::Skip },
+                NewRun::new(
+                    "background",
+                    "adk-rust",
+                    "alice",
+                    APP_TARGET,
+                    serde_json::json!({ "text": "The pulse schedule fired." }),
+                ),
+            ))
+            .build()
+            .unwrap();
+        kernel.start().await.unwrap();
+
+        // 1. The jittered tick.
+        let started = std::time::Instant::now();
+        let (wake_run, fired) = loop {
+            let all = runs.list(RunFilter::default()).await.unwrap();
+            let fired = all.iter().find(|run| {
+                run.target == APP_TARGET
+                    && run.state == RunState::Completed
+                    && run.idempotency_key.as_deref().is_some_and(|key| key.starts_with("cron:"))
+            });
+            if let Some(fired) = fired {
+                let wake_key = fired.idempotency_key.as_deref().unwrap().split('#').next().unwrap();
+                let wake_run = all
+                    .iter()
+                    .find(|run| run.idempotency_key.as_deref() == Some(wake_key))
+                    .unwrap()
+                    .clone();
+                break (wake_run, fired.clone());
+            }
+            assert!(started.elapsed() < Duration::from_secs(90), "no pulse ran");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+        let event: WakeEvent = serde_json::from_value(wake_run.input.clone()).unwrap();
+        let at: chrono::DateTime<Utc> =
+            event.payload["scheduled_for"].as_str().unwrap().parse().unwrap();
+        let spec = ScheduleSpec::Cron { expr: pulse.into(), timezone: "UTC".into() };
+        let offset = jitter.salted("adk-rust").offset_in(&spec, event.source.as_str(), at);
+        println!(
+            "tick {} scheduled {at}, offset {offset:?}, not before {:?}; trigger run enqueued {}, result {:?}",
+            event.key, event.not_before, fired.created_at, fired.result
+        );
+        assert_eq!(
+            event.key,
+            adk_kernel::keys::cron(&event.source, at),
+            "keyed by the scheduled time"
+        );
+        assert!(offset < Duration::from_secs(10), "under half the 20 s gap");
+        if !offset.is_zero() {
+            let release = at + chrono::Duration::from_std(offset).unwrap();
+            assert_eq!(event.not_before, Some(release));
+            assert!(fired.created_at >= release, "routed no earlier than the offset");
+        }
+
+        // 2. Run now through the CLI, on a sleeper whose cron fires once a year.
+        let yearly = "0 0 0 1 1 *";
+        let sleeper = kernel
+            .processes()
+            .spawn(
+                NewRun::new(
+                    "background",
+                    "adk-rust",
+                    "alice",
+                    APP_TARGET,
+                    serde_json::json!({ "text": "The yearly report schedule woke you." }),
+                ),
+                ProcessSpec::new(ProcessKind::Scheduled).with_wake(WakeSet::any_of([Wake::Cron {
+                    expr: yearly.into(),
+                    missed: MissedFirePolicy::Skip,
+                }])),
+            )
+            .await
+            .unwrap()
+            .meta
+            .pid;
+        while runs.get(&sleeper).await.unwrap().map(|run| run.state) != Some(RunState::Waiting) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let target =
+            KernelTarget { home: Some(home.path().to_path_buf()), ..KernelTarget::default() };
+        run_now(&target, Some(&sleeper), None, Some("live-1")).await.unwrap();
+        let started = std::time::Instant::now();
+        let done = loop {
+            let run = runs.get(&sleeper).await.unwrap().unwrap();
+            if run.state.is_terminal() {
+                break run;
+            }
+            assert!(started.elapsed() < Duration::from_secs(90), "the run now did not finish");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+        println!("run now of {sleeper}: {:?}, result {:?}", done.state, done.result);
+        assert_eq!(done.state, RunState::Completed);
+        kernel.stop().await.unwrap();
     }
 }
 

@@ -9,28 +9,391 @@
 [![GitHub Discussions](https://img.shields.io/github/discussions/zavora-ai/adk-rust?style=flat&logo=github&color=5865F2)](https://github.com/zavora-ai/adk-rust/discussions)
 [![Sponsors](https://img.shields.io/github/sponsors/zavora-ai?logo=githubsponsors&color=EA4AAA)](https://github.com/sponsors/zavora-ai)
 
-A production-ready Rust framework for building AI agents. Model-agnostic, type-safe
-and async, across 49 publishable crates for agent orchestration.
+A Rust framework for building AI agents, including agents that work on their own inside limits
+you set. Model-agnostic, type-safe and async, across 51 publishable crates for agent
+orchestration.
 
 > **v3.0.0 release candidate — unpublished.** This major release carries breaking
 > API changes: tool calls run through one governed path, the server binds `127.0.0.1`
 > and refuses unlisted hosts and origins by default, and run budgets, durable runs,
-> approvals, and audit records join the runtime. The published release is 2.3.0, with all
-> 43 crates on [crates.io](https://crates.io/crates/adk-rust/2.3.0).
+> approvals, and audit records join the runtime, with the harness, the agent kernel and
+> agent surfaces on top. The published release is 2.3.0, with all 43 crates on
+> [crates.io](https://crates.io/crates/adk-rust/2.3.0); `adk-harness`, `adk-kernel`,
+> `adk-surface`, `adk-site`, `adk-drivers`, `adk-website`, `adk-vision`, and `adk-vision-sam-codec` are new in 3.0.0.
 >
 > **Milestone:** ADK-Rust has crossed **500K total crates.io downloads** across
 > the workspace crates.
 >
+> [What's new in 3.0](docs/official_docs/whats-new-3.0.md) lists every area the release adds.
 > Coming from 2.x: see the [2.x to 3.0 migration guide](docs/official_docs/migration/2.x-to-3.0.md)
 > and the [CHANGELOG](CHANGELOG.md). Coming from 1.x: start with the
 > [1.0 to 2.0 guide](docs/official_docs/migration/1.0-to-2.0.md).
+
+## What 3.0 gives you: autonomous agents
+
+An autonomous agent pursues a goal over many steps, wakes itself, and keeps working while nobody
+watches. 3.0 makes that safe to run:
+
+| Property | What you get | Guide |
+|----------|--------------|-------|
+| **Autonomous** | A goal iterates until its check passes, parks on a decision and resumes at the same iteration; the kernel wakes an agent on a schedule, a file change, a webhook, a queue message, an approval or a finished run | [plans and goals](docs/official_docs/harness/plan-and-goals.md#goals), [wake-ups](docs/official_docs/core/wake-ups.md) |
+| **Governed** | Every tool call from every agent passes one path: tool policies (default-deny with `DeclarativePolicy`), approvals that hold a call across runs, run budgets and a daily spend cap, a kill switch that freezes every replica, an OS sandbox for the shell, and a signed audit log | [tool authorization](docs/official_docs/security/tool-authorization.md) |
+| **Durable** | A run resumes from its checkpoint after a crash; a held call survives a restart and runs once when approved; the action ledger keeps a non-idempotent call from running twice | [durable runtime](docs/official_docs/core/durable-runtime.md) |
+| **Observable and steerable** | OpenTelemetry spans, the spend ledger, and `adk-rust ps` and `top` over the kernel's processes; a message sent to a running turn from code (`Runner::steer`), a surface or the kernel's control plane | [telemetry](docs/official_docs/observability/telemetry.md), [steering](docs/official_docs/surfaces/index.md#steering-a-running-turn) |
+| **Always on** | `adk-rust up` runs the harness as the agent kernel; the web home, the terminal, a phone and chat channels attach to the same running state | [kernel](docs/official_docs/kernel/index.md), [surfaces](docs/official_docs/surfaces/index.md) |
+
+Start with **[Build an autonomous agent](docs/official_docs/autonomy/index.md)**: one agent from a
+scaffold to running on its own, and which runtime fits your deployment.
+
+---
+
+## Build and test an agent in five minutes
+
+Scaffold an OpenAI agent with the HTTP runtime:
+
+```bash
+cargo install cargo-adk
+cargo adk new quickstart_agent --template api --provider openai
+cd quickstart_agent
+cp .env.example .env
+# Open .env and replace the OPENAI_API_KEY placeholder, then:
+cargo run
+```
+
+> **Note:** until 3.0.0 is on crates.io, `cargo install cargo-adk` installs 2.3.0. To scaffold a
+> 3.0 project, install from a clone (`cargo install --locked --path cargo-adk`; on Linux the clone's
+> `.cargo/config.toml` links with `clang` and `wild`) and point the generated project at the clone —
+> see [Before 3.0.0 is published](docs/official_docs/quickstart.md#before-300-is-published).
+
+The server listens on `127.0.0.1:8080` (set `BIND_HOST=0.0.0.0` to listen on every interface).
+Confirm it with:
+
+```bash
+curl -fsS http://127.0.0.1:8080/api/health
+```
+
+For a page where you talk to your agents, decide what they ask to do and review what they
+did, install the CLI with `cargo install adk-cli` (before 3.0.0 is published it installs 2.3.0, so
+install from the clone as above); `adk-rust serve` serves
+[the web home](docs/official_docs/surfaces/web-home.md) at
+[http://127.0.0.1:8080/ui/](http://127.0.0.1:8080/ui/): Threads, Today and Memory & rules, in
+light and dark.
+
+![The web home: agents, a thread with a decision waiting, and the Decisions list](docs/official_docs/images/surfaces/web-threads-light.png)
+
+The [five-minute quickstart](docs/official_docs/quickstart.md) explains the
+generated files and the console-only alternative.
+
+### Add ADK-Rust to an existing project
+
+```toml
+[dependencies]
+adk-rust = "3.0.0"                                        # Gemini, agents, runner, sessions
+# adk-rust = { version = "3.0.0", features = ["standard"] }  # + server, auth, graph, eval
+```
+
+| Tier | Includes | Use case |
+|------|----------|----------|
+| `minimal` (default) | Gemini provider, agents, runner, sessions | Fast starter agents |
+| `standard` | minimal + OpenAI, Anthropic, tools, memory, telemetry, server, auth, graph, eval, guardrail, plugins, artifacts, skills, computer use | Serving an agent over HTTP |
+| `enterprise` | standard + realtime, browser, RAG, payments, AWP, and `autonomy`: the harness and its kernel, background runs with cron and webhook wake-ups, approvals, SQLite stores, and the signed audit log | Voice, retrieval, payments, and unattended agents |
+| `full` | enterprise + audio, code execution, sandbox, code tools, the AWP website, vision, and the functional, node-cache, delta, time-travel and YAML graph capabilities | Everything that needs no external infrastructure |
+
+A tier is a starting point, not a ceiling. Add any single capability on top of one
+without moving to the next tier, so `features = ["minimal", "audio"]` gives you the
+minimal build plus audio. [`adk-rust/Cargo.toml`](adk-rust/Cargo.toml) lists every feature you
+can add this way.
+
+## One agent, end to end
+
+```rust
+use adk_rust::prelude::*;
+use adk_rust::Launcher;
+
+#[tokio::main]
+async fn main() -> AnyhowResult<()> {
+    dotenvy::dotenv().ok();
+    let model = GeminiModel::new(&std::env::var("GOOGLE_API_KEY")?, "gemini-3.8-flash")?;
+
+    let agent = LlmAgentBuilder::new("assistant")
+        .instruction("You are a helpful assistant. Be concise and accurate.")
+        .model(Arc::new(model))
+        .build()?;
+
+    Launcher::new(Arc::new(agent)).run().await?;
+    Ok(())
+}
+```
+
+Swap the provider by swapping the client. The agent, runner and tools are unchanged:
+
+| Provider | Client | Feature | Key |
+|----------|--------|---------|-----|
+| Gemini | `GeminiModel::new(key, model)` | default | `GOOGLE_API_KEY` |
+| OpenAI | `OpenAIClient::new(OpenAIConfig::new(key, model))` | `openai` | `OPENAI_API_KEY` |
+| OpenAI Responses | `OpenAIResponsesClient::new(OpenAIResponsesConfig::new(key, model))` | `openai` | `OPENAI_API_KEY` |
+| Anthropic | `AnthropicClient::new(AnthropicConfig::new(key, model))` | `anthropic` | `ANTHROPIC_API_KEY` |
+| DeepSeek | `DeepSeekClient::chat(key)` | `deepseek` | `DEEPSEEK_API_KEY` |
+| Groq | `GroqClient::new(GroqConfig::gpt_oss_120b(key))` | `groq` | `GROQ_API_KEY` |
+| Ollama | `OllamaModel::new(OllamaConfig::new(model))` | `ollama` | none |
+| Bedrock | `BedrockClient::new(BedrockConfig::new(region, model_id)).await?` | `bedrock` | AWS credential chain |
+| mistral.rs | `MistralRsModel::new(config).await?` | `adk-mistralrs` | none, local |
+
+Or let it choose: `adk_rust::run(instructions, input)` picks a provider from the
+environment, among those you compiled in.
+
+### Models
+
+| Provider | Model Examples | Feature Flag |
+|----------|---------------|--------------|
+| Gemini | `gemini-3.8-flash` (default), `gemini-4-hydrogen`, `gemini-4-carbon`, `gemini-4-argon`, `gemini-3.5-flash-lite` | (default) |
+| OpenAI | `gpt-6.1-sol` (default), `gpt-6-astra`, `gpt-6.1-terra`, `gpt-6-luna`, `gpt-5.6-terra` | `openai` |
+| OpenAI Responses API | `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-luna`, `gpt-5.6-terra` | `openai` |
+| Anthropic | `claude-sonnet-5-5` (default), `claude-fable-5-2`, `claude-opus-5-5`, `claude-haiku-5-5` | `anthropic` |
+| DeepSeek | `deepseek-flash` (default; `deepseek-v4-flash` is accepted), `deepseek-v4-pro` | `deepseek` |
+| Groq | `openai/gpt-oss-120b`, `openai/gpt-oss-20b` | `groq` |
+| Ollama | `qwen3.6:35b-a3b`, `qwen3.5`, `llama3.2:3b` | `ollama` |
+| Fireworks AI | `accounts/fireworks/models/kimi-k3` | `openai` (preset) |
+| Together AI | `moonshotai/Kimi-K3.1-Pro` | `openai` (preset) |
+| Mistral AI | `mistral-large-latest` | `openai` (preset) |
+| Perplexity | `sonar-pro` | `openai` (preset) |
+| Cerebras | `gpt-oss-120b` | `openai` (preset) |
+| SambaNova | `gpt-oss-120b` | `openai` (preset) |
+| xAI (Grok) | `grok-4.7` | `openai` (preset) |
+| OrcaRouter | `openai/gpt-5.6-terra`, `anthropic/claude-sonnet-5-5` | `openai` (preset) |
+| API Route | (listed by `GET /v1/models`) | `openai` (preset) |
+| Amazon Bedrock | `us.anthropic.claude-sonnet-5-5`, `global.anthropic.claude-fable-5-2` | `bedrock` |
+| Azure AI Inference | (endpoint-specific) | `azure-ai` |
+| mistral.rs | **Gemma 4**, Phi-3, Llama, Qwen 3.5, Voxtral, FLUX | `adk-mistralrs` |
+
+Defaults are curated in `adk_model::catalog` and were checked on 17 November 2026.
+Deployment-scoped providers such as Bedrock and Azure AI still require the model
+or deployment identifier available in your own account and region.
+
+Use `adk_model::catalog::recommended_model(provider)` for ADK's portable default,
+`MODEL_CATALOG` for user-facing pickers, and `validate_model_selection` when
+accepting configuration. Unknown IDs remain valid for private deployments and
+new releases; known retired IDs include an actionable replacement.
+
+## What you can build
+
+Each row links to its guide and names a runnable example. An example named without a path
+lives in [adk-playground](https://github.com/zavora-ai/adk-playground).
+
+| Capability | Guide | Example |
+|------------|-------|---------|
+| The web home — Threads, Today and Memory & rules: decisions with full detail, what happened while you were away, what your agents may do, and Stop all; a developer panel with topology, protocols, state and telemetry | [web home](docs/official_docs/surfaces/web-home.md) | `adk-rust serve`, `adk-rust up` |
+| Tools — `#[tool]` derives the JSON schema from your argument type | [tools](docs/official_docs/tools/function-tools.md) | `coding_agent` |
+| MCP clients and servers on `rmcp` 3 — tools, resources, prompts, elicitation, tasks | [mcp](docs/official_docs/mcp/index.md) | `mcp_protocol_revisions` |
+| Workflow agents — sequential, parallel, loop | [agents](docs/official_docs/agents/workflow-agents.md) | `multi_perspective_analysis` |
+| Portable teams — validated handoff, delegation, policies, receipts and shared state | [multi-agent](docs/official_docs/agents/multi-agent.md) | `team_architectures` |
+| Graph workflows — checkpoints, durable resume, human-in-the-loop, subgraphs | [graph-agents](docs/official_docs/agents/graph-agents.md) | `graph_subgraph_claims` |
+| The harness — a governed coding agent: modes, approvals remembered per user, a sandboxed shell, team members, plan graphs and durable goals | [harness](docs/official_docs/harness/index.md) | [`examples/harness_openai`](examples/harness_openai), [`examples/harness_anthropic`](examples/harness_anthropic) |
+| Coding agents — read, edit and run code in a confined workspace | [coding-agent](docs/official_docs/coding-agent/index.md) | `coding_goal` |
+| Realtime voice and video — OpenAI Realtime, Gemini Live, Vertex, LiveKit, WebRTC | [realtime](docs/official_docs/agents/realtime-agents.md) | `realtime_voice` |
+| Governed computer use — approval interrupts bound to a digest | [computer-use](docs/official_docs/computer-use/index.md) | — |
+| RAG — chunking, embeddings, vector search, 6 backends | [rag](docs/official_docs/tools/rag.md) | — |
+| Memory — semantic search, project isolation, a bi-temporal knowledge graph | [memory](docs/official_docs/tools/memory-tools.md) | [`examples/skill_memory_improvements`](examples/skill_memory_improvements) |
+| Servers — REST with SSE, A2A v1.0.0, durable background runs, cron, webhook wake-ups, approvals | [deployment](docs/official_docs/deployment/server.md) | `background_runs` |
+| Governance — tool policies, a replicated kill switch, run budgets, a spend ledger, an action ledger, and signed audit logs | [tool authorization](docs/official_docs/security/tool-authorization.md) | `durable_company` |
+| Gemini Enterprise Agent Platform — Agent Engine BYOC, managed state, memory, artifacts, telemetry and sandbox | [agent-engine](docs/official_docs/deployment/agent-engine.md) | `vertex_sandbox` |
+| Agentic Web Protocol 2.0 — signed site contracts and releases, verified agent identity, capabilities over A2A, MCP and HTTP, `awp verify` | [awp](docs/official_docs/deployment/awp.md) | `awp_agent` (AWP 1.x) |
+| AWP websites — a static, signed site with an agent edge, run by a team of agents inside its owner's charter; migration from WordPress | [website quickstart](docs/official_docs/deployment/website-quickstart.md) | [`examples/website`](examples/website) |
+| Agentic commerce — ACP and AP2 with durable journals | [payments](docs/official_docs/security/payments.md) | `payments` |
+| Editor interop — use an ACP coding agent as a tool, or expose yours | [acp](docs/official_docs/acp/index.md) | — |
+| Browser automation — WebDriver tools for navigation, extraction, forms, and screenshots | [browser-tools](docs/official_docs/tools/browser-tools.md) | — |
+| Evaluation — trajectory, rubric, LLM-judge, A/B, CI output | [evaluation](docs/official_docs/evaluation/evaluation.md) | `eval_showcase` |
+| Guardrails, RBAC, SSO, audit logging | [security](docs/official_docs/security/access-control.md) | — |
+| Observability — OpenTelemetry tracing, structured logging | [observability](docs/official_docs/observability/telemetry.md) | `advanced_agents` |
+
+### Scaffold a project
+
+```bash
+cargo install cargo-adk
+
+cargo adk new my-agent                       # basic Gemini agent (alias for --template llm)
+cargo adk new my-agent --template tools      # agent with #[tool] custom tools
+cargo adk new my-agent --template rag        # RAG with vector search
+cargo adk new my-agent --template api        # REST server
+cargo adk new my-agent --template graph      # graph workflow with checkpoints
+cargo adk new my-agent --template realtime   # realtime voice agent
+cargo adk new my-agent --template agent-engine # Gemini Enterprise Agent Engine BYOC
+cargo adk new my-agent --template harness    # governed harness: REPL with approvals, AGENTS.md, skills
+cargo adk new my-agent --template autonomous # unattended agent: goals and a schedule on the kernel, durable stores
+cargo adk new my-site --template website     # AWP 2.0 website: content, theme, charter, data and its edge
+cargo adk new my-desk --template vision      # Document desk: perception on the device, a gated cloud describer
+
+# Compose addons with any template
+cargo adk new my-agent --template tools --addon telemetry --addon sessions
+cargo adk new my-agent --addon mcp --addon guardrails
+
+cd my-agent
+cp .env.example .env    # add your API key
+cargo run
+```
+
+**Agent types** — the core agent structure.
+
+| Template | What you get |
+|----------|--------------|
+| `llm` (alias `basic`) | Single LLM agent with tool calling |
+| `tools` | LLM agent with `#[tool]` custom tools |
+| `sequential` | Multi-agent pipeline executing in order |
+| `parallel` | Parallel execution with result aggregation |
+| `loop` | Iterates until a condition is met |
+| `conditional` | Routes based on LLM decisions |
+| `graph` | Graph workflow with an agent node and per-step checkpoints |
+| `realtime` | Gemini Live voice agent with transcripts |
+| `rag` | Vector search over a knowledge base |
+| `api` | REST server exposing the agent over HTTP |
+| `agent-engine` | Gemini Enterprise Agent Engine BYOC container and Terraform deployment |
+| `openai` | OpenAI-powered agent |
+| `custom` | Manual `Agent` trait implementation |
+| `harness` | Governed harness agent: modes, approvals, a shell, `AGENTS.md` and skills, at the console or served |
+| `autonomous` | An agent that runs unattended: a rubric-graded goal and a schedule on the kernel, durable stores, an approval-gated side effect, a budget and the OS sandbox |
+| `website` | An AWP 2.0 site project and the edge binary that serves it |
+| `vision` | A Document desk: on-device readers and a cloud describer behind the egress gate |
+
+**Enterprise patterns** — pre-composed, several capabilities already wired together.
+
+| Template | What you get |
+|----------|--------------|
+| `production` | LLM agent with server, auth, sessions and telemetry |
+| `multi-agent` | Supervisor over sub-agents, with telemetry |
+| `pipeline` | Sequential data processing with session state |
+| `chatbot` | Conversational agent with memory and an HTTP interface |
+| `a2a-server` (alias `a2a`) | A2A protocol server with session management |
+| `managed-agents` | Anthropic Managed Agents API session with SSE streaming |
+
+**Addons** — composable with any template, and with each other.
+
+| Addon | Adds |
+|-------|------|
+| `telemetry` | OpenTelemetry tracing |
+| `auth` | API key and JWT authentication |
+| `sessions` | Session state management |
+| `memory` | Semantic memory and RAG |
+| `mcp` | MCP tool integration |
+| `guardrails` | Input and output validation |
+| `eval` | Evaluation framework |
+| `browser` | Browser automation |
+| `server` | HTTP server with A2A |
+
+`cargo adk build` compiles the project without deploying, and `cargo adk validate`
+checks an agent definition without building. `cargo adk templates` and
+`cargo adk addons` print these lists.
+
+## Crates
+
+| Crate | Purpose | Key Features |
+|-------|---------|--------------|
+| `adk-core` | Foundational traits and types | `Agent`, `Tool`, `Llm`, `Content`, `Event`, `AdkError`, the governed tool path, agent identity, budgets, and durable runtime contracts |
+| `adk-agent` | Agent implementations | `LlmAgent`, workflow agents, and portable `TeamSpec` / `CompiledTeam` composition |
+| `adk-skill` | AgentSkills parsing and selection | Skill markdown parser, `.skills` discovery/indexing, lexical matching, prompt injection helpers |
+| `adk-model` | LLM integrations | Gemini, OpenAI, Anthropic, DeepSeek, Groq, Ollama, Bedrock, Azure AI + OpenAI-compatible presets (Fireworks, Together, Mistral, Perplexity, Cerebras, SambaNova, xAI, OrcaRouter, API Route) |
+| `adk-gemini` | Gemini client | Google Gemini API client with streaming and multimodal support |
+| `adk-gcp` | Shared Google Cloud plumbing | ADC credential caching, bounded REST transport, Vertex resource names, and LRO polling |
+| `adk-anthropic` | Anthropic client | Dedicated Anthropic API client with streaming, thinking, caching, citations, vision, PDF, pricing |
+| `adk-mistralrs` | Native local inference | mistral.rs v0.8 — **Gemma 4**, Qwen 3.5, Voxtral, ISQ/MXFP4 quantization, LoRA adapters |
+| `adk-tool` | Tool system and extensibility | Typed Rust tools, provider-native tools, MCP clients and server SDK, and Vertex AI Example Store |
+| `adk-devtools` | Coding-agent dev tools | `read_file`/`write_file`/`edit_file`/`glob`/`grep`/`bash` as a `DevToolset`, scoped to a sandboxed `Workspace` |
+| `adk-session` | Session and state management | In-memory, SQLite, PostgreSQL, Redis, MongoDB, Firestore, Neo4j, and Vertex AI backends; encrypted sessions; durable stores (spend, action, approval, audit, lease, run, schedule, governance) on every backend |
+| `adk-artifact` | Binary artifacts for agents | In-memory and GCS storage, versioning, MIME types, and image/PDF/video support |
+| `adk-memory` | Long-term memory | Semantic stores, Vertex AI Memory Bank, project isolation, and bi-temporal knowledge graphs |
+| `adk-payments` | Agentic commerce orchestration | ACP/AP2 adapters, canonical transaction kernel, durable journals, evidence-backed payment flows |
+| `awp-types` | AWP protocol types | AWP 2.0 site contract, keys, releases, capabilities, status, events, consent, charter and signals, with JSON Schemas; the AWP 1.x types — zero `adk-*` deps |
+| `adk-awp` | Agentic Web Protocol implementation | AWP 2.0 routes and version negotiation, capabilities as tools, signing and the static bundle, the verifier and conformance kit; the AWP 1.x routes behind `awp-v1` |
+| `adk-site` | Site pipeline (Experimental) | Content, the built-in and sandboxed external generators, the launch gate, signed releases and the site log, host adapters, migration, constant updates |
+| `adk-drivers` | Service drivers (Experimental) | DNS and registrar, email, analytics and search console, social and advertising, as kernel driver manifests with conformance suites |
+| `adk-website` | The AWP website product (Experimental) | Site kinds, the team of eight agents, onboarding, capability packs, playbooks, incidents, alarms, the weekly review and deployment shapes |
+| `adk-vision` | Local-first perception (Experimental) | Regions in source pixels with their transform chains, model manifests pinned by revision and SHA-256, detection, segmentation, document, embedding, description, tracking and editing traits with conformance suites, crop escalation and the egress gate |
+| `adk-vision-sam-codec` | Meta `sam-3.1` mask codec (Experimental, SAM License) | A Rust port of the mask codec in Meta's `@meta-sam/parser`, distributed under the SAM License rather than Apache-2.0; `adk-vision` reaches it through the opt-in `sam-codec` feature after recorded licence acceptance |
+| `adk-acp` | Agent Client Protocol integration | Official stable v1 client and server, one-shot and persistent sessions, streaming, cancellation, async permissions, client files and terminals, per-session MCP, and editor-facing ADK agents |
+| `adk-rag` | RAG pipeline | Document chunking, embeddings, vector search, reranking, 6 backends |
+| `adk-runner` | Agent execution runtime | Event streaming, session persistence, transfer enforcement, plugins, run budgets, spend and action ledgers, durable cancellation, `Runner::close` |
+| `adk-server` | Production API servers | REST and SSE, A2A, loopback-first security defaults, durable background runs and cron, webhook wake-ups, approvals, governance endpoints, and Gemini Enterprise Agent Engine runtime dispatch |
+| `adk-harness` | Governed harness agent (Beta) | `HarnessAgent` over `LlmAgent`: modes, standing approvals, host or OS-sandboxed `bash`, todos, `AGENTS.md`, skills, team members, plan graphs, durable goals |
+| `adk-kernel` | Agent kernel (Beta) | Resident supervisor with a process table, wake sources (cron, file, webhook, queue, approval), an event bus, freeze across replicas, and a control plane; stores in memory and on SQLite, PostgreSQL, Redis, MongoDB, Firestore, and Neo4j |
+| `adk-surface` | Agent surfaces (Beta) | `SurfaceEngine` turns sessions, decisions, and activity into plain words for every surface; the web home and its HTTP API (`web`), agent-drawn forms and tables (`genui`), and the workflow observer |
+| `adk-cli` | Run and inspect agents from a terminal | `adk-rust` binary: interactive REPL, web server, coding agent (`code`/`goal`/`ultracode`), skills, graph checkpoint inspection, signed audit log verification; embeddable `Launcher` |
+| `adk-realtime` | Real-time voice & multimodal agents | OpenAI Realtime + Gemini Live, bidirectional audio, video frames, VAD, affective dialogue, server-side tools via `IntegratedRealtimeRunner` |
+| `adk-graph` | Graph-based workflows | LangGraph-style orchestration, state reducers, checkpointing (memory, SQLite, delta), durable resume, human-in-the-loop interrupts, subgraphs, `with_goto` routing, per-node retry and timeouts, time travel |
+| `adk-browser` | Browser automation | WebDriver tools for navigation, forms, screenshots, and PDF generation, with private-network and upload confinement |
+| `adk-computer-use` | Governed desktop automation | Deterministic graph over `computer-use-mcp`: parallel observation, digest-bound approval interrupts, single-executor mutation, verification; wire contracts + tamper-evident evaluation receipts |
+| `adk-eval` | Agent evaluation | Test definitions, trajectory validation, LLM-judged scoring, rubrics |
+| `adk-guardrail` | Runtime validation | Input/output checks, PII redaction, and argument-level tool allow/deny/revision |
+| `adk-auth` | Access control | Role-based permissions, declarative scope-based security, SSO/OAuth, audit logging |
+| `adk-sandbox` | Sandboxed code execution | Process/WASM backends, OS-level sandbox profiles (Seatbelt on macOS, bubblewrap on Linux, a restricted-token tier on Windows) |
+| `adk-telemetry` | Observability | OpenTelemetry tracing, structured logging, and Google Cloud export |
+| `adk-managed` | Managed agent runtime (Experimental) | Provider-neutral agent execution, event replay, custom tool calls and confirmations parked on durable runs; sessions survive process loss with durable stores |
+| `adk-enterprise` | Enterprise client SDK (Experimental) | HTTP/SSE client for managed agent service, zero runtime deps |
+| `adk-plugin` | Lifecycle hooks | `EnhancedPlugin` trait, tool and model interception, priority pipeline, shared `PluginContext` |
+| `adk-retry-reflect` | Retry and reflect plugin | Intercepts tool failures, injects reflection prompts, exponential backoff, circuit breaker |
+| `adk-action` | Action node types | 14 deterministic node types, `StandardProperties`, variable interpolation — the shared types behind `adk-graph`'s `ActionNodeExecutor` |
+| `adk-code` | Code execution substrate | Process, Docker, embedded runtimes, and Vertex AI Agent Engine managed sandboxes |
+| `adk-codeact-monty` | Python runtime for CodeAct (Experimental) | Pydantic Monty interpreter, sandboxed OS access, suspend and resume snapshots |
+| `adk-audio` | Audio processing | STT and TTS providers, Deepgram streaming, desktop capture and playback, VAD, ONNX models (Whisper, Moonshine, Kokoro) |
+| `adk-bench` | Benchmarking | Framework runtime performance against real LLM APIs, and cross-framework comparison with Python ADK |
+| `adk-deploy` | Deployment utilities | Targets, manifests, and Gemini Enterprise Agent Engine BYOC deployment |
+| `adk-rust-macros` | Procedural macros | `#[tool]` with `read_only`/`idempotent`/`concurrency_safe`/`long_running`/`lenient_args`, `#[entrypoint]` and `#[task]` for the functional API |
+| `cargo-adk` | Cargo subcommand | Project templates including the harness and Agent Engine BYOC, composable addons, eval runs, benchmarks, and deployment |
+| `adk-rust` | Umbrella crate | Re-exports every crate above behind tiered feature presets — the one dependency most projects need |
+
+> **Retired and extracted repos:** [adk-ui](https://github.com/zavora-ai/adk-ui) 3 builds on `adk-surface`'s `genui` feature with extension catalogs ([Agent-Drawn UI](docs/official_docs/surfaces/genui.md#extension-catalogs)); its 2.x line is retired. And [adk-studio](https://github.com/zavora-ai/adk-studio) is retired in favour of the workflow observer; [adk-playground](https://github.com/zavora-ai/adk-playground) holds more examples.
+
+## Performance
+
+Measured with `cargo adk bench` in June 2026, same model, workload, and prompt for every
+framework.
+
+| Framework | Cold Start | Agent Loop Overhead (mean) | Agent Loop Overhead (P95) | Peak RSS |
+|-----------|-----------|---------------------------|--------------------------|----------|
+| **ADK-Rust** | **109 ms** | **568 μs** | **615 μs** | ~15 MB |
+| Gemini Python SDK | 501 ms | 253 μs | 334 μs | 69.7 MB |
+| LangGraph | 502 ms | 1,228 ms | 1,228 ms | 92.7 MB |
+
+Cold start is process launch to first API call. Overhead is turn time minus the LLM
+round trip, for one tool call on a fresh session. Apple M-series, macOS, June 2026. Run it
+yourself with `cargo adk bench --dry-run` to see the cost estimate first.
+
+### Long sessions
+
+The framework's work per turn grows with the history a turn loads and sends the model: every
+model call carries the whole conversation, as stateless chat APIs require. `adk-bench`'s
+keyless long-history benchmark measures that cost with a scripted model that answers
+instantly, so the numbers below are the framework's own CPU time. A turn is a user message,
+one tool call and the answer, four events; an iteration is one tool call inside a single
+autonomous run.
+
+| Workload, 1,000 steps | Per step, first 100 | Per step, last 100 | Process CPU, whole run | Peak RSS |
+|-----------------------|---------------------|--------------------|------------------------|----------|
+| 1,000 turns, whole session (4,000 events at the end) | 0.18–0.26 ms | 4.7–6.2 ms | 2.3–2.7 s | 288–290 MB |
+| 1,000 turns, `history_max_events = 50` | 71–77 μs | 62–64 μs | 0.07 s | 20 MB |
+| One autonomous run, 1,000 tool calls (2,002 events) | 35–40 μs | 0.27–0.29 ms | 0.15–0.17 s | 27 MB |
+
+Release build, in-memory sessions, 200-byte tool results, Apple M4 (10 cores, 24 GB), macOS
+26.2, November 2026; process CPU time, ranges over three runs on a shared machine. Without a
+window, a turn stays under 1 ms until the session holds about 1,300 events (330 turns), then
+rises by about 1.5 ms per 1,000 more; `RunConfig::history_max_events` keeps it flat. The
+default SQLite store adds its own per-turn cost, decoding the stored session from JSON.
+Reproduce with:
+
+```bash
+cargo run -p adk-bench --release --example long_history -- turns 1000
+cargo run -p adk-bench --release --example long_history -- turns 1000 --window 50
+cargo run -p adk-bench --release --example long_history -- loop 1000
+```
+
+## Rust & Beyond podcast
+
+Each episode covers the release it shipped with; the numbers are that release's.
 
 ### 🎬 Rust & Beyond Podcast — Episode 3: Agents That Act
 
 **ADK-Rust v2.0.0 — Agents That Act.** Eight chapters on agents that run on their
 own and finish what they start: a workflow that resumes exactly where it stopped,
 a graph that changes course when the problem does, and approvals you can trust
-down to the digest. 42 crates, 4,300+ tests, sub-millisecond loop overhead.
+down to the digest. 42 crates, 4,300+ tests, sub-millisecond loop overhead on a fresh session.
 
 <a href="https://www.youtube.com/watch?v=RIh-M0W1CiQ">
   <img src="docs/podcast/episode-3-thumbnail.png" alt="▶ Watch Episode 3: ADK-Rust v2.0.0 — Agents That Act" width="100%">
@@ -58,6 +421,8 @@ down to the digest. 42 crates, 4,300+ tests, sub-millisecond loop overhead.
   approved is what runs
 - **What It Costs** — no automatic crash recovery, an unbounded child ledger, and why
   we kept two orchestration APIs when the other ADKs deprecated one
+  *(true of v2.0.0; in 3.0.0 a durable run resumes after a crash — see
+  [durable runtime](docs/official_docs/core/durable-runtime.md))*
 
 </details>
 
@@ -106,302 +471,6 @@ The episode 3 video and slides are not in the repository: the video alone is abo
 
 </details>
 
----
-
-## Build and test an agent in five minutes
-
-Scaffold an OpenAI agent with the HTTP runtime:
-
-```bash
-cargo install cargo-adk
-cargo adk new quickstart_agent --template api --provider openai
-cd quickstart_agent
-cp .env.example .env
-# Open .env and replace the OPENAI_API_KEY placeholder, then:
-cargo run
-```
-
-The server listens on `127.0.0.1:8080` (set `BIND_HOST=0.0.0.0` to listen on every interface).
-Confirm it with:
-
-```bash
-curl -fsS http://127.0.0.1:8080/api/health
-```
-
-For a page where you talk to your agents, decide what they ask to do and review what they
-did, `adk-rust serve` serves [the web home](docs/official_docs/surfaces/web-home.md) at
-[http://127.0.0.1:8080/ui/](http://127.0.0.1:8080/ui/): Threads, Today and Memory & rules, in
-light and dark.
-
-![The web home: agents, a thread with a decision waiting, and the Decisions list](docs/official_docs/images/surfaces/web-threads-light.png)
-
-The [five-minute quickstart](docs/official_docs/quickstart.md) explains the
-generated files and the console-only alternative.
-
-### Add ADK-Rust to an existing project
-
-```toml
-[dependencies]
-adk-rust = "3.0.0"                                        # Gemini, agents, runner, sessions
-# adk-rust = { version = "3.0.0", features = ["standard"] }  # + server, auth, graph, eval
-```
-
-| Tier | Includes | Use case |
-|------|----------|----------|
-| `minimal` (default) | Gemini provider, agents, runner, sessions | Fast starter agents |
-| `standard` | minimal + OpenAI, Anthropic, tools, memory, telemetry, server, auth, graph, eval, guardrail, plugins, artifacts, skills, computer use | Serving an agent over HTTP |
-| `enterprise` | standard + realtime, browser, RAG, payments, AWP | Voice, retrieval and payments |
-| `full` | enterprise + audio, code execution, sandbox, code tools, the harness and its kernel, the AWP website, and the functional, node-cache, delta, and time-travel graph capabilities | Everything that needs no external infrastructure |
-
-A tier is a starting point, not a ceiling. Add any single capability on top of one
-without moving to the next tier, so `features = ["minimal", "audio"]` gives you the
-minimal build plus audio. [`adk-rust/Cargo.toml`](adk-rust/Cargo.toml) lists every feature you
-can add this way.
-
-## One agent, end to end
-
-```rust
-use adk_rust::prelude::*;
-use adk_rust::Launcher;
-
-#[tokio::main]
-async fn main() -> AnyhowResult<()> {
-    dotenvy::dotenv().ok();
-    let model = GeminiModel::new(&std::env::var("GOOGLE_API_KEY")?, "gemini-3.7-flash")?;
-
-    let agent = LlmAgentBuilder::new("assistant")
-        .instruction("You are a helpful assistant. Be concise and accurate.")
-        .model(Arc::new(model))
-        .build()?;
-
-    Launcher::new(Arc::new(agent)).run().await?;
-    Ok(())
-}
-```
-
-Swap the provider by swapping the client. The agent, runner and tools are unchanged:
-
-| Provider | Client | Feature | Key |
-|----------|--------|---------|-----|
-| Gemini | `GeminiModel::new(key, model)` | default | `GOOGLE_API_KEY` |
-| OpenAI | `OpenAIClient::new(OpenAIConfig::new(key, model))` | `openai` | `OPENAI_API_KEY` |
-| OpenAI Responses | `OpenAIResponsesClient::new(OpenAIResponsesConfig::new(key, model))` | `openai` | `OPENAI_API_KEY` |
-| Anthropic | `AnthropicClient::new(AnthropicConfig::new(key, model))` | `anthropic` | `ANTHROPIC_API_KEY` |
-| DeepSeek | `DeepSeekClient::chat(key)` | `deepseek` | `DEEPSEEK_API_KEY` |
-| Groq | `GroqClient::new(GroqConfig::gpt_oss_120b(key))` | `groq` | `GROQ_API_KEY` |
-| Ollama | `OllamaModel::new(OllamaConfig::new(model))` | `ollama` | none |
-| Bedrock | `BedrockClient::new(BedrockConfig::new(region, model_id)).await?` | `bedrock` | AWS credential chain |
-| mistral.rs | `MistralRsModel::new(config).await?` | `adk-mistralrs` | none, local |
-
-Or let it choose: `adk_rust::run(instructions, input)` picks a provider from the
-environment, among those you compiled in.
-
-### Models
-
-| Provider | Model Examples | Feature Flag |
-|----------|---------------|--------------|
-| Gemini | `gemini-3.7-flash` (default), `gemini-3.6-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-pro-preview` | (default) |
-| OpenAI | `gpt-5.6-terra` (default), `gpt-5.6-sol`, `gpt-5.6-luna` | `openai` |
-| OpenAI Responses API | `gpt-5.6-terra`, `gpt-5.6-sol`, `gpt-5.6-luna` | `openai` |
-| Anthropic | `claude-sonnet-5` (default), `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1` | `anthropic` |
-| DeepSeek | `deepseek-flash` (default; `deepseek-v4-flash` is accepted), `deepseek-v4-pro` | `deepseek` |
-| Groq | `openai/gpt-oss-120b`, `openai/gpt-oss-20b` | `groq` |
-| Ollama | `qwen3.6:35b-a3b`, `qwen3.5`, `llama3.2:3b` | `ollama` |
-| Fireworks AI | `accounts/fireworks/models/kimi-k2p6` | `openai` (preset) |
-| Together AI | `MiniMaxAI/MiniMax-M2.7` | `openai` (preset) |
-| Mistral AI | `mistral-medium-latest` | `openai` (preset) |
-| Perplexity | `sonar-pro` | `openai` (preset) |
-| Cerebras | `gpt-oss-120b` | `openai` (preset) |
-| SambaNova | `gpt-oss-120b` | `openai` (preset) |
-| xAI (Grok) | `grok-4.6` | `openai` (preset) |
-| OrcaRouter | `openai/gpt-5.6-terra`, `anthropic/claude-sonnet-5` | `openai` (preset) |
-| Cheaper Inference | `gpt-5.4-mini`, `claude-sonnet-5` | `openai` (preset) |
-| API Route | (listed by `GET /v1/models`) | `openai` (preset) |
-| Amazon Bedrock | `anthropic.claude-sonnet-4-20250514-v1:0` | `bedrock` |
-| Azure AI Inference | (endpoint-specific) | `azure-ai` |
-| mistral.rs | **Gemma 4**, Phi-3, Llama, Qwen 3.5, Voxtral, FLUX | `adk-mistralrs` |
-
-Defaults are curated in `adk_model::catalog` and were checked on 23 August 2026.
-Deployment-scoped providers such as Bedrock and Azure AI still require the model
-or deployment identifier available in your own account and region.
-
-Use `adk_model::catalog::recommended_model(provider)` for ADK's portable default,
-`MODEL_CATALOG` for user-facing pickers, and `validate_model_selection` when
-accepting configuration. Unknown IDs remain valid for private deployments and
-new releases; known retired IDs include an actionable replacement.
-
-## What you can build
-
-Each row links to its guide and a runnable example.
-
-| Capability | Guide | Example |
-|------------|-------|---------|
-| The web home — Threads, Today and Memory & rules: decisions with full detail, what happened while you were away, what your agents may do, and Stop all; a developer panel with topology, protocols, state and telemetry | [web home](docs/official_docs/surfaces/web-home.md) | `adk-rust serve`, `adk-rust up` |
-| Tools — `#[tool]` derives the JSON schema from your argument type | [tools](docs/official_docs/tools/function-tools.md) | [`examples/coding_agent`](examples/coding_agent) |
-| MCP clients and servers on `rmcp 3.1` — tools, resources, prompts, elicitation, tasks | [mcp](docs/official_docs/mcp/index.md) | [`examples/mcp_protocol_revisions`](examples/mcp_protocol_revisions) |
-| Workflow agents — sequential, parallel, loop | [agents](docs/official_docs/agents/workflow-agents.md) | [`examples/multi_perspective_analysis`](examples/multi_perspective_analysis) |
-| Portable teams — validated handoff, delegation, policies, receipts and shared state | [multi-agent](docs/official_docs/agents/multi-agent.md) | [`examples/team_architectures`](examples/team_architectures) |
-| Graph workflows — checkpoints, durable resume, human-in-the-loop, subgraphs | [graph-agents](docs/official_docs/agents/graph-agents.md) | [`examples/graph_subgraph_claims`](examples/graph_subgraph_claims) |
-| The harness — a governed coding agent: modes, approvals remembered per user, a sandboxed shell, team members, plan graphs and durable goals | [harness](docs/official_docs/harness/index.md) | [`examples/harness_openai`](examples/harness_openai), [`examples/harness_anthropic`](examples/harness_anthropic) |
-| Coding agents — read, edit and run code in a confined workspace | [coding-agent](docs/official_docs/coding-agent/index.md) | [`examples/coding_goal`](examples/coding_goal) |
-| Realtime voice and video — OpenAI Realtime, Gemini Live, Vertex, LiveKit, WebRTC | [realtime](docs/official_docs/agents/realtime-agents.md) | [`examples/realtime_voice`](examples/realtime_voice) |
-| Governed computer use — approval interrupts bound to a digest | [computer-use](docs/official_docs/computer-use/index.md) | — |
-| RAG — chunking, embeddings, vector search, 6 backends | [rag](docs/official_docs/tools/rag.md) | — |
-| Memory — semantic search, project isolation, a bi-temporal knowledge graph | [memory](docs/official_docs/tools/memory-tools.md) | [`examples/skill_memory_improvements`](examples/skill_memory_improvements) |
-| Servers — REST with SSE, A2A v1.0.0, durable background runs, cron, webhook wake-ups, approvals | [deployment](docs/official_docs/deployment/server.md) | [`examples/background_runs`](examples/background_runs) |
-| Governance — tool policies, a replicated kill switch, run budgets, a spend ledger, an action ledger, and signed audit logs | [tool authorization](docs/official_docs/security/tool-authorization.md) | [`examples/durable_company`](examples/durable_company) |
-| Gemini Enterprise Agent Platform — Agent Engine BYOC, managed state, memory, artifacts, telemetry and sandbox | [agent-engine](docs/official_docs/deployment/agent-engine.md) | [`examples/vertex_sandbox`](examples/vertex_sandbox) |
-| Agentic Web Protocol 2.0 — signed site contracts and releases, verified agent identity, capabilities over A2A, MCP and HTTP, `awp verify` | [awp](docs/official_docs/deployment/awp.md) | [`examples/awp_agent`](examples/awp_agent) (AWP 1.x) |
-| AWP websites — a static, signed site with an agent edge, run by a team of agents inside its owner's charter; migration from WordPress | [website quickstart](docs/official_docs/deployment/website-quickstart.md) | [`examples/website`](examples/website) |
-| Agentic commerce — ACP and AP2 with durable journals | [payments](docs/official_docs/security/payments.md) | [`examples/payments`](examples/payments) |
-| Editor interop — use an ACP coding agent as a tool, or expose yours | [acp](docs/official_docs/acp/index.md) | — |
-| Browser automation — WebDriver tools for navigation, extraction, forms, and screenshots | [browser-tools](docs/official_docs/tools/browser-tools.md) | — |
-| Evaluation — trajectory, rubric, LLM-judge, A/B, CI output | [evaluation](docs/official_docs/evaluation/evaluation.md) | [`examples/eval_showcase`](examples/eval_showcase) |
-| Guardrails, RBAC, SSO, audit logging | [security](docs/official_docs/security/access-control.md) | — |
-| Observability — OpenTelemetry tracing, structured logging | [observability](docs/official_docs/observability/telemetry.md) | [`examples/advanced_agents`](examples/advanced_agents) |
-
-### Scaffold a project
-
-```bash
-cargo install cargo-adk
-
-cargo adk new my-agent                       # basic Gemini agent (alias for --template llm)
-cargo adk new my-agent --template tools      # agent with #[tool] custom tools
-cargo adk new my-agent --template rag        # RAG with vector search
-cargo adk new my-agent --template api        # REST server
-cargo adk new my-agent --template graph      # graph workflow with checkpoints
-cargo adk new my-agent --template realtime   # realtime voice agent
-cargo adk new my-agent --template agent-engine # Gemini Enterprise Agent Engine BYOC
-cargo adk new my-agent --template harness    # governed harness: REPL with approvals, AGENTS.md, skills
-cargo adk new my-site --template website     # AWP 2.0 website: content, theme, charter, data and its edge
-
-# Compose addons with any template
-cargo adk new my-agent --template tools --addon telemetry --addon sessions
-cargo adk new my-agent --addon mcp --addon guardrails
-
-cd my-agent
-cp .env.example .env    # add your API key
-cargo run
-```
-
-**Agent types** — the core agent structure.
-
-| Template | What you get |
-|----------|--------------|
-| `llm` (alias `basic`) | Single LLM agent with tool calling |
-| `tools` | LLM agent with `#[tool]` custom tools |
-| `sequential` | Multi-agent pipeline executing in order |
-| `parallel` | Parallel execution with result aggregation |
-| `loop` | Iterates until a condition is met |
-| `conditional` | Routes based on LLM decisions |
-| `graph` | Graph workflow with an agent node and per-step checkpoints |
-| `realtime` | Gemini Live voice agent with transcripts |
-| `rag` | Vector search over a knowledge base |
-| `api` | REST server exposing the agent over HTTP |
-| `agent-engine` | Gemini Enterprise Agent Engine BYOC container and Terraform deployment |
-| `openai` | OpenAI-powered agent |
-| `custom` | Manual `Agent` trait implementation |
-
-**Enterprise patterns** — pre-composed, several capabilities already wired together.
-
-| Template | What you get |
-|----------|--------------|
-| `production` | LLM agent with server, auth, sessions and telemetry |
-| `multi-agent` | Supervisor over sub-agents, with telemetry |
-| `pipeline` | Sequential data processing with session state |
-| `chatbot` | Conversational agent with memory and an HTTP interface |
-| `a2a-server` (alias `a2a`) | A2A protocol server with session management |
-| `managed-agents` | Anthropic Managed Agents API session with SSE streaming |
-
-**Addons** — composable with any template, and with each other.
-
-| Addon | Adds |
-|-------|------|
-| `telemetry` | OpenTelemetry tracing |
-| `auth` | API key and JWT authentication |
-| `sessions` | Session state management |
-| `memory` | Semantic memory and RAG |
-| `mcp` | MCP tool integration |
-| `guardrails` | Input and output validation |
-| `eval` | Evaluation framework |
-| `browser` | Browser automation |
-| `server` | HTTP server with A2A |
-
-`cargo adk build` compiles the project without deploying, and `cargo adk validate`
-checks an agent definition without building. `cargo adk templates` and
-`cargo adk addons` print these lists.
-
-## Crates
-
-| Crate | Purpose | Key Features |
-|-------|---------|--------------|
-| `adk-core` | Foundational traits and types | `Agent`, `Tool`, `Llm`, `Content`, `Event`, `AdkError`, the governed tool path, agent identity, budgets, and durable runtime contracts |
-| `adk-agent` | Agent implementations | `LlmAgent`, workflow agents, and portable `TeamSpec` / `CompiledTeam` composition |
-| `adk-skill` | AgentSkills parsing and selection | Skill markdown parser, `.skills` discovery/indexing, lexical matching, prompt injection helpers |
-| `adk-model` | LLM integrations | Gemini, OpenAI, Anthropic, DeepSeek, Groq, Ollama, Bedrock, Azure AI + OpenAI-compatible presets (Fireworks, Together, Mistral, Perplexity, Cerebras, SambaNova, xAI, OrcaRouter, Cheaper Inference, API Route) |
-| `adk-gemini` | Gemini client | Google Gemini API client with streaming and multimodal support |
-| `adk-gcp` | Shared Google Cloud plumbing | ADC credential caching, bounded REST transport, Vertex resource names, and LRO polling |
-| `adk-anthropic` | Anthropic client | Dedicated Anthropic API client with streaming, thinking, caching, citations, vision, PDF, pricing |
-| `adk-mistralrs` | Native local inference | mistral.rs v0.8 — **Gemma 4**, Qwen 3.5, Voxtral, ISQ/MXFP4 quantization, LoRA adapters |
-| `adk-tool` | Tool system and extensibility | Typed Rust tools, provider-native tools, MCP clients and server SDK, and Vertex AI Example Store |
-| `adk-devtools` | Coding-agent dev tools | `read_file`/`write_file`/`edit_file`/`glob`/`grep`/`bash` as a `DevToolset`, scoped to a sandboxed `Workspace` |
-| `adk-session` | Session and state management | In-memory, SQLite, PostgreSQL, Redis, MongoDB, Firestore, Neo4j, and Vertex AI backends; encrypted sessions; durable stores (spend, action, approval, audit, lease, run, schedule, governance) on every backend |
-| `adk-artifact` | Binary artifacts for agents | In-memory and GCS storage, versioning, MIME types, and image/PDF/video support |
-| `adk-memory` | Long-term memory | Semantic stores, Vertex AI Memory Bank, project isolation, and bi-temporal knowledge graphs |
-| `adk-payments` | Agentic commerce orchestration | ACP/AP2 adapters, canonical transaction kernel, durable journals, evidence-backed payment flows |
-| `awp-types` | AWP protocol types | AWP 2.0 site contract, keys, releases, capabilities, status, events, consent, charter and signals, with JSON Schemas; the AWP 1.x types — zero `adk-*` deps |
-| `adk-awp` | Agentic Web Protocol implementation | AWP 2.0 routes and version negotiation, capabilities as tools, signing and the static bundle, the verifier and conformance kit; the AWP 1.x routes behind `awp-v1` |
-| `adk-site` | Site pipeline (Experimental) | Content, the built-in and sandboxed external generators, the launch gate, signed releases and the site log, host adapters, migration, constant updates |
-| `adk-drivers` | Service drivers (Experimental) | DNS and registrar, email, analytics and search console, social and advertising, as kernel driver manifests with conformance suites |
-| `adk-website` | The AWP website product (Experimental) | Site kinds, the team of eight agents, onboarding, capability packs, playbooks, incidents, alarms, the weekly review and deployment shapes |
-| `adk-acp` | Agent Client Protocol integration | Official stable v1 client and server, one-shot and persistent sessions, streaming, cancellation, async permissions, client files and terminals, per-session MCP, and editor-facing ADK agents |
-| `adk-rag` | RAG pipeline | Document chunking, embeddings, vector search, reranking, 6 backends |
-| `adk-runner` | Agent execution runtime | Event streaming, session persistence, transfer enforcement, plugins, run budgets, spend and action ledgers, durable cancellation, `Runner::close` |
-| `adk-server` | Production API servers | REST and SSE, A2A, loopback-first security defaults, durable background runs and cron, webhook wake-ups, approvals, governance endpoints, and Gemini Enterprise Agent Engine runtime dispatch |
-| `adk-harness` | Governed harness agent (Beta) | `HarnessAgent` over `LlmAgent`: modes, standing approvals, host or OS-sandboxed `bash`, todos, `AGENTS.md`, skills, team members, plan graphs, durable goals |
-| `adk-kernel` | Agent kernel (Beta) | Resident supervisor with a process table, wake sources (cron, file, webhook, queue, approval), an event bus, freeze across replicas, and a control plane; process stores on SQLite, PostgreSQL, and Redis |
-| `adk-surface` | Agent surfaces (Beta) | `SurfaceEngine` turns sessions, decisions, and activity into plain words for every surface; the web home and its HTTP API (`web`), agent-drawn forms and tables (`genui`), and the workflow observer |
-| `adk-cli` | Run and inspect agents from a terminal | `adk-rust` binary: interactive REPL, web server, coding agent (`code`/`goal`/`ultracode`), skills, graph checkpoint inspection, signed audit log verification; embeddable `Launcher` |
-| `adk-realtime` | Real-time voice & multimodal agents | OpenAI Realtime + Gemini Live, bidirectional audio, video frames, VAD, affective dialogue, server-side tools via `IntegratedRealtimeRunner` |
-| `adk-graph` | Graph-based workflows | LangGraph-style orchestration, state reducers, checkpointing (memory, SQLite, delta), durable resume, human-in-the-loop interrupts, subgraphs, `with_goto` routing, per-node retry and timeouts, time travel |
-| `adk-browser` | Browser automation | WebDriver tools for navigation, forms, screenshots, and PDF generation, with private-network and upload confinement |
-| `adk-computer-use` | Governed desktop automation | Deterministic graph over `computer-use-mcp`: parallel observation, digest-bound approval interrupts, single-executor mutation, verification; wire contracts + tamper-evident evaluation receipts |
-| `adk-eval` | Agent evaluation | Test definitions, trajectory validation, LLM-judged scoring, rubrics |
-| `adk-guardrail` | Runtime validation | Input/output checks, PII redaction, and argument-level tool allow/deny/revision |
-| `adk-auth` | Access control | Role-based permissions, declarative scope-based security, SSO/OAuth, audit logging |
-| `adk-sandbox` | Sandboxed code execution | Process/WASM backends, OS-level sandbox profiles (Seatbelt on macOS, bubblewrap on Linux, a restricted-token tier on Windows) |
-| `adk-telemetry` | Observability | OpenTelemetry tracing, structured logging, and Google Cloud export |
-| `adk-managed` | Managed agent runtime (Experimental) | Provider-neutral agent execution, event replay, custom tool calls and confirmations parked on durable runs; sessions survive process loss with durable stores |
-| `adk-enterprise` | Enterprise client SDK (Experimental) | HTTP/SSE client for managed agent service, zero runtime deps |
-| `adk-plugin` | Lifecycle hooks | `EnhancedPlugin` trait, tool and model interception, priority pipeline, shared `PluginContext` |
-| `adk-retry-reflect` | Retry and reflect plugin | Intercepts tool failures, injects reflection prompts, exponential backoff, circuit breaker |
-| `adk-action` | Action node types | 14 deterministic node types, `StandardProperties`, variable interpolation — the shared types behind `adk-graph`'s `ActionNodeExecutor` |
-| `adk-code` | Code execution substrate | Process, Docker, embedded runtimes, and Vertex AI Agent Engine managed sandboxes |
-| `adk-codeact-monty` | Python runtime for CodeAct (Experimental) | Pydantic Monty interpreter, sandboxed OS access, suspend and resume snapshots |
-| `adk-audio` | Audio processing | STT and TTS providers, Deepgram streaming, desktop capture and playback, VAD, ONNX models (Whisper, Moonshine, Kokoro) |
-| `adk-bench` | Benchmarking | Framework runtime performance against real LLM APIs, and cross-framework comparison with Python ADK |
-| `adk-deploy` | Deployment utilities | Targets, manifests, and Gemini Enterprise Agent Engine BYOC deployment |
-| `adk-rust-macros` | Procedural macros | `#[tool]` with `read_only`/`idempotent`/`concurrency_safe`/`long_running`/`lenient_args`, `#[entrypoint]` and `#[task]` for the functional API |
-| `cargo-adk` | Cargo subcommand | Project templates including the harness and Agent Engine BYOC, composable addons, eval runs, benchmarks, and deployment |
-| `adk-rust` | Umbrella crate | Re-exports every crate above behind tiered feature presets — the one dependency most projects need |
-
-> **Retired and extracted repos:** [adk-ui](https://github.com/zavora-ai/adk-ui) is retired in favour of `adk-surface`'s `genui` feature ([Agent-Drawn UI](docs/official_docs/surfaces/genui.md)), and [adk-studio](https://github.com/zavora-ai/adk-studio) is retired in favour of the workflow observer; [adk-playground](https://github.com/zavora-ai/adk-playground) holds more examples.
-
-## Performance
-
-Measured with `cargo adk bench` in June 2026, same model, workload, and prompt for every
-framework.
-
-| Framework | Cold Start | Agent Loop Overhead (mean) | Agent Loop Overhead (P95) | Peak RSS |
-|-----------|-----------|---------------------------|--------------------------|----------|
-| **ADK-Rust** | **109 ms** | **568 μs** | **615 μs** | ~15 MB |
-| Gemini Python SDK | 501 ms | 253 μs | 334 μs | 69.7 MB |
-| LangGraph | 502 ms | 1,228 ms | 1,228 ms | 92.7 MB |
-
-Cold start is process launch to first API call. Overhead is turn time minus the LLM
-round trip. Apple M-series, macOS, June 2026. Run it yourself with
-`cargo adk bench --dry-run` to see the cost estimate first.
-
 ## Develop
 
 ```bash
@@ -420,15 +489,15 @@ per-platform tool matrix and the CI cost tiers.
 - [Official docs](docs/official_docs/) — guides for every capability above
 - [Wiki](https://github.com/zavora-ai/adk-rust/wiki) — tutorials and quickstarts
 - [docs.rs](https://docs.rs/adk-rust) — API reference
-- [Examples](examples/) — 148 standalone crates, plus more in the
-  [playground](https://github.com/zavora-ai/adk-playground)
+- [Examples](examples/) — the standalone scenario and validation crates; the teaching
+  examples live in the [playground](https://github.com/zavora-ai/adk-playground)
 
 ## Companion projects
 
 | Project | What it is |
 |---------|------------|
 | [adk-studio](https://github.com/zavora-ai/adk-studio) | Visual agent builder, retired in favour of the [workflow observer](docs/official_docs/surfaces/workflow.md) (spec 3.3 §13 decision 12) |
-| [adk-ui](https://github.com/zavora-ai/adk-ui) | Retired, for ADK-Rust 2 only — agent-drawn UI is `adk-surface`'s `genui` feature |
+| [adk-ui](https://github.com/zavora-ai/adk-ui) | 3.x: extension catalogs for `adk-surface`'s `genui` — charts, metrics, pages and scenes; 2.x is for ADK-Rust 2 only |
 | [adk-playground](https://github.com/zavora-ai/adk-playground) | Working examples, and a hosted playground |
 
 ## Project

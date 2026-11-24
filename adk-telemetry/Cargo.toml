@@ -12,6 +12,7 @@ documentation = "https://docs.rs/adk-telemetry"
 keywords = ["ai", "agent", "adk", "telemetry", "tracing"]
 categories = ["api-bindings", "development-tools::debugging"]
 readme = "README.md"
+exclude = ["tests/"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -35,7 +36,6 @@ tonic = { version = "0.14", optional = true, default-features = false, features 
 default = ["genai-semconv"]
 genai-semconv = []
 otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
-metrics = ["otlp"]
 json = ["tracing-subscriber/json"]
 # Telemetry to Google Cloud: OTLP trace export to telemetry.googleapis.com with
 # ADC-minted auth headers, GCP resource detection, and Cloud Logging JSON output.
@@ -44,10 +44,10 @@ json = ["tracing-subscriber/json"]
 gcp = [
     "otlp",
     "json",
-    "google-cloud-auth",
-    "http",
-    "tokio",
-    "tonic",
+    "dep:google-cloud-auth",
+    "dep:http",
+    "dep:tokio",
+    "dep:tonic",
     "dep:serde_json",
     "opentelemetry-otlp/tls-aws-lc",
     "opentelemetry-otlp/tls-webpki-roots",
@@ -59,6 +59,7 @@ gcp = [
 sqlite = ["dep:rusqlite", "dep:serde_json"]
 
 [dev-dependencies]
+# The in-memory span exporter the GenAI convention tests assert against.
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
-proptest = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }

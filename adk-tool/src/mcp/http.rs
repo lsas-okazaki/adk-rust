@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(feature = "http-transport")]
-use reqwest_mcp::header::{HeaderName, HeaderValue};
+use reqwest::header::{HeaderName, HeaderValue};
 #[cfg(feature = "http-transport")]
 use rmcp::{
     model::ClientJsonRpcMessage,
@@ -29,7 +29,7 @@ use rmcp::{
 };
 
 #[cfg(feature = "http-transport")]
-type HttpResult<T> = std::result::Result<T, StreamableHttpError<reqwest_mcp::Error>>;
+type HttpResult<T> = std::result::Result<T, StreamableHttpError<reqwest::Error>>;
 
 /// Brokered credentials for an MCP HTTP connection: the broker, the acting context
 /// tokens are minted for, the requested scopes, and the endpoint as the resource.
@@ -62,7 +62,7 @@ impl BrokeredAuth {
 #[cfg(feature = "http-transport")]
 #[derive(Clone)]
 struct McpHttpClient {
-    inner: reqwest_mcp::Client,
+    inner: reqwest::Client,
     oauth: Option<Arc<OAuth2Config>>,
     brokered: Option<(Arc<BrokeredAuth>, Url)>,
 }
@@ -108,7 +108,7 @@ impl McpHttpClient {
             Err(StreamableHttpError::UnexpectedServerResponse(message))
                 if message.starts_with("HTTP 401 ") => {}
             Err(StreamableHttpError::Client(error))
-                if error.status() == Some(reqwest_mcp::StatusCode::UNAUTHORIZED) => {}
+                if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) => {}
             result => return result,
         }
         tracing::debug!("MCP server rejected the OAuth2 access token; fetching a new one");
@@ -128,7 +128,7 @@ async fn oauth_token(oauth: &OAuth2Config) -> HttpResult<String> {
 
 #[cfg(feature = "http-transport")]
 impl StreamableHttpClient for McpHttpClient {
-    type Error = reqwest_mcp::Error;
+    type Error = reqwest::Error;
 
     fn post_message(
         &self,
@@ -257,6 +257,9 @@ impl HttpElicitationConnectionFactory {
         if let Some(resource_handler) = &self.resource_notification_handler {
             handler = handler.with_resource_notification_handler(Arc::clone(resource_handler));
         }
+        if self.builder.tasks.as_ref().is_some_and(|config| config.enable_tasks) {
+            handler = handler.with_tasks();
+        }
         handler
             .serve(transport)
             .await
@@ -347,6 +350,8 @@ pub struct McpHttpClientBuilder {
     reinit_on_expired_session: bool,
     /// Brokered credentials; when set they replace `auth`.
     brokered: Option<Arc<BrokeredAuth>>,
+    /// Task support declared and used by `connect_with_elicitation`.
+    tasks: Option<super::McpTaskConfig>,
 }
 
 impl McpHttpClientBuilder {
@@ -365,6 +370,7 @@ impl McpHttpClientBuilder {
             resource_notification_handler: None,
             reinit_on_expired_session: true,
             brokered: None,
+            tasks: None,
         }
     }
 
@@ -507,7 +513,7 @@ impl McpHttpClientBuilder {
             config = config.auth_header(token);
         }
 
-        let inner = reqwest_mcp::Client::builder()
+        let inner = reqwest::Client::builder()
             .timeout(self.timeout)
             .build()
             .map_err(|error| AdkError::tool(format!("failed to build MCP HTTP client: {error}")))?;
@@ -523,6 +529,30 @@ impl McpHttpClientBuilder {
     /// to create a toolset that advertises elicitation capabilities.
     pub fn with_elicitation_handler(mut self, handler: Arc<dyn ElicitationHandler>) -> Self {
         self.elicitation_handler = Some(handler);
+        self
+    }
+
+    /// Declares the tasks extension (SEP-2663) and follows the tasks the server answers calls
+    /// with under `config`.
+    ///
+    /// A task may ask for input, so this applies to
+    /// [`connect_with_elicitation`](Self::connect_with_elicitation), whose handler answers it;
+    /// [`connect`](Self::connect) refuses a builder with task support.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    ///
+    /// use adk_tool::mcp::{AutoDeclineElicitationHandler, McpHttpClientBuilder, McpTaskConfig};
+    ///
+    /// let builder = McpHttpClientBuilder::new("https://agents.example.com/mcp")
+    ///     .with_elicitation_handler(Arc::new(AutoDeclineElicitationHandler))
+    ///     .with_task_support(McpTaskConfig::enabled());
+    /// # let _ = builder;
+    /// ```
+    pub fn with_task_support(mut self, config: super::McpTaskConfig) -> Self {
+        self.tasks = Some(config);
         self
     }
 
@@ -566,6 +596,12 @@ impl McpHttpClientBuilder {
     /// - Authentication fails
     #[cfg(feature = "http-transport")]
     pub async fn connect(self) -> Result<super::McpToolset<()>> {
+        if self.tasks.is_some() {
+            return Err(AdkError::tool(
+                "a toolset with task support answers its tasks' input requests; set a handler \
+                 with `with_elicitation_handler` and connect with `connect_with_elicitation`",
+            ));
+        }
         self.check_brokered().await?;
         let factory = Arc::new(HttpConnectionFactory { builder: self.clone() });
         let client = factory.connect_once().await?;
@@ -614,6 +650,7 @@ impl McpHttpClientBuilder {
 
         self.check_brokered().await?;
         let resource_notification_handler = self.resource_notification_handler.clone();
+        let tasks = self.tasks.clone();
         let factory = Arc::new(HttpElicitationConnectionFactory {
             builder: self,
             handler,
@@ -621,7 +658,11 @@ impl McpHttpClientBuilder {
         });
         let client = factory.connect_once().await?;
 
-        Ok(super::McpToolset::new(client).with_connection_factory(factory))
+        let toolset = super::McpToolset::new(client).with_connection_factory(factory);
+        Ok(match tasks {
+            Some(config) => toolset.with_task_support(config),
+            None => toolset,
+        })
     }
 
     /// Connect with elicitation support (stub when http-transport feature is disabled).

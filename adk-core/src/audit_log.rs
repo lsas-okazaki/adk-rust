@@ -155,6 +155,9 @@ pub enum AuditRecordKind {
     /// A subject's data was erased. The record names the subject by pseudonym only, with
     /// each store's outcome.
     Erasure,
+    /// A session was forked, rewound, or had its events edited. The record names events by ID
+    /// and carries a digest of the changed events, never their content.
+    SessionHistory,
     /// Any other kind.
     Other(String),
 }
@@ -172,6 +175,7 @@ impl AuditRecordKind {
             Self::Configuration => "configuration",
             Self::KeyRotated => "key_rotated",
             Self::Erasure => "erasure",
+            Self::SessionHistory => "session_history",
             Self::Other(name) => name,
         }
     }
@@ -189,6 +193,7 @@ impl From<String> for AuditRecordKind {
             "configuration" => Self::Configuration,
             "key_rotated" => Self::KeyRotated,
             "erasure" => Self::Erasure,
+            "session_history" => Self::SessionHistory,
             _ => Self::Other(value),
         }
     }
@@ -937,6 +942,17 @@ pub trait AuditRecorder: Send + Sync {
     ///
     /// Returns the recorder's error when the record cannot be written.
     async fn record(&self, draft: AuditRecordDraft) -> Result<()>;
+
+    /// Makes every record written so far verifiable without a later write, such as by
+    /// signing a checkpoint over them. A process calls it when it stops cleanly; a
+    /// recorder that wraps another forwards it. The default does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the recorder's error when the records cannot be sealed.
+    async fn seal(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// An [`AuditRecorder`] with the [`AuditFailureMode`] that governs it.

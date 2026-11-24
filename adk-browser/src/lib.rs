@@ -22,7 +22,7 @@
 //!
 //! // Create a toolset and register it with `LlmAgentBuilder::toolset`
 //! let toolset = BrowserToolset::with_profile(browser.clone(), BrowserProfile::Scraping);
-//! assert_eq!(toolset.all_tools().len(), 13);
+//! assert_eq!(toolset.all_tools().len(), 14);
 //!
 //! // Clean up
 //! browser.stop().await?;
@@ -30,7 +30,7 @@
 //! # }
 //! ```
 //!
-//! `BrowserToolset::new` offers 44 tools. `browser_evaluate_js` and `browser_file_upload` are
+//! `BrowserToolset::new` offers 45 tools. `browser_evaluate_js` and `browser_file_upload` are
 //! opt-in, navigation accepts only `http` and `https`, and private network addresses are refused.
 //!
 //! ## Available Tools
@@ -62,6 +62,9 @@
 //! - `browser_extract_links` - Get all links on page
 //! - `browser_page_info` - Get current URL and title
 //! - `browser_page_source` - Get HTML source
+//! - `browser_elements` - List interactive elements with rectangles in CSS pixels and a
+//!   stable selector each, for set-of-marks grounding: the chosen mark becomes a
+//!   `browser_click` by selector
 //!
 //! ### Screenshots
 //! - `browser_screenshot` - Capture page or element screenshot
@@ -163,16 +166,25 @@
 //!           (ChromeDriver, etc.)
 //! ```
 
+mod browser_use;
+mod computer;
 mod config;
 mod escape;
+pub mod frames;
 mod pool;
 mod session;
 pub mod tools;
 mod toolset;
+mod viewport;
 
 // Re-export main types
+pub use browser_use::{
+    BROWSER_BATCH_HALT_TEXT, BROWSER_TOOLSET, BrowserUseMember, BrowserUseToolset,
+};
+pub use computer::WebDriverComputer;
 pub use config::{BrowserConfig, BrowserType};
 pub use escape::escape_js_string;
+pub use frames::{Frame, FrameFeed, MIN_FRAME_INTERVAL};
 pub use pool::BrowserSessionPool;
 pub use session::{BrowserSession, ElementState, shared_session};
 pub use toolset::{BrowserProfile, BrowserToolset, minimal_browser_tools, readonly_browser_tools};
@@ -198,6 +210,8 @@ pub use tools::{
     // Advanced Actions
     DragAndDropTool,
     ElementStateTool,
+    // Set-of-marks grounding
+    ElementsTool,
     EvaluateJsTool,
     // Extraction
     ExtractAttributeTool,

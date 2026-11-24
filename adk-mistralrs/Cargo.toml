@@ -10,6 +10,7 @@ repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/adk-mistralrs"
 readme = "README.md"
+exclude = ["tests/", "benches/", ".gitignore"]
 keywords = ["ai", "agent", "adk", "llm", "local-inference"]
 categories = ["api-bindings", "asynchronous"]
 
@@ -20,7 +21,6 @@ features = ["reqwest"]
 [dependencies]
 # ADK core dependencies
 adk-core = { workspace = true }
-adk-telemetry = { workspace = true }
 
 # Async runtime
 async-trait = { workspace = true }
@@ -51,7 +51,6 @@ reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = "1.0"
-tokio-test = "0.4"
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 [features]

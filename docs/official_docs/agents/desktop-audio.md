@@ -10,6 +10,8 @@ The desktop audio pipeline connects system audio hardware to the existing `adk-a
 Microphone → AudioCapture → AudioStream → [VAD → STT → Agent → TTS] → AudioPlayback → Speaker
 ```
 
+The STT and TTS stages are `adk-audio`'s speech providers; see [Speech with adk-audio](../audio/speech.md).
+
 All components use the `cpal` crate for cross-platform audio (CoreAudio on macOS, PipeWire/ALSA/PulseAudio on Linux, WASAPI on Windows) and produce/consume the standard `AudioFrame` type.
 
 ## Feature Flags
@@ -20,7 +22,7 @@ All components use the `cpal` crate for cross-platform audio (CoreAudio on macOS
 adk-audio = { version = "3.0.0", features = ["desktop-audio"] }
 ```
 
-The `desktop-audio` feature adds `cpal` as a dependency (and enables the no-op `vad` feature; `VadProcessor` is always compiled). It is not part of the `all` feature, since it needs audio hardware. On Linux it links ALSA, so install `libasound2-dev`.
+The `desktop-audio` feature adds `cpal` as a dependency; `VadProcessor` is always compiled. It is not part of the `all` feature, since it needs audio hardware. On Linux it links ALSA, so install `libasound2-dev`.
 
 ### PipeWire Support
 

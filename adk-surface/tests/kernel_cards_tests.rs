@@ -53,7 +53,11 @@ async fn a_proposed_routine_reads_in_plain_words() {
     s.engine
         .execute(
             &web(),
-            Command::Send { session_id: "s1".into(), text: "Keep me up with the news".into() },
+            Command::Send {
+                session_id: "s1".into(),
+                text: "Keep me up with the news".into(),
+                images: Vec::new(),
+            },
         )
         .await
         .unwrap();
@@ -106,6 +110,7 @@ async fn a_proposed_routine_reads_in_plain_words() {
                 edited_args: None,
                 reason: None,
                 expanded: true,
+                evidence: Vec::new(),
             },
         )
         .await

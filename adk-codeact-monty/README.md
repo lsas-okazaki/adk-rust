@@ -29,8 +29,8 @@ read-only or read-write paths and an explicit environment map (see
 
 ```toml
 [dependencies]
-adk-agent = { version = "3.0", features = ["codeact"] }
-adk-codeact-monty = "3.0"
+adk-agent = { version = "3.0.0", features = ["codeact"] }
+adk-codeact-monty = "3.0.0"
 ```
 
 Or use the meta-crate's `codeact-monty` feature, which implies `codeact` and is not part of any
@@ -38,7 +38,7 @@ tier:
 
 ```toml
 [dependencies]
-adk-rust = { version = "3.0", features = ["codeact-monty"] }
+adk-rust = { version = "3.0.0", features = ["codeact-monty"] }
 ```
 
 The crate has no feature flags of its own.
@@ -127,12 +127,8 @@ dispatched.
 
 ## Example
 
-A runnable example lives in
-[`examples/codeact_monty_agent`](https://github.com/zavora-ai/adk-rust/tree/main/examples/codeact_monty_agent):
-
-```bash
-cargo run --manifest-path examples/codeact_monty_agent/Cargo.toml
-```
+The runnable `codeact_monty_agent` example lives in
+[adk-playground](https://github.com/zavora-ai/adk-playground).
 
 It runs offline with a deterministic model that writes one Python script: it
 calls two tools (`fetch_cart`, `tax_rate`) and does real work between them (a

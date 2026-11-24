@@ -52,7 +52,7 @@ use std::sync::Arc;
 async fn main() -> Result<()> {
     let api_key = std::env::var("GOOGLE_API_KEY")
         .map_err(|_| AdkError::config("GOOGLE_API_KEY is not set"))?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 
     let agent = LlmAgentBuilder::new("weather_agent")
         .description("Answers weather questions")
@@ -217,6 +217,11 @@ from the [operations table](#operations), waits for the create operation,
 and prints the engine resource name. The same client is available
 programmatically as `adk_deploy::gcp::GcpDeployClient` (umbrella feature
 `gcp-deploy`).
+
+`cargo adk deploy --target agent-engine` (cargo-adk feature `gcp`) deploys from
+`adk-deploy.toml` instead: `[env]` entries, Secret Manager references for
+`[[secrets]]`, and `[scaling]` become the engine's `deploymentSpec`. See
+[Deploy Targets](deploy-targets.md#agent-engine) for the settings and the IAM roles.
 
 ## Environment variables
 

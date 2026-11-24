@@ -35,7 +35,8 @@ With the `kernel` feature, the harness declares one more tool:
 ```
 
 It is class `Todo`, so every mode allows it, and its only effect is an agenda item in state
-`proposed`. `when` is any wake the kernel knows — `{"at": …}`, `{"cron": {…}}`,
+`proposed`. `when` is any wake the kernel knows — `{"at": …}`,
+`{"cron": {"expr": …, "missed": "skip"}}` ([missed occurrences](scheduling.md#cron-wakes-and-missed-occurrences)),
 `{"fileChange": {…}}`, `{"runFinished": {"pid": …}}` — and is optional. The follow-up's
 session starts in the proposing session's mode, so its process never runs above the mode of
 the run that proposed it (K-I7). Without a kernel hosting the harness, the tool answers that
@@ -153,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
 | `Agenda::propose(item, mode)` | Checks the policy, stores the item `proposed` and routes it |
 | `Agenda::approve(id, by)` | `proposed` → `approved` → `scheduled`; withdraws the item's inbox request |
 | `Agenda::reject(id, by, reason)` | `proposed` or `approved` → `rejected` |
-| `Agenda::schedule(id, wake, by)` | Puts the item's process to sleep on `wake`, approving a proposed item first |
+| `Agenda::schedule(id, wake, by)` | Puts the item's process to sleep on `wake`, approving a proposed item first; a scheduled item moves while its process has not started — queued, asleep, or claimed only to park on its wake set |
 | `Agenda::list(filter)`, `get(id)` | The items, oldest first |
 
 The items live in an `AgendaStore`: `InMemoryAgendaStore`, `SqliteAgendaStore` (in

@@ -37,6 +37,7 @@ adk-guardrail = "3.0.0"
 | Feature | Default | Enables |
 |---------|---------|---------|
 | `schema` | yes | `SchemaValidator` through `jsonschema` |
+| `model-armor` | no | `ModelArmor`: Google Cloud Model Armor guardrails for input, output and tool results |
 
 ## Quick Start
 
@@ -130,6 +131,30 @@ fn tool_guardrails() -> Result<ToolGuardrailSet, Box<dyn std::error::Error>> {
 
 Pass the set to `LlmAgentBuilder::tool_guardrails`, or to a realtime runtime as its tool-result screen. Tool guardrails run in order and revisions compose; the first denial stops evaluation and is reported to the model as the tool's result. `PathAllowList` checks every key it names at any depth of the arguments — nested objects and arrays included — and denies the call if any occurrence holds a value other than a path, or a path outside the allowed roots. It denies a call with no path under a configured name (`allow_missing()` permits it), and applies to every tool unless `on_tools` names them. It is a preflight check: a tool that opens files where another process can write must still open them relative to a trusted directory handle, as the `adk-devtools` file tools do, to close the time-of-check/time-of-use race.
 
+### Model Armor
+
+With the `model-armor` feature, `ModelArmor` screens content against a Google Cloud Model Armor
+template — prompt injection and jailbreak, Responsible AI, Sensitive Data Protection, malicious
+URIs, CSAM — and hands out a guardrail for each set:
+
+```rust,ignore
+use adk_guardrail::model_armor::{FailMode, ModelArmor};
+use adk_guardrail::{GuardrailSet, ToolGuardrailSet};
+
+let armor = ModelArmor::builder("projects/my-project/locations/us-central1/templates/agent-screen")
+    .fail_mode(FailMode::Closed) // the default: content Model Armor could not screen is blocked
+    .build()?;
+
+let input = GuardrailSet::new().with(armor.prompt_guardrail()); // sanitizeUserPrompt
+let output = GuardrailSet::new().with(armor.response_guardrail()); // sanitizeModelResponse
+let tools = ToolGuardrailSet::new().with(armor.tool_result_guardrail()); // results, as prompts
+```
+
+A match blocks the content (or withholds the tool result) and the block names the matching
+filters; a Sensitive Data Protection de-identification replaces the text instead.
+`FailMode::Open` passes content Model Armor could not screen as a `Low` failure, recorded as a
+guardrail warning. See the [Model Armor guide](../docs/official_docs/security/guardrails.md#model-armor).
+
 ## Guardrail Results
 
 Each guardrail returns one of three results:
@@ -163,6 +188,24 @@ Detects and redacts personally identifiable information:
   check, as one run of digits or grouped 4-4-4-4, 4-6-5 (American Express), or 4-4-4-4-3; a
   number that fails the check, such as an order number, passes unchanged
 - `IpAddress` → `[IP REDACTED]`
+
+`PiiRedactor::find` reports the same data as `PiiMatch`es — the type and the byte range in the
+original text — so a caller that holds positions for the text, such as the word boxes of a page
+read by OCR, can redact it there:
+
+```rust
+use adk_guardrail::{PiiRedactor, PiiType};
+
+let text = "Ana Diaz, ana@example.com";
+let found = PiiRedactor::new().find(text);
+assert_eq!(found[0].pii_type, PiiType::Email);
+assert_eq!(&text[found[0].range.clone()], "ana@example.com");
+```
+
+As a `Guardrail`, `PiiRedactor` redacts text parts only: an image part passes through unchanged,
+whatever text it shows. `adk-vision`'s `ImagePrivacyGuardrail` (feature `guardrail`) covers
+personal text in images: it reads the image on the device and fills the boxes of the words these
+patterns match.
 
 `PiiRedactor::new()` redacts every type except `IpAddress`. To redact IP addresses as well, name
 the types with `with_types`:
@@ -249,6 +292,7 @@ so text beside a tool call is not checked, and `validate` without evidence fails
 | `ToolGuardrail::validate_result`, `ResultTextGuardrail`, and `validate_preamble` are new; `validate_call` defaults to allowing | — |
 | `validate_output`, `OutputEvidence`, `GuardrailExecutor::enforce_output`, and `CitationRequired` are new; an agent screens its final answer through `validate_output`, which defaults to `validate` | — |
 | `Low` findings pass and are recorded as warnings | — |
+| The implicit `jsonschema` feature is removed | Enable `schema` (on by default) |
 
 See the [2.x to 3.0 migration guide](../docs/official_docs/migration/2.x-to-3.0.md) and the [changelog](../CHANGELOG.md) for the full list.
 

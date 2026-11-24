@@ -17,10 +17,12 @@ own (spec 3.2 §8.1, K-I17).
 | `adk-rust nice PID QUEUE` | Moves a queued or sleeping process to `interactive`, `background` or `maintenance`; the moved process gets a new pid |
 | `adk-rust agenda [list\|approve ID\|reject ID\|schedule ID --at TIME\|--cron EXPR]` | The agenda: follow-ups proposed for later ([Proactivity](proactivity.md)) |
 | `adk-rust wake --file GLOB\|--cron EXPR\|--webhook NAME -- "task"` | A sleeping process that runs the task when it wakes |
+| `adk-rust run-now PID\|--trigger NAME [--request-id ID]` | Runs a cron sleeper or a standing cron trigger now, outside its schedule; the next tick still fires ([running a schedule now](scheduling.md#running-a-schedule-now)) |
 | `adk-rust freeze [--reason R]` / `unfreeze` | The kill switch, on every replica; `unfreeze` only over the kernel's socket or pipe, never `--server` (spec 3.3 S-I10) |
 | `adk-rust events [--follow] [--after CURSOR] [--json]` | The event bus |
 | `adk-rust proc [ledger\|baselines\|observations]` | The activity ledger (`--export FILE` for JSONL), each partition's baselines, the observations ([`/proc`](proc.md)) |
-| `adk-rust goal TEXT --until CMD` | With a kernel running, enqueues the goal on its `background` queue and follows it |
+| `adk-rust goal TEXT --until CMD` | With a kernel running, enqueues the goal on its `background` queue, as you, and follows it |
+| `adk-rust approvals list\|approve ID\|deny ID [--reason R]` | The kernel's approvals inbox, under the `apr_…` ids every surface shows (`ID` or a unique prefix of one); an approval resumes the parked process at once. Calls an in-process session holds in `harness.db` are listed beside them |
 | `adk-rust drivers list\|mount FILE [--yes]\|unmount ID\|restart ID\|reapprove ID` | The kernel's [drivers](drivers.md): MCP servers it supervises under the manifests you mounted |
 | `adk-rust pair [--name NAME] [--scope decide,read,stop] [--days 1-365]` | Issues a code that pairs one phone, tray or terminal ([pairing](pairing.md)) |
 | `adk-rust pair list\|revoke ID\|accept CODE` | The paired devices and chat accounts, and those waiting; remove one, or dismiss a waiting one; pair the chat account that was sent `CODE` |
@@ -56,6 +58,12 @@ adk-rust up --store postgres://harness:…@db/harness --bind 0.0.0.0:8081 --auth
 adk-rust up --home /srv/kernel                     # socket and harness.db under /srv/kernel
 ```
 
+> **Note:** `--bind` belongs to `adk-rust up`. The `up` of an app built on `HarnessLauncher`
+> (the `harness` and `autonomous` templates) takes `--port` (default 8080) and `--host`:
+> `cargo run -- up --port 8081`. A `--host` other than loopback needs a token set in code with
+> `HarnessLauncher::with_auth_token`; the app's `up` takes no `--auth-token` and does not read
+> `ADK_SERVE_TOKEN`.
+
 ```text
 $ adk-rust up --mode ask
   store harness.db: sessions, approvals, runs, processes, schedules, the activity ledger
@@ -69,6 +77,10 @@ ADK-Rust kernel up on http://127.0.0.1:8080
   approvals: GET /api/approvals, POST /api/approvals/{id}/decide
 Press Ctrl+C to drain and stop
 ```
+
+`up` binds its address first, so a taken port fails before anything starts, and listens only
+once the kernel and its socket are up: a connection to the address, such as a readiness probe,
+succeeds only when control commands reach the kernel too.
 
 > **Note:** a Unix socket path is limited to about 100 bytes, so a deep `--home` is refused
 > at start with that remedy; choose a short kernel home.
@@ -317,7 +329,24 @@ current rate) and lists only unfinished processes, highest burn first.
 
 With a kernel running at the default home over `harness.db`, `goal` writes the goal to the
 session and enqueues it on the kernel's `background` queue instead of running a worker of its
-own, then follows it:
+own, then follows it. The goal runs as you, authenticated as a goal in this process is, so
+the session's `--mode` and your standing rules apply on the kernel: in Auto a call the mode
+allows runs without asking. Commands run in the kernel's shell, under the sandbox `up` was
+started with. The banner states the mode the goal runs in:
+
+```text
+$ adk-rust goal "add factorial with a test" --until "python3 -m unittest -q" --mode auto --yes
+goal mode on the kernel at unix:/Users/ana/Library/Application Support/adk-rust/kernel.sock
+mode auto as ana, in the kernel's shell; --yes approves held calls while this terminal follows
+```
+
+A call the goal holds waits in the kernel's inbox. A terminal asks for it; `--yes` approves it
+through the inbox while this terminal follows the goal, except an unsandboxed retry without
+`--allow-unsandboxed`; otherwise decide it with `adk-rust approvals approve ID` or from any
+surface, and the goal continues at once. A kernel started with `adk-rust up --auto-review` has
+the session's model review such a call first in `auto` mode: it runs or is refused at once,
+listed as decided by `model:<model id>`, and only a call the model escalates waits for you
+([Auto review](../harness/modes-and-approvals.md#auto-review)).
 
 | Outcome | Exit code |
 |---|---|
@@ -379,8 +408,26 @@ occurrence across replicas) and, when a run completes or fails, starts its succe
 with the finished run as its parent; `adk-rust kill` on the sleeper ends the series. The
 expression's cursor is kept in `harness.db` (or the `--store` backend), so after the kernel was
 down it fires the missed occurrence once if it is no more than a minute late, the sleeper's
-`skip` policy, and never one that already fired. A new series replays nothing from before it
+`skip` policy ([missed occurrences](scheduling.md#cron-wakes-and-missed-occurrences)), and
+never one that already fired. A new series replays nothing from before it
 began.
+
+The woken turn reads why it woke, after its task: the source, the event's key, the time and
+the payload — the changed file's path, the webhook's body, the cron occurrence — as
+[data the agent does not take instructions from](index.md#what-a-woken-turn-is-told).
+
+### `adk-rust run-now`
+
+```text
+$ adk-rust run-now 64551be2
+queued a run now of 64551be2-d2e1-407e-92e2-8c96efea1597 (now:64551be2-d2e1-407e-92e2-8c96efea1597:6f1c…); the next scheduled tick still fires. `adk-rust events` shows the wake.
+$ adk-rust run-now --trigger ci-digest --request-id deploy-42
+queued a run now of trigger ci-digest (now:trigger:ci-digest:deploy-42); the next scheduled tick still fires. `adk-rust events` shows the wake.
+```
+
+The run passes quiet hours, budgets and quotas like a scheduled tick, and a freeze refuses
+it. A retry with the same `--request-id` queues nothing new
+([running a schedule now](scheduling.md#running-a-schedule-now)).
 
 ## `adk-rust partitions`
 

@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use super::a2ui::DataModel;
+use super::catalog::Catalogs;
 use super::draw::DrawnEnvelope;
 use super::drawn::{DrawnField, DrawnInput, DrawnNode};
 use super::validate::{ActionArg, Validator};
@@ -31,6 +32,8 @@ pub(crate) struct Submission {
     pub(crate) values_digest: String,
     /// The agent that drew the form, by its name in the runtime.
     pub(crate) drawn_by: String,
+    /// The digest of the drawing the person pressed Send on.
+    pub(crate) digest: String,
 }
 
 /// The envelope of every drawing a render tool provably made in `events`, oldest first,
@@ -77,6 +80,7 @@ fn changed() -> SurfaceError {
 /// per its field and passes the field's checks (`surface.invalid`).
 pub(crate) fn submission(
     events: &[Event],
+    catalogs: &Catalogs,
     surface_id: &str,
     version: u64,
     action_id: &str,
@@ -91,7 +95,14 @@ pub(crate) fn submission(
         return Err(changed());
     }
     let draft = latest.draft().ok_or_else(changed)?;
-    let validated = Validator::forms()
+    // The form is checked again against its own catalog, which this home must show.
+    let catalog = catalogs.get(&latest.catalog_id).ok_or_else(|| {
+        SurfaceError::Invalid(format!(
+            "this home does not render the catalog {}; the agent can draw the form again",
+            latest.catalog_id
+        ))
+    })?;
+    let validated = Validator::new(catalog)
         .validate(&draft)
         .map_err(|refusal| SurfaceError::Invalid(refusal.message()))?;
     let Some(action) = validated.draft.actions.iter().find(|action| action.id == action_id) else {
@@ -104,7 +115,7 @@ pub(crate) fn submission(
             "this form was sent already; the agent can draw it again".to_string(),
         ));
     }
-    let tree = super::view::tree(&validated);
+    let tree = super::view::tree(catalog, &validated);
     let mut fields = BTreeMap::new();
     collect(&tree, &mut fields);
     let mut model = DataModel::new(validated.draft.data_model.clone());
@@ -147,7 +158,13 @@ pub(crate) fn submission(
         let _ = write!(hex, "{byte:02x}");
         hex
     });
-    Ok(Submission { tool: action.tool.clone(), args: Value::Object(args), values_digest, drawn_by })
+    Ok(Submission {
+        tool: action.tool.clone(),
+        args: Value::Object(args),
+        values_digest,
+        drawn_by,
+        digest: latest.digest(),
+    })
 }
 
 /// Every field in `node`, by path, with its label.

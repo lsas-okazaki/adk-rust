@@ -5,13 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Rust Agent Development Kit (ADK-Rust): build AI agents in Rust with modular components for models, tools, memory, and more"
+description = "Rust Agent Development Kit (ADK-Rust): build AI agents in Rust, including autonomous agents governed by policies, approvals and budgets, with durable runs, tools, memory, and more"
 homepage = "https://github.com/zavora-ai/adk-rust"
 repository.workspace = true
 documentation = "https://docs.rs/adk-rust"
-keywords = ["ai", "agent", "llm", "adk", "framework"]
+keywords = ["ai", "agent", "llm", "adk", "autonomous"]
 categories = ["api-bindings", "asynchronous", "web-programming"]
 readme = "README.md"
+exclude = ["tests/", "examples/"]
 
 [features]
 default = ["minimal"]
@@ -47,7 +48,7 @@ standard = [
     "computer-use",
 ]
 
-# Enterprise — standard + all production specialist crates.
+# Enterprise — standard + all production specialist crates and the autonomy runtime.
 enterprise = [
     "standard",
     "realtime",
@@ -55,11 +56,13 @@ enterprise = [
     "rag",
     "payments",
     "awp",
+    "autonomy",
 ]
 
 # Full — everything: enterprise + all domain add-ons.
 full = [
     "enterprise",
+    "autonomy",
     "audio",
     "code",
     "sandbox",
@@ -68,12 +71,15 @@ full = [
     "graph-node-cache",
     "graph-delta",
     "graph-time-travel",
+    "graph-yaml",
     "harness",
     "harness-kernel",
     # The kernel's daily baselines and observations (spec 3.2 §7.10, §13 Q4).
     "adk-kernel?/proc-baselines",
     # The AWP 2.0 website product (spec 3.5 §7.1, D-14).
     "website",
+    # Local-first perception, pure Rust (spec 3.7 §8.3, Q11).
+    "vision",
 ]
 
 # Gemini Enterprise Agent Platform — every Vertex/EAP integration except
@@ -100,6 +106,7 @@ gemini-agent-platform = [
     "vertex-agent-registry", # Agent Registry discovery (adk-tool)
     "vertex-skill-registry", # Skill Registry consumption (adk-skill)
     "vertex-remote-engine", # remote ReasoningEngine sub-agents (adk-server)
+    "gcp-model-armor", # Model Armor guardrails (adk-guardrail)
 ]
 
 # gemini-agent-platform + realtime: adds the Vertex AI Live API (bidirectional
@@ -109,12 +116,11 @@ gemini-agent-platform-full = [
     "vertex-live", # Vertex AI Live API (adk-realtime)
 ]
 
-# CLI launcher support
-cli = ["dep:adk-cli", "runner", "server", "sessions", "telemetry"]
+# CLI launcher support. DeepSeek and Groq share the reqwest stack the CLI already links, so
+# `cli` compiles them; the providers below link a client crate of their own.
+cli = ["dep:adk-cli", "runner", "server", "sessions", "telemetry", "adk-cli/deepseek", "adk-cli/groq"]
 cli-openai = ["cli", "adk-cli/openai"]
 cli-anthropic = ["cli", "adk-cli/anthropic"]
-cli-deepseek = ["cli", "adk-cli/deepseek"]
-cli-groq = ["cli", "adk-cli/groq"]
 cli-ollama = ["cli", "adk-cli/ollama"]
 # mistral.rs in process behind `adk-rust --provider mistralrs` (spec 3.1 §8.1); a heavy build
 cli-mistralrs = ["cli", "adk-cli/mistralrs"]
@@ -126,7 +132,7 @@ agents = ["dep:adk-agent"]
 record-payloads = ["agents", "adk-agent/record-payloads"]
 models = ["dep:adk-model"]
 tools = ["dep:adk-tool", "adk-agent?/team-tools"]
-skills = ["dep:adk-skill", "adk-agent?/skills"]
+skills = ["dep:adk-skill", "adk-agent?/skills", "adk-runner?/skills"]
 # Google ADK-style progressive skill discovery and activation tools.
 skills-progressive-disclosure = ["skills", "adk-skill/progressive-disclosure", "adk-agent?/skills-progressive-disclosure"]
 sessions = ["dep:adk-session"]
@@ -135,7 +141,8 @@ artifacts = ["dep:adk-artifact"]
 gcs-artifacts = ["artifacts", "adk-artifact/gcs"]
 memory = ["dep:adk-memory"]
 runner = ["dep:adk-runner"]
-server = ["dep:adk-server", "adk-server/a2a-v1"]
+# A2A v1 and the agent registry REST API (`adk_rust::registry`) need nothing beyond adk-server.
+server = ["dep:adk-server", "adk-server/a2a-v1", "adk-server/agent-registry"]
 telemetry = ["dep:adk-telemetry"]
 telemetry-otlp = ["telemetry", "adk-telemetry/otlp"]
 telemetry-sqlite = ["telemetry", "adk-telemetry/sqlite"]
@@ -145,7 +152,8 @@ code = ["dep:adk-code"]
 sandbox = ["dep:adk-sandbox"]
 realtime = ["dep:adk-realtime"]
 browser = ["dep:adk-browser"]
-eval = ["dep:adk-eval"]
+# Persona-driven user simulation (`adk_rust::personas`) needs nothing beyond adk-eval.
+eval = ["dep:adk-eval", "adk-eval/personas"]
 guardrail = ["dep:adk-guardrail", "adk-agent?/guardrails"]
 auth = ["dep:adk-auth"]
 plugin = ["dep:adk-plugin", "adk-agent?/enhanced-plugins"]
@@ -174,6 +182,26 @@ harness-memory-local = ["harness", "adk-harness/memory-embeddings-local"]
 # The agent kernel, the harness's always-on form (spec 3.2 §8.2): `adk_rust::kernel`, and
 # with `cli` the `adk-rust up` composition through `HarnessLauncher::with_kernel`.
 harness-kernel = ["harness", "dep:adk-kernel", "adk-harness/kernel"]
+# Everything an agent needs to run unattended (docs/official_docs/autonomy/index.md): the
+# harness and its kernel, durable and background runs with cron wake-ups (`adk-server`
+# `background`, `adk-core` `cron`), signed webhook wake-ups (`webhook-ingress`), the approvals
+# service with notifications (`approvals`), SQLite sessions and durable stores for runs,
+# approvals, the action ledger, spend, standing rules, modes and goals (`adk-session` and
+# `adk-harness` `sqlite`), and the signed audit log (`adk-auth` `signed-audit`). In
+# `enterprise` and `full`; add `cli` for `HarnessLauncher`.
+autonomy = [
+    "harness-kernel",
+    "server",
+    "sessions",
+    "auth",
+    "adk-core/cron",
+    "adk-server/background",
+    "adk-server/webhook-ingress",
+    "adk-server/approvals",
+    "adk-session/sqlite",
+    "adk-harness/sqlite",
+    "adk-auth/signed-audit",
+]
 # Agent surfaces (spec 3.3 §6.1): `adk_rust::surface`, the engine every surface runs on and
 # the web home, its page and HTTP API; with `cli` and `harness`, the harness launcher
 # (`adk-rust serve`, `up`) mounts the home. Opt-in, in no tier.
@@ -184,15 +212,29 @@ surface = ["dep:adk-surface", "adk-surface/web", "adk-cli?/surface"]
 # and `adk-rust awp`. In `full`.
 website = ["dep:adk-website", "dep:adk-site", "harness-kernel", "awp", "adk-awp/signing", "server", "adk-server/awp", "adk-cli?/website"]
 
+# Local-first perception (spec 3.7 §8.3, Q11): `adk_rust::vision` (adk-vision) with the model
+# fetcher, the cloud describers (Gemini, Claude, Muse, NVIDIA NIM), Meta `sam-3.1`'s client and
+# the image privacy guardrail; streams (spec 3.7 §7.13): the pipeline, watches and the frame
+# sources — RTSP cameras (`retina`), files and H.264 through a user-installed ffmpeg
+# (`ffmpeg-sidecar` spawns it, nothing is linked or downloaded), screens, browsers and the web
+# home's camera — ByteTrack tracking (`trackforge`) and Gemini native video. With `harness`,
+# the vision pack (`pack_vision`, `vision_watch`); with `harness-kernel`, `VisionWakeSource` as
+# a watch sink; with `cli`, `adk-rust vision`. Every one is pure Rust with no native runtime:
+# in `full`. The test fixtures (`stream-fixtures`) and adk-vision's `computer-use` (target
+# evidence and computer-use observations as a frame source, which link `adk-computer-use`)
+# stay on adk-vision.
+vision = ["dep:adk-vision", "adk-vision/fetch", "adk-vision/cloud", "adk-vision/nim", "adk-vision/sam", "adk-vision/guardrail", "adk-vision/stream", "adk-vision/track", "adk-vision/gemini-video", "adk-vision/rtsp", "adk-vision/ffmpeg", "adk-vision/screen", "adk-vision/browser", "adk-vision/surface-camera", "adk-harness?/vision", "adk-kernel?/vision", "adk-cli?/vision"]
+# The on-device backends (spec 3.7 §7.6, Q11): RF-DETR, EfficientSAM, SAM 2.1 and SigLIP 2 on
+# ONNX Runtime (downloaded at build time), PP-OCRv6, and PaddleOCR-VL-1.6 on Candle. Native
+# runtimes and a heavy build: in no tier.
+vision-local = ["vision", "adk-vision/onnx", "adk-vision/ocr", "adk-vision/ocr-vl", "adk-cli?/vision-local"]
+
 # Managed agent runtime (feature-gated, experimental). The provider features below also
 # let its `DefaultModelResolver` construct that provider's models.
 managed-runtime = ["dep:adk-managed"]
 
 # Enterprise client SDK (feature-gated, experimental)
 enterprise-client = ["dep:adk-enterprise"]
-
-# A2A protocol feature (forwarded to adk-server)
-a2a = ["server", "adk-server/a2a-v1"]
 
 # Model provider features (forwarded to adk-model)
 gemini = ["models", "adk-model/gemini", "adk-managed?/gemini"]
@@ -209,12 +251,6 @@ ollama = ["models", "adk-model/ollama", "adk-managed?/ollama"]
 # Local inference in process through mistral.rs 0.8 (spec 3.1 §8.1, §8.4); GPU through
 # adk-mistralrs's own `cuda` and `metal` features. A heavy build: not in any tier.
 mistralrs = ["models", "dep:adk-mistralrs"]
-fireworks = ["models", "adk-model/fireworks"]
-together = ["models", "adk-model/together"]
-mistral = ["models", "adk-model/mistral"]
-perplexity = ["models", "adk-model/perplexity"]
-cerebras = ["models", "adk-model/cerebras"]
-sambanova = ["models", "adk-model/sambanova"]
 bedrock = ["models", "adk-model/bedrock"]
 azure-ai = ["models", "adk-model/azure-ai"]
 
@@ -254,8 +290,6 @@ openai-webrtc = ["realtime", "adk-realtime/openai-webrtc"]
 # v0.7.0 competitive parity features (opt-in only, NOT included in standard or full)
 # YAML agent config and hot reload (forwarded to adk-server)
 yaml-agent = ["server", "adk-server/yaml-agent"]
-# Agent Registry REST API (forwarded to adk-server)
-agent-registry = ["server", "adk-server/agent-registry"]
 # Gemini Enterprise Agent Platform runtime contract: class-method dispatch
 # endpoints and the turnkey serve_agent_engine entrypoint (forwarded to adk-server)
 agent-engine = ["server", "adk-server/agent-engine"]
@@ -272,7 +306,7 @@ vertex-rag = ["rag", "adk-rag/vertex-rag"]
 # Agent Retrieval (Vector Search 2.0) VectorStore backend (forwarded to adk-rag)
 agent-retrieval = ["rag", "adk-rag/agent-retrieval"]
 # Agent Registry client + discovery tool (forwarded to adk-tool); unrelated to
-# the local YAML `agent-registry` feature below
+# `adk_rust::registry`, the agent registry REST API of `server`
 vertex-agent-registry = ["tools", "adk-tool/vertex-agent-registry"]
 # Skill Registry read-only client + safe extraction (forwarded to adk-skill)
 vertex-skill-registry = ["skills", "adk-skill/vertex-skill-registry"]
@@ -312,14 +346,14 @@ bigquery = ["tools", "adk-tool/bigquery"]
 spanner = ["tools", "adk-tool/spanner"]
 # Memory tools (LoadMemoryTool, PreloadMemoryTool) (forwarded to adk-tool)
 memory-tools = ["tools", "memory", "adk-tool/memory-tools"]
-# User personas for evaluation (forwarded to adk-eval)
-personas = ["eval", "adk-eval/personas"]
 # Prompt optimization CLI command (forwarded to adk-cli)
 optimize = ["cli", "adk-cli/optimize"]
 # Cloud secret manager providers (forwarded to adk-auth)
 aws-secrets = ["auth", "adk-auth/aws-secrets"]
 azure-keyvault = ["auth", "adk-auth/azure-keyvault"]
 gcp-secrets = ["auth", "adk-auth/gcp-secrets"]
+# Model Armor guardrails for input, output and tool results (forwarded to adk-guardrail)
+gcp-model-armor = ["guardrail", "adk-guardrail/model-armor"]
 # Video avatar support for realtime sessions (forwarded to adk-realtime)
 video-avatar = ["realtime", "adk-realtime/video-avatar"]
 
@@ -329,7 +363,9 @@ audio-tts = ["audio", "adk-audio/tts"]
 audio-stt = ["audio", "adk-audio/stt"]
 audio-fx = ["audio", "adk-audio/fx"]
 audio-mlx = ["audio", "adk-audio/mlx"]
-audio-onnx = ["audio", "adk-audio/onnx"]
+# Every ONNX speech model on one `ort` runtime: Whisper, Distil-Whisper and Moonshine STT,
+# Chatterbox TTS; the model is a checkpoint path chosen at run time.
+audio-onnx = ["audio", "adk-audio/onnx", "adk-audio/whisper-onnx", "adk-audio/distil-whisper", "adk-audio/moonshine", "adk-audio/chatterbox"]
 audio-all = ["audio", "adk-audio/all"]
 
 # Anthropic client crate (direct access to adk-anthropic types)
@@ -343,6 +379,8 @@ graph-functional = ["graph", "adk-graph/functional"]
 graph-node-cache = ["graph", "adk-graph/node-cache"]
 graph-delta = ["graph", "adk-graph/delta-checkpoint"]
 graph-time-travel = ["graph", "adk-graph/time-travel"]
+# Graph workflows from YAML or JSON files: `adk_rust::graph::definition`
+graph-yaml = ["graph", "adk-graph/yaml"]
 # These two need external infrastructure, so they stay out of `full` alongside
 # the other production backends.
 graph-sqlite = ["graph", "adk-graph/sqlite"]
@@ -354,24 +392,17 @@ graph-mongodb = ["graph", "adk-graph/mongodb"]
 graph-neo4j = ["graph", "adk-graph/neo4j"]
 graph-firestore = ["graph", "adk-graph/firestore"]
 
-# Action node features (forwarded to adk-graph)
-action = ["graph", "dep:adk-action", "adk-graph/action"]
-action-http = ["action", "adk-graph/action-http"]
+# Action node features (forwarded to adk-graph). `action` includes the database and email
+# nodes, which link nothing more, and `action-http` the RSS node, which reads a feed over HTTP.
+action = ["graph", "dep:adk-action", "adk-graph/action", "adk-graph/action-db", "adk-graph/action-email"]
+action-http = ["action", "adk-graph/action-http", "adk-graph/action-rss"]
 action-trigger = ["action", "adk-graph/action-trigger"]
-action-db = ["action", "adk-graph/action-db"]
-action-code = ["action", "adk-graph/action-code"]
-action-email = ["action", "adk-graph/action-email"]
-action-rss = ["action", "adk-graph/action-rss"]
 action-full = ["action", "adk-graph/action-full"]
 
-# ONNX audio model features (forwarded to adk-audio)
-whisper-onnx = ["audio", "adk-audio/whisper-onnx"]
-distil-whisper = ["audio", "adk-audio/distil-whisper"]
-moonshine = ["audio", "adk-audio/moonshine"]
+# Audio models that link more than `audio-onnx` (forwarded to adk-audio)
 qwen3-tts = ["audio", "adk-audio/qwen3-tts"]
 all-onnx = ["audio", "adk-audio/all-onnx"]
 kokoro = ["audio", "adk-audio/kokoro"]
-chatterbox = ["audio", "adk-audio/chatterbox"]
 
 [dependencies]
 # Core is always included
@@ -415,6 +446,7 @@ adk-kernel = { workspace = true, optional = true }
 adk-surface = { workspace = true, optional = true }
 adk-site = { workspace = true, optional = true }
 adk-website = { workspace = true, optional = true }
+adk-vision = { workspace = true, optional = true }
 adk-mistralrs = { workspace = true, optional = true }
 
 # Re-export common dependencies
@@ -440,7 +472,7 @@ name = "performance_0_8_llm_agents"
 required-features = ["minimal"]
 
 [package.metadata.docs.rs]
-# Use "full" to show the complete API surface on docs.rs, plus the Monty
-# opt-ins (not part of any tier) so their modules appear in the docs.
-features = ["full", "code-embedded-python", "codeact-monty"]
+# Use "full" to show the complete API surface on docs.rs, plus the opt-ins in no tier
+# whose modules belong in the docs: Monty and agent surfaces.
+features = ["full", "code-embedded-python", "codeact-monty", "surface"]
 rustdoc-args = ["--cfg", "docsrs"]

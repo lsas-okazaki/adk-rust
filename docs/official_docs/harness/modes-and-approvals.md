@@ -13,7 +13,7 @@ call waits for a person. This page covers the modes, how an approval is answered
 | `read_only` | Investigate: reads and todos only |
 | `plan` | Investigate and propose: reads, todos, and a plan presented with `exit_plan_mode` |
 | `ask` | Work with you: reads run, edits and commands wait for approval. The default |
-| `auto` | Work alone in the workspace: reads and edits run, host commands still wait |
+| `auto` | Work alone in the workspace: reads and edits run, host commands still wait — or, with [auto review](#auto-review), a model decides them first |
 
 The mode decides each tool class:
 
@@ -24,7 +24,7 @@ The mode decides each tool class:
 | Edit (`write_file`, `edit_file`, `apply_patch`) | Deny | Deny | Approval | Allow |
 | Edit of a protected path | Deny | Deny | Approval, non-waivable | Approval, non-waivable |
 | `bash` on the host | Deny | Deny | Approval | Approval (Allow with `allow_host_shell_in_auto`) |
-| `bash` in the OS sandbox | Deny | Allow, read-only workspace | Approval (Allow with `auto_allow_sandboxed`) | Allow when protected paths hold |
+| `bash` in the OS sandbox | Deny | Allow, read-only workspace | Approval (Allow with `auto_allow_sandboxed`) | Allow when the sandbox keeps the protected paths: always under Seatbelt, only while every root-level one exists under bubblewrap ([details](shell-and-sandbox.md#auto_allow_sandboxed)) |
 | Unsandboxed retry of a sandboxed command | Deny | Deny | Approval, non-waivable | Approval, non-waivable |
 | External tool, read-only, from a trusted origin | Allow | Allow | Allow | Allow |
 | Any other external tool | Deny | Deny | Approval | Approval |
@@ -148,6 +148,19 @@ A prompter that does not override `prompt_change_set` asks about each call on it
 `ChangeSet::compose` is public, so a surface that groups held edits itself — spec 3.3's
 decision card — computes the same change set and the same `expect_sha256` per call.
 
+### Screen plans
+
+Desktop actions get the same treatment through the computer-use pack (spec 3.7 Q8). Up to N
+actions previewed together in one window form a screen plan; at its first step
+`ApprovalPrompter::prompt_screen_plan` shows the whole plan and returns one
+`ScreenPlanAnswer` (`Approve`, or `Deny { message }`), and the handler answers each later step
+from that decision, once and in order, with `plan: { digest, step }` added to the step's
+arguments. Before each step runs it is previewed again and its fresh target checked against
+the previewed one; a deviation runs nothing and ends the plan, and the step is held for a fresh
+approval. `computer_use_execute` stays outside every standing rule. A prompter that does not
+override `prompt_screen_plan` asks about each step on its own. See
+[Screen plans](packs.md#screen-plans-one-approval-per-plan).
+
 ### Held calls
 
 Without a prompter nothing waits in the run: the call is recorded in the approval store,
@@ -219,6 +232,55 @@ async fn main() -> anyhow::Result<()> {
 `Harness::decide` refuses a fingerprint that is not pending: a call already decided,
 cancelled by a mode change, or never held. A decision also wakes a durable run parked on the
 call, such as a goal (see [Plans and goals](plan-and-goals.md)).
+
+## Auto review
+
+`HarnessAgentBuilder::auto_review(reviewer)` — `--auto-review` or `auto_review = true` in the
+user config for `adk-rust` — has a model review, in Auto mode, each call the mode holds before
+you are asked: it approves, denies, or escalates the call to you. It is off by default, and a
+workspace's `.adk/harness.toml` cannot turn it on.
+
+| Call in Auto mode | With auto review |
+|---|---|
+| `bash` on the host, any other external tool | Reviewed: approved and run, denied with the reviewer's reason, or escalated to you |
+| Everything Auto allows or denies | Unchanged; a denial is never reviewed |
+| Edit of a protected path, unsandboxed retry, `exit_plan_mode`, `memory_write`, `memory_delete`, payments, computer use, partition crossings | Non-waivable: always yours, never reviewed |
+| Any call in `read_only`, `plan` or `ask` | Never reviewed: those modes mean you decide |
+| A served harness whose caller is not authenticated | Auto decides as Ask, so nothing is reviewed |
+
+```rust
+use std::sync::Arc;
+
+use adk_core::{ModelApprover, ReviewScope};
+use adk_harness::{HarnessAgent, HarnessMode, InstructionsConfig};
+use adk_model::{ScriptedLlm, ScriptedResponse};
+
+fn main() -> adk_core::Result<()> {
+    let model = Arc::new(ScriptedLlm::new("scripted", vec![ScriptedResponse::text("done")]));
+    let dir = std::env::temp_dir();
+    let harness = HarnessAgent::builder("harness")
+        .model(model.clone())
+        .workspace(adk_devtools::Workspace::new(&dir))
+        .project_instructions(InstructionsConfig { user_file: None, ..InstructionsConfig::default() })
+        .mode(HarnessMode::Auto)
+        // The reviewer can be the session's model or a cheaper one; MCP tools stay yours.
+        .auto_review(Arc::new(
+            ModelApprover::new(model).scope(ReviewScope::default().excluding_tools(["mcp_*"])),
+        ))
+        .build()?;
+    assert!(harness.runtime().auto_review().is_some());
+    Ok(())
+}
+```
+
+An escalated call is prompted or held exactly as it would be without a reviewer, with the
+reviewer's note in its reason, and the same call is not reviewed again while it waits for you.
+Each verdict is a signed audit record with the reviewer, `model:<model id>`, as the actor; an
+approval or a denial is also filed in the approval inbox as decided by it, so
+`adk-rust approvals list` and the kernel's `decided` event show who decided. The reviewer's
+model call counts against the run's budget and spending limit. See
+[Model Reviewer](../security/tool-authorization.md#model-reviewer) for what it sees, its
+prompt-injection risk and the mitigations.
 
 ## Standing rules
 

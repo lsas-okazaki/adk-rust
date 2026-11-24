@@ -7,10 +7,12 @@ license.workspace = true
 authors.workspace = true
 description = "Python CodeRuntime for the ADK-Rust CodeActAgent, backed by the Pydantic Monty interpreter"
 repository = "https://github.com/zavora-ai/adk-rust"
+homepage.workspace = true
 documentation = "https://docs.rs/adk-codeact-monty"
 keywords = ["ai", "agent", "adk", "python", "codeact"]
 categories = ["api-bindings", "asynchronous"]
 readme = "README.md"
+exclude = ["tests/"]
 
 [dependencies]
 adk-core = { workspace = true }
@@ -25,7 +27,7 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 # Only needed by the unit test that defines a sample `Tool`. The runnable
-# example lives in `examples/codeact_monty_agent` as a standalone crate.
+# example, `codeact_monty_agent`, is a standalone crate in adk-playground.
 async-trait = { workspace = true }
 # Temp directories for the filesystem-access integration tests.
 tempfile = "3"

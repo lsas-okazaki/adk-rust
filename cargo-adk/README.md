@@ -12,6 +12,12 @@ Scaffolding, build, evaluation, and deployment CLI for [ADK-Rust](https://github
 cargo install cargo-adk
 ```
 
+`cargo adk bench` and the `adk-bench` dependency are behind the `bench` feature:
+
+```bash
+cargo install cargo-adk --features bench
+```
+
 ## Commands
 
 | Command | Purpose |
@@ -21,9 +27,9 @@ cargo install cargo-adk
 | `cargo adk addons` | List capability addons |
 | `cargo adk build` | Compile the project (`cargo build --release`, or `--debug`) |
 | `cargo adk validate` | Check a YAML agent definition (`--yaml`) or a Rust source file (`--rust`) |
-| `cargo adk deploy` | Build, bundle, and push to a deployment control plane |
+| `cargo adk deploy` | Build, bundle, and push to a deployment control plane, or deploy to a target: `--target container`, `agent-engine`, `ecs-express`, or `azure-container-apps` |
 | `cargo adk eval` | Run eval sets against an agent binary, or gate on drift in an exported activity ledger |
-| `cargo adk bench` | Run performance benchmarks against real LLM APIs |
+| `cargo adk bench` | Run performance benchmarks against real LLM APIs (feature `bench`) |
 
 ### `cargo adk new` — Scaffold a new agent
 
@@ -38,7 +44,9 @@ cargo adk new my-agent --template api        # REST API server
 cargo adk new my-agent --template graph      # graph-based workflow
 cargo adk new my-agent --template realtime   # realtime voice/audio agent
 cargo adk new my-agent --template harness    # governed harness: REPL with approvals
+cargo adk new my-agent --template autonomous # unattended agent on the agent kernel
 cargo adk new my-site --template website     # AWP 2.0 website and its edge
+cargo adk new my-desk --template vision      # Document desk with the vision pack
 
 # Compose with addons
 cargo adk new my-agent --template tools --addon telemetry --addon auth
@@ -147,6 +155,46 @@ Deploy flow:
 6. Compute the SHA-256 checksum
 7. Push to the control plane
 
+### `cargo adk deploy --target` — Deploy to a container runtime or a cloud
+
+`--target` deploys `adk-deploy.toml` through a provider-neutral deploy target instead of the
+control plane. Each target checks the deployment guarantees first: secrets by reference only, an
+explicit session store, and `[auth]` before public ingress.
+
+```bash
+# Write the Dockerfile, compose.yaml and kubernetes.yaml to .adk-deploy/container/
+cargo adk deploy --target container --plan
+
+# Deploy, then check the endpoint's health and that it refuses unauthenticated calls
+cargo adk deploy --target container
+
+# Agent Engine on Google Cloud (cargo install cargo-adk --features gcp)
+cargo adk deploy --target agent-engine --image us-central1-docker.pkg.dev/p/agents/a:1.0.0
+
+# Amazon ECS Express Mode (cargo install cargo-adk --features aws)
+cargo adk deploy --target ecs-express --image 123456789012.dkr.ecr.us-east-1.amazonaws.com/a:1.0.0
+
+# Azure Container Apps (cargo install cargo-adk --features azure)
+cargo adk deploy --target azure-container-apps --image acme.azurecr.io/a:1.0.0
+```
+
+| Flag | Description |
+|------|-------------|
+| `--target` | `platform` (default), `container`, `agent-engine`, `ecs-express`, or `azure-container-apps` |
+| `--image` | Image to deploy; default `[targets.<name>] image` |
+| `--manifest` | Manifest path (default `adk-deploy.toml`) |
+| `--plan` | Write and print what would be created; deploy nothing |
+| `--status <id>`, `--destroy <id>` | Report or remove a deployment |
+| `--no-verify` | Skip the endpoint check after deploying |
+
+| Feature | Enables |
+|---------|---------|
+| `gcp` | `--target agent-engine` |
+| `aws` | `--target ecs-express` |
+| `azure` | `--target azure-container-apps` |
+
+See [Deploy Targets](../docs/official_docs/deployment/deploy-targets.md).
+
 ### `cargo adk eval` — Run eval sets against an agent binary
 
 ```bash
@@ -163,7 +211,7 @@ The agent runs as its own process: it reads one JSON request per line on stdin a
 | Response | `{"text", "tool_calls": [{"name", "args"}]}` |
 | Error response | `{"error"}` — fails the case |
 
-Responses are scored with `adk_eval::Evaluator` against `--criteria` (an `EvaluationCriteria` JSON file; default an exact tool trajectory and a response similarity of 0.8). LLM-judged criteria need `--judge-model` and the provider's API key. `--tolerance` (default 0.05) is the largest score drop that is not a regression, and `--turn-timeout` (default 300 seconds) bounds each response. The command exits non-zero when a case fails, the agent misbehaves, the baseline is missing for `--check-regression`, or a score regresses. See the [evaluation guide](../docs/official_docs/evaluation/evaluation.md) for every flag and an example agent binary.
+Responses are scored with `adk_eval::Evaluator` against `--criteria` (an `EvaluationCriteria` JSON file; default an exact tool trajectory and a response similarity of 0.8). LLM-judged criteria need `--judge-model` and the provider's API key. `--tolerance` (default 0.05) is the largest score drop that is not a regression, and `--turn-timeout` (default 300 seconds) bounds each response. `--num-runs N` runs the eval sets N times and reports each case's pass rate, score mean and standard deviation, and flakiness; `--min-pass-rate` (default 1.0) is the fraction of runs a case must pass, and a saved baseline holds each case's `pass_rate`. `--judge-max-calls` and `--judge-max-cost-usd` bound the judge's calls across every run; the evaluation stops when they are spent. The command exits non-zero when a case fails, the agent misbehaves, the baseline is missing for `--check-regression`, or a score regresses. See the [evaluation guide](../docs/official_docs/evaluation/evaluation.md) for every flag and an example agent binary.
 
 #### `cargo adk eval --ledger` — Gate on drift in an activity ledger
 
@@ -191,7 +239,9 @@ cargo adk eval --ledger ledger.jsonl --format json --output ledger-report.json
 | `api` | REST API server exposing the agent over HTTP |
 | `agent-engine` | Gemini Enterprise Agent Engine BYOC container: `serve_agent_engine` binary, `Dockerfile`, and `deploy/terraform/` |
 | `openai` | OpenAI-powered LLM agent |
-| `harness` | The governed harness: `HarnessAgent` over SQLite sessions run by `HarnessLauncher` (`cargo run` is the REPL with approvals, `cargo run -- serve` serves it), `.adk/harness.toml`, an `AGENTS.md` skeleton, an example skill, and a scripted smoke test |
+| `harness` | The governed harness: `HarnessAgent` over SQLite sessions, approvals, action ledger, standing rules and kernel stores, run by `HarnessLauncher` (`cargo run` is the REPL with approvals, `cargo run -- serve` serves it, `cargo run -- up` runs the agent kernel, `cargo run -- goal` works toward a goal), `.adk/harness.toml`, an `AGENTS.md` skeleton, an example skill, and a scripted smoke test |
+| `autonomous` | An agent that runs unattended ([guide](../docs/official_docs/autonomy/index.md)): `HarnessAgent` in `auto` mode on the `autonomy` feature, with every store in `.adk/state.db`, the OS sandbox for `bash`, an approval-gated `publish_status` side effect, a per-run budget, a daily spend cap, a signed audit log and a weekday cron trigger; `cargo run -- up` runs the agent kernel with its home in `.adk`, `cargo run -- goal` works toward a goal on it, and a scripted test checks that publishing waits for a decision |
+| `vision` | A Document desk ([getting started](../docs/official_docs/vision/getting-started.md)): `HarnessAgent` in `auto` mode with the vision pack on `vision-local` — PP-OCRv6 reads each page in `inbox/` on the device, RF-DETR and PP-OCRv6 cover faces and personal text before any image leaves, a cloud `Describer` over the provider model sees only a field's crop, `.adk/vision.toml` denies whole pages and asks for crops at the terminal, and tables land in `tables/`; a scripted test checks that a describe is held and nothing leaves when the person says no. Takes no addon that serves |
 | `website` | An AWP 2.0 website (spec 3.5 §7.17): the site project `adk-website new` scaffolds — `site.toml`, the `paper` theme, a business draft charter with its own site id, capabilities, public terms, draft legal pages, `data/`, the holding page — and an edge binary: `cargo run` serves the release `adk-rust site publish` puts in `data/host` with `search_site` on the AWP edge, `cargo run -- check` builds and runs the launch gate; a smoke test. Takes no addon |
 | `managed-agents` | Anthropic Managed Agents session with SSE streaming |
 
@@ -232,7 +282,7 @@ The `api` template and the `server` addon listen on `BIND_HOST` (default `127.0.
 The `docker` addon emits three build-time files and touches no runtime code:
 
 - `Dockerfile` — multi-stage build: `rust:1.95-slim` build stage (tag kept in lockstep with the workspace `rust-toolchain.toml`, optional `sccache` lines commented out) and a `gcr.io/distroless/cc-debian12` runtime stage with `ENV PORT=8080` and `ENTRYPOINT ["/app/agent"]`.
-- `Dockerfile.static` — fully static variant: `x86_64-unknown-linux-musl` build (musl-tools and cmake for `aws-lc-sys`) on a `FROM scratch` runtime that copies in the CA bundle (`rustls-tls-native-roots` reads `/etc/ssl/certs` at runtime). Works with the `gemini-agent-platform` / `gemini-agent-platform-full` feature sets; incompatible with `livekit` (OpenSSL via native-tls) and the adk-audio `onnx` / `kokoro` / `desktop-audio` features (shared ONNX Runtime, espeak-ng, ALSA).
+- `Dockerfile.static` — fully static variant: `x86_64-unknown-linux-musl` build (musl-tools and cmake for `aws-lc-sys`) on a `FROM scratch` runtime that copies in the CA bundle (reqwest's `rustls` verifies against the system trust store, read from `/etc/ssl/certs` at runtime). Works with the `gemini-agent-platform` / `gemini-agent-platform-full` feature sets; incompatible with `livekit` (OpenSSL via native-tls) and the adk-audio `onnx` / `kokoro` / `desktop-audio` features (shared ONNX Runtime, espeak-ng, ALSA).
 - `.dockerignore` — excludes `target/`, `.git/`, and `.env` files from the build context.
 
 ### Enterprise Patterns (5)
@@ -242,7 +292,7 @@ Pre-composed combinations of a base template and addons. Patterns share the `--t
 | Pattern | Base | Addons | Use case |
 |---------|------|--------|----------|
 | `multi-agent` | sequential | telemetry | Multi-agent supervisor with observability |
-| `production` | llm | server, auth, sessions, telemetry | Production-ready agent service |
+| `production` | llm | server, auth, sessions, telemetry | Agent service with HTTP, auth, sessions and telemetry |
 | `pipeline` | sequential | sessions, telemetry | Sequential data processing pipeline |
 | `chatbot` | llm | sessions, memory, server | Conversational chatbot with memory and HTTP interface |
 | `a2a-server` (alias `a2a`) | llm | server, sessions | A2A protocol server with session management |
@@ -283,6 +333,9 @@ cargo adk build         # verify compilation
 | `cargo adk eval` runs an agent binary over a line protocol; `--agent-cmd` is required, and the command fails closed | Add `--agent-cmd`; the ignored `--model` and `--concurrency` flags are removed |
 | An eval set without cases is an error | — |
 | The `api` template and the `server` addon bind `BIND_HOST` (default `127.0.0.1`) | Set `BIND_HOST=0.0.0.0` where the server must be reachable from other machines |
+| `cargo adk bench --suite` is removed; it ran the ordinary workloads whatever suite it named | Drop the flag |
+| `cargo adk bench` is behind the `bench` feature, off by default; without it the subcommand exits 2 with the install command | `cargo install cargo-adk --features bench` |
+| New templates: `harness`, `autonomous`, `website` and `vision` | — |
 
 See the [2.x to 3.0 migration guide](../docs/official_docs/migration/2.x-to-3.0.md) and the [changelog](../CHANGELOG.md) for the full list.
 

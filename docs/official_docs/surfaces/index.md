@@ -179,17 +179,59 @@ match outcome {
 |---|---|
 | `decide` | `ApprovalService::decide` at the version the surface saw. A version conflict becomes `alreadyDecided` with who, where and when ("You said yes in Telegram at 07:31") and is never retried (S-I2); a decision still open at a newer version comes back as `changed` |
 | `cancelAnswer` | Cancels a spoken "allow once" inside its cancel window |
-| `send` | Starts a turn; while a decision of the session is open (whoever may answer it), a turn runs, or earlier input waits, the message is queued instead and sent, oldest first, once the session is free, whichever surface answered the decision (S-I4) |
-| `queue` | Queues the message as the session's next |
+| `send` | Starts a turn; while a decision of the session is open (whoever may answer it), a turn runs, or earlier input waits, the message is queued instead and sent, oldest first, once the session is free, whichever surface answered the decision (S-I4). A message queued behind a running turn is offered to that turn; see [Steering a running turn](#steering-a-running-turn) |
+| `steer` | Sends a message to the running turn of the caller's own session and answers once it has a fate: `steered` when the turn took it, `queued` or `sent` when it goes as the session's next message |
+| `queue` | Queues the message as the session's next; never offered to a running turn |
+| `newThread` | Starts a thread with an agent: the session's first message goes to it, and its harness stamps the session as its own (spec 3.3 §5.7) |
+| `stopTurn` | Stops the running turn of the caller's own session (spec 3.3 §5.1): a person only. A kernel kills the session's running and queued runs; a harness or a runner interrupts its run in flight. The agent waits for the next message, and nothing held for a decision is answered; the outcome is `turnStopped` |
 | `stopAll` | Freezes every agent, from any surface (S-I10) |
 | `resumeAll` | Unfreezes, only from the web home or a paired local terminal (S-I10) |
 | `setMode` | Changes the session's mode; making agents act more on their own is a standing permission, so only the web home, the phone and the terminal may loosen it |
 | `submitDrawn` | Sends a form an agent drew (`genui`): checks the version the person saw, the declared action and each value, then asks the drawing agent for the call, which it holds for the person; nothing runs until they decide. Only a person at a screen sends one. See [Agent-Drawn UI](genui.md#sending-a-form) |
 
-> **Note:** §6 also names "steer", a message that reaches a turn while it runs. The runtime
-> takes one through [`Runner::steer`](../core/runner.md#steering-a-running-agent), but surfaces
-> have no steer command yet: a message sent during a turn is queued as the session's next
-> message, and **Stop all** stops a turn that has gone wrong.
+
+`send`, `queue` and `newThread` carry `images`: up to four PNG, JPEG, WebP or GIF images
+(`ImageData { mimeType, data }`, base64), each at most 3 MB once decoded. The engine checks
+each one's bytes against its declared type before they reach the agent as parts of the
+message, through `Source::start_turn_with_images` (`LocalSource`: the kernel's `content`
+input, or `Harness::send_content_as`). A message with images is never offered to a running
+turn; it waits for the next one. A source that can't take images refuses them rather than
+dropping them.
+
+### Steering a running turn
+
+A message sent while a turn of its session runs reaches that turn (§6 "steer"). The engine
+offers it through `Source::steer`, which ends in
+[`Runner::steer`](../core/runner.md#steering-a-running-agent): the runtime screens it as it
+screens a turn's own message — plugins, then every agent's input guardrails — and the agent
+takes it after its current tool step, before its next model call.
+
+| Step | What happens |
+|---|---|
+| Offered | The message joins the session's queue, marked as held by the turn. `GET /surface/sessions/{session}/queued` lists it, and it cannot be taken back |
+| Taken | The session holds it as a user event with a steering marker, the feed shows it in the thread, and it leaves the queue. `steer` answers `steered` with the event's id |
+| Handed back | The turn ended first: it answered in words, held a call, failed or was stopped. The message keeps its place in the queue and goes as the session's next message, once. `steer` answers `queued` |
+| Not offered | A decision of the session is open, earlier input waits that no turn holds, or no turn runs here: the message is queued or sent as `send` does it |
+
+`send` answers at once with `queued`; `steer` waits for one of the outcomes above. The engine
+follows each offered message on a task of its own, so a surface that disconnects loses
+nothing, and the session's queue holds the message exactly once until it is taken or sent.
+
+| Source | The turn that takes it |
+|---|---|
+| `LocalSource` with a harness or a runner | The run in flight in this process |
+| `LocalSource` with a kernel | The process this replica runs (`Kernel::steer`) |
+| `ControlSource` | The process the kernel that answers runs (`POST /api/kernel/sessions/{session}/steer`) |
+
+A turn another replica runs is not offered the message: it is handed back at once and goes as
+the session's next message.
+
+Governance is the turn's own. A steered message is a user message: input guardrails and
+plugins screen it, a refusal reaches the caller and is recorded, and nothing is offered while
+everything is stopped. It never answers a decision: while one is open the message is queued
+behind it (S-I4), and a held call ends the turn, which hands the message back. `steer` is a
+person's command on their own session; from an agent it is `surface.not_here`, and for a
+session that is not the caller's `surface.not_found` (S-I8).
 
 ### Error codes
 
@@ -199,7 +241,7 @@ match outcome {
 | `surface.answer_not_allowed` | The surface may not give this answer (§7.2) |
 | `surface.confirm_presence` | A high-risk approval without confirming it is you |
 | `surface.call_not_expanded` | A truncated call approved before it was expanded |
-| `surface.not_here` | An agent answering a decision, resuming outside the home, loosening the mode from chat or voice |
+| `surface.not_here` | An agent answering a decision or steering a turn, resuming outside the home, loosening the mode from chat or voice, a `steer` while everything is stopped |
 | `surface.unsupported` | The source cannot do it |
 | `surface.drawn_changed` | A drawn form sent at a version the agent has changed since (`409`) |
 | `surface.invalid` | A malformed command, such as a drawn form's undeclared action, a value that does not fit its field, or a form sent already |
@@ -213,8 +255,12 @@ hint names what the call acts on, or the decision is one the kernel itself asks 
 suggestion adds, an agenda item, a driver to start — the record also carries that `title` and
 the card's `summary`, so "What your agents did" reads "You said yes to adding Finance" and never
 the kernel's tool name.
-`surface.send`, `surface.stop_all`, `surface.resume_all` and `surface.set_mode` record the
-other commands the same way. `surface.drawn.submitted` records a drawn form's send with
+`surface.send`, `surface.stop_all`, `surface.resume_all`, `surface.set_mode` and
+`surface.stop_turn` record the other commands the same way; a message with images also
+carries how many (`images`), never the images. `surface.steer` records a message for a running turn with
+`sessionId` and `outcome`: `offered` before the turn holds a `steer`, `delivered` with the
+`eventId` once a turn took a message, `returned` when it handed a `steer` back, and `refused`
+with the `code` of the refusal. `surface.drawn.submitted` records a drawn form's send with
 `sessionId`, `surfaceId`, `version`, `actionId`, `tool`, `argsDigest` (the audit trail's
 digest of the call's arguments, as the call's approval records carry it), `valuesDigest`,
 `callId` and `drawnBy`, never the values.
@@ -265,9 +311,11 @@ the server's auth middleware authenticates every request.
 | `GET /surface/sessions/{session}/thread` | The session's entries |
 | `GET /surface/sessions/{session}/feed` | Server-sent events: `entry` (with `id` = `seq`), `decisions`, `reset`; resumes after `Last-Event-ID` or `?after=` |
 | `GET /surface/sessions/{session}/queued` | `QueuedResponse`: what the caller typed while a decision of the session was open or a turn ran, sent oldest first once the session is free (§7.4 rule 2) |
+| `GET /surface/agents/{id}/threads` | `AgentThreads`: the caller's threads with the agent (`ThreadSummary` each), for **Thread history** |
 | `GET /surface/agents` | The roster, and `primary`: the agent a message goes to when the person names none (`Source::primary_agent`; `LocalSource`'s kernel target, else its harness's agent), absent when the source has none |
 | `GET /surface/status?session=` | The status line |
 | `GET /surface/briefing?since=` | "While you were away" |
+| `GET /surface/answers?since=` | `AnswerSummary`: how the caller answered since `since` (the last seven days by default) — allowed once, always allowed, edited, denied — and on which surfaces, from the engine's `AnswerLog` |
 | `POST /surface/commands` | `{"surface", "origin", "command"}` → the outcome |
 | `GET /surface/openapi.json` | The OpenAPI 3.1 document |
 | `GET /surface/genui/capabilities` | What the home claims of A2UI, AG-UI and MCP Apps, and the catalogs it renders; with `genui`, mounted by `adk_surface::web::genui::router` |
@@ -308,6 +356,9 @@ generated from the Rust types. `bash scripts/check-surface-api.sh` fails when th
 
 - [The Web Home](web-home.md) — the page at `/ui/` that reads and acts through this API
 - [The Terminal](terminal.md) — the `tui` feature: full screen, inline and JSON
+- [Approve with the Image](approve-with-image.md) — a held call's images on every surface: the exact image that would leave, the digest an answer names, changing it before it leaves
+- [The Annotated Viewer](annotated-viewer.md) — what an agent saw: each region's backend, frame and transform chain, two backends compared, a corrected region saved as an eval case
+- [The Live Camera Surface](live-camera.md) — watching a camera an agent watches: overlays, tracks, watches and zones, the frame governor, the source switch; switch off, edit a zone, stop the stream, raise a card from a frame
 - [Chat](chat.md) — the `channels` feature: the Telegram adapter over the kernel's channel contract
 - [The Phone](phone.md) — the `mobile` feature: wake-ups from your own kernel, device answers and "Confirm it's you"
 - [The Desktop Tray](desktop.md) — Experimental, a separate app: the home in a desktop window and the tray panel at `/ui/tray`

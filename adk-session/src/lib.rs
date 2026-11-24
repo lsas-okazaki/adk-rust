@@ -15,6 +15,7 @@
 //!   stores, the lease, run, schedule, and governance state stores of the durable runtime, and
 //!   the subject registries and consent stores of [`adk_core::subject`]
 //! - [`SessionSubjectData`] - A subject's sessions, exported and erased through any backend
+//! - [`archive`] - Archive, unarchive and export sessions on every backend
 //! - [`Session`] - Conversation session with state and events
 //! - [`State`] - Key-value state with typed prefixes
 //! - [`SessionService`] - Trait for custom session backends
@@ -51,12 +52,29 @@
 //! | `user:` | [`KEY_PREFIX_USER`] | Shared by every session of the user |
 //! | `app:` | [`KEY_PREFIX_APP`] | Shared by every session of the app |
 //! | `temp:` | [`KEY_PREFIX_TEMP`] | Not persisted |
+//!
+//! ## Feature flags
+//!
+//! No feature is on by default; [`InMemorySessionService`] needs none.
+//!
+//! | Feature | Enables |
+//! |---------|---------|
+//! | `sqlite` | `SqliteSessionService` |
+//! | `database` | Alias for `sqlite` |
+//! | `postgres` | `PostgresSessionService`, with TLS |
+//! | `redis` | `RedisSessionService` on a standalone server or Redis Cluster |
+//! | `mongodb` | `MongoSessionService` |
+//! | `neo4j` | `Neo4jSessionService` |
+//! | `firestore` | `FirestoreSessionService` |
+//! | `vertex-session` | `VertexAiSessionService` over the Vertex AI Session API |
+//! | `encrypted-session` | `EncryptedSession`: AES-256-GCM encryption at rest over any backend, with key rotation |
 #![allow(clippy::result_large_err)]
 #![deny(missing_docs)]
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 /// SQL-backed approval stores for calls held for confirmation.
 pub mod approval;
+pub mod archive;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 /// SQL-backed audit log stores for signed, Merkle-hashed audit logs.
 pub mod audit_log;
@@ -69,6 +87,7 @@ pub mod event;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 /// SQL-backed governance state stores for a kill switch shared by every replica.
 pub mod governance_state;
+pub mod history;
 /// In-memory session backend for testing and lightweight use cases.
 pub mod inmemory;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -90,7 +109,6 @@ pub mod session;
 pub mod state;
 /// Shared utilities for extracting and merging state deltas across backends.
 pub mod state_utils;
-/// The session family's adapter for subject export and erasure.
 pub mod subject;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 /// SQL-backed subject registries and consent stores.
@@ -194,8 +212,16 @@ pub mod subject_redis;
 /// Vertex AI Session API backend.
 pub mod vertex;
 
+pub use archive::{
+    ARCHIVE_AUTHOR, ARCHIVE_KEY, ArchiveMark, SESSION_BUNDLE_FORMAT, SessionBundle, ensure_writable,
+};
 pub use consent_gate::ConsentGatedSessionService;
 pub use event::{Event, EventActions, Events};
+pub use history::{
+    FORK_ORIGIN_KEY, ForkOrigin, ForkRequest, HistoryChange, HistoryEdit, HistoryOperation,
+    HistoryOutcome, HistoryRewrite, ImportSessionRequest, RewriteHistoryRequest, RewrittenHistory,
+    SessionHistory,
+};
 pub use inmemory::InMemorySessionService;
 pub use service::{
     AppendEventRequest, CreateRequest, DeleteRequest, GetRequest, ListRequest, SessionService,

@@ -173,6 +173,7 @@ fn build() -> anyhow::Result<LlmAgent> {
 | Calls without IDs | Ollama sends calls without IDs; the agent assigns each an `adk-call-` ID and leaves it out of the next request |
 | Calls written as text | Tool-call markup a model writes into its text (the Qwen/Hermes, Llama, Mistral Nemo, DeepSeek, DeepSeek-V3, Gemma 4, and action-tag formats) becomes a call when it names a declared tool, streamed or not |
 | Tool images | Images a tool returns are sent in a user message after the tool messages |
+| Images | Inline PNG, JPEG and GIF parts go out as the message's native `images`, base64-encoded, so a vision model (`ollama show <model>` lists `vision`) sees them; other attachments, WebP included, which Ollama 0.32 refuses there, are described in the text |
 
 ---
 
@@ -182,6 +183,14 @@ The final `/api/chat` line's counts become `UsageMetadata`. Ollama leaves out a 
 zero, such as `prompt_eval_count` when the whole prompt came from its cache; a missing count
 reads as zero, `eval_count` is still reported, and `UsageMetadata::provider_usage` holds the
 metric fields the line carried.
+
+## Data Locality
+
+`OllamaModel::data_locality()` is `Loopback` when the configured host is `localhost` or a
+loopback address, so a guardrail treats the call as staying on this machine. A cloud model
+(`…-cloud`) is `Remote` at any host, because the local server forwards it to ollama.com, and a
+server on another machine is `Remote` too. See
+[Data locality](providers.md#data-locality).
 
 ---
 

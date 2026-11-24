@@ -1,11 +1,16 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    CacheControlEphemeral, CitationsConfig, Content, ContentBlock, ContentBlockSourceContent,
-    ContextManagement, DocumentSource, EffortLevel, ImageBlock, ImageSource, MessageParam,
-    MessageParamContent, Metadata, Model, OutputConfig, OutputFormat, SkillRef, SpeedMode,
-    SystemPrompt, TextBlock, ThinkingConfig, ToolChoice, ToolResultBlockContent, ToolUnionParam,
+    CacheControlEphemeral, CitationsConfig, CompactionParam, Content, ContentBlock,
+    ContentBlockSourceContent, ContextManagement, DocumentSource, EffortLevel, ImageBlock,
+    ImageSource, MessageParam, MessageParamContent, Metadata, Model, OutputConfig, OutputFormat,
+    SkillRef, SpeedMode, SystemPrompt, TextBlock, ThinkingConfig, ThreadParam, ToolChoice,
+    ToolResultBlockContent, ToolUnionParam,
 };
+
+/// The beta header a request with structured outputs (an output format or a strict tool)
+/// sends.
+pub const STRUCTURED_OUTPUTS_BETA: &str = "structured-outputs-2025-11-13";
 
 /// Security limits for DoS prevention
 const MAX_MESSAGE_COUNT: usize = 1000;
@@ -115,6 +120,22 @@ pub struct MessageCreateParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_management: Option<ContextManagement>,
 
+    /// Asks for a summary of the conversation in place of a reply. Requires beta header
+    /// `compact-2026-09-04`, which the client adds; it cannot be combined with
+    /// `context_management`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionParam>,
+
+    /// Keeps the conversation on the API for a short time, so a later request sends only the
+    /// new messages. Requires beta header `message-threads-2026-08-12`, which the client adds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ThreadParam>,
+
+    /// Beta headers to send beyond those the request's features require
+    /// ([`required_betas`](Self::required_betas)). Sent only as headers, never in the body.
+    #[serde(skip)]
+    pub betas: Vec<String>,
+
     /// Geographic routing for data residency control (e.g. "US", "EU").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_geo: Option<String>,
@@ -189,6 +210,9 @@ impl MessageCreateParams {
             output_config: None,
 
             context_management: None,
+            compaction: None,
+            thread: None,
+            betas: Vec::new(),
             inference_geo: None,
             service_tier: None,
             container: None,
@@ -221,6 +245,9 @@ impl MessageCreateParams {
             output_config: None,
 
             context_management: None,
+            compaction: None,
+            thread: None,
+            betas: Vec::new(),
             inference_geo: None,
             service_tier: None,
             container: None,
@@ -513,8 +540,8 @@ impl MessageCreateParams {
                         ));
                     }
                 }
-                ThinkingConfig::Disabled => {
-                    // No validation needed for disabled state
+                ThinkingConfig::Disabled | ThinkingConfig::BetweenTools => {
+                    // No validation needed when thinking is off
                 }
                 ThinkingConfig::Adaptive { .. } => {
                     // No validation needed for adaptive thinking
@@ -561,6 +588,20 @@ impl MessageCreateParams {
         self
     }
 
+    /// The beta headers the declared tools require, without duplicates, in declaration
+    /// order: `computer-use-2025-11-24` for `computer_20251124` and
+    /// `computer-use-2025-01-24` for `computer_20250124`. The client adds them to the
+    /// request.
+    pub fn tool_beta_headers(&self) -> Vec<&'static str> {
+        let mut betas = Vec::new();
+        for beta in self.tools.iter().flatten().filter_map(ToolUnionParam::beta_header) {
+            if !betas.contains(&beta) {
+                betas.push(beta);
+            }
+        }
+        betas
+    }
+
     /// Check if this request requires the structured outputs beta header.
     ///
     /// Returns `true` if either:
@@ -586,6 +627,140 @@ impl MessageCreateParams {
 
         false
     }
+
+    /// Check if this request requires the advisor tool beta header
+    /// ([`ADVISOR_TOOL_BETA`](crate::types::ADVISOR_TOOL_BETA)).
+    ///
+    /// Returns `true` when the request declares the advisor tool, or replays an
+    /// `advisor_tool_result` block from an earlier turn: the API accepts those blocks only
+    /// under the beta, even after the tool is removed.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_anthropic::{MessageCreateParams, ToolUnionParam};
+    ///
+    /// let mut params = MessageCreateParams::default();
+    /// assert!(!params.requires_advisor_beta());
+    /// params.tools = Some(vec![ToolUnionParam::new_advisor_tool("claude-sonnet-5-5")]);
+    /// assert!(params.requires_advisor_beta());
+    /// ```
+    pub fn requires_advisor_beta(&self) -> bool {
+        let declared = self
+            .tools
+            .iter()
+            .flatten()
+            .any(|tool| matches!(tool, ToolUnionParam::Advisor20260301(_)));
+        declared
+            || self.messages.iter().any(|message| match &message.content {
+                MessageParamContent::Array(blocks) => blocks.iter().any(|block| {
+                    matches!(block, ContentBlock::Unknown(raw) if raw["type"] == "advisor_tool_result")
+                }),
+                MessageParamContent::String(_) => false,
+            })
+    }
+
+    /// Whether the request needs the `compact-2026-09-04` beta: it asks for a compaction or
+    /// carries a compaction block.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_anthropic::{CompactionParam, KnownModel, MessageCreateParams};
+    ///
+    /// let mut params = MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet46);
+    /// assert!(!params.requires_compaction_beta());
+    /// params.compaction = Some(CompactionParam::summarize());
+    /// assert!(params.requires_compaction_beta());
+    /// ```
+    /// The beta headers the request's features require: structured outputs, context
+    /// management, fast mode, compaction, tool changes and threads. The client sends them with
+    /// [`betas`](Self::betas).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_anthropic::{KnownModel, MessageCreateParams, ThreadParam};
+    ///
+    /// let mut params = MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet46);
+    /// assert!(params.required_betas().is_empty());
+    /// params.thread = Some(ThreadParam::Create);
+    /// assert_eq!(params.required_betas(), ["message-threads-2026-08-12"]);
+    /// ```
+    pub fn required_betas(&self) -> Vec<&'static str> {
+        let mut betas = Vec::new();
+        if self.requires_structured_outputs_beta() {
+            betas.push(crate::types::STRUCTURED_OUTPUTS_BETA);
+        }
+        if self.context_management.is_some() {
+            betas.push("context-management-2025-06-27");
+        }
+        if self.speed.is_some() {
+            betas.push("fast-mode-2026-02-01");
+        }
+        for beta in self.tool_beta_headers() {
+            if !betas.contains(&beta) {
+                betas.push(beta);
+            }
+        }
+        if self.requires_advisor_beta() {
+            betas.push(crate::types::ADVISOR_TOOL_BETA);
+        }
+        if self.requires_compaction_beta() {
+            betas.push(crate::types::COMPACTION_BETA);
+        }
+        if self.requires_inline_tools_beta() {
+            betas.push(crate::types::INLINE_TOOLS_BETA);
+        }
+        if self.thread.is_some() {
+            betas.push(crate::types::MESSAGE_THREADS_BETA);
+        }
+        betas
+    }
+
+    /// Whether the request needs the `inline-tools-2026-09-15` beta: it carries a tool change,
+    /// or a compaction block that records tool changes, which the API applies only with it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_anthropic::{
+    ///     ContentBlock, KnownModel, MessageCreateParams, MessageParam, MessageRole,
+    ///     ToolChangeTarget, ToolRemovalBlock,
+    /// };
+    ///
+    /// let mut params = MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet46);
+    /// assert!(!params.requires_inline_tools_beta());
+    /// params.messages.push(MessageParam::new_with_blocks(
+    ///     vec![ContentBlock::ToolRemoval(ToolRemovalBlock {
+    ///         tool: ToolChangeTarget::reference("get_weather"),
+    ///     })],
+    ///     MessageRole::System,
+    /// ));
+    /// assert!(params.requires_inline_tools_beta());
+    /// ```
+    pub fn requires_inline_tools_beta(&self) -> bool {
+        self.messages.iter().any(|message| match &message.content {
+            MessageParamContent::Array(blocks) => blocks.iter().any(|block| match block {
+                ContentBlock::ToolAddition(_) | ContentBlock::ToolRemoval(_) => true,
+                ContentBlock::Compaction(compaction) => {
+                    compaction.extra.contains_key("tool_changes")
+                }
+                _ => false,
+            }),
+            MessageParamContent::String(_) => false,
+        })
+    }
+
+    pub fn requires_compaction_beta(&self) -> bool {
+        self.compaction.is_some()
+            || self.messages.iter().any(|message| match &message.content {
+                MessageParamContent::Array(blocks) => {
+                    blocks.iter().any(|block| matches!(block, ContentBlock::Compaction(_)))
+                }
+                MessageParamContent::String(_) => false,
+            })
+    }
 }
 
 impl Default for MessageCreateParams {
@@ -610,6 +785,9 @@ impl Default for MessageCreateParams {
             output_config: None,
 
             context_management: None,
+            compaction: None,
+            thread: None,
+            betas: Vec::new(),
             inference_geo: None,
             service_tier: None,
             container: None,
@@ -678,6 +856,12 @@ impl ContentSize {
                 DocumentSource::UrlPdf(_) | DocumentSource::File(_) => {}
             },
             ContentBlock::Thinking(thinking) => self.text += thinking.thinking.len(),
+            ContentBlock::Compaction(compaction) => self.text += compaction.content.len(),
+            ContentBlock::ToolAddition(addition) => {
+                self.text +=
+                    json_text_len(&serde_json::to_value(&addition.tool).unwrap_or_default())
+            }
+            ContentBlock::ToolRemoval(_) => {}
             ContentBlock::CodeExecutionResult(result) => self.text += result.output.len(),
             // Server-generated blocks replayed verbatim; the API produced them within its limits.
             ContentBlock::WebSearchToolResult(_)
@@ -695,6 +879,11 @@ impl ContentSize {
         match content {
             Content::Text(text) => self.text += text.text.len(),
             Content::Image(image) => self.add_image(image)?,
+            Content::BrowserState(state) => {
+                for tab in &state.tabs {
+                    self.text += tab.tab_id.len() + tab.title.len() + tab.url.len();
+                }
+            }
         }
         Ok(())
     }

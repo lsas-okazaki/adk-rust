@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,22 +30,49 @@ use crate::model::{
 use crate::origin::{Caller, Origin, SurfaceKind};
 use crate::project::{self, Place, Projector};
 use crate::rules::{self, Answer, Row};
-use crate::source::Source;
+use crate::source::{Source, Steered, Steering};
 use crate::words;
 
 /// The audit action of "Send" and "Queue" (spec 3.3 §11).
 pub const SURFACE_AUDIT_SEND: &str = "surface.send";
+/// The audit action of a message sent to a running turn (spec 3.3 §6 "steer", §11): what
+/// "Steer" was refused or offered, and how a message a turn held ended.
+pub const SURFACE_AUDIT_STEER: &str = "surface.steer";
+
+/// The audit action of **Stop the turn** (spec 3.3 §5.1), recorded before the turn stops.
+pub const SURFACE_AUDIT_STOP_TURN: &str = "surface.stop_turn";
 /// The audit action of "Stop all" (spec 3.3 §11).
 pub const SURFACE_AUDIT_STOP_ALL: &str = "surface.stop_all";
 /// The audit action of "Resume all" (spec 3.3 §11).
 pub const SURFACE_AUDIT_RESUME_ALL: &str = "surface.resume_all";
 /// The audit action of a mode change (spec 3.3 §11).
 pub const SURFACE_AUDIT_SET_MODE: &str = "surface.set_mode";
+/// The audit action of an app's call approved by the home's opt-in consent policy instead of
+/// a person (spec 3.3 §6.1 `genui-apps`).
+pub const SURFACE_AUDIT_APP_CALL_AUTO_APPROVED: &str = "surface.app.call_auto_approved";
 /// The audit action of a drawn form's Send (spec 3.3 §7.4 rule 5, §11).
 pub const SURFACE_AUDIT_DRAWN_SUBMITTED: &str = "surface.drawn.submitted";
+/// The audit action of a person's approval of a form's call, sealed to the drawing they saw
+/// (spec 3.3 §7.4 rule 5).
+pub const SURFACE_AUDIT_DRAWN_SEALED: &str = "surface.drawn.sealed";
 /// The audit action of an answer as it is given, written before it takes effect; its
 /// `surface.decide` record says how it ended (spec 3.3 §11).
 pub const SURFACE_AUDIT_ANSWER: &str = "surface.answer";
+/// The audit action of a person changing an image before it leaves: the old digest, the new
+/// one and the change, written before the call is held again (spec 3.7 §9.3 `vision.edit`).
+pub const SURFACE_AUDIT_IMAGE_CHANGE: &str = "surface.image.change";
+
+/// The audit action of a labelled example saved from the annotated viewer (spec 3.7 §8.2):
+/// the session, the answer, the image's digest, the file, the case and the region kept.
+pub const SURFACE_AUDIT_VISION_EXAMPLE: &str = "surface.vision.example";
+
+/// The code an answer is recorded with when the images it names are not the call's.
+const EVIDENCE_CHANGED: &str = "surface.evidence_changed";
+
+/// What the agent is told of a call a person changed before it ran: it is held again, with
+/// what it would send now, for their answer (spec 3.7 V-I5).
+const HELD_AGAIN_REASON: &str = "The person changed this call before it ran. It is held again \
+    with the change, and the images it would send now, for their answer.";
 
 /// How often the feed reads the session store when the source has nothing faster.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -72,10 +100,16 @@ async fn with_digest<F: std::future::Future>(digest: Option<String>, future: F) 
 /// A command from a surface (spec 3.3 §6). Every command runs as an authenticated
 /// [`Caller`], whose subject, surface and [`Origin`] reach its audit record.
 ///
-/// §6 also names "steer", a message that reaches a turn while it runs. The runtime takes one
-/// through `Runner::steer`, but the engine has no steer command yet: a message sent during a
-/// turn is the session's next message ([`Send`](Self::Send)), and
-/// [`StopAll`](Self::StopAll) stops a turn that has gone wrong.
+/// A message sent while a turn of its session runs reaches that turn (§6 "steer"): the
+/// engine offers it through [`Source::steer`], the runtime screens it as it screens a turn's
+/// own message, and the agent takes it at its next safe point. A turn that ends first hands
+/// the message back, and it goes as the session's next message, once.
+///
+/// | Command | A turn of the session runs | Answers |
+/// |---|---|---|
+/// | [`Send`](Self::Send) | Offered to the turn; it waits in the session's queue until the turn takes it or hands it back | At once: [`Queued`](CommandOutcome::Queued) |
+/// | [`Steer`](Self::Steer) | The same | Once the message has a fate: [`Steered`](CommandOutcome::Steered), or [`Queued`](CommandOutcome::Queued) when handed back |
+/// | [`Queue`](Self::Queue) | Never offered: the session's next message | At once: [`Queued`](CommandOutcome::Queued) |
 ///
 /// # Example
 ///
@@ -112,6 +146,30 @@ pub enum Command {
         /// The surface showed the call in full (§7.1).
         #[serde(default)]
         expanded: bool,
+        /// The digests of the images the surface showed, in the order of the card's media
+        /// (spec 3.7 §8.2): an answer that lets a call with images run names the images it
+        /// lets leave, and is refused when they are not the call's.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        evidence: Vec<String>,
+    },
+    /// Tightens the crop of one of a decision's images or covers more of it, then holds the
+    /// call again with the new image in its place (spec 3.7 §8.2, board choice A8): the crop
+    /// only shrinks and covering only grows. The decision at `version` closes; the call with
+    /// the new image waits for the person's answer.
+    #[serde(rename_all = "camelCase")]
+    ChangeImage {
+        /// The card's `id`.
+        decision_id: String,
+        /// The card's `version`.
+        version: u64,
+        /// The digest of the image the person changed, as the card showed it.
+        from: String,
+        /// The change.
+        change: crate::evidence::ImageChange,
+        /// Only make the new image and say its digest and size, holding nothing again: what
+        /// the editor shows before **Use this image** (board choice A8).
+        #[serde(default)]
+        preview: bool,
     },
     /// Cancels a spoken "allow once" inside its cancel window (§7.2).
     #[serde(rename_all = "camelCase")]
@@ -119,21 +177,52 @@ pub enum Command {
         /// The decision.
         decision_id: String,
     },
-    /// Sends a message; queued instead while a decision of the session is open (S-I4).
+    /// Sends a message; queued instead while a decision of the session is open (S-I4). A
+    /// running turn of the session is offered it and takes it at its agent's next safe point;
+    /// a turn that ends first leaves it queued as the session's next message.
     #[serde(rename_all = "camelCase")]
     Send {
         /// The session.
         session_id: String,
         /// The message.
         text: String,
+        /// The images the person sent with it (spec 3.3 §5.1): at most
+        /// [`MAX_IMAGES`](crate::MAX_IMAGES). A message with images is never offered to a
+        /// running turn; it goes as the session's next.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<crate::model::ImageData>,
     },
-    /// Queues a message as the session's next, after its open decisions (S-I4).
+    /// Sends a message to the running turn of the caller's own session and waits for what
+    /// became of it (§6 "steer"): [`Steered`](CommandOutcome::Steered) when the turn took it,
+    /// [`Queued`](CommandOutcome::Queued) or [`Sent`](CommandOutcome::Sent) when it was handed
+    /// back and goes as the session's next message. A person sends it, never an agent.
+    #[serde(rename_all = "camelCase")]
+    Steer {
+        /// The session.
+        session_id: String,
+        /// The message.
+        text: String,
+    },
+    /// Stops the running turn of the caller's own session (spec 3.3 §5.1): a person only; the
+    /// agent waits for the next message, and nothing held for a decision is answered.
+    #[serde(rename_all = "camelCase")]
+    StopTurn {
+        /// The session.
+        session_id: String,
+    },
+    /// Queues a message as the session's next, after its open decisions (S-I4): never offered
+    /// to a running turn.
     #[serde(rename_all = "camelCase")]
     Queue {
         /// The session.
         session_id: String,
         /// The message.
         text: String,
+        /// The images the person sent with it (spec 3.3 §5.1): at most
+        /// [`MAX_IMAGES`](crate::MAX_IMAGES). A message with images is never offered to a
+        /// running turn; it goes as the session's next.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<crate::model::ImageData>,
     },
     /// Stops every agent (S-I10).
     #[serde(rename_all = "camelCase")]
@@ -162,6 +251,11 @@ pub enum Command {
         session_id: String,
         /// The first message.
         text: String,
+        /// The images the person sent with it (spec 3.3 §5.1): at most
+        /// [`MAX_IMAGES`](crate::MAX_IMAGES). A message with images is never offered to a
+        /// running turn; it goes as the session's next.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<crate::model::ImageData>,
     },
     /// Adds an agent by hand, previewed with `digest` (spec 3.3 §5.7).
     #[serde(rename_all = "camelCase")]
@@ -262,6 +356,24 @@ pub enum CommandOutcome {
         /// The decision now.
         card: DecisionCard,
     },
+    /// What a change to an image would make, held nowhere: the editor shows it before **Use
+    /// this image** (board choice A8).
+    #[serde(rename_all = "camelCase")]
+    ImagePreview {
+        /// The image the change would make: its digest and size, and the one it replaces.
+        changed: crate::evidence::ImageChanged,
+    },
+    /// The call was held again with what the person changed — its arguments, or one of its
+    /// images (spec 3.7 V-I5): `card` is the old decision, closed; the call waiting with the
+    /// new image follows in the feed.
+    #[serde(rename_all = "camelCase")]
+    HeldAgain {
+        /// The image change, when an image changed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        changed: Option<crate::evidence::ImageChanged>,
+        /// The old decision.
+        card: DecisionCard,
+    },
     /// A spoken "allow once" takes effect at `cancel_until` unless cancelled (§7.2).
     #[serde(rename_all = "camelCase")]
     Pending {
@@ -284,7 +396,28 @@ pub enum CommandOutcome {
         /// The session.
         session_id: String,
     },
-    /// The message waits until the session's open decisions are answered (S-I4).
+    /// The session's running turn was stopped, or none was running (spec 3.3 §5.1).
+    #[serde(rename_all = "camelCase")]
+    TurnStopped {
+        /// The session.
+        session_id: String,
+        /// A turn was running and stopped.
+        stopped: bool,
+        /// "Stopped. Your agent waits for your next message."
+        text: String,
+    },
+    /// The session's running turn took the message at its agent's next safe point (§6
+    /// "steer"): the session holds it as event `event_id`, and the turn's next model call
+    /// carries it.
+    #[serde(rename_all = "camelCase")]
+    Steered {
+        /// The session.
+        session_id: String,
+        /// The id of the session event that carries the message.
+        event_id: String,
+    },
+    /// The message waits: until the session's open decisions are answered (S-I4), or until its
+    /// running turn takes it or ends.
     #[serde(rename_all = "camelCase")]
     Queued {
         /// The session.
@@ -410,6 +543,9 @@ pub struct SurfaceEngineBuilder {
     stops_need: Option<String>,
     card_hints: Vec<Arc<dyn CardHints>>,
     granted: Vec<GrantedUse>,
+    #[cfg(feature = "genui")]
+    seals: Option<crate::genui::ApprovalSeals>,
+    cameras: Option<crate::camera::Cameras>,
 }
 
 impl fmt::Debug for SurfaceEngineBuilder {
@@ -559,6 +695,41 @@ impl SurfaceEngineBuilder {
         self
     }
 
+    /// Seals each approval of a drawn form's call to the drawing the person saw, with
+    /// `seals` (spec 3.3 §7.4 rule 5); give the same seals to the harness that runs the
+    /// drawing agent (`HarnessAgentBuilder::requested_call_seal`), which checks them right
+    /// before the call runs.
+    #[cfg(feature = "genui")]
+    #[must_use]
+    pub fn approval_seals(mut self, seals: crate::genui::ApprovalSeals) -> Self {
+        self.seals = Some(seals);
+        self
+    }
+
+    /// Shows drawings in the extension catalog `catalog` too (spec 3.3 §6.1 `genui`,
+    /// extension catalogs): register every catalog the agents' render tools draw in
+    /// (`DrawToolset::catalog`). A drawing in a catalog not registered here is refused
+    /// ("this home does not render the catalog …").
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    /// use adk_surface::genui::DrawToolset;
+    /// use adk_surface::{LocalSource, SurfaceEngine};
+    ///
+    /// # fn example(source: LocalSource, toolset: DrawToolset) {
+    /// let engine = SurfaceEngine::builder(Arc::new(source)).with_catalog(toolset.catalog()).build();
+    /// assert_eq!(engine.catalogs().iter().count(), 2);
+    /// # }
+    /// ```
+    #[cfg(feature = "genui")]
+    #[must_use]
+    pub fn with_catalog(mut self, catalog: &'static crate::genui::Catalog) -> Self {
+        self.projector.catalogs = self.projector.catalogs.clone().with(catalog);
+        self
+    }
+
     /// How often the feed reads the store when the source signals nothing sooner.
     #[must_use]
     pub fn poll_interval(mut self, poll: Duration) -> Self {
@@ -603,6 +774,27 @@ impl SurfaceEngineBuilder {
         self
     }
 
+    /// Serves the live camera surface over `cameras` (spec 3.7 §8.2): the routes under
+    /// `/surface/cameras` read and act on them. Without it they answer `surface.unsupported`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    /// use adk_surface::camera::Cameras;
+    /// use adk_surface::{LocalSource, SurfaceEngine};
+    ///
+    /// # fn example(source: LocalSource, cameras: Cameras) {
+    /// let engine = SurfaceEngine::builder(Arc::new(source)).cameras(cameras).build();
+    /// # let _ = engine;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn cameras(mut self, cameras: crate::camera::Cameras) -> Self {
+        self.cameras = Some(cameras);
+        self
+    }
+
     /// The engine.
     pub fn build(mut self) -> SurfaceEngine {
         if !self.quiet_set {
@@ -639,12 +831,17 @@ impl SurfaceEngineBuilder {
                 stops_need: self.stops_need,
                 card_hints: self.card_hints,
                 granted: self.granted,
+                cameras: self.cameras,
                 #[cfg(feature = "genui")]
                 drawn,
+                #[cfg(feature = "genui")]
+                seals: self.seals,
                 queues: Mutex::new(HashMap::new()),
+                next_input: AtomicU64::new(1),
                 draining: Mutex::new(HashSet::new()),
                 wake: Notify::new(),
                 spoken: Mutex::new(HashMap::new()),
+                changed_images: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -657,7 +854,9 @@ impl SurfaceEngineBuilder {
 /// Surfaces hold no state a reconnect cannot rebuild: everything here is read from the
 /// source's stores, except input queued behind an open decision or a running turn, which
 /// waits in this process and is sent, oldest first, once the session is free — whichever
-/// surface answered the decision.
+/// surface answered the decision. A message queued behind a running turn is offered to that
+/// turn (§6 "steer"): it leaves the queue when the turn takes it, and stays in its place when
+/// the turn hands it back, so it reaches the agent exactly once.
 ///
 /// # Example
 ///
@@ -694,11 +893,19 @@ struct Inner {
     card_hints: Vec<Arc<dyn CardHints>>,
     /// What every agent the home runs may also do (spec 3.3 §5.7).
     granted: Vec<GrantedUse>,
+    /// The cameras of the live camera surface (spec 3.7 §8.2).
+    cameras: Option<crate::camera::Cameras>,
     /// The cards of drawn forms this engine sent (spec 3.3 §7.4 rule 5).
     #[cfg(feature = "genui")]
     drawn: Arc<crate::genui::DrawnHints>,
-    /// Input queued behind an open decision, per (user, session), oldest first.
-    queues: Mutex<HashMap<(String, String), VecDeque<String>>>,
+    /// The seals of approvals of drawn forms' calls, when set.
+    #[cfg(feature = "genui")]
+    seals: Option<crate::genui::ApprovalSeals>,
+    /// Input queued behind an open decision or a running turn, per (user, session), oldest
+    /// first.
+    queues: Mutex<HashMap<(String, String), VecDeque<QueuedInput>>>,
+    /// The id of the next queued message.
+    next_input: AtomicU64,
     /// Sessions with a delivery loop running. Changed only under the `queues` lock, so a
     /// message queued while a loop ends always finds a loop.
     draining: Mutex<HashSet<(String, String)>>,
@@ -706,6 +913,29 @@ struct Inner {
     wake: Notify,
     /// Spoken "allow once" answers inside their cancel window, by decision.
     spoken: Mutex<HashMap<String, Spoken>>,
+    /// Images a person changed through this engine, by the new image's digest: the digest it
+    /// replaced, which the card of the call held again names (spec 3.7 §8.2).
+    changed_images: Mutex<HashMap<String, String>>,
+}
+
+/// A send's audit fields, with how many images the message carries when it carries any.
+fn with_images(mut fields: Value, images: usize) -> Value {
+    if images > 0 {
+        fields["images"] = json!(images);
+    }
+    fields
+}
+
+/// One message of a session's queue.
+struct QueuedInput {
+    /// Names the message while it waits, whatever joins or leaves the queue.
+    id: u64,
+    text: String,
+    /// The images the person sent with it.
+    images: Vec<crate::images::MessageImage>,
+    /// The session's running turn holds it (spec 3.3 §6 "steer"): it is sent as the next
+    /// message only once the turn hands it back.
+    offered: bool,
 }
 
 /// A spoken "allow once" waiting out its cancel window.
@@ -747,6 +977,9 @@ impl SurfaceEngine {
             stops_need: None,
             card_hints: Vec::new(),
             granted: Vec::new(),
+            #[cfg(feature = "genui")]
+            seals: None,
+            cameras: None,
         }
     }
 
@@ -757,6 +990,37 @@ impl SurfaceEngine {
 
     fn now(&self) -> DateTime<Utc> {
         self.inner.clock.now()
+    }
+
+    /// The cameras of the live camera surface, when the engine serves them (spec 3.7 §8.2).
+    pub fn camera_hub(&self) -> Option<&crate::camera::Cameras> {
+        self.inner.cameras.as_ref()
+    }
+
+    /// The engine's clock, for the camera views.
+    pub(crate) fn clock_now(&self) -> DateTime<Utc> {
+        self.now()
+    }
+
+    /// How agents are named and times are shown.
+    pub(crate) fn projector(&self) -> &Projector {
+        &self.inner.projector
+    }
+
+    /// `Ok` when `session` is one of `caller`'s (S-I8), `surface.not_found` otherwise.
+    pub(crate) async fn owns_session(&self, caller: &Caller, session: &str) -> Result<()> {
+        self.transcript(caller, session).await.map(|_| ())
+    }
+
+    /// Sends `text` to `session` as `caller`'s message, queued behind an open decision or a
+    /// running turn as a typed message is.
+    pub(crate) async fn send_message(
+        &self,
+        caller: &Caller,
+        session: &str,
+        text: String,
+    ) -> Result<CommandOutcome> {
+        self.send(caller, session.to_string(), text, Vec::new(), false, true).await
     }
 
     /// What every agent the home runs may also do, as the host granted it (spec 3.3 §5.7).
@@ -774,6 +1038,13 @@ impl SurfaceEngine {
     /// ```
     pub fn granted(&self) -> &[GrantedUse] {
         &self.inner.granted
+    }
+
+    /// The catalogs this engine shows drawings in: `forms` and every catalog registered with
+    /// [`SurfaceEngineBuilder::with_catalog`] (spec 3.3 §6.1 `genui`).
+    #[cfg(feature = "genui")]
+    pub fn catalogs(&self) -> &crate::genui::Catalogs {
+        &self.inner.projector.catalogs
     }
 
     /// How long a spoken answer, or a spoken screen action, can be cancelled (spec 3.3 §5.6).
@@ -895,6 +1166,20 @@ impl SurfaceEngine {
         let hint = self.hint(request).await;
         let mut card =
             self.inner.projector.card(request, caller, always, answer.as_ref(), self.now(), &hint);
+        // A call held again after a person changed it closed this request with a refusal; it
+        // reads as the change it was (spec 3.7 V-I5).
+        if let (Some(decided), Some(record)) = (card.decided.as_mut(), answer.as_ref())
+            && request.state == ApprovalState::Rejected
+            && record.answer == Answer::Edit
+            && record.approval_id == request.id
+        {
+            decided.answer = crate::model::DecidedAnswer::Edited;
+            decided.text = words::held_again_at(&decided.at_text);
+            if let Some(step) = card.timeline.last_mut() {
+                step.text = decided.text.clone();
+            }
+        }
+        self.add_media(caller, request, &hint, &mut card).await;
         // How far a surface's answer reaches: once, or by the standing rule it made (§5.4).
         if let (Some(decided), Some(record)) = (card.decided.as_mut(), answer.as_ref())
             && decided.via.is_some()
@@ -980,6 +1265,323 @@ impl SurfaceEngine {
     /// The label of "Always allow" for `request`, when the source can create its rule. A
     /// request that needs more than one approver never offers it: the rule would let every
     /// later call skip the other approvers (spec 3.3 §7.2, §8.2).
+    /// The images `request` holds, on its card, and what they change about its answers and
+    /// its timeline (spec 3.7 §8.2): a chat card carries none (S-I5), and a decision whose run
+    /// ended while it waits says so (board choice A12).
+    async fn add_media(
+        &self,
+        caller: &Caller,
+        request: &ApprovalRequest,
+        hint: &CardHint,
+        card: &mut DecisionCard,
+    ) {
+        let waiting = request.state == ApprovalState::Pending;
+        if waiting && let Some(ended) = self.inner.source.run_ended(request).await {
+            let at_text = self.inner.projector.hh_mm(ended);
+            let minutes = (ended - request.created_at).num_minutes().max(0);
+            card.parked = Some(crate::model::ParkedView {
+                at: ended,
+                text: words::stopped_waiting(&card.agent.display_name, &at_text),
+                at_text: at_text.clone(),
+            });
+            let at = card.timeline.len().saturating_sub(1);
+            let step = crate::model::TimelineStep {
+                text: words::run_ended(minutes, &at_text),
+                current: false,
+            };
+            card.timeline.insert(at, step);
+        }
+        let decided = card.decided.as_ref().map(|decided| decided.answer);
+        let agent = card.agent.display_name.clone();
+        let Some(media) = self.media(request, hint, decided, &agent).await else { return };
+        if waiting {
+            rules::image_answers(rules::row(caller), self.image_gate(&media), &mut card.allowed);
+            if let Some(day) =
+                media.images.iter().find_map(|image| image.purged.as_ref()?.day.clone())
+            {
+                let at = card.timeline.len().saturating_sub(1);
+                let step = crate::model::TimelineStep {
+                    text: words::image_deleted_step(&day),
+                    current: false,
+                };
+                card.timeline.insert(at, step);
+            }
+        }
+        if rules::row(caller) != Row::Chat {
+            card.media = Some(media);
+        }
+    }
+
+    /// The media of `request`'s card, or `None` when it holds no image.
+    async fn media(
+        &self,
+        request: &ApprovalRequest,
+        hint: &CardHint,
+        decided: Option<crate::model::DecidedAnswer>,
+        agent: &str,
+    ) -> Option<crate::evidence::CardMedia> {
+        let first = crate::evidence::images(request).first().map(|image| image.digest.clone())?;
+        let kept = self.inner.source.evidence_kept(request).await;
+        let replaces = {
+            let changed =
+                self.inner.changed_images.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            request
+                .args_redacted
+                .get("image")
+                .and_then(Value::as_str)
+                .and_then(|named| changed.get(named))
+                .or_else(|| changed.get(&first))
+                .cloned()
+        };
+        // "Open the source image" opens the annotated viewer when the source keeps the
+        // session's images and the feature named no other place (board choice A9).
+        let viewer_facts =
+            hint.media.as_ref().filter(|facts| facts.source_href.is_none()).and_then(|facts| {
+                let named = request.args_redacted.get("image").and_then(Value::as_str)?;
+                self.inner.source.keeps_vision_answers().then(|| {
+                    facts.clone().with_source_href(crate::viewer::viewer_path(
+                        &request.scope.session_id,
+                        named,
+                    ))
+                })
+            });
+        crate::evidence::project(
+            request,
+            &crate::evidence::MediaInput {
+                facts: viewer_facts.as_ref().or(hint.media.as_ref()),
+                kept: &kept,
+                decided,
+                agent: agent.to_string(),
+                now: self.now(),
+                offset: self.inner.projector.offset,
+                can_change: self.inner.source.holds_again(),
+                replaces,
+            },
+        )
+    }
+
+    /// What the rules need to know of a card's images.
+    fn image_gate(&self, media: &crate::evidence::CardMedia) -> rules::ImageGate {
+        rules::ImageGate {
+            sendable: media.sendable(),
+            holds_again: self.inner.source.holds_again(),
+        }
+    }
+
+    /// The `index`th image decision `id` holds as evidence, for `caller` (spec 3.7 §8.3): only a
+    /// decision the caller may see, its bytes checked against the evidence's digest by the
+    /// source.
+    ///
+    /// # Errors
+    ///
+    /// `surface.not_found` when the caller has no such decision or image, or the image is no
+    /// longer kept; the source's error.
+    pub async fn evidence_image(
+        &self,
+        caller: &Caller,
+        id: &str,
+        index: usize,
+    ) -> Result<crate::evidence::EvidenceBytes> {
+        let request = self.owned_request(caller, id).await?;
+        let missing = || SurfaceError::not_found(format!("image {index} of decision '{id}'"));
+        if index >= crate::evidence::images(&request).len() {
+            return Err(missing());
+        }
+        self.inner.source.evidence_image(&request, index).await?.ok_or_else(missing)
+    }
+
+    // -----------------------------------------------------------------------
+    // The annotated viewer (spec 3.7 §8.2, X12)
+    // -----------------------------------------------------------------------
+
+    /// The answer records of `session` for `caller`, parsed; a record that does not parse is
+    /// logged and left out.
+    async fn vision_records(
+        &self,
+        caller: &Caller,
+        session: &str,
+    ) -> Result<Vec<crate::viewer::Record>> {
+        // Only the caller's own session (S-I8): the inbox's rule for a thread.
+        self.transcript(caller, session).await?;
+        let raw = self.inner.source.vision_answers(caller.user_id(), session).await?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|value| match crate::viewer::Record::parse(value) {
+                Ok(record) => Some(record),
+                Err(error) => {
+                    tracing::warn!(error = %error, session.id = %session, "an answer record is not shown");
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// The annotated viewer of image `image` — a `sha256:` digest, or the name of an image
+    /// the session holds — in `caller`'s `session` (spec 3.7 §8.2, X12): every answer the
+    /// vision tools gave for it, `answer` shown (the newest otherwise), `compare` beside it.
+    ///
+    /// # Errors
+    ///
+    /// `surface.not_found` when the caller has no such session or the session no such image;
+    /// the source's error.
+    pub async fn viewer(
+        &self,
+        caller: &Caller,
+        session: &str,
+        image: &str,
+        answer: Option<&str>,
+        compare: Option<&str>,
+    ) -> Result<crate::viewer::ViewerView> {
+        let records = self.vision_records(caller, session).await?;
+        let missing = || SurfaceError::not_found(format!("image '{image}' of session '{session}'"));
+        let digest = if image.starts_with("sha256:") {
+            image.to_string()
+        } else if let Some(record) = records.iter().find(|record| {
+            record.image.name.as_deref() == Some(image)
+                || record.image.artifact.as_deref() == Some(image)
+        }) {
+            record.image.digest.clone()
+        } else {
+            let bytes = self
+                .inner
+                .source
+                .vision_image(caller.user_id(), session, image)
+                .await?
+                .ok_or_else(missing)?;
+            crate::evidence::digest_of(&bytes.bytes)
+        };
+        let records: Vec<crate::viewer::Record> =
+            records.into_iter().filter(|record| record.image.digest == digest).collect();
+        let agent = records.last().map(|record| record.agent.clone()).unwrap_or_default();
+        let files = self.inner.source.example_files(caller.user_id()).await?;
+        let input = crate::viewer::ViewerInput {
+            session,
+            agent_name: self.inner.projector.agent(&agent).display_name,
+            offset: self.inner.projector.offset,
+            can_save: files.is_some(),
+            files: files.unwrap_or_default(),
+        };
+        if let Some(view) = crate::viewer::view(&records, answer, compare, &input) {
+            return Ok(view);
+        }
+        // Nothing has answered for it yet: the picture alone.
+        let bytes = self.inner.source.vision_image(caller.user_id(), session, &digest).await?;
+        let bytes = match bytes {
+            Some(bytes) => bytes,
+            None => self
+                .inner
+                .source
+                .vision_image(caller.user_id(), session, image)
+                .await?
+                .ok_or_else(missing)?,
+        };
+        Ok(crate::viewer::unanswered(session, image, &digest, &bytes, &input))
+    }
+
+    /// The bytes of image `image` (a digest or a name) of `caller`'s `session`, checked
+    /// against its digest (spec 3.7 §8.3).
+    ///
+    /// # Errors
+    ///
+    /// `surface.not_found` when the caller has no such session or image; the source's error.
+    pub async fn viewer_image(
+        &self,
+        caller: &Caller,
+        session: &str,
+        image: &str,
+    ) -> Result<crate::evidence::EvidenceBytes> {
+        self.transcript(caller, session).await?;
+        self.inner.source.vision_image(caller.user_id(), session, image).await?.ok_or_else(|| {
+            SurfaceError::not_found(format!("image '{image}' of session '{session}'"))
+        })
+    }
+
+    /// The `RegionSet` of answer `answer` in `caller`'s `session`, as the vision tools
+    /// published it (board choice V14); with `with`, both answers' sets in an array.
+    ///
+    /// # Errors
+    ///
+    /// `surface.not_found` when the caller has no such session or answer.
+    pub async fn viewer_export(
+        &self,
+        caller: &Caller,
+        session: &str,
+        answer: &str,
+        with: Option<&str>,
+    ) -> Result<Value> {
+        let records = self.vision_records(caller, session).await?;
+        let set = |id: &str| {
+            crate::viewer::find(&records, id)
+                .map(|record| serde_json::to_value(&record.region_set).unwrap_or(Value::Null))
+                .ok_or_else(|| {
+                    SurfaceError::not_found(format!("answer '{id}' of session '{session}'"))
+                })
+        };
+        match with {
+            Some(other) => Ok(Value::Array(vec![set(answer)?, set(other)?])),
+            None => set(answer),
+        }
+    }
+
+    /// Saves a labelled example from an answer in `caller`'s `session` (board choices V11–V13):
+    /// an `adk-eval` case in the eval set `example.file`, its image beside the file. The run's
+    /// answer is untouched; the example is recorded (`surface.vision.example`).
+    ///
+    /// # Errors
+    ///
+    /// `surface.not_found` when the caller has no such session or answer; `surface.invalid`
+    /// when the example does not fit the answer or the file; `surface.unsupported` when the
+    /// source saves no examples.
+    pub async fn save_example(
+        &self,
+        caller: &Caller,
+        session: &str,
+        example: &crate::viewer::LabelledExample,
+    ) -> Result<crate::viewer::SavedExample> {
+        crate::viewer::check_file(&example.file).map_err(SurfaceError::Invalid)?;
+        let records = self.vision_records(caller, session).await?;
+        let record = crate::viewer::find(&records, &example.answer).ok_or_else(|| {
+            SurfaceError::not_found(format!("answer '{}' of session '{session}'", example.answer))
+        })?;
+        let case = crate::viewer::example_case(record, example).map_err(SurfaceError::Invalid)?;
+        let image = self
+            .inner
+            .source
+            .vision_image(caller.user_id(), session, &record.image.digest)
+            .await?
+            .ok_or_else(|| SurfaceError::not_found(format!("image '{}'", record.image.digest)))?;
+        let existing = self.inner.source.example_set(caller.user_id(), &example.file).await?;
+        let set = crate::viewer::with_case(existing, &example.file, case);
+        let image_path = crate::viewer::fixture_image_path(&record.image.digest, &image.mime_type);
+        // The example is on record before it is written (spec 3.3 §11).
+        self.record(
+            caller,
+            SURFACE_AUDIT_VISION_EXAMPLE,
+            json!({
+                "sessionId": session,
+                "answer": record.call_id,
+                "invocationId": record.invocation_id,
+                "tool": record.tool,
+                "imageDigest": record.image.digest,
+                "file": example.file,
+                "caseName": example.case_name,
+                "scope": example.scope,
+                "region": example.region,
+            }),
+        )
+        .await?;
+        self.inner.source.save_example(caller, &example.file, set, &image_path, &image).await?;
+        Ok(crate::viewer::SavedExample {
+            file: example.file.clone(),
+            case_name: example.case_name.clone(),
+            image: image_path,
+            text: format!(
+                "Saved to {} as {}. The run's answer stays as it was.",
+                example.file, example.case_name
+            ),
+        })
+    }
+
     async fn always_label(&self, request: &ApprovalRequest) -> Option<String> {
         if request.policy.quorum > 1 {
             return None;
@@ -1192,6 +1794,56 @@ impl SurfaceEngine {
         Ok(crate::agents::roster(rows, &definitions, can_change))
     }
 
+    /// How `caller` answered since `since` (spec 3.3 §5.1 "How you answered"): each answer
+    /// counted, and on which surfaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns the answer log's error.
+    pub async fn answers_since(
+        &self,
+        caller: &Caller,
+        since: DateTime<Utc>,
+    ) -> Result<crate::answers::AnswerSummary> {
+        let mine: Vec<AnswerRecord> = self
+            .inner
+            .answers
+            .since(since)
+            .await?
+            .into_iter()
+            .filter(|record| record.by.id == caller.user_id())
+            .collect();
+        Ok(crate::answers::AnswerSummary::of(since, &mine))
+    }
+
+    /// The threads `caller` has with `agent`, newest first (spec 3.3 §5.1 "Thread history"):
+    /// each session and when it last changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the source's error.
+    pub async fn agent_threads(
+        &self,
+        caller: &Caller,
+        agent: &str,
+    ) -> Result<crate::agents::AgentThreads> {
+        let offset = self.inner.projector.offset;
+        let mut threads: Vec<crate::agents::ThreadSummary> = self
+            .inner
+            .source
+            .agent_threads(caller.user_id(), agent)
+            .await?
+            .into_iter()
+            .map(|(session_id, at)| crate::agents::ThreadSummary {
+                session_id,
+                at,
+                when: at.with_timezone(&offset).format("%-d %b %H:%M").to_string(),
+            })
+            .collect();
+        threads.sort_by_key(|thread| std::cmp::Reverse(thread.at));
+        Ok(crate::agents::AgentThreads { agent: agent.to_string(), threads })
+    }
+
     /// The agents `caller` removed, each with its threads, which stay readable (spec 3.3
     /// §5.7, §13 decision 18): what "Removed agents" at the roster's foot lists.
     ///
@@ -1300,11 +1952,11 @@ impl SurfaceEngine {
     ///
     /// | Code | When |
     /// |---|---|
-    /// | `surface.not_found` | No decision or session of the caller has that id (S-I8) |
+    /// | `surface.not_found` | No decision or session of the caller has that id (S-I8); a `Steer` to a session that is not the caller's |
     /// | `surface.answer_not_allowed` | The surface may not give this answer (§7.2) |
     /// | `surface.confirm_presence` | A high-risk approval without confirming it is you |
     /// | `surface.call_not_expanded` | A truncated call approved before it was expanded |
-    /// | `surface.not_here` | An agent answering, resuming outside the home, loosening the mode from chat or voice |
+    /// | `surface.not_here` | An agent answering or steering, resuming outside the home, loosening the mode from chat or voice, a `Steer` while everything is stopped |
     /// | `surface.operator_only` | Stop all or Resume all from a caller outside the group [`stops_need`](SurfaceEngineBuilder::stops_need) names |
     /// | `surface.invalid` | A spoken answer: it goes through `decide_spoken` with its transcript (feature `voice`) |
     /// | `surface.unsupported` | The source cannot do it |
@@ -1317,7 +1969,15 @@ impl SurfaceEngine {
                     "a spoken answer goes through decide_spoken with its transcript".into(),
                 ))
             }
-            Command::Decide { decision_id, version, answer, edited_args, reason, expanded } => {
+            Command::Decide {
+                decision_id,
+                version,
+                answer,
+                edited_args,
+                reason,
+                expanded,
+                evidence,
+            } => {
                 self.decide(
                     caller,
                     &decision_id,
@@ -1325,14 +1985,25 @@ impl SurfaceEngine {
                     answer,
                     edited_args,
                     reason,
-                    expanded,
+                    (expanded, evidence),
                     None,
                 )
                 .await
             }
+            Command::ChangeImage { decision_id, version, from, change, preview } => {
+                self.change_image(caller, &decision_id, version, &from, change, preview).await
+            }
             Command::CancelAnswer { decision_id } => self.cancel_answer(caller, &decision_id).await,
-            Command::Send { session_id, text } => self.send(caller, session_id, text, false).await,
-            Command::Queue { session_id, text } => self.send(caller, session_id, text, true).await,
+            Command::Send { session_id, text, images } => {
+                let images = crate::images::decode(&images)?;
+                self.send(caller, session_id, text, images, false, true).await
+            }
+            Command::Steer { session_id, text } => self.steer(caller, session_id, text).await,
+            Command::StopTurn { session_id } => self.stop_turn(caller, session_id).await,
+            Command::Queue { session_id, text, images } => {
+                let images = crate::images::decode(&images)?;
+                self.send(caller, session_id, text, images, true, false).await
+            }
             Command::StopAll { reason } => {
                 self.may_stop(caller)?;
                 self.stop_all(caller, reason).await
@@ -1342,8 +2013,9 @@ impl SurfaceEngine {
                 self.resume_all(caller).await
             }
             Command::SetMode { session_id, mode } => self.set_mode(caller, &session_id, mode).await,
-            Command::NewThread { agent, session_id, text } => {
-                self.new_thread(caller, &agent, session_id, text).await
+            Command::NewThread { agent, session_id, text, images } => {
+                let images = crate::images::decode(&images)?;
+                self.new_thread(caller, &agent, session_id, text, images).await
             }
             command @ (Command::AddAgent { .. }
             | Command::ChangeAgent { .. }
@@ -1376,7 +2048,14 @@ impl SurfaceEngine {
         if !matches!(caller.origin, Origin::Keyboard | Origin::Pointer | Origin::Touch) {
             return Err(SurfaceError::NotHere(words::SEND_FORMS_FROM_A_SCREEN.to_string()));
         }
-        let sent = crate::genui::submission(&events, &surface, version, action, values)?;
+        let sent = crate::genui::submission(
+            &events,
+            &self.inner.projector.catalogs,
+            &surface,
+            version,
+            action,
+            values,
+        )?;
         // A running turn writes the session meanwhile, so the call waits until it ends, as a
         // message does: a second run would interleave its events with the turn's (S-I4).
         let key = (caller.user_id().to_string(), session.clone());
@@ -1395,7 +2074,8 @@ impl SurfaceEngine {
             sent.tool.clone(),
             sent.args.clone(),
             caller.subject.clone(),
-            adk_core::RequestedVia::form(surface.clone(), version, action),
+            adk_core::RequestedVia::form(surface.clone(), version, action)
+                .with_digest(sent.digest.clone()),
         );
         let call_id = call.function_call_id.clone();
         if !self.inner.drawn.begin_send(
@@ -1425,6 +2105,7 @@ impl SurfaceEngine {
                     "valuesDigest": sent.values_digest,
                     "callId": call_id,
                     "drawnBy": sent.drawn_by,
+                    "drawingDigest": sent.digest,
                 }),
             )
             .await?;
@@ -1445,6 +2126,38 @@ impl SurfaceEngine {
         session: &str,
     ) -> Result<Vec<adk_core::Event>> {
         self.transcript(caller, session).await
+    }
+
+    /// Approves the waiting decision `decision_id` by the home's policy `policy` (spec 3.3
+    /// §6.1 `genui-apps`, opt-in tiered consent the person set): decided as the person, the
+    /// rule recorded as `surface.app.call_auto_approved` and on the decision, then resumed like
+    /// their answer.
+    #[cfg(feature = "genui-apps")]
+    pub(crate) async fn approve_by_policy(
+        &self,
+        caller: &Caller,
+        decision_id: &str,
+        version: u64,
+        policy: &str,
+        ext: Value,
+    ) -> Result<()> {
+        let mut fields = json!({ "approvalId": decision_id, "policy": policy, "initiator": "app" });
+        if let (Some(fields), Value::Object(ext)) = (fields.as_object_mut(), ext) {
+            fields.extend(ext);
+        }
+        self.record(caller, SURFACE_AUDIT_APP_CALL_AUTO_APPROVED, fields).await?;
+        // The person's own standing consent: decided as them, the rule on the record.
+        let mut decision =
+            ApprovalDecision::approve(caller.subject.clone()).with_groups(caller.groups.clone());
+        decision.reason = Some(format!("approved by the home's {policy} consent"));
+        let updated = self.inner.source.decide(decision_id, version, decision).await?;
+        if updated.state != ApprovalState::Pending {
+            if let Err(error) = self.inner.source.resolved_by(caller, &updated).await {
+                tracing::warn!(error = %error, decision.id = %updated.id, "the approved call could not be resumed");
+            }
+            self.spawn_drain(caller.clone(), updated.scope.session_id.clone());
+        }
+        Ok(())
     }
 
     /// Asks for `call`, a tool call the app from `app` asked for in `session` (spec 3.3 §6.1
@@ -1525,7 +2238,16 @@ impl SurfaceEngine {
         let (settle, settled) = oneshot::channel();
         let outcome = with_digest(
             Some(digest),
-            self.decide(caller, decision_id, version, answer, None, None, false, Some(settle)),
+            self.decide(
+                caller,
+                decision_id,
+                version,
+                answer,
+                None,
+                None,
+                (false, Vec::new()),
+                Some(settle),
+            ),
         )
         .await?;
         let settled = matches!(outcome, CommandOutcome::Pending { .. }).then_some(settled);
@@ -1541,7 +2263,7 @@ impl SurfaceEngine {
         answer: Answer,
         edited_args: Option<Value>,
         reason: Option<String>,
-        expanded: bool,
+        (expanded, evidence): (bool, Vec<String>),
         settle: Option<oneshot::Sender<Result<CommandOutcome>>>,
     ) -> Result<CommandOutcome> {
         let request = self.owned_request(caller, id).await?;
@@ -1557,7 +2279,14 @@ impl SurfaceEngine {
         }
         let always = self.always_label(&request).await;
         let hint = self.hint(&request).await;
-        let facts = self.inner.projector.facts(&request, always, &hint);
+        let mut facts = self.inner.projector.facts(&request, always, &hint);
+        let images: Vec<String> =
+            crate::evidence::images(&request).iter().map(|image| image.digest.clone()).collect();
+        if !images.is_empty() {
+            let agent = self.inner.projector.agent(&project::agent_name(&request)).display_name;
+            let media = self.media(&request, &hint, None, &agent).await;
+            facts.image = media.as_ref().map(|media| self.image_gate(media));
+        }
         if let Err(violation) = rules::check(caller, &facts, answer, expanded) {
             let error = SurfaceError::Rule(violation);
             self.audit_decide(caller, &request, answer, "refused", Some(&error.code())).await?;
@@ -1565,6 +2294,43 @@ impl SurfaceEngine {
         }
         if answer == Answer::Edit && edited_args.is_none() {
             return Err(SurfaceError::Invalid("an edit needs the changed arguments".into()));
+        }
+        // An answer to an MCP server's form is checked against its schema before it is on
+        // record, so the person hears what to fix instead of the server declining it later.
+        if answer == Answer::Edit
+            && let Some(crate::model::ElicitationView::Form { fields, .. }) =
+                crate::project::elicitation_of(&request)
+            && let Some(content) = edited_args.as_ref()
+            && let Err(reason) = crate::project::check_answer(&fields, content)
+        {
+            return Err(SurfaceError::Invalid(format!(
+                "the answer does not fit the form: {reason}"
+            )));
+        }
+        // An answer that lets a call with images run names the images the person saw: the
+        // decision binds to those digests, and to no other image (spec 3.7 V-I5).
+        if !images.is_empty()
+            && matches!(answer, Answer::AllowOnce | Answer::AlwaysAllow | Answer::Edit)
+        {
+            if evidence.is_empty() {
+                return Err(SurfaceError::Invalid(
+                    "an answer that sends images names the digests of the images it saw: send \
+                     the card's `media.images[].digest` as `evidence`"
+                        .into(),
+                ));
+            }
+            if evidence != images || request.version != version {
+                self.audit_decide(caller, &request, answer, "changed", Some(EVIDENCE_CHANGED))
+                    .await?;
+                let card = self.card(caller, &request).await?;
+                return Ok(CommandOutcome::Changed { card });
+            }
+        }
+        // An edited call with images is held again with what it would send now, never run on
+        // arguments whose images nobody saw (spec 3.7 V-I5).
+        if !images.is_empty() && answer == Answer::Edit {
+            let args = edited_args.unwrap_or(Value::Null);
+            return self.held_again(caller, &request, version, args).await;
         }
         if rules::row(caller) == Row::Voice && answer == Answer::AllowOnce {
             // A spoken answer to a decision that changed since it was read is shown again at
@@ -1584,6 +2350,199 @@ impl SurfaceEngine {
             return self.speak_later(caller, request, version, settle).await;
         }
         self.commit(caller, &request, version, answer, edited_args, reason).await
+    }
+
+    /// Tightens the crop of one of decision `id`'s images or covers more of it, then holds its
+    /// call again with the new image (spec 3.7 §8.2, board choice A8, V-I5).
+    async fn change_image(
+        &self,
+        caller: &Caller,
+        id: &str,
+        version: u64,
+        from: &str,
+        change: crate::evidence::ImageChange,
+        preview: bool,
+    ) -> Result<CommandOutcome> {
+        let request = self.owned_request(caller, id).await?;
+        if !matches!(caller.origin, Origin::Keyboard | Origin::Pointer | Origin::Touch)
+            || !matches!(rules::row(caller), Row::Web | Row::Phone | Row::Terminal)
+        {
+            return Err(SurfaceError::NotHere(
+                "an image is changed by a person looking at it, in the home or on the phone".into(),
+            ));
+        }
+        if request.state != ApprovalState::Pending {
+            return self.already_decided(caller, &request, Answer::Edit).await;
+        }
+        let card = self.card(caller, &request).await?;
+        let media = card.media.as_ref().ok_or_else(|| {
+            SurfaceError::Invalid(format!("decision '{id}' holds no image to change"))
+        })?;
+        let image = media.images.get(change.image as usize).ok_or_else(|| {
+            SurfaceError::not_found(format!("image {} of decision '{id}'", change.image))
+        })?;
+        if request.version != version || image.digest != from {
+            return Ok(CommandOutcome::Changed { card });
+        }
+        if !media.can_change {
+            return Err(SurfaceError::unsupported("changing this image before it leaves"));
+        }
+        change.check(image.width, image.height).map_err(SurfaceError::Invalid)?;
+        if preview {
+            return self.preview_change(&request, from, &change).await;
+        }
+        // The change is on record before it takes effect (spec 3.3 §11).
+        self.record(
+            caller,
+            SURFACE_AUDIT_IMAGE_CHANGE,
+            json!({
+                "approvalId": request.id,
+                "sessionId": request.scope.session_id,
+                "tool": request.tool_name,
+                "version": version,
+                "fromDigest": from,
+                "crop": change.crop,
+                "cover": change.cover,
+            }),
+        )
+        .await?;
+        let changed = match self.inner.source.change_image(caller, &request, version, &change).await
+        {
+            Ok(changed) => changed,
+            Err(error) => return self.not_held_again(caller, &request, error).await,
+        };
+        self.inner
+            .changed_images
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(changed.to.clone(), changed.from.clone());
+        self.record(
+            caller,
+            SURFACE_AUDIT_IMAGE_CHANGE,
+            json!({
+                "approvalId": request.id,
+                "fromDigest": changed.from,
+                "toDigest": changed.to,
+                "outcome": "held_again",
+            }),
+        )
+        .await?;
+        self.after_held_again(caller, &request, Some(changed)).await
+    }
+
+    /// The image `change` would make of `request`'s image, made as the source makes it, and
+    /// held nowhere (board choice A8).
+    #[cfg(feature = "web")]
+    async fn preview_change(
+        &self,
+        request: &ApprovalRequest,
+        from: &str,
+        change: &crate::evidence::ImageChange,
+    ) -> Result<CommandOutcome> {
+        let image = self
+            .inner
+            .source
+            .evidence_image(request, change.image as usize)
+            .await?
+            .ok_or_else(|| SurfaceError::Invalid("the image is no longer kept".into()))?;
+        let (bytes, width, height) =
+            crate::evidence::changed_png(&image.bytes, change).map_err(SurfaceError::Invalid)?;
+        let changed = crate::evidence::ImageChanged {
+            from: from.to_string(),
+            to: crate::evidence::digest_of(&bytes),
+            width,
+            height,
+        };
+        Ok(CommandOutcome::ImagePreview { changed })
+    }
+
+    #[cfg(not(feature = "web"))]
+    async fn preview_change(
+        &self,
+        _request: &ApprovalRequest,
+        _from: &str,
+        _change: &crate::evidence::ImageChange,
+    ) -> Result<CommandOutcome> {
+        Err(SurfaceError::unsupported("changing an image before it leaves"))
+    }
+
+    /// Holds `request`'s call again with the edited `args` (spec 3.7 V-I5).
+    async fn held_again(
+        &self,
+        caller: &Caller,
+        request: &ApprovalRequest,
+        version: u64,
+        args: Value,
+    ) -> Result<CommandOutcome> {
+        self.record(
+            caller,
+            SURFACE_AUDIT_ANSWER,
+            json!({
+                "approvalId": request.id,
+                "sessionId": request.scope.session_id,
+                "tool": request.tool_name,
+                "answer": Answer::Edit,
+                "version": version,
+                "heldAgain": true,
+            }),
+        )
+        .await?;
+        if let Err(error) =
+            self.inner.source.hold_again(caller, request, version, args, HELD_AGAIN_REASON).await
+        {
+            return self.not_held_again(caller, request, error).await;
+        }
+        self.after_held_again(caller, request, None).await
+    }
+
+    /// What a hold again that failed shows: the decision as it is now when someone answered
+    /// or changed it first (S-I2), else the error.
+    async fn not_held_again(
+        &self,
+        caller: &Caller,
+        request: &ApprovalRequest,
+        error: SurfaceError,
+    ) -> Result<CommandOutcome> {
+        let Some(now) = self.inner.source.request(&request.id).await? else {
+            return Err(error);
+        };
+        if now.state != ApprovalState::Pending {
+            return self.already_decided(caller, &now, Answer::Edit).await;
+        }
+        if now.version != request.version {
+            let card = self.card(caller, &now).await?;
+            return Ok(CommandOutcome::Changed { card });
+        }
+        Err(error)
+    }
+
+    /// Records a hold again as the person's change and shows the closed decision.
+    async fn after_held_again(
+        &self,
+        caller: &Caller,
+        request: &ApprovalRequest,
+        changed: Option<crate::evidence::ImageChanged>,
+    ) -> Result<CommandOutcome> {
+        let record = AnswerRecord {
+            approval_id: request.id.clone(),
+            by: caller.subject.clone(),
+            via: caller.via(),
+            answer: Answer::Edit,
+            at: self.now(),
+        };
+        if let Err(error) = self.inner.answers.record(&record).await {
+            tracing::warn!(error = %error, decision.id = %request.id, "where the change was made could not be kept");
+        }
+        self.inner.wake.notify_waiters();
+        let closed =
+            self.inner.source.request(&request.id).await?.unwrap_or_else(|| request.clone());
+        if let Err(error) =
+            self.audit_decide(caller, &closed, Answer::Edit, "held_again", None).await
+        {
+            tracing::warn!(error = %error, decision.id = %closed.id, "the call was held again; its audit record failed");
+        }
+        let card = self.card(caller, &closed).await?;
+        Ok(CommandOutcome::HeldAgain { changed, card })
     }
 
     /// Records the answer: `ApprovalService::decide` at `version`, never retried (S-I2).
@@ -1625,6 +2584,43 @@ impl SurfaceEngine {
             given["transcriptDigest"] = json!(digest);
         }
         self.record(caller, SURFACE_AUDIT_ANSWER, given).await?;
+        // A yes to a form's call is sealed to the drawing the person saw before it takes
+        // effect, so the call that runs is the one they approved (spec 3.3 §7.4 rule 5).
+        #[cfg(feature = "genui")]
+        if matches!(answer, Answer::AllowOnce | Answer::Edit)
+            && let Some(seals) = &self.inner.seals
+            && let Some(sent) = self.inner.drawn.sent_call(request)
+        {
+            let args = decision.edited_args.clone().unwrap_or_else(|| sent.args.clone());
+            let card_text = format!(
+                "{} {}",
+                request.tool_name,
+                serde_json::to_string(&args).unwrap_or_default()
+            );
+            let seal = seals.seal(crate::genui::SealInput {
+                function_call_id: sent.call_id.clone(),
+                tool_name: request.tool_name.clone(),
+                args,
+                card_text,
+                drawing_digest: sent.digest.clone(),
+                surface_id: sent.form.0.clone(),
+                version: sent.form.1,
+                approver: caller.user_id().to_string(),
+            });
+            self.record(
+                caller,
+                SURFACE_AUDIT_DRAWN_SEALED,
+                json!({
+                    "approvalId": request.id,
+                    "callId": sent.call_id,
+                    "surfaceId": sent.form.0,
+                    "version": sent.form.1,
+                    "drawingDigest": sent.digest,
+                    "seal": seal,
+                }),
+            )
+            .await?;
+        }
         match self.inner.source.decide(&request.id, version, decision).await {
             Ok(updated) => {
                 // The decision is recorded and cannot be taken back: nothing after this point
@@ -1854,41 +2850,77 @@ impl SurfaceEngine {
         Ok(CommandOutcome::AnswerCancelled { decision_id: id.to_string() })
     }
 
+    /// **Stop the turn**: a person stops the running turn of their own session; recorded
+    /// before it takes effect.
+    async fn stop_turn(&self, caller: &Caller, session: String) -> Result<CommandOutcome> {
+        if let Origin::Agent { agent } = &caller.origin {
+            return Err(SurfaceError::NotHere(format!(
+                "an agent ({agent}) never stops a person's turn; a person does (spec 3.3 §7.4)"
+            )));
+        }
+        if self.inner.source.transcript(caller.user_id(), &session).await?.is_none() {
+            return Err(SurfaceError::not_found(format!("session '{session}'")));
+        }
+        self.audit_command(caller, SURFACE_AUDIT_STOP_TURN, json!({ "sessionId": session }))
+            .await?;
+        let stopped = self.inner.source.stop_turn(caller, &session).await?;
+        Ok(CommandOutcome::TurnStopped {
+            session_id: session,
+            stopped,
+            text: words::TURN_STOPPED.to_string(),
+        })
+    }
+
+    /// Sends `text` as a message of the session: a turn at once when the session is free,
+    /// queued otherwise, or always when `queue`. With `offer`, a message that waits behind a
+    /// running turn is offered to that turn (spec 3.3 §6 "steer").
     async fn send(
         &self,
         caller: &Caller,
         session: String,
         text: String,
+        images: Vec<crate::images::MessageImage>,
         queue: bool,
+        offer: bool,
     ) -> Result<CommandOutcome> {
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && images.is_empty() {
             return Err(SurfaceError::Invalid("the message is empty".into()));
         }
+        // A running turn takes text at its next safe point; images wait for the next turn.
+        let offer = offer && images.is_empty();
+        let pictures = images.len();
         let key = (caller.user_id().to_string(), session.clone());
         let open = self.session_open(caller, &session).await?;
         // Earlier queued input goes first, including a message the delivery loop is starting
-        // a turn for right now: a new message never overtakes it (S-I4).
-        let earlier = {
+        // a turn for right now: a new message never overtakes it (S-I4). Input the running
+        // turn holds is no reason to wait: that turn takes its messages in order.
+        let (waiting, earlier) = {
             let queues = self.inner.queues.lock().unwrap_or_else(|e| e.into_inner());
-            queues.get(&key).is_some_and(|queued| !queued.is_empty())
-                || self.inner.draining.lock().unwrap_or_else(|e| e.into_inner()).contains(&key)
+            let queued = queues.get(&key);
+            (
+                queued.is_some_and(|queued| queued.iter().any(|input| !input.offered)),
+                queued.is_some_and(|queued| !queued.is_empty())
+                    || self.inner.draining.lock().unwrap_or_else(|e| e.into_inner()).contains(&key),
+            )
         };
         // A running turn takes the message next, as an open decision does (S-I4).
-        let busy = !open && !earlier && self.inner.source.busy(caller.user_id(), &session).await?;
+        let busy = !open && !waiting && self.inner.source.busy(caller.user_id(), &session).await?;
         if open || earlier || busy || queue {
             // Recorded before it is queued: a message whose record failed is never sent.
             self.audit_command(
                 caller,
                 SURFACE_AUDIT_SEND,
-                json!({ "sessionId": session, "queued": true }),
+                with_images(json!({ "sessionId": session, "queued": true }), pictures),
             )
             .await?;
-            let position = {
-                let mut queues = self.inner.queues.lock().unwrap_or_else(|e| e.into_inner());
-                let entry = queues.entry(key).or_default();
-                entry.push_back(text);
-                u32::try_from(entry.len()).unwrap_or(u32::MAX)
+            let held = match busy && offer && !queue {
+                true => self.offer(caller, &session, &text).await?,
+                false => None,
             };
+            let (id, position) = self.enqueue(&key, text.clone(), images, held.is_some());
+            if let Some(held) = held {
+                self.settle_offer(caller.clone(), session.clone(), id, held, None);
+            }
             self.spawn_drain(caller.clone(), session.clone());
             let text = if open {
                 words::SENT_AFTER_THIS_CARD_IS_ANSWERED
@@ -1904,11 +2936,185 @@ impl SurfaceEngine {
         self.audit_command(
             caller,
             SURFACE_AUDIT_SEND,
-            json!({ "sessionId": session, "queued": false }),
+            with_images(json!({ "sessionId": session, "queued": false }), pictures),
         )
         .await?;
-        self.inner.source.start_turn(caller, &session, &text).await?;
+        self.inner.source.start_turn_images(caller, &session, &text, &images).await?;
         Ok(CommandOutcome::Sent { session_id: session })
+    }
+
+    /// Adds `text` to the end of the session's queue; returns its id and its place, from 1.
+    fn enqueue(
+        &self,
+        key: &(String, String),
+        text: String,
+        images: Vec<crate::images::MessageImage>,
+        offered: bool,
+    ) -> (u64, u32) {
+        let id = self.inner.next_input.fetch_add(1, Ordering::Relaxed);
+        let mut queues = self.inner.queues.lock().unwrap_or_else(|e| e.into_inner());
+        let queued = queues.entry(key.clone()).or_default();
+        queued.push_back(QueuedInput { id, text, images, offered });
+        (id, u32::try_from(queued.len()).unwrap_or(u32::MAX))
+    }
+
+    /// Offers `text` to the session's running turn (spec 3.3 §6 "steer"). `None` when no turn
+    /// takes it, or the source cannot be asked just now: the message then waits its turn. A
+    /// message the runtime refuses is not queued, and the refusal is on record.
+    async fn offer(&self, caller: &Caller, session: &str, text: &str) -> Result<Option<Steering>> {
+        match self.inner.source.steer(caller, session, text).await {
+            Ok(held) => Ok(held),
+            Err(error) if transient(&error) => {
+                tracing::debug!(error = %error, session.id = %session, "a running turn could not be offered a message; it waits as the next message");
+                Ok(None)
+            }
+            Err(error) => {
+                let fields =
+                    json!({ "sessionId": session, "outcome": "refused", "code": error.code() });
+                if let Err(audit) = self.audit_command(caller, SURFACE_AUDIT_STEER, fields).await {
+                    tracing::warn!(error = %audit, session.id = %session, "a refused message's audit record failed");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Follows the queued message `id`, which the session's running turn holds, to its end,
+    /// on a task of the engine's own, so a surface that goes away loses nothing. Taken by
+    /// the turn, the message leaves the queue; handed back, it stays in its place as the
+    /// session's next message. `done` hears which.
+    fn settle_offer(
+        &self,
+        caller: Caller,
+        session: String,
+        id: u64,
+        held: Steering,
+        done: Option<oneshot::Sender<Result<CommandOutcome>>>,
+    ) {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let key = (caller.user_id().to_string(), session.clone());
+            let settled = held.await;
+            let delivered = match &settled {
+                Ok(Steered::Delivered { event_id }) => Some(event_id.clone()),
+                Ok(Steered::Returned) => None,
+                // What became of it could not be read. A message is never dropped, so it
+                // goes as the next message.
+                Err(error) => {
+                    tracing::warn!(error = %error, session.id = %session, "what became of a message a running turn held could not be read; it goes as the next message");
+                    None
+                }
+            };
+            let position = {
+                let mut queues = engine.inner.queues.lock().unwrap_or_else(|e| e.into_inner());
+                let queued = queues.entry(key).or_default();
+                let place = queued.iter().position(|input| input.id == id);
+                match (place, &delivered) {
+                    (Some(place), Some(_)) => {
+                        queued.remove(place);
+                    }
+                    (Some(place), None) => queued[place].offered = false,
+                    (None, _) => {}
+                }
+                place.map_or(1, |place| u32::try_from(place + 1).unwrap_or(u32::MAX))
+            };
+            let fields = match &delivered {
+                Some(event_id) => {
+                    json!({ "sessionId": session, "outcome": "delivered", "eventId": event_id })
+                }
+                None => json!({ "sessionId": session, "outcome": "returned" }),
+            };
+            // The message already has its fate: a record that fails does not change it.
+            if (delivered.is_some() || done.is_some())
+                && let Err(error) = engine.audit_command(&caller, SURFACE_AUDIT_STEER, fields).await
+            {
+                tracing::warn!(error = %error, session.id = %session, "a steered message's audit record failed");
+            }
+            // The delivery loop looks again: a message handed back is the session's next,
+            // and a queue the turn emptied ends the loop.
+            engine.inner.wake.notify_waiters();
+            engine.spawn_drain(caller, session.clone());
+            if let Some(done) = done {
+                let outcome = match delivered {
+                    Some(event_id) => CommandOutcome::Steered { session_id: session, event_id },
+                    None => CommandOutcome::Queued {
+                        session_id: session,
+                        position,
+                        text: words::SENT_WHEN_YOUR_AGENT_IS_FREE.to_string(),
+                    },
+                };
+                let _ = done.send(Ok(outcome));
+            }
+        });
+    }
+
+    /// "Steer" (spec 3.3 §6): sends `text` to the running turn of the caller's own session
+    /// and waits for what became of it. Refused, and recorded as refused, from an agent, for
+    /// a session that is not the caller's (S-I8), and while everything is stopped.
+    async fn steer(
+        &self,
+        caller: &Caller,
+        session: String,
+        text: String,
+    ) -> Result<CommandOutcome> {
+        if text.trim().is_empty() {
+            return Err(SurfaceError::Invalid("the message is empty".into()));
+        }
+        let refusal = if let Origin::Agent { agent } = &caller.origin {
+            Some(SurfaceError::NotHere(format!(
+                "an agent ({agent}) never sends a message to a person's running turn; a person \
+                 does (spec 3.3 §7.4)"
+            )))
+        } else if self.inner.source.transcript(caller.user_id(), &session).await?.is_none() {
+            Some(SurfaceError::not_found(format!("session '{session}'")))
+        } else if self.inner.source.stopped().await? {
+            Some(SurfaceError::NotHere(words::ALL_AGENTS_STOPPED.to_string()))
+        } else {
+            None
+        };
+        if let Some(error) = refusal {
+            self.audit_command(
+                caller,
+                SURFACE_AUDIT_STEER,
+                json!({ "sessionId": session, "outcome": "refused", "code": error.code() }),
+            )
+            .await?;
+            return Err(error);
+        }
+        let key = (caller.user_id().to_string(), session.clone());
+        // An open decision, or a message that waits, goes first (S-I4): the message is handed
+        // back at once, as the session's next.
+        let waiting = self
+            .inner
+            .queues
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .is_some_and(|queued| queued.iter().any(|input| !input.offered));
+        if waiting || self.session_open(caller, &session).await? {
+            return self.send(caller, session, text, Vec::new(), false, false).await;
+        }
+        // Recorded before the turn holds it: a message whose record failed is never sent.
+        self.audit_command(
+            caller,
+            SURFACE_AUDIT_STEER,
+            json!({ "sessionId": session, "outcome": "offered" }),
+        )
+        .await?;
+        let Some(held) = self.offer(caller, &session, &text).await? else {
+            // No turn takes it here.
+            return self.send(caller, session, text, Vec::new(), false, false).await;
+        };
+        let (id, _) = self.enqueue(&key, text, Vec::new(), true);
+        let (done, settled) = oneshot::channel();
+        self.settle_offer(caller.clone(), session, id, held, Some(done));
+        settled.await.unwrap_or_else(|_| {
+            Err(SurfaceError::Invalid(
+                "the engine stopped before the turn said whether it took the message; the \
+                 session's thread shows it when it did"
+                    .into(),
+            ))
+        })
     }
 
     /// Whether the session has a decision open: one the caller may answer, or a call held for
@@ -1960,7 +3166,17 @@ impl SurfaceEngine {
                         return;
                     }
                 }
+                // A message the running turn holds is not sent until the turn hands it back.
+                let held = engine
+                    .inner
+                    .queues
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&key)
+                    .and_then(VecDeque::front)
+                    .is_some_and(|input| input.offered);
                 let free = match engine.session_open(&caller, &session).await {
+                    _ if held => Ok(false),
                     Ok(true) => Ok(false),
                     Ok(false) => {
                         engine.inner.source.busy(caller.user_id(), &session).await.map(|busy| !busy)
@@ -1987,15 +3203,22 @@ impl SurfaceEngine {
                         continue;
                     }
                 }
-                let next = engine
+                let next = {
+                    let mut queues = engine.inner.queues.lock().unwrap_or_else(|e| e.into_inner());
+                    match queues.get_mut(&key) {
+                        Some(queued) if queued.front().is_some_and(|input| !input.offered) => {
+                            queued.pop_front()
+                        }
+                        _ => None,
+                    }
+                };
+                let Some(input) = next else { continue };
+                match engine
                     .inner
-                    .queues
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get_mut(&key)
-                    .and_then(VecDeque::pop_front);
-                let Some(text) = next else { continue };
-                match engine.inner.source.start_turn(&caller, &session, &text).await {
+                    .source
+                    .start_turn_images(&caller, &session, &input.text, &input.images)
+                    .await
+                {
                     Ok(()) => {
                         wait = poll;
                         // Let the turn begin before looking again.
@@ -2005,7 +3228,7 @@ impl SurfaceEngine {
                         {
                             let mut queues =
                                 engine.inner.queues.lock().unwrap_or_else(|e| e.into_inner());
-                            queues.entry(key.clone()).or_default().push_front(text);
+                            queues.entry(key.clone()).or_default().push_front(input);
                             if !transient(&error) {
                                 // It stays queued and shown; the next message or answer tries
                                 // again.
@@ -2032,18 +3255,20 @@ impl SurfaceEngine {
     }
 
     /// Takes back the newest input queued for the session, before it is sent; `None` when
-    /// none waits (spec 3.3 §7.4 rule 2).
+    /// none waits (spec 3.3 §7.4 rule 2), or when the session's running turn holds the newest
+    /// (§6 "steer"): the turn may take it at any moment.
     pub fn unqueue_last(&self, caller: &Caller, session: &str) -> Option<String> {
-        self.inner
-            .queues
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(&(caller.user_id().to_string(), session.to_string()))
-            .and_then(VecDeque::pop_back)
+        let mut queues = self.inner.queues.lock().unwrap_or_else(|e| e.into_inner());
+        let queued = queues.get_mut(&(caller.user_id().to_string(), session.to_string()))?;
+        match queued.back() {
+            Some(input) if !input.offered => queued.pop_back().map(|input| input.text),
+            _ => None,
+        }
     }
 
     /// The input queued for the session, oldest first, as the person reads it: an app's
-    /// suggestion is its words and label.
+    /// suggestion is its words and label. A message the session's running turn holds is
+    /// listed until the turn takes it.
     pub fn queued(&self, caller: &Caller, session: &str) -> Vec<String> {
         self.inner
             .queues
@@ -2053,8 +3278,9 @@ impl SurfaceEngine {
             .map(|queue| {
                 queue
                     .iter()
-                    .map(|text| {
-                        crate::genui::suggested_message(text).unwrap_or_else(|| text.clone())
+                    .map(|input| {
+                        crate::genui::suggested_message(&input.text)
+                            .unwrap_or_else(|| input.text.clone())
                     })
                     .collect()
             })
@@ -2093,6 +3319,13 @@ impl SurfaceEngine {
                 })
                 .collect()
         };
+        // Every camera's gate closes before anything else (spec 3.7 V-I17): no frame passes
+        // the hub from here on, wherever the freeze reaches next.
+        if let Some(cameras) = &self.inner.cameras
+            && let Err(error) = cameras.freeze_all().await
+        {
+            tracing::warn!(error = %error, "the cameras' gate closed; their source refused the pause");
+        }
         // Stopping never waits on the audit log (spec 3.2 K-I8): record after, warn on failure.
         self.inner.source.stop_all(caller, &reason).await?;
         let mut fields = json!({ "reason": reason });
@@ -2115,6 +3348,9 @@ impl SurfaceEngine {
         }
         self.audit_command(caller, SURFACE_AUDIT_RESUME_ALL, json!({})).await?;
         self.inner.source.resume_all(caller).await?;
+        if let Some(cameras) = &self.inner.cameras {
+            cameras.thaw_all().await?;
+        }
         Ok(CommandOutcome::Resumed)
     }
 
@@ -2231,8 +3467,9 @@ impl SurfaceEngine {
         agent: &str,
         session: String,
         text: String,
+        images: Vec<crate::images::MessageImage>,
     ) -> Result<CommandOutcome> {
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && images.is_empty() {
             return Err(SurfaceError::Invalid("the message is empty".into()));
         }
         if let Origin::Agent { agent } = &caller.origin {
@@ -2243,10 +3480,13 @@ impl SurfaceEngine {
         self.audit_command(
             caller,
             SURFACE_AUDIT_SEND,
-            json!({ "sessionId": session, "queued": false, "agent": agent }),
+            with_images(
+                json!({ "sessionId": session, "queued": false, "agent": agent }),
+                images.len(),
+            ),
         )
         .await?;
-        self.inner.source.start_turn_with(caller, agent, &session, &text).await?;
+        self.inner.source.start_turn_with_images(caller, agent, &session, &text, &images).await?;
         Ok(CommandOutcome::Sent { session_id: session })
     }
 

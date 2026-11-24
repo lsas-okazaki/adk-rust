@@ -21,9 +21,8 @@ All operations are rooted at a `Workspace` and rejected if they escape it.
 Mutations require a writable workspace; `bash` requires `Workspace::allow_bash(true)`.
 
 The `bash` tool emits its output incrementally as it runs, so UIs can display a
-live terminal (see the
-[`streaming_bash`](https://github.com/zavora-ai/adk-rust/tree/main/examples/streaming_bash)
-example). The framework forwards each chunk as a partial event on the agent's `EventStream`;
+live terminal (see the `streaming_bash` example in
+[adk-playground](https://github.com/zavora-ai/adk-playground)). The framework forwards each chunk as a partial event on the agent's `EventStream`;
 consumers detect them with `event.tool_progress_stream()`. The tool's final result for the
 model carries at most `INLINE_OUTPUT_CHARS` (30,000) characters of output: a longer stream
 keeps its first third and last two thirds around a marker naming the bytes left out, and the
@@ -37,7 +36,7 @@ keeps it running in the background (`adk-harness` background shells).
 
 ```toml
 [dependencies]
-adk-devtools = "3.0"
+adk-devtools = "3.0.0"
 ```
 
 The crate has no feature flags.
@@ -126,6 +125,14 @@ environment — and names its isolation; the tool keeps the timeout ceiling, out
 streaming, standard input, session and group kill. `HostLauncher` (`sh -c`, the default)
 reproduces the built-in behaviour. A sandboxing launcher can wrap the script with an
 `adk-sandbox` enforcer.
+
+| Method | Default | Purpose |
+|--------|---------|---------|
+| `command` | required | The command that runs the script |
+| `isolation` | required | The isolation the launcher names for `bash` |
+| `guarded_command` | `command`, with no guard | The command and a `LaunchGuard` that `BashTool` holds until the process exits, such as the call's egress proxy |
+| `egress` | `ToolEgress::Undeclared`, which a run egress policy refuses | What the launcher's commands reach on the network, declared as `bash`'s `Tool::egress` |
+| `spawn_contained` (Windows) | `None` | Starts the process itself, for confinement set when the process is created, such as a restricted token |
 
 ```rust
 use std::sync::Arc;

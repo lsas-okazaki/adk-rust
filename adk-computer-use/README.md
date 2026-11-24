@@ -6,7 +6,24 @@ Give an ADK agent safe, governed control of a real desktop.
 [![Documentation](https://docs.rs/adk-computer-use/badge.svg)](https://docs.rs/adk-computer-use)
 [![License](https://img.shields.io/crates/l/adk-computer-use.svg)](https://github.com/zavora-ai/adk-rust/blob/main/LICENSE)
 
-This crate is the ADK-Rust orchestration layer for
+`ComputerUseToolset` runs each member of Claude's computer use toolset
+(`computer.left_click`, `computer.screenshot`, ...) as a governed tool call over an
+`adk_core::ComputerActuator` you supply, such as `adk_browser::WebDriverComputer`: tool
+policy, approvals, the kill switch, budgets and the action ledger decide every action, and
+an action that is refused or fails stops the rest of the model's batch. See
+[Governed Computer Use and Browser Use](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/computer-use/toolsets.md).
+
+`McpComputerActuator` is that actuator for a desktop: it performs each action with a plain
+tool of a running [`computer-use-mcp`](https://github.com/zavora-ai/computer-use-mcp) server
+(`screenshot`, `click`, `scroll`, `type`, `key`, ...) and converts the model's screenshot
+pixels to the server's screen points.
+
+> **Note:** No released `computer-use-mcp` serves the governed tools `ComputerUseMcpRuntime`
+> calls (`preview_action`, `execute_action`, control leases, target reservations,
+> `emergency_stop`). The reference graph below runs against your own `ComputerUseRuntime`;
+> to act through the server, use `McpComputerActuator`.
+
+This crate is also the ADK-Rust orchestration layer for
 [`computer-use-mcp`](https://github.com/zavora-ai/computer-use-mcp). It does not
 perform any desktop actuation itself. The actual clicking, typing, and
 screen-reading happens in `computer-use-mcp`, which remains authoritative for
@@ -45,8 +62,8 @@ by wrapping every action in the same fixed, predictable control flow:
 
 ```toml
 [dependencies]
-adk-computer-use = "3.0"
-adk-graph = "3.0"
+adk-computer-use = "3.0.0"
+adk-graph = "3.0.0"
 ```
 
 Or use the meta-crate, where the `computer-use` feature (included in `standard`) exposes it as
@@ -54,7 +71,7 @@ Or use the meta-crate, where the `computer-use` feature (included in `standard`)
 
 ```toml
 [dependencies]
-adk-rust = { version = "3.0", features = ["computer-use"] }
+adk-rust = { version = "3.0.0", features = ["computer-use"] }
 ```
 
 The crate has no feature flags of its own.
@@ -95,9 +112,12 @@ every error after it is acquired.
 
 ## What's included
 
-| Module | What it provides |
+Every item below is exported at the crate root; `contracts` and `runtime` are also public
+modules.
+
+| Area | What it provides |
 | --- | --- |
-| `contracts` | The `computer-use-mcp` MCP server wire types (`action`, `target`, `approval`, `receipt`, `lease`, `session`, `safety`), each validated so they cannot carry unsafe or disclosing data. |
+| `contracts` | The `computer-use-mcp` MCP server wire types (`action`, `target`, `approval`, `receipt`, `lease`, `session`, `safety`), each validated so they cannot carry unsafe or disclosing data. Target `Bounds` state their `CoordinateSpace` (logical points or screenshot pixels) and device pixel ratio, and `TargetEvidence::check_screen_binding` checks them against the screenshot's ratio. |
 | `runtime` | The `ComputerUseRuntime` trait plus its live MCP adapter, `ComputerUseMcpRuntime`. |
 | `graph` | `build_reference_graph` and its checkpointer-aware variant. |
 | `auth` | `ScopeAuthorizer` and `ComputerUseAuthContext` — the `computer:*` scope gate tied to your adk-auth identity. |

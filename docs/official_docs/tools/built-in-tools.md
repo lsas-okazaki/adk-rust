@@ -14,6 +14,7 @@ Provider-native tools are declared through the normal `Tool` API, so you can mix
 | `UrlContextTool` | Gemini URL grounding | Summarize or reason over live URLs |
 | `GoogleMapsTool` | Gemini Google Maps grounding | Places, routes, and local context |
 | `GeminiCodeExecutionTool` | Gemini native code execution | Server-side Python execution |
+| `AnthropicAdvisorTool` | Claude's advisor tool (`advisor_20260301`, beta) | The executor consults a stronger Claude model inside the request; see [Anthropic](../models/anthropic.md#advisor-tool) |
 | `WebSearchTool` | Anthropic native web search | Claude server-side web search; `with_dynamic_filtering()` declares `web_search_20260209`, and `with_allowed_callers(["direct"])` turns its dynamic filtering off |
 | `OpenAIWebSearchTool` | OpenAI Responses web search | OpenAI-hosted retrieval |
 | `DeepSeekWebSearchTool` | DeepSeek Responses web search | DeepSeek server-side search with `deepseek-v4-pro` on `OpenAIResponsesClient` at `https://api.deepseek.com` |
@@ -34,7 +35,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
 
     // Create the GoogleSearchTool
     let search_tool = GoogleSearchTool;
@@ -245,7 +246,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
 
     // Create an agent with ExitLoopTool for iterative refinement
     let refiner = LlmAgentBuilder::new("content_refiner")
@@ -327,7 +328,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
 
     // Create agent with artifact loading capability
     let agent = LlmAgentBuilder::new("document_analyzer")
@@ -433,7 +434,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
 
     // Create agent with multiple built-in tools
     let agent = LlmAgentBuilder::new("research_agent")

@@ -627,18 +627,66 @@ fn drive_codeact(
                         }
                     }
                     unanswered = false;
-                    let script = match next_script(
-                        model.as_ref(),
-                        &transcript,
-                        &generate_content_config,
-                        &model_hooks,
-                    )
-                    .await
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            yield Err(e);
-                            return;
+                    // Auto-compaction before the model call, and once more after the model
+                    // rejected the request as too long; the system prompt is never compacted.
+                    let mut rejected: Option<AdkError> = None;
+                    let mut resent = false;
+                    let script = loop {
+                        let rejection = rejected.take();
+                        if let Some(compactor) =
+                            invocation_ctx.run_config().history_compactor.clone()
+                        {
+                            let trigger = if rejection.is_some() {
+                                adk_core::CompactionTrigger::ContextLimitExceeded
+                            } else {
+                                adk_core::CompactionTrigger::BeforeModelCall
+                            };
+                            let request =
+                                adk_core::HistoryCompactionRequest::new(&transcript[1..], trigger)
+                                    .with_preamble(&transcript[..1]);
+                            match compactor
+                                .compact(invocation_ctx.clone(), model.clone(), request)
+                                .await
+                            {
+                                Ok(Some(compacted)) => {
+                                    transcript.truncate(1);
+                                    transcript.extend(compacted.history);
+                                    if let Some(event) = compacted.event {
+                                        yield Ok(event);
+                                    }
+                                }
+                                Ok(None) => {
+                                    if let Some(error) = rejection {
+                                        yield Err(error);
+                                        return;
+                                    }
+                                }
+                                Err(error) => {
+                                    yield Err(error);
+                                    return;
+                                }
+                            }
+                        }
+                        match next_script(
+                            model.as_ref(),
+                            &transcript,
+                            &generate_content_config,
+                            &model_hooks,
+                        )
+                        .await
+                        {
+                            Ok(s) => break s,
+                            Err(e)
+                                if invocation_ctx.run_config().history_compactor.is_some()
+                                    && adk_core::intra_compaction::is_context_limit_error(&e)
+                                    && !std::mem::replace(&mut resent, true) =>
+                            {
+                                rejected = Some(e);
+                            }
+                            Err(e) => {
+                                yield Err(e);
+                                return;
+                            }
                         }
                     };
                     transcript.push(Content::new("model").with_text(script.clone()));
@@ -1202,7 +1250,8 @@ async fn run_authorized_tool(
             args.clone(),
         ));
         for callback in policy.hooks.before_tool.iter().chain(policy.before_tool) {
-            match callback(cb_ctx.clone()).await {
+            // A panic fails the call closed, as an error does.
+            match adk_core::guard_callback("before-tool callback", callback(cb_ctx.clone())).await {
                 Ok(Some(content)) => {
                     return Ok(ToolRun::Finished(Ok(content_to_tool_value(&content)), None));
                 }
@@ -1672,6 +1721,7 @@ fn suspend_event(invocation_id: &str, agent_name: &str, cp: &CodeActCheckpoint) 
                 args: cp.call.args.clone(),
                 acting: None,
                 origin: None,
+                evidence: Vec::new(),
             });
             // Mark the turn as interrupted and carry a human-readable prompt,
             // mirroring LlmAgent's confirmation interrupt event.
@@ -1785,10 +1835,12 @@ async fn next_script(
 
     let mut content: Option<Content> = None;
 
+    // Plugins and callbacks take the request: one that skips the call leaves nothing to send.
     // before-model plugins: modify the request or short-circuit.
     #[cfg(feature = "enhanced-plugins")]
     if let Some(epm) = hooks.plugins {
-        match epm.run_before_model_call(request.clone(), hooks.ctx.clone()).await? {
+        let taken = std::mem::replace(&mut request, LlmRequest::new("", vec![]));
+        match epm.run_before_model_call(taken, hooks.ctx.clone()).await? {
             BeforeModelCallResult::Continue(modified) => request = modified,
             BeforeModelCallResult::ShortCircuit(response) => content = response.content,
         }
@@ -1797,7 +1849,8 @@ async fn next_script(
     // before-model callbacks: rewrite the request or skip the call with a response.
     if content.is_none() {
         for callback in hooks.hooks.before_model.iter().chain(hooks.before) {
-            match callback(hooks.ctx.clone(), request.clone()).await? {
+            let taken = std::mem::replace(&mut request, LlmRequest::new("", vec![]));
+            match callback(hooks.ctx.clone(), taken).await? {
                 BeforeModelResult::Continue(modified) => request = modified,
                 BeforeModelResult::Skip(response) => {
                     content = response.content;
@@ -1810,14 +1863,30 @@ async fn next_script(
     if content.is_none() {
         let mut stream = hooks.scope.generate(model, request, false).await?;
         let mut text = String::new();
+        let mut finish_reason = None;
+        let mut provider_error = (None, None);
         while let Some(chunk) = stream.next().await {
-            if let Some(c) = chunk?.content {
+            let chunk = chunk?;
+            finish_reason = chunk.finish_reason.or(finish_reason);
+            if chunk.error_code.is_some() {
+                provider_error = (chunk.error_code, chunk.error_message);
+            }
+            if let Some(c) = chunk.content {
                 for part in &c.parts {
                     if let Part::Text { text: t } = part {
                         text.push_str(t);
                     }
                 }
             }
+        }
+        // A refusal is not a script to run, and a malformed tool call is not one either.
+        let (provider_code, provider_message) = provider_error;
+        if let Some(error) = crate::llm_agent::finish_error(
+            finish_reason,
+            provider_message.as_deref().or(Some(text.as_str())),
+            provider_code.as_deref(),
+        ) {
+            return Err(error);
         }
         content = Some(Content::new("model").with_text(text));
     }
@@ -2006,6 +2075,7 @@ pub struct CodeActAgent {
     max_skill_chars: usize,
     instruction: Option<String>,
     instruction_provider: Option<Arc<InstructionProvider>>,
+    static_instruction: Option<String>,
     global_instruction: Option<String>,
     global_instruction_provider: Option<Arc<GlobalInstructionProvider>>,
     include_contents: IncludeContents,
@@ -2233,6 +2303,14 @@ impl Agent for CodeActAgent {
         }
     }
 
+    async fn prewarm(&self) -> adk_core::Result<()> {
+        self.model.prewarm().await?;
+        for agent in &self.sub_agents {
+            agent.prewarm().await?;
+        }
+        Ok(())
+    }
+
     async fn screen_user_input(&self, content: &Content) -> adk_core::Result<Option<Content>> {
         let own = if self.input_guardrails.is_empty() {
             None
@@ -2323,6 +2401,7 @@ impl Agent for CodeActAgent {
         let skill_block = self.select_skill_block(&ctx);
         let mut system_prompt = assemble_system_prompt(
             skill_block.as_deref(),
+            self.static_instruction.as_deref(),
             global.as_deref(),
             instruction.as_deref(),
             &self.runtime.capabilities().prompt,
@@ -2537,6 +2616,7 @@ pub struct CodeActAgentBuilder {
     max_skill_chars: usize,
     instruction: Option<String>,
     instruction_provider: Option<Arc<InstructionProvider>>,
+    static_instruction: Option<String>,
     global_instruction: Option<String>,
     global_instruction_provider: Option<Arc<GlobalInstructionProvider>>,
     include_contents: IncludeContents,
@@ -2584,6 +2664,7 @@ impl CodeActAgentBuilder {
             max_skill_chars: DEFAULT_MAX_SKILL_CHARS,
             instruction: None,
             instruction_provider: None,
+            static_instruction: None,
             global_instruction: None,
             global_instruction_provider: None,
             include_contents: IncludeContents::default(),
@@ -2968,6 +3049,16 @@ impl CodeActAgentBuilder {
         self
     }
 
+    /// Set an instruction sent exactly as written, after any selected skill and before the
+    /// global instruction and [`instruction`](Self::instruction).
+    ///
+    /// No `{key}` placeholder is read, so text you do not control — a skill file, a tool's
+    /// documentation — keeps its braces.
+    pub fn static_instruction(mut self, instruction: impl Into<String>) -> Self {
+        self.static_instruction = Some(instruction.into());
+        self
+    }
+
     /// Set a global instruction placed before the agent instruction. Supports the same
     /// `{key}` placeholders as [`instruction`](Self::instruction).
     pub fn global_instruction(mut self, instruction: impl Into<String>) -> Self {
@@ -3045,6 +3136,7 @@ impl CodeActAgentBuilder {
             max_skill_chars: self.max_skill_chars,
             instruction: self.instruction,
             instruction_provider: self.instruction_provider,
+            static_instruction: self.static_instruction,
             global_instruction: self.global_instruction,
             global_instruction_provider: self.global_instruction_provider,
             include_contents: self.include_contents,
@@ -3094,6 +3186,7 @@ impl Default for CodeActAgentBuilder {
 /// section.
 fn assemble_system_prompt(
     skill: Option<&str>,
+    static_instruction: Option<&str>,
     global: Option<&str>,
     instruction: Option<&str>,
     runtime_prompt: &str,
@@ -3102,6 +3195,7 @@ fn assemble_system_prompt(
 ) -> String {
     [
         skill.unwrap_or_default(),
+        static_instruction.unwrap_or_default(),
         global.unwrap_or_default(),
         instruction.unwrap_or_default(),
         CODEACT_SYSTEM_PROMPT,
@@ -3490,6 +3584,87 @@ mod tests {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
     }
 
+    /// A model that ends its turn with `finish_reason`, `text`, and an optional provider error.
+    struct FinishingLlm {
+        finish_reason: adk_core::FinishReason,
+        text: &'static str,
+        error: Option<(&'static str, &'static str)>,
+    }
+
+    #[async_trait]
+    impl Llm for FinishingLlm {
+        fn name(&self) -> &str {
+            "finishing"
+        }
+        async fn generate_content(
+            &self,
+            _req: LlmRequest,
+            _stream: bool,
+        ) -> adk_core::Result<adk_core::LlmResponseStream> {
+            let mut response =
+                adk_core::model::LlmResponse::new(Content::new("model").with_text(self.text));
+            response.finish_reason = Some(self.finish_reason);
+            response.error_code = self.error.map(|(code, _)| code.to_string());
+            response.error_message = self.error.map(|(_, message)| message.to_string());
+            Ok(Box::pin(futures::stream::once(async move { Ok(response) })))
+        }
+    }
+
+    /// The first error the loop yields, and how many planned programs no script started.
+    async fn first_error(model: FinishingLlm) -> (AdkError, usize) {
+        let runtime = Arc::new(ScriptedRuntime::new(vec![vec![Planned::Complete(
+            json!({"type": "final_result", "value": "ran anyway"}),
+        )]]));
+        let input = base_inputs(Arc::new(model), runtime.clone(), user("go"));
+        let mut stream = Box::pin(run_codeact(input));
+        let error = loop {
+            match stream.next().await.expect("the loop ends with an error") {
+                Ok(_) => continue,
+                Err(error) => break error,
+            }
+        };
+        (error, runtime.programs_left())
+    }
+
+    #[tokio::test]
+    async fn a_refusal_ends_the_run_without_running_a_script() {
+        let (error, programs_left) = first_error(FinishingLlm {
+            finish_reason: adk_core::FinishReason::Refusal,
+            text: "I can't help with that.",
+            error: None,
+        })
+        .await;
+        assert_eq!(
+            (error.code, error.category, programs_left),
+            ("model.refusal", adk_core::ErrorCategory::Forbidden, 1)
+        );
+        assert!(error.message.contains("I can't help with that."), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_reported_with_an_error_code_keeps_the_provider_message() {
+        let (error, programs_left) = first_error(FinishingLlm {
+            finish_reason: adk_core::FinishReason::Refusal,
+            text: "",
+            error: Some(("refusal", "Claude declined the request (category cyber): Declined.")),
+        })
+        .await;
+        assert_eq!((error.code, programs_left), ("model.refusal", 1));
+        assert!(error.message.contains("category cyber"), "{}", error.message);
+        assert_eq!(error.details.metadata["provider_error_code"], json!("refusal"));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_tool_call_ends_the_run_without_running_a_script() {
+        let (error, programs_left) = first_error(FinishingLlm {
+            finish_reason: adk_core::FinishReason::MalformedToolCall,
+            text: "",
+            error: None,
+        })
+        .await;
+        assert_eq!((error.code, programs_left), ("model.malformed_tool_call", 1));
+    }
+
     #[tokio::test]
     async fn produces_final_result() {
         let events = drive(
@@ -3700,6 +3875,126 @@ mod tests {
         assert!(rt.last_raise().unwrap().contains("not_found"));
     }
 
+    /// Replaces the history with one notice once asked `compact_on` times or more, recording
+    /// each trigger it is asked with.
+    #[derive(Debug, Default)]
+    struct NoticeCompactor {
+        compact_on: usize,
+        triggers: StdMutex<Vec<adk_core::CompactionTrigger>>,
+    }
+
+    #[async_trait]
+    impl adk_core::HistoryCompactor for NoticeCompactor {
+        async fn compact(
+            &self,
+            _ctx: Arc<dyn InvocationContext>,
+            _model: Arc<dyn Llm>,
+            request: adk_core::HistoryCompactionRequest<'_>,
+        ) -> adk_core::Result<Option<adk_core::CompactedHistory>> {
+            let mut triggers = self.triggers.lock().unwrap();
+            triggers.push(request.trigger);
+            if triggers.len() < self.compact_on {
+                return Ok(None);
+            }
+            let mut event = Event::new("inv-1");
+            event.actions.compaction = Some(adk_core::EventCompaction {
+                start_timestamp: chrono::Utc::now(),
+                end_timestamp: chrono::Utc::now(),
+                compacted_content: adk_core::history::system_notice("compacted"),
+            });
+            Ok(Some(adk_core::CompactedHistory {
+                history: vec![adk_core::history::system_notice("compacted")],
+                event: Some(event),
+            }))
+        }
+    }
+
+    /// Rejects its first request as too long inside the stream, then answers as `FakeLlm`.
+    struct RejectsFirst {
+        inner: Arc<FakeLlm>,
+        rejected: StdMutex<bool>,
+    }
+
+    #[async_trait]
+    impl Llm for RejectsFirst {
+        fn name(&self) -> &str {
+            "rejects-first"
+        }
+        async fn generate_content(
+            &self,
+            req: LlmRequest,
+            stream: bool,
+        ) -> adk_core::Result<adk_core::LlmResponseStream> {
+            if !std::mem::replace(&mut *self.rejected.lock().unwrap(), true) {
+                let error = AdkError::new(
+                    ErrorComponent::Model,
+                    ErrorCategory::InvalidInput,
+                    "model.test.api_error",
+                    "400: prompt is too long: 1048577 tokens > 1000000 maximum",
+                );
+                return Ok(Box::pin(futures::stream::once(async move { Err(error) })));
+            }
+            self.inner.generate_content(req, stream).await
+        }
+    }
+
+    fn with_compactor(input: &mut LoopInputs, compactor: Arc<NoticeCompactor>) {
+        let config =
+            adk_core::RunConfig { history_compactor: Some(compactor), ..Default::default() };
+        input.invocation_ctx =
+            Arc::new(MockInvocationContext::new(user("go")).with_run_config(config));
+    }
+
+    #[tokio::test]
+    async fn the_transcript_is_compacted_before_each_model_call() {
+        let model = FakeLlm::new("noop");
+        let rt = Arc::new(ScriptedRuntime::with_suspension(vec![
+            vec![Planned::Raised("the first try failed".to_string())],
+            vec![Planned::Complete(json!({"type": "final_result", "value": "done"}))],
+        ]));
+        let compactor = Arc::new(NoticeCompactor { compact_on: 2, ..Default::default() });
+        let mut input = base_inputs(model.clone(), rt, user("go"));
+        with_compactor(&mut input, compactor.clone());
+
+        let events = collect(input).await;
+
+        assert_eq!(final_text(events.last().unwrap()).as_deref(), Some("done"));
+        assert_eq!(
+            *compactor.triggers.lock().unwrap(),
+            vec![adk_core::CompactionTrigger::BeforeModelCall; 2]
+        );
+        // The system prompt stays; the rest of the transcript is the compactor's.
+        assert_eq!(
+            model.seen.lock().unwrap()[1],
+            vec![user("sys"), adk_core::history::system_notice("compacted")]
+        );
+        assert_eq!(events.iter().filter(|event| event.actions.compaction.is_some()).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_script_request_rejected_as_too_long_is_compacted_and_sent_once_more() {
+        let inner = FakeLlm::new("noop");
+        let model = Arc::new(RejectsFirst { inner: inner.clone(), rejected: StdMutex::new(false) });
+        let rt = Arc::new(ScriptedRuntime::with_suspension(vec![vec![Planned::Complete(
+            json!({"type": "final_result", "value": "done"}),
+        )]]));
+        let compactor = Arc::new(NoticeCompactor { compact_on: 2, ..Default::default() });
+        let mut input = base_inputs(model, rt, user("go"));
+        with_compactor(&mut input, compactor.clone());
+
+        let events = collect(input).await;
+
+        assert_eq!(final_text(events.last().unwrap()).as_deref(), Some("done"));
+        assert_eq!(
+            *compactor.triggers.lock().unwrap(),
+            vec![
+                adk_core::CompactionTrigger::BeforeModelCall,
+                adk_core::CompactionTrigger::ContextLimitExceeded
+            ]
+        );
+        assert_eq!(inner.calls(), 1, "the compacted request was sent once more");
+    }
+
     /// The full Agent path: `run()` reads session state, suspends, and on a
     /// second `run()` (with the result in the message) resumes to a final.
     #[tokio::test]
@@ -3841,6 +4136,7 @@ mod tests {
     fn assemble_orders_sections() {
         let prompt = assemble_system_prompt(
             Some("SKILL"),
+            Some("LITERAL {window_id}"),
             Some("GLOBAL"),
             Some("HOUSE"),
             "RT-ENV",
@@ -3848,6 +4144,7 @@ mod tests {
             Some("XFER"),
         );
         let skill = prompt.find("SKILL").unwrap();
+        let literal = prompt.find("LITERAL {window_id}").unwrap();
         let global = prompt.find("GLOBAL").unwrap();
         let user = prompt.find("HOUSE").unwrap();
         let base = prompt.find("You act by writing code").unwrap();
@@ -3855,7 +4152,8 @@ mod tests {
         let tools = prompt.find("TOOLS").unwrap();
         let xfer = prompt.find("XFER").unwrap();
         assert!(
-            skill < global
+            skill < literal
+                && literal < global
                 && global < user
                 && user < base
                 && base < rt
@@ -4054,6 +4352,23 @@ mod tests {
         run_collect(&agent, Arc::new(MockInvocationContext::new(user("go")))).await;
         let sys = first_transcript_text(&model);
         assert!(sys.find("GLOBAL IDENTITY").unwrap() < sys.find("AGENT RULES").unwrap());
+    }
+
+    #[tokio::test]
+    async fn static_instruction_is_sent_as_written_before_the_global_instruction() {
+        let model = FakeLlm::new("noop");
+        let agent = CodeActAgent::builder()
+            .model(model.clone())
+            .runtime(final_runtime())
+            .static_instruction("Call set_target {window_id} first.")
+            .global_instruction("GLOBAL IDENTITY")
+            .instruction("AGENT RULES")
+            .build()
+            .unwrap();
+        run_collect(&agent, Arc::new(MockInvocationContext::new(user("go")))).await;
+        let sys = first_transcript_text(&model);
+        let literal = sys.find("Call set_target {window_id} first.").unwrap();
+        assert!(literal < sys.find("GLOBAL IDENTITY").unwrap());
     }
 
     #[tokio::test]

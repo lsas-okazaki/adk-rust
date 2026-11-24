@@ -274,6 +274,8 @@ struct ActiveRunCleanup {
     active_runs: ActiveRuns,
     run_id: u64,
     inbox: adk_core::SteeringInbox,
+    /// Keeps the run in the runner's session activity until the stream ends.
+    _activity: crate::history::ActivityGuard,
 }
 
 /// A newly registered runner invocation and its event stream.
@@ -498,18 +500,22 @@ pub struct RunnerConfig {
     /// Each run derives a child of this token, so cancelling it stops every in-flight
     /// run, while [`Runner::interrupt`] cancels only the targeted run's child.
     pub cancellation_token: Option<CancellationToken>,
-    /// Optional intra-invocation compaction configuration.
-    /// When set, the runner estimates token count before each agent run
-    /// and triggers mid-invocation summarization when the threshold is exceeded.
-    pub intra_compaction_config: Option<adk_core::IntraCompactionConfig>,
-    /// Optional summarizer for intra-invocation compaction.
-    /// Required when `intra_compaction_config` is set.
-    pub intra_compaction_summarizer: Option<Arc<dyn adk_core::BaseEventsSummarizer>>,
-    /// Optional context compaction configuration for token-budget overflow handling.
+    /// When the run's agents compact their history before a model call (auto-compaction).
     ///
-    /// When set, the runner applies the configured [`CompactionStrategy`](crate::compaction::CompactionStrategy)
-    /// to shrink the event history when the context exceeds the token budget,
-    /// retrying the model request up to `max_retries` times.
+    /// `None` is the default, which is on: a request is compacted once it passes 80% of the
+    /// model's context window, or 100,000 estimated tokens when the model reports none
+    /// ([`IntraCompactionConfig::default`](adk_core::IntraCompactionConfig)).
+    /// `Some(IntraCompactionConfig::disabled())` turns it off. A run's
+    /// [`RunConfig::intra_compaction`] takes precedence.
+    pub intra_compaction_config: Option<adk_core::IntraCompactionConfig>,
+    /// The summarizer auto-compaction uses. `None` summarizes with the model the agent is
+    /// calling ([`LlmEventSummarizer`](adk_core::LlmEventSummarizer)).
+    pub intra_compaction_summarizer: Option<Arc<dyn adk_core::BaseEventsSummarizer>>,
+    /// A compaction strategy auto-compaction applies in place of a summary.
+    ///
+    /// When set, an agent's history is shortened with the configured
+    /// [`CompactionStrategy`](crate::compaction::CompactionStrategy) before any model call
+    /// whose request passes `context_budget` estimated tokens, up to `max_retries` times.
     ///
     /// This field is only available when the `context-compaction` feature is enabled.
     #[cfg(feature = "context-compaction")]
@@ -584,8 +590,14 @@ pub struct Runner {
     cache_manager: Option<Arc<tokio::sync::Mutex<CacheManager>>>,
     request_context: Option<adk_core::RequestContext>,
     cancellation_token: Option<CancellationToken>,
-    intra_compactor: Option<Arc<crate::intra_compaction::IntraInvocationCompactor>>,
-    /// Optional context compaction configuration for token-budget overflow handling.
+    /// When agents compact their history during a run; a run's own setting takes precedence.
+    intra_compaction: adk_core::IntraCompactionConfig,
+    /// The summarizer auto-compaction uses; `None` uses the agent's model.
+    intra_summarizer: Option<Arc<dyn adk_core::BaseEventsSummarizer>>,
+    /// Summaries written off the critical path, kept across runs so a session's next turn
+    /// swaps in what the last one started.
+    background_compactions: Arc<crate::intra_compaction::BackgroundCompactions>,
+    /// A compaction strategy auto-compaction applies in place of a summary.
     #[cfg(feature = "context-compaction")]
     context_compaction: Option<Arc<crate::compaction::CompactionConfig>>,
     /// Hold taken before each model call when the run config carries a spend ledger.
@@ -593,6 +605,8 @@ pub struct Runner {
     /// Per-session cancellation tokens for the interrupt API.
     /// Each `run()` call registers a token here; `interrupt()` cancels it.
     active_runs: ActiveRuns,
+    /// The sessions this runner's runs are on, shared with other runners a host builds.
+    session_activity: crate::history::SessionActivity,
     next_run_id: Arc<std::sync::atomic::AtomicU64>,
     /// Policy installed on runs that carry none.
     tool_policy: Option<Arc<dyn adk_core::ToolPolicy>>,
@@ -657,14 +671,8 @@ impl Runner {
             .as_ref()
             .map(|c| Arc::new(tokio::sync::Mutex::new(CacheManager::new(c.clone()))));
 
-        let intra_compactor = config.intra_compaction_config.as_ref().and_then(|ic_config| {
-            config.intra_compaction_summarizer.as_ref().map(|summarizer| {
-                Arc::new(crate::intra_compaction::IntraInvocationCompactor::new(
-                    ic_config.clone(),
-                    summarizer.clone(),
-                ))
-            })
-        });
+        let intra_compaction = config.intra_compaction_config.unwrap_or_default();
+        let intra_summarizer = config.intra_compaction_summarizer;
 
         let governance = config.governance.unwrap_or_default();
         if let Some(audit) = &config.audit {
@@ -689,11 +697,14 @@ impl Runner {
             cache_manager,
             request_context: config.request_context,
             cancellation_token: config.cancellation_token,
-            intra_compactor,
+            intra_compaction,
+            intra_summarizer,
+            background_compactions: Arc::default(),
             #[cfg(feature = "context-compaction")]
             context_compaction: config.context_compaction.map(Arc::new),
             llm_spend_estimate: crate::spend::LlmSpendEstimate::default(),
             active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_activity: crate::history::SessionActivity::new(),
             next_run_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             tool_policy: config.tool_policy,
             egress_policy: config.egress_policy,
@@ -843,6 +854,24 @@ impl Runner {
         &self.governance
     }
 
+    /// The tool policy every run whose own config sets none is governed by.
+    ///
+    /// A host that layers a run-specific policy under it — a sub-agent's tool ceiling —
+    /// composes the two with [`StrictestPolicy`](adk_core::StrictestPolicy), so the runner's
+    /// decisions still apply.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut config = runner.run_config().clone();
+    /// let mut layers: Vec<Arc<dyn ToolPolicy>> = config.tool_policy.clone().or_else(|| runner.tool_policy().cloned()).into_iter().collect();
+    /// layers.push(Arc::new(ToolCeiling::new(["read_file"])));
+    /// config.tool_policy = Some(Arc::new(StrictestPolicy::new(layers)));
+    /// ```
+    pub fn tool_policy(&self) -> Option<&Arc<dyn adk_core::ToolPolicy>> {
+        self.tool_policy.as_ref()
+    }
+
     /// Releases what the runner's agents and plugins hold: every agent's toolsets, through
     /// [`Agent::close`] on the root agent, then the plugins' close hooks.
     ///
@@ -866,6 +895,78 @@ impl Runner {
         if let Some(manager) = &self.plugin_manager {
             manager.close().await;
         }
+    }
+
+    /// Readies the root agent, and optionally a session, before the first message: the
+    /// model's pooled connection, the servers an agent starts on its first turn, and the
+    /// session store's connection (see [`crate::prewarm`]). It sends no prompt and spends no
+    /// tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns the kill switch's error when the runner is frozen, `runner.prewarm.timeout`
+    /// when it takes longer than the request's budget, `session.archived` when the session
+    /// is archived, `session.not_found`, or the model's error.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use adk_core::{SessionId, UserId};
+    /// use adk_runner::{Prewarm, Runner};
+    ///
+    /// # async fn example(runner: &Runner) -> adk_core::Result<()> {
+    /// // While the person is still typing: the first turn starts on a warm connection.
+    /// let report = runner
+    ///     .prewarm(Prewarm::new().session(UserId::new("ana")?, SessionId::new("trip")?))
+    ///     .await?;
+    /// println!("ready in {:?}, warm until {}", report.elapsed, report.warm_until);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn prewarm(&self, request: crate::Prewarm) -> Result<crate::PrewarmReport> {
+        self.governance.check()?;
+        self.run_config.check_governance()?;
+        let started = std::time::Instant::now();
+        let budget = request.budget_or_default();
+        let session_read = request.session.is_some();
+        let work = async {
+            if let Some((user_id, session_id)) = &request.session {
+                let identity = adk_core::AdkIdentity::new(
+                    AppName::try_from(self.app_name.clone())?,
+                    user_id.clone(),
+                    session_id.clone(),
+                );
+                let session = self.session_service.get_for_identity(&identity).await?;
+                adk_session::ensure_writable(session.as_ref())?;
+            }
+            self.root_agent.prewarm().await
+        };
+        match tokio::time::timeout(budget, work).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(adk_core::AdkError::new(
+                    adk_core::ErrorComponent::Agent,
+                    adk_core::ErrorCategory::Timeout,
+                    "runner.prewarm.timeout",
+                    format!(
+                        "prewarming did not finish within {budget:?}; the first turn readies \
+                         what it did not, or give Prewarm::budget more time"
+                    ),
+                ));
+            }
+        }
+        let elapsed = started.elapsed();
+        tracing::debug!(
+            prewarm.elapsed_ms = elapsed.as_millis() as u64,
+            session_read,
+            "runner prewarmed"
+        );
+        let warm_for = chrono::Duration::from_std(crate::prewarm::WARM_FOR).unwrap_or_default();
+        Ok(crate::PrewarmReport {
+            elapsed,
+            session_read,
+            warm_until: chrono::Utc::now() + warm_for,
+        })
     }
 
     /// Returns the runner's configured [`RunConfig`].
@@ -1012,9 +1113,14 @@ impl Runner {
             }
             None => Some(user_id.as_str().to_owned()),
         };
-        let intra_compactor = self.intra_compactor.clone();
-        #[cfg(feature = "context-compaction")]
-        let context_compaction = self.context_compaction.clone();
+        // The compactor the run's agents call before each model call, unless the run brings
+        // its own or turns compaction off.
+        let mut intra_compactor = if run_config.history_compactor.is_some() {
+            None
+        } else {
+            self.intra_compactor(run_config.intra_compaction.as_ref())
+        };
+        let background_compactions = self.background_compactions.clone();
 
         // Built once and used for every persistence write, so a backend with a
         // composite natural key can bind each event to its tenant.
@@ -1060,6 +1166,7 @@ impl Runner {
             active_runs: active_runs.clone(),
             run_id,
             inbox: steering_inbox.clone(),
+            _activity: self.session_activity.enter(identity.clone()),
         };
         let stop_invocation_id = invocation_id.to_string();
         let stop_default_author = self.root_agent.name().to_string();
@@ -1111,6 +1218,11 @@ impl Runner {
                     return;
                 }
             };
+            // An archived session is read-only: no turn adds to it until it is unarchived.
+            if let Err(error) = adk_session::ensure_writable(session.as_ref()) {
+                yield Err(error);
+                return;
+            }
 
             // A saved message that was never screened — saved by an earlier release, or
             // appended to the session directly — is screened before any model sees it.
@@ -1152,6 +1264,8 @@ impl Runner {
                 run_config.transfer_targets = targets;
                 run_config.parent_agent = None;
             }
+            run_config.transfer_target_descriptions =
+                Self::describe_agents(&root_agent, &run_config.transfer_targets);
 
             // Clone services for potential reuse in transfer
             #[cfg(feature = "artifacts")]
@@ -1224,6 +1338,20 @@ impl Runner {
             }
             if let Some(memory) = memory_service {
                 invocation_ctx = invocation_ctx.with_memory(memory);
+            }
+
+            // Agents compact their history through the run config, and each compaction is
+            // recorded in this run's session.
+            if let Some(compactor) = intra_compactor.take() {
+                let background =
+                    compactor.config().background.then(|| background_compactions.clone());
+                run_config.history_compactor = Some(Arc::new(
+                    crate::intra_compaction::RunCompactor::new(
+                        compactor,
+                        invocation_ctx.mutable_session().clone(),
+                    )
+                    .with_background(background),
+                ));
             }
 
             // Apply run config (streaming mode, etc.)
@@ -1418,7 +1546,7 @@ impl Runner {
                     // (the full instruction is resolved inside the agent, but the
                     // description provides a reasonable proxy for cache keying).
                     let system_instruction = agent_to_run.description().to_string();
-                    let tools = std::collections::HashMap::new();
+                    let tools = adk_core::ToolDeclarations::new();
                     let ttl = context_cache_config.as_ref().map_or(600, |c| c.ttl_seconds);
 
                     match cache_model.create_cache(&system_instruction, &tools, ttl).await {
@@ -1508,66 +1636,16 @@ impl Runner {
                 }
             }
 
-            // ===== INTRA-INVOCATION COMPACTION =====
-            // If intra-compaction is configured, check if the session events
-            // exceed the token threshold and compact them before the agent runs.
-            if let Some(ref compactor) = intra_compactor {
-                compactor.reset_cycle();
-                let session_events = ctx.mutable_session().as_ref().events_snapshot();
-                // The summary call counts against the run's budget and spend ledger.
-                let scope = adk_core::ModelCallScope::for_run(
-                    adk_core::InvocationContext::run_config(ctx.as_ref()),
-                    ctx.app_name(),
-                    agent_to_run.name(),
-                );
-                match scope.within(compactor.maybe_compact(&session_events)).await {
-                    Ok(Some(compacted_events)) => {
-                        ctx.mutable_session().replace_events(compacted_events);
-                        tracing::info!("intra-invocation compaction applied before agent execution");
-                    }
-                    Ok(None) => {} // No compaction needed
-                    Err(e) => {
-                        tracing::warn!(error = %e.diagnostics(), "intra-invocation compaction check failed");
-                    }
-                }
-            }
-
-            // ===== CONTEXT COMPACTION (TOKEN BUDGET) =====
-            // If context-compaction is configured, proactively check the estimated
-            // token count before calling the agent. If it exceeds the budget,
-            // apply compaction to bring it under the limit.
-            #[cfg(feature = "context-compaction")]
-            if let Some(ref cc_config) = context_compaction {
-                let session_events = ctx.mutable_session().events_snapshot();
-                let estimated = crate::compaction::estimate_event_tokens(&session_events);
-                if estimated > cc_config.context_budget {
-                    tracing::info!(
-                        estimated_tokens = estimated,
-                        budget = cc_config.context_budget,
-                        "context exceeds budget, applying proactive compaction"
-                    );
-                    let scope = adk_core::ModelCallScope::for_run(
-                        adk_core::InvocationContext::run_config(ctx.as_ref()),
-                        ctx.app_name(),
-                        agent_to_run.name(),
-                    );
-                    match scope.within(crate::compaction::apply_compaction_with_retry(cc_config, session_events)).await {
-                        Ok(compacted) => {
-                            ctx.mutable_session().replace_events(compacted);
-                            tracing::info!("proactive context compaction succeeded");
-                        }
-                        Err(e) => {
-                            // Proactive compaction failed — proceed anyway and let the
-                            // model reject the request if it's truly too large.
-                            tracing::warn!(error = %e.diagnostics(), "proactive context compaction failed, proceeding with full context");
-                        }
-                    }
-                }
-            }
-
             // Run the agent with instrumentation (ADK-Go style attributes)
+            // The GenAI `invoke_agent` span of an in-process agent; the tracing name and the
+            // `gcp.vertex.agent.*` fields stay for the in-process debug exporter.
             let agent_span = tracing::info_span!(
                 "agent.execute",
+                otel.name = %format!("invoke_agent {}", agent_to_run.name()),
+                otel.kind = "internal",
+                "gen_ai.operation.name" = "invoke_agent",
+                "gen_ai.agent.name" = %agent_to_run.name(),
+                "gen_ai.agent.description" = tracing::field::Empty,
                 "gcp.vertex.agent.invocation_id" = ctx.invocation_id(),
                 "gcp.vertex.agent.session_id" = ctx.session_id(),
                 "gcp.vertex.agent.event_id" = ctx.invocation_id(), // Use invocation_id as event_id for agent spans
@@ -1582,42 +1660,12 @@ impl Runner {
             if let Some(user) = &telemetry_user_id {
                 agent_span.record("adk.user_id", user.as_str());
             }
+            if !agent_to_run.description().is_empty() {
+                agent_span.record("gen_ai.agent.description", agent_to_run.description());
+            }
 
             let mut agent_stream = match agent_to_run.run(ctx.clone()).instrument(agent_span.clone()).await {
                 Ok(s) => s,
-                #[cfg(feature = "context-compaction")]
-                Err(e) if context_compaction.is_some() && crate::compaction::is_token_limit_error(&e) => {
-                    // Token limit error on agent.run() — apply compaction and retry
-                    let cc_config = context_compaction.as_ref().unwrap();
-                    tracing::warn!(
-                        error = %e.diagnostics(),
-                        "agent execution failed with token limit error, attempting compaction"
-                    );
-                    let session_events = ctx.mutable_session().events_snapshot();
-                    let scope = adk_core::ModelCallScope::for_run(
-                        adk_core::InvocationContext::run_config(ctx.as_ref()),
-                        ctx.app_name(),
-                        agent_to_run.name(),
-                    );
-                    match scope.within(crate::compaction::apply_reactive_compaction(cc_config, session_events)).await {
-                        Ok(compacted) => {
-                            ctx.mutable_session().replace_events(compacted);
-                            tracing::info!("context compaction succeeded after token limit error, retrying agent");
-                            // Retry the agent call with compacted context
-                            match agent_to_run.run(ctx.clone()).instrument(agent_span.clone()).await {
-                                Ok(s) => s,
-                                Err(retry_err) => {
-                                    yield Err(retry_err);
-                                    return;
-                                }
-                            }
-                        }
-                        Err(compaction_err) => {
-                            yield Err(compaction_err);
-                            return;
-                        }
-                    }
-                }
                 Err(e) => {
                     yield Err(e);
                     return;
@@ -1630,12 +1678,6 @@ impl Runner {
             let mut streamed_content = HashMap::new();
             let mut in_flight = InFlightCalls::default();
             let mut cancelled = false;
-            // A model call inside the agent's loop fails as an `Err` item in its
-            // stream, not as an `Err` from `run()`, so the stream gets its own
-            // compact-and-rerun — once per invocation, since a second overflow
-            // means compaction cannot help.
-            #[cfg(feature = "context-compaction")]
-            let mut reactive_compaction_used = false;
 
             while let Some(result) = {
                 // Race the next event against cancellation so an in-flight
@@ -1760,42 +1802,6 @@ impl Runner {
                         }
                     }
                     Err(e) => {
-                        #[cfg(feature = "context-compaction")]
-                        if !reactive_compaction_used
-                            && let Some(cc_config) = context_compaction.as_ref()
-                            && crate::compaction::is_token_limit_error(&e)
-                        {
-                            reactive_compaction_used = true;
-                            tracing::warn!(
-                                error = %e.diagnostics(),
-                                "agent stream failed with token limit error, attempting compaction"
-                            );
-                            let session_events = ctx.mutable_session().events_snapshot();
-                            let scope = adk_core::ModelCallScope::for_run(
-                                adk_core::InvocationContext::run_config(ctx.as_ref()),
-                                ctx.app_name(),
-                                agent_to_run.name(),
-                            );
-                            match scope.within(crate::compaction::apply_reactive_compaction(cc_config, session_events)).await {
-                                Ok(compacted) => {
-                                    ctx.mutable_session().replace_events(compacted);
-                                    tracing::info!("context compaction succeeded after token limit error, rerunning agent");
-                                    match agent_to_run.run(ctx.clone()).instrument(agent_span.clone()).await {
-                                        Ok(s) => {
-                                            agent_stream = s;
-                                            continue;
-                                        }
-                                        Err(retry_err) => {
-                                            yield Err(retry_err);
-                                            return;
-                                        }
-                                    }
-                                }
-                                Err(compaction_err) => {
-                                    tracing::warn!(error = %compaction_err.diagnostics(), "reactive compaction failed");
-                                }
-                            }
-                        }
                         yield Err(e);
                         return;
                     }
@@ -1901,6 +1907,8 @@ impl Runner {
                     transfer_run_config.parent_agent = parent_name;
                 }
                 root_agent.configure_run(&target_name, &mut transfer_run_config);
+                transfer_run_config.transfer_target_descriptions =
+                    Self::describe_agents(&root_agent, &transfer_run_config.transfer_targets);
 
                 // For transfers, we reuse the same mutable session to preserve state
                 let transfer_invocation_id = format!("inv-{}", uuid::Uuid::new_v4());
@@ -2439,6 +2447,7 @@ impl Runner {
             SessionId::try_from(session_id)?,
         );
         let session = self.session_service.get_for_identity(&identity).await?;
+        adk_session::ensure_writable(session.as_ref())?;
         let mut in_flight = InFlightCalls::default();
         for event in session.events().all() {
             in_flight.observe(&event);
@@ -2678,6 +2687,53 @@ impl Runner {
         runs.values().map(|run| run.identity.clone()).collect()
     }
 
+    /// Records this runner's runs in `activity` instead of a registry of its own, so a
+    /// [`HistoryControl`](crate::HistoryControl) over another runner, or over the sessions
+    /// alone, sees them.
+    ///
+    /// Set it before the first run.
+    #[must_use]
+    pub fn with_session_activity(mut self, activity: crate::history::SessionActivity) -> Self {
+        self.session_activity = activity;
+        self
+    }
+
+    /// The registry this runner records its runs in.
+    pub fn session_activity(&self) -> &crate::history::SessionActivity {
+        &self.session_activity
+    }
+
+    /// Fork, rewind, and edit of this runner's sessions under the runtime's rules: refused
+    /// while a run of this runner, or of any runner sharing its
+    /// [`session_activity`](Self::session_activity), is on the session, and recorded in the
+    /// runner's audit trail. The runner's durable run store, when set, also refuses sessions a
+    /// worker is running.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_core::audit_log::AuditActor;
+    /// use adk_core::principal::SubjectRef;
+    /// use adk_session::ForkRequest;
+    ///
+    /// let actor = AuditActor::subject(SubjectRef::human("alice"));
+    /// let fork = runner
+    ///     .history_control()
+    ///     .fork(&actor, ForkRequest::new(identity).at_event(event_id))
+    ///     .await?;
+    /// ```
+    pub fn history_control(&self) -> crate::history::HistoryControl {
+        let mut control = crate::history::HistoryControl::new(self.session_service.clone())
+            .with_activity(self.session_activity.clone());
+        if let Some(trail) = self.audit_trail() {
+            control = control.with_audit(trail.clone());
+        }
+        if let Some(store) = &self.durable_runs {
+            control = control.with_run_store(store.clone());
+        }
+        control
+    }
+
     /// Returns the session IDs of all currently running agent executions.
     ///
     /// Session IDs are deduplicated. Use [`Runner::active_runs`] when the app and
@@ -2693,11 +2749,34 @@ impl Runner {
 
     /// Returns a reference to the context compaction configuration, if set.
     ///
-    /// This is used by the runner's generate_content loop to detect token limit
-    /// errors and apply compaction strategies before retrying.
+    /// Auto-compaction applies its strategy in place of a summary.
     #[cfg(feature = "context-compaction")]
     pub fn context_compaction(&self) -> Option<&crate::compaction::CompactionConfig> {
         self.context_compaction.as_deref()
+    }
+
+    /// The compactor a run's agents use: from `run`, the run's own setting, or the runner's,
+    /// with the runner's summarizer or strategy; `None` when compaction is off.
+    fn intra_compactor(
+        &self,
+        run: Option<&adk_core::IntraCompactionConfig>,
+    ) -> Option<Arc<crate::intra_compaction::IntraInvocationCompactor>> {
+        use crate::intra_compaction::IntraInvocationCompactor;
+        let config = run.unwrap_or(&self.intra_compaction).clone();
+        if !config.enabled {
+            return None;
+        }
+        #[cfg(feature = "context-compaction")]
+        if let Some(strategy) = &self.context_compaction {
+            return Some(Arc::new(IntraInvocationCompactor::with_strategy(
+                config,
+                strategy.clone(),
+            )));
+        }
+        Some(Arc::new(match &self.intra_summarizer {
+            Some(summarizer) => IntraInvocationCompactor::new(config, summarizer.clone()),
+            None => IntraInvocationCompactor::with_model_summary(config),
+        }))
     }
 
     /// Find which agent should handle the request based on session history
@@ -2819,6 +2898,33 @@ impl Runner {
         }
 
         None
+    }
+
+    /// The description of each agent named in `names`, found in the tree under `root`.
+    /// A name the tree does not hold, or an agent without a description, is left out.
+    pub fn describe_agents(
+        root: &Arc<dyn Agent>,
+        names: &[String],
+    ) -> std::collections::HashMap<String, String> {
+        fn visit(
+            agent: &Arc<dyn Agent>,
+            names: &[String],
+            found: &mut std::collections::HashMap<String, String>,
+        ) {
+            if names.iter().any(|name| name == agent.name())
+                && !agent.description().trim().is_empty()
+            {
+                found.insert(agent.name().to_string(), agent.description().to_string());
+            }
+            for sub in agent.sub_agents() {
+                visit(sub, names, found);
+            }
+        }
+        let mut found = std::collections::HashMap::new();
+        if !names.is_empty() {
+            visit(root, names, &mut found);
+        }
+        found
     }
 
     /// Compute the parent name and peer names for a given agent in the tree.

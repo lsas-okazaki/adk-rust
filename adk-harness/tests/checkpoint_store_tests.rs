@@ -85,6 +85,37 @@ mod sealed {
         })
     }
 
+    /// A sealed store over one SQLite file. Each `open` is a new pool and a new wrapper
+    /// with the same keyring, as a restarted process would open them.
+    struct SealedSqlite {
+        dir: tempfile::TempDir,
+        keyring: StoreKeyring,
+    }
+
+    impl SealedSqlite {
+        fn new() -> Self {
+            Self { dir: tempfile::tempdir().unwrap(), keyring: StoreKeyring::generate() }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl adk_graph::conformance::CheckpointerHarness for SealedSqlite {
+        async fn open(&self) -> Arc<dyn Checkpointer> {
+            let options = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(self.dir.path().join("sealed.db"))
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .busy_timeout(std::time::Duration::from_secs(30));
+            let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+            let inner = Arc::new(SqliteCheckpointer::from_pool(pool).await.unwrap());
+            Arc::new(SealedCheckpointer::new(inner, self.keyring.clone()))
+        }
+    }
+
+    mod conformance {
+        adk_graph::checkpointer_conformance_tests!(harness = super::SealedSqlite::new());
+    }
+
     fn rich_checkpoint() -> adk_graph::Checkpoint {
         let mut checkpoint = checkpoint("plan-thread", 1, SENTINEL);
         checkpoint.metadata.insert("note".into(), SENTINEL.into());
@@ -307,12 +338,10 @@ mod restart {
     async fn the_goal_graph_continues_its_thread_after_a_restart() {
         let dir = workspace();
         let (user, session) = (user("alice"), session_id("s1"));
-        let spec = GoalSpec {
-            goal: "create done.txt".into(),
-            until: "test -f done.txt".into(),
-            max_iterations: 3,
-            check_timeout: Duration::from_secs(30),
-        };
+        let spec = GoalSpec::new("create done.txt")
+            .with_until("test -f done.txt")
+            .with_max_iterations(3)
+            .with_check_timeout(Duration::from_secs(30));
         {
             // Ask with no prompter: the write is held and the graph stops at `iterate`.
             let first = process(

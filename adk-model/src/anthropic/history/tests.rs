@@ -29,34 +29,39 @@ fn message() -> Message {
 #[test]
 fn preserves_native_blocks_and_unicode_citations() {
     let original = message();
-    let response = convert::from_anthropic_message(&original).0;
+    let response = convert::from_anthropic_message(&original, Default::default()).0;
     let metadata = response.citation_metadata.unwrap();
     assert_eq!(metadata.citation_sources[0].end_index, Some(3));
-    let restored = restore(response.content.as_ref().unwrap()).unwrap();
+    let restored = restore(response.content.as_ref().unwrap(), Default::default()).unwrap();
     assert_eq!(restored, original.content);
 }
 
 #[test]
 fn respects_removed_calls_and_changed_arguments() {
-    let mut content = convert::from_anthropic_message(&message()).0.content.unwrap();
+    let mut content =
+        convert::from_anthropic_message(&message(), Default::default()).0.content.unwrap();
     let Part::FunctionCall { args, .. } = &mut content.parts[1] else { panic!("call expected") };
     *args = json!({"path":"after.txt"});
-    let blocks = restore(&content).unwrap();
+    let blocks = restore(&content, Default::default()).unwrap();
     assert!(matches!(&blocks[1], ContentBlock::ToolUse(tool) if tool.input["path"] == "after.txt"));
     content.parts.remove(1);
     assert!(
-        restore(&content).unwrap().iter().all(|block| !matches!(block, ContentBlock::ToolUse(_)))
+        restore(&content, Default::default())
+            .unwrap()
+            .iter()
+            .all(|block| !matches!(block, ContentBlock::ToolUse(_)))
     );
 }
 
 #[test]
 fn edited_text_falls_back_to_plain_conversion() {
-    let mut content = convert::from_anthropic_message(&message()).0.content.unwrap();
+    let mut content =
+        convert::from_anthropic_message(&message(), Default::default()).0.content.unwrap();
     // A guardrail that redacts the answer after the response, for example.
     content.parts[0] = Part::Text { text: "[REDACTED]".into() };
-    assert_eq!(restore(&content), None);
+    assert_eq!(restore(&content, Default::default()), None);
 
-    let request = convert::content_to_message(&content, false).unwrap();
+    let request = convert::content_to_message(&content, false, Default::default()).unwrap();
     assert_eq!(
         request.content,
         adk_anthropic::MessageParamContent::Array(vec![
@@ -72,21 +77,23 @@ fn edited_text_falls_back_to_plain_conversion() {
 
 #[test]
 fn malformed_carriers_fall_back_to_plain_conversion() {
-    let mut content = convert::from_anthropic_message(&message()).0.content.unwrap();
+    let mut content =
+        convert::from_anthropic_message(&message(), Default::default()).0.content.unwrap();
     content.parts = vec![Part::ServerToolResponse {
         server_tool_response: json!({"type":KIND,"content":"invalid"}),
     }];
-    assert_eq!(restore(&content), None);
+    assert_eq!(restore(&content, Default::default()), None);
     content.role = "user".into();
-    content.parts = convert::from_anthropic_message(&message()).0.content.unwrap().parts;
-    assert_eq!(restore(&content), None);
+    content.parts =
+        convert::from_anthropic_message(&message(), Default::default()).0.content.unwrap().parts;
+    assert_eq!(restore(&content, Default::default()), None);
 }
 
 #[test]
 fn marks_a_paused_turn_for_continuation() {
     let mut message = message();
     message.stop_reason = Some(StopReason::PauseTurn);
-    let response = convert::from_anthropic_message(&message).0;
+    let response = convert::from_anthropic_message(&message, Default::default()).0;
     assert!(!response.turn_complete);
     assert_eq!(response.provider_metadata.unwrap()["continue_turn"], true);
 }
@@ -94,12 +101,15 @@ fn marks_a_paused_turn_for_continuation() {
 #[test]
 fn preserves_refusal_and_context_limit_reasons() {
     for (stop, reason) in [
-        (StopReason::Refusal, adk_core::FinishReason::Safety),
+        (StopReason::Refusal, adk_core::FinishReason::Refusal),
         (StopReason::ModelContextWindowExceeded, adk_core::FinishReason::MaxTokens),
     ] {
         let mut message = message();
         message.stop_reason = Some(stop);
-        assert_eq!(convert::from_anthropic_message(&message).0.finish_reason, Some(reason));
+        assert_eq!(
+            convert::from_anthropic_message(&message, Default::default()).0.finish_reason,
+            Some(reason)
+        );
     }
 }
 
@@ -131,7 +141,7 @@ fn thinking_tool_turn(redacted: bool) -> Message {
 }
 
 fn replayed_blocks(content: &Content) -> Vec<ContentBlock> {
-    match convert::content_to_message(content, false).unwrap().content {
+    match convert::content_to_message(content, false, Default::default()).unwrap().content {
         adk_anthropic::MessageParamContent::Array(blocks) => blocks,
         other => panic!("expected content blocks, got {other:?}"),
     }
@@ -140,14 +150,14 @@ fn replayed_blocks(content: &Content) -> Vec<ContentBlock> {
 #[test]
 fn signed_thinking_blocks_replay_unchanged_in_a_tool_use_turn() {
     let original = thinking_tool_turn(false);
-    let content = convert::from_anthropic_message(&original).0.content.unwrap();
+    let content = convert::from_anthropic_message(&original, Default::default()).0.content.unwrap();
     assert_eq!(replayed_blocks(&content), original.content);
 }
 
 #[test]
 fn redacted_thinking_replays_unchanged_in_a_tool_use_turn() {
     let original = thinking_tool_turn(true);
-    let content = convert::from_anthropic_message(&original).0.content.unwrap();
+    let content = convert::from_anthropic_message(&original, Default::default()).0.content.unwrap();
     assert_eq!(replayed_blocks(&content), original.content);
 }
 
@@ -167,7 +177,7 @@ fn streamed_thinking_keeps_its_signature_for_replay() {
     ]
     .map(|event| Ok(serde_json::from_value::<adk_anthropic::MessageStreamEvent>(event).unwrap()));
     let responses = futures::executor::block_on(futures::TryStreamExt::try_collect::<Vec<_>>(
-        super::super::streaming::responses(futures::stream::iter(events)),
+        super::super::streaming::responses(futures::stream::iter(events), Default::default()),
     ))
     .unwrap();
     let complete = responses.last().unwrap().content.clone().unwrap();
@@ -251,17 +261,78 @@ fn wire(blocks: &[ContentBlock]) -> serde_json::Value {
 
 #[test]
 fn web_fetch_results_replay_as_received() {
-    let content = convert::from_anthropic_message(&web_fetch_turn()).0.content.unwrap();
+    let content =
+        convert::from_anthropic_message(&web_fetch_turn(), Default::default()).0.content.unwrap();
     assert_eq!(wire(&replayed_blocks(&content)), web_fetch_turn_json());
 }
 
 #[test]
 fn web_fetch_results_survive_the_adk_part_fallback() {
-    let mut content = convert::from_anthropic_message(&web_fetch_turn()).0.content.unwrap();
+    let mut content =
+        convert::from_anthropic_message(&web_fetch_turn(), Default::default()).0.content.unwrap();
     // Drop the native copy so the request is built from the ADK parts alone.
     content.parts.retain(|part| {
         !matches!(part, Part::ServerToolResponse { server_tool_response }
             if server_tool_response["type"] == KIND)
     });
     assert_eq!(wire(&replayed_blocks(&content)), web_fetch_turn_json());
+}
+
+/// The response of an on-demand compaction request, as the Claude API documents it.
+fn compaction_message() -> Message {
+    let mut message = Message::new(
+        "msg_compaction".into(),
+        vec![ContentBlock::Compaction(adk_anthropic::CompactionBlock::new(
+            "The user is designing a recipe app.",
+            "EuYBCkQY",
+        ))],
+        Model::Custom("claude-sonnet-5-5".into()),
+        Usage::try_from(json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "iterations": [{"type": "compaction", "input_tokens": 144, "output_tokens": 276}]
+        }))
+        .unwrap(),
+    );
+    message.stop_reason = Some(StopReason::Compaction);
+    message
+}
+
+#[test]
+fn a_compaction_reads_as_its_summary_and_keeps_the_signed_block_for_replay() {
+    let response = convert::from_anthropic_message(&compaction_message(), Default::default()).0;
+
+    let content = response.content.unwrap();
+    assert!(adk_core::intra_compaction::is_native_compaction(&content));
+    assert_eq!(
+        content.parts[0],
+        Part::Text {
+            text: adk_core::intra_compaction::compaction_summary_text(
+                "The user is designing a recipe app."
+            )
+        }
+    );
+    assert_eq!(response.finish_reason, Some(adk_core::FinishReason::Stop));
+    assert!(response.turn_complete);
+    // The summarization call is counted from its iteration, not the zero top-level usage.
+    let usage = response.usage_metadata.unwrap();
+    assert_eq!((usage.prompt_token_count, usage.candidates_token_count), (144, 276));
+
+    assert_eq!(
+        restore(&content, Default::default()),
+        Some(vec![ContentBlock::Compaction(adk_anthropic::CompactionBlock::new(
+            "The user is designing a recipe app.",
+            "EuYBCkQY",
+        ))])
+    );
+}
+
+#[test]
+fn a_compaction_whose_summary_text_was_rewritten_is_sent_as_the_new_text() {
+    let mut content = convert::from_anthropic_message(&compaction_message(), Default::default())
+        .0
+        .content
+        .unwrap();
+    content.parts[0] = Part::Text { text: "redacted by a guardrail".to_string() };
+    assert_eq!(restore(&content, Default::default()), None);
 }

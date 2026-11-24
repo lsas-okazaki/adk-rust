@@ -40,7 +40,7 @@ const TICK: Duration = Duration::from_millis(250);
 /// What the scrollback already shows.
 pub(crate) struct Printer<W: Write> {
     out: W,
-    renderer: Renderer,
+    pub(crate) renderer: Renderer,
     color: bool,
     raw: bool,
     session: Option<String>,
@@ -441,6 +441,7 @@ async fn inline(surface: TerminalSurface) -> io::Result<i32> {
     term::enter_inline(&mut io::stdout())?;
     let guard = Guard;
     let mut printer = Printer::new(io::stdout(), theme, color, true);
+    printer.renderer.home = surface.home.clone();
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
     let mut code = EXIT_DONE;
@@ -507,6 +508,7 @@ fn start(
     app.agents_pane.granted = surface.engine.granted().to_vec();
     app.model = surface.model.clone();
     app.place = surface.place.clone();
+    app.home = surface.home.clone();
     app.commands = surface.commands.clone();
     // Without bracketed paste a paste arrives as keys: a decision key with more keys right
     // behind it is typing (§7.4 rule 2).
@@ -550,6 +552,7 @@ where
     let engine = &surface.engine;
     let caller = &surface.caller;
     let mut printer = Printer::new(out, theme, color, false);
+    printer.renderer.home = surface.home.clone();
     let mut stdin = input.lines();
     let mut lines: VecDeque<String> = VecDeque::new();
     let mut input_open = true;
@@ -570,8 +573,11 @@ where
             let baseline = engine.thread(caller, &app.session).await.map_or(0, |t| t.len());
             let mut settler = Settler::new(baseline as u64);
             settler.sent();
-            let command =
-                crate::engine::Command::Send { session_id: app.session.clone(), text: line };
+            let command = crate::engine::Command::Send {
+                session_id: app.session.clone(),
+                text: line,
+                images: Vec::new(),
+            };
             match engine.execute(caller, command).await {
                 Ok(outcome) => app.update(Update::Outcome(Box::new(Ok(outcome))), Instant::now()),
                 Err(error) => break End::error(error.to_string()),

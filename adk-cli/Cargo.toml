@@ -5,16 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Command-line launcher for Rust Agent Development Kit (ADK-Rust) agents"
+description = "The adk-rust command and Launcher for ADK-Rust: the governed harness agent in the terminal and behind a server, the agent kernel, and the website, site, AWP and vision tools"
 homepage.workspace = true
 repository.workspace = true
 documentation = "https://docs.rs/adk-cli"
 keywords = ["ai", "agent", "adk", "cli", "launcher"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
+exclude = ["tests/"]
 
 [package.metadata.docs.rs]
-all-features = true
+# The library's public modules need only the default features and `optimize`; the other
+# features change the binary, and `mistralrs` alone adds about 180 crates (mistral.rs, candle).
+features = ["optimize"]
 
 [lib]
 name = "adk_cli"
@@ -39,7 +42,7 @@ adk-tool.workspace = true
 adk-telemetry.workspace = true
 adk-skill.workspace = true
 adk-deploy.workspace = true
-adk-graph = { workspace = true, features = ["time-travel"] }
+adk-graph = { workspace = true, features = ["time-travel", "yaml"] }
 # The harness REPL, `code`, `goal`, `ultracode` and `serve` (spec 3.1 §8.1)
 adk-harness = { workspace = true, optional = true }
 # `adk-rust up`, `attach`, `ps`, `top`, `kill`, `suspend`, `resume`, `freeze`, `unfreeze` and
@@ -64,6 +67,8 @@ adk-awp = { workspace = true, optional = true, features = ["verify"] }
 awp-types = { workspace = true, optional = true }
 # `adk-rust website …` (spec 3.5 §8.1, D-14): the product, served beside the web home
 adk-website = { workspace = true, optional = true }
+# `adk-rust vision …` (spec 3.7 §8.1): manifests, fetcher, backends and the egress gate
+adk-vision = { workspace = true, optional = true }
 # Private JWK key files for `awp keys` (spec 3.5 §7.2, A-I5)
 base64 = { version = "0.22", optional = true }
 zeroize = { version = "1.8.2", optional = true }
@@ -100,11 +105,13 @@ keyring = { version = "3.6.3", default-features = false, features = ["windows-na
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_SystemServices", "Win32_System_Threading"] }
 
+# The Secret Service over zbus, pure Rust, so the build needs no libdbus. `async-io` rather
+# than `tokio`: keyring's API is blocking, and zbus's tokio `block_on` panics inside a runtime.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+keyring = { version = "3.6.3", default-features = false, features = ["async-secret-service", "async-io", "crypto-rust"] }
 
 [features]
-default = ["gemini", "openai", "anthropic", "ollama", "audit", "persist", "harness", "encrypted", "memory-local", "surface", "channels", "tui", "slack", "discord", "matrix"]
+default = ["gemini", "openai", "anthropic", "ollama", "audit", "persist", "harness", "encrypted", "surface", "channels", "tui", "slack", "discord", "matrix", "teams"]
 gemini = ["adk-model/gemini"]
 openai = ["adk-model/openai"]
 anthropic = ["adk-model/anthropic"]
@@ -171,7 +178,8 @@ encrypted = ["adk-harness?/encrypted", "adk-session/encrypted-session", "dep:sql
 browser = ["harness", "adk-harness/browser", "dep:adk-browser"]
 computer-use = ["harness", "adk-harness/computer-use"]
 # The in-process ONNX embedder for long-term memory, the default of a local provider
-# (spec 3.1 §7.15.2, H10); `ort` downloads the onnxruntime binary at build time
+# (spec 3.1 §7.15.2, H10). Off by default: `ort` downloads the onnxruntime binary at build
+# time, so a default `cargo install adk-cli` would need the network.
 memory-local = ["adk-harness?/memory-embeddings-local"]
 # `--store-key secret:<provider>/<name>` through adk-auth's secret providers
 secrets-gcp = ["dep:adk-auth", "adk-auth/gcp-secrets"]
@@ -206,6 +214,10 @@ slack = ["channels", "adk-surface/slack"]
 whatsapp = ["channels", "adk-surface/whatsapp"]
 discord = ["channels", "adk-surface/discord"]
 matrix = ["channels", "adk-surface/matrix"]
+# Microsoft Teams: `adk-rust up` starts it when TEAMS_APP_ID and TEAMS_APP_PASSWORD are set, and
+# serves the bot's messaging endpoint, `POST /api/messages`, on a listener of its own
+# (TEAMS_BIND, 127.0.0.1:3978) that a tunnel or reverse proxy publishes alone.
+teams = ["channels", "adk-surface/teams"]
 # The phone (spec 3.3 §5.4): `adk-rust up --home-url https://… --auth-token …` serves the
 # home as an installable app with Web Push from the kernel and "Confirm it's you". Opt-in:
 # its passkey checks link the system's OpenSSL (webauthn-rs).
@@ -228,6 +240,20 @@ website = ["harness", "persist", "surface", "whatsapp", "adk-surface?/website", 
 # agent it hosts the `verb_*` tools, which always ask first, serves `/api/surface/verbs`, and
 # adds `/snooze` to the terminal attached to it. No dependency beyond `surface`.
 verb-ui = ["surface", "adk-surface/verb-ui"]
+# `adk-rust vision` (spec 3.7 §8.1): the model manifest with licence classes, fetches by revision
+# with SHA-256 checks, recorded licence acceptance, the egress log, and `vision run` through the
+# egress gate of `.adk/vision.toml`: the cloud describers (Claude, Gemini, NVIDIA NIM) and Meta
+# `sam-3.1`; `vision sources list` and `sources test` over the cameras on this machine, RTSP
+# URLs and video files, through a user-installed ffmpeg. Pure Rust; opt-in.
+vision = ["dep:adk-vision", "adk-vision/fetch", "adk-vision/cloud", "adk-vision/nim", "adk-vision/sam", "adk-vision/guardrail", "adk-vision/device", "adk-vision/rtsp", "adk-model/anthropic", "adk-model/gemini", "dep:chrono"]
+# The on-device backends for `adk-rust vision run` (spec 3.7 §7.6): RF-DETR, EfficientSAM and
+# SAM 2.1 on ONNX Runtime, PP-OCRv6 and PaddleOCR-VL-1.6, and the face and personal-text
+# redactors the egress gate runs. ONNX Runtime is downloaded at build time.
+vision-local = ["vision", "adk-vision/onnx", "adk-vision/ocr", "adk-vision/ocr-vl"]
+# `vision run --mask-decoder licensed`: `sam-3.1` masks decoded in process by
+# `adk-vision-sam-codec`, the port of Meta's codec under the SAM License (not Apache-2.0), once
+# `vision models accept sam-mask-codec` records a person's acceptance. In no adk-rust tier.
+vision-sam-codec = ["vision", "adk-vision/sam-codec"]
 
 # Standard error to terminal.log while the full screen is up (spec 3.3 §5.2, S-I9)
 [target.'cfg(unix)'.dependencies]

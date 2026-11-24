@@ -24,6 +24,15 @@
 //! `%25`, `:` → `%3A`). Session entries are merged on their id, so ingesting the
 //! same session again updates its entries instead of failing.
 //!
+//! An entry's public id, [`MemoryEntry::id`], is its `memory_id` property: the id the
+//! caller set, or the internal id above. Entries written before 3.0 have no `memory_id`,
+//! so their internal id stands in.
+//!
+//! # Expiry
+//!
+//! `expires_at` holds Unix milliseconds. Search skips expired entries, both matches and
+//! `FOLLOWS` neighbours, and [`purge_expired`](MemoryService::purge_expired) deletes them.
+//!
 //! # Vector Search
 //!
 //! The vector index ranks all tenants together, so a search over-fetches
@@ -71,6 +80,7 @@ pub struct Neo4jMemoryService {
     graph: Graph,
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     vector_candidate_cap: usize,
+    default_ttl: Option<std::time::Duration>,
 }
 
 /// Default upper bound on the vector-index candidates fetched per search.
@@ -81,6 +91,26 @@ pub const DEFAULT_VECTOR_CANDIDATE_CAP: usize = 1000;
 /// Multiple of the requested `limit` fetched from the vector index before the
 /// tenant filter runs.
 const VECTOR_OVERFETCH_FACTOR: usize = 10;
+
+/// Schema codes that mean an `IF NOT EXISTS` statement raced another one and lost.
+const SCHEMA_ALREADY_EXISTS: [&str; 4] = [
+    "Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists",
+    "Neo.ClientError.Schema.ConstraintAlreadyExists",
+    "Neo.ClientError.Schema.IndexAlreadyExists",
+    "Neo.ClientError.Schema.ConstraintWithNameAlreadyExists",
+];
+
+/// Runs one idempotent schema statement, succeeding when a concurrent `migrate` created
+/// the same rule first.
+async fn run_schema_statement(
+    graph: &Graph,
+    cypher: &str,
+) -> std::result::Result<(), neo4rs::Error> {
+    match graph.run(neo4rs::query(cypher)).await {
+        Err(neo4rs::Error::Neo4j(error)) if SCHEMA_ALREADY_EXISTS.contains(&error.code()) => Ok(()),
+        result => result,
+    }
+}
 
 /// Number of vector-index candidates to request for a search returning `limit` entries.
 ///
@@ -161,6 +191,16 @@ impl Neo4jMemoryService {
             &["CREATE INDEX memory_project_id IF NOT EXISTS \
                  FOR (m:MemoryEntry) ON (m.project_id)"],
         ),
+        (
+            3,
+            "add memory_id and expires_at indexes",
+            &[
+                "CREATE INDEX memory_memory_id IF NOT EXISTS \
+                 FOR (m:MemoryEntry) ON (m.app_name, m.user_id, m.memory_id)",
+                "CREATE INDEX memory_expires_at IF NOT EXISTS \
+                 FOR (m:MemoryEntry) ON (m.expires_at)",
+            ],
+        ),
     ];
 
     /// Create a Neo4j memory service from an existing graph connection.
@@ -186,7 +226,28 @@ impl Neo4jMemoryService {
         graph: Graph,
         embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     ) -> adk_core::Result<Self> {
-        Ok(Self { graph, embedding_provider, vector_candidate_cap: DEFAULT_VECTOR_CANDIDATE_CAP })
+        Ok(Self {
+            graph,
+            embedding_provider,
+            vector_candidate_cap: DEFAULT_VECTOR_CANDIDATE_CAP,
+            default_ttl: None,
+        })
+    }
+
+    /// Expires each entry written without an expiry `ttl` after it is written.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_memory::Neo4jMemoryService;
+    /// use std::time::Duration;
+    ///
+    /// let service =
+    ///     Neo4jMemoryService::new(graph, None)?.with_default_ttl(Duration::from_secs(30 * 24 * 3600));
+    /// ```
+    pub fn with_default_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.default_ttl = Some(ttl);
+        self
     }
 
     /// Sets the maximum number of vector-index candidates fetched per search.
@@ -220,32 +281,38 @@ impl Neo4jMemoryService {
     ///
     /// The runner:
     /// 1. Creates a uniqueness constraint on registry nodes.
-    /// 2. Detects baseline — if `memory_entry_unique` constraint exists but
-    ///    registry is empty, records v1 as already applied.
+    /// 2. Detects baseline — if v1's last rule, the `memory_content` index,
+    ///    exists but the registry is empty, records v1 as already applied.
     /// 3. Reads the maximum applied version from the registry.
     /// 4. Returns an error if the database version exceeds the compiled-in max.
     /// 5. Executes each unapplied step idempotently and records it.
     /// 6. Creates the vector index if an embedding provider is configured
     ///    (always idempotent, runs after migration steps).
+    ///
+    /// Several processes may migrate one database at once: a schema statement that
+    /// loses a race to create the same rule succeeds, and each version is recorded with
+    /// `MERGE`, so a version another process recorded first is not an error.
     pub async fn migrate(&self) -> adk_core::Result<()> {
         // Step 1: Ensure registry has a uniqueness constraint on `version`
-        self.graph
-            .run(neo4rs::query(&format!(
+        run_schema_statement(
+            &self.graph,
+            &format!(
                 "CREATE CONSTRAINT {}_version_unique IF NOT EXISTS \
                  FOR (m:{}) REQUIRE (m.version) IS UNIQUE",
                 Self::REGISTRY_LABEL.to_lowercase(),
                 Self::REGISTRY_LABEL,
-            )))
-            .await
-            .map_err(|e| {
-                adk_core::AdkError::memory(format!("migration registry creation failed: {e}"))
-            })?;
+            ),
+        )
+        .await
+        .map_err(|e| {
+            adk_core::AdkError::memory(format!("migration registry creation failed: {e}"))
+        })?;
 
         // Step 2: Read current max applied version
         let mut max_applied = self.read_max_applied_version().await?;
 
-        // Step 3: Baseline detection — if registry is empty but memory_entry_unique
-        // constraint already exists, record v1 as applied.
+        // Step 3: Baseline detection — if registry is empty but v1's last
+        // index already exists, record v1 as applied.
         if max_applied == 0 {
             let existing = self.detect_existing_tables().await?;
             if existing
@@ -275,7 +342,7 @@ impl Neo4jMemoryService {
             }
 
             for cypher in cypher_statements {
-                self.graph.run(neo4rs::query(cypher)).await.map_err(|e| {
+                run_schema_statement(&self.graph, cypher).await.map_err(|e| {
                     adk_core::AdkError::memory(format!(
                         "{}",
                         crate::migration::MigrationError {
@@ -301,7 +368,7 @@ impl Neo4jMemoryService {
                  OPTIONS {{indexConfig: {{`vector.dimensions`: {dims}, \
                  `vector.similarity_function`: 'cosine'}}}}"
             );
-            self.graph.run(neo4rs::query(&vector_index_query)).await.map_err(|e| {
+            run_schema_statement(&self.graph, &vector_index_query).await.map_err(|e| {
                 adk_core::AdkError::memory(format!(
                     "migration failed: vector index creation failed: {e}"
                 ))
@@ -335,12 +402,14 @@ impl Neo4jMemoryService {
         }
     }
 
-    /// Detect whether the `memory_entry_unique` constraint already exists (baseline).
+    /// Detect whether v1's last rule, the `memory_content` index, already exists
+    /// (baseline). A first `migrate` running in another process creates v1's rules in
+    /// order, so an earlier rule existing does not mean v1 is complete.
     async fn detect_existing_tables(&self) -> Result<bool> {
         let mut row_stream = self
             .graph
             .execute(neo4rs::query(
-                "SHOW CONSTRAINTS YIELD name WHERE name = 'memory_entry_unique' RETURN name",
+                "SHOW INDEXES YIELD name WHERE name = 'memory_content' RETURN name",
             ))
             .await
             .map_err(|e| adk_core::AdkError::memory(format!("baseline detection failed: {e}")))?;
@@ -354,10 +423,13 @@ impl Neo4jMemoryService {
         Ok(found)
     }
 
-    /// Record a successfully applied migration step as a registry node.
+    /// Records an applied migration step as a registry node, unless another process
+    /// recorded it first. The uniqueness constraint on `version` makes `MERGE` take a lock,
+    /// so concurrent records create one node.
     async fn record_migration(&self, version: i64, description: &str) -> Result<()> {
         let query_str = format!(
-            "CREATE (m:{} {{version: $version, description: $description, applied_at: datetime()}})",
+            "MERGE (m:{} {{version: $version}}) \
+             ON CREATE SET m.description = $description, m.applied_at = datetime()",
             Self::REGISTRY_LABEL,
         );
         self.graph
@@ -442,7 +514,11 @@ impl Neo4jMemoryService {
             .map(|i| session_entry_id(app_name, user_id, project_id, session_id, i))
             .collect();
 
+        let now = chrono::Utc::now();
         for (i, entry) in entries.iter().enumerate() {
+            let memory_id = entry.id.clone().unwrap_or_else(|| entry_ids[i].clone());
+            let expires_at = crate::expiry::resolve_expiry(entry, self.default_ttl, now)
+                .map(|at| at.timestamp_millis());
             let content_json = serde_json::to_string(&entry.content)
                 .map_err(|e| adk_core::AdkError::memory(format!("serialization failed: {e}")))?;
             // Neo4j stores vectors as lists of 64-bit floats.
@@ -460,7 +536,8 @@ impl Neo4jMemoryService {
                          e.session_id = $session_id, e.content = $content, \
                          e.content_text = $content_text, e.author = $author, \
                          e.timestamp = $timestamp, e.embedding = $embedding, \
-                         e.project_id = $project_id \
+                         e.project_id = $project_id, e.memory_id = $memory_id, \
+                         e.expires_at = $expires_at \
                      MERGE (s)-[:FROM_SESSION]->(e)",
                 )
                 .param("session_id", session_id.to_string())
@@ -472,7 +549,9 @@ impl Neo4jMemoryService {
                 .param("author", entry.author.clone())
                 .param("timestamp", entry.timestamp.to_rfc3339())
                 .param("embedding", embedding)
-                .param("project_id", project_id.map(str::to_string)),
+                .param("project_id", project_id.map(str::to_string))
+                .param("memory_id", memory_id)
+                .param("expires_at", expires_at),
             )
             .await
             .map_err(failed)?;
@@ -552,66 +631,50 @@ impl MemoryService for Neo4jMemoryService {
         let content_text = crate::text::extract_text(&entry.content);
         let content_json = serde_json::to_string(&entry.content)
             .map_err(|e| adk_core::AdkError::memory(format!("serialization failed: {e}")))?;
-        let timestamp_str = entry.timestamp.to_rfc3339();
         let entry_id = direct_entry_id(app_name, user_id, project_id, uuid::Uuid::new_v4());
+        let memory_id = entry.id.clone().unwrap_or_else(|| entry_id.clone());
+        let expires_at =
+            crate::expiry::resolve_expiry(&entry, self.default_ttl, chrono::Utc::now())
+                .map(|at| at.timestamp_millis());
 
-        if let Some(ref provider) = self.embedding_provider {
-            let text_for_embed =
-                if content_text.is_empty() { " ".to_string() } else { content_text.clone() };
-            let embeddings = provider.embed(&[text_for_embed]).await.map_err(|e| {
-                adk_core::AdkError::memory(format!("embedding generation failed: {e}"))
-            })?;
-            let embedding_f64: Vec<f64> = embeddings[0].iter().map(|&v| v as f64).collect();
+        let embedding: Option<Vec<f64>> = match &self.embedding_provider {
+            Some(provider) => {
+                let text_for_embed =
+                    if content_text.is_empty() { " ".to_string() } else { content_text.clone() };
+                let embeddings = provider.embed(&[text_for_embed]).await.map_err(|e| {
+                    adk_core::AdkError::memory(format!("embedding generation failed: {e}"))
+                })?;
+                Some(embeddings[0].iter().map(|&v| f64::from(v)).collect())
+            }
+            None => None,
+        };
 
-            self.graph
-                .run(
-                    neo4rs::query(
-                        "CREATE (e:MemoryEntry { \
-                             id: $id, app_name: $app_name, user_id: $user_id, \
-                             content: $content, content_text: $content_text, \
-                             author: $author, timestamp: $timestamp, \
-                             embedding: $embedding, project_id: $project_id \
-                         })",
-                    )
-                    .param("id", entry_id)
-                    .param("app_name", app_name.to_string())
-                    .param("user_id", user_id.to_string())
-                    .param("content", content_json)
-                    .param("content_text", content_text)
-                    .param("author", entry.author.clone())
-                    .param("timestamp", timestamp_str)
-                    .param("embedding", embedding_f64)
-                    .param("project_id", project_id.to_string()),
+        // A null `$embedding` or `$expires_at` leaves the property unset.
+        self.graph
+            .run(
+                neo4rs::query(
+                    "CREATE (e:MemoryEntry { \
+                         id: $id, app_name: $app_name, user_id: $user_id, \
+                         content: $content, content_text: $content_text, \
+                         author: $author, timestamp: $timestamp, \
+                         embedding: $embedding, project_id: $project_id, \
+                         memory_id: $memory_id, expires_at: $expires_at \
+                     })",
                 )
-                .await
-                .map_err(|e| {
-                    adk_core::AdkError::memory(format!("add_entry_to_project failed: {e}"))
-                })?;
-        } else {
-            self.graph
-                .run(
-                    neo4rs::query(
-                        "CREATE (e:MemoryEntry { \
-                             id: $id, app_name: $app_name, user_id: $user_id, \
-                             content: $content, content_text: $content_text, \
-                             author: $author, timestamp: $timestamp, \
-                             project_id: $project_id \
-                         })",
-                    )
-                    .param("id", entry_id)
-                    .param("app_name", app_name.to_string())
-                    .param("user_id", user_id.to_string())
-                    .param("content", content_json)
-                    .param("content_text", content_text)
-                    .param("author", entry.author.clone())
-                    .param("timestamp", timestamp_str)
-                    .param("project_id", project_id.to_string()),
-                )
-                .await
-                .map_err(|e| {
-                    adk_core::AdkError::memory(format!("add_entry_to_project failed: {e}"))
-                })?;
-        }
+                .param("id", entry_id)
+                .param("app_name", app_name.to_string())
+                .param("user_id", user_id.to_string())
+                .param("content", content_json)
+                .param("content_text", content_text)
+                .param("author", entry.author.clone())
+                .param("timestamp", entry.timestamp.to_rfc3339())
+                .param("embedding", embedding)
+                .param("project_id", project_id.to_string())
+                .param("memory_id", memory_id)
+                .param("expires_at", expires_at),
+            )
+            .await
+            .map_err(|e| adk_core::AdkError::memory(format!("add_entry_to_project failed: {e}")))?;
 
         Ok(())
     }
@@ -625,6 +688,10 @@ impl MemoryService for Neo4jMemoryService {
             None => "AND node.project_id IS NULL".to_string(),
             Some(_) => "AND (node.project_id IS NULL OR node.project_id = $project_id)".to_string(),
         };
+        // Mirrors `expiry::is_expired`: an entry is live while `expires_at > now`. A `FOLLOWS`
+        // neighbour is held to the same rule, and `collect` skips nulls, so a missing expiry
+        // is collected as -1.
+        let now = chrono::Utc::now().timestamp_millis();
 
         let results = if let Some(ref provider) = self.embedding_provider {
             // Vector search via db.index.vector.queryNodes
@@ -642,12 +709,18 @@ impl MemoryService for Neo4jMemoryService {
                  YIELD node, score \
                  WHERE node.app_name = $app_name AND node.user_id = $user_id \
                  {project_filter} \
+                 AND (node.expires_at IS NULL OR node.expires_at > $now) \
                  WITH node, score ORDER BY score DESC LIMIT $limit \
                  OPTIONAL MATCH (node)-[:FOLLOWS]-(adjacent:MemoryEntry) \
+                 WHERE adjacent.expires_at IS NULL OR adjacent.expires_at > $now \
                  RETURN node.id AS id, node.content AS content, \
                         node.author AS author, node.timestamp AS timestamp, \
+                        coalesce(node.memory_id, node.id) AS memory_id, \
+                        node.expires_at AS expires_at, \
                         score, \
                         collect(adjacent.id) AS adj_ids, \
+                        collect(coalesce(adjacent.memory_id, adjacent.id)) AS adj_memory_ids, \
+                        collect(coalesce(adjacent.expires_at, -1)) AS adj_expires_at, \
                         collect(adjacent.content) AS adj_contents, \
                         collect(adjacent.author) AS adj_authors, \
                         collect(adjacent.timestamp) AS adj_timestamps \
@@ -660,7 +733,8 @@ impl MemoryService for Neo4jMemoryService {
                 .param("limit", limit as i64)
                 .param("query_embedding", query_vec)
                 .param("app_name", req.app_name.clone())
-                .param("user_id", req.user_id.clone());
+                .param("user_id", req.user_id.clone())
+                .param("now", now);
 
             if let Some(ref pid) = req.project_id {
                 query = query.param("project_id", pid.clone());
@@ -700,11 +774,17 @@ impl MemoryService for Neo4jMemoryService {
                  YIELD node, score \
                  WHERE node.app_name = $app_name AND node.user_id = $user_id \
                  {project_filter} \
+                 AND (node.expires_at IS NULL OR node.expires_at > $now) \
                  OPTIONAL MATCH (node)-[:FOLLOWS]-(adjacent:MemoryEntry) \
+                 WHERE adjacent.expires_at IS NULL OR adjacent.expires_at > $now \
                  RETURN node.id AS id, node.content AS content, \
                         node.author AS author, node.timestamp AS timestamp, \
+                        coalesce(node.memory_id, node.id) AS memory_id, \
+                        node.expires_at AS expires_at, \
                         score, \
                         collect(adjacent.id) AS adj_ids, \
+                        collect(coalesce(adjacent.memory_id, adjacent.id)) AS adj_memory_ids, \
+                        collect(coalesce(adjacent.expires_at, -1)) AS adj_expires_at, \
                         collect(adjacent.content) AS adj_contents, \
                         collect(adjacent.author) AS adj_authors, \
                         collect(adjacent.timestamp) AS adj_timestamps \
@@ -716,7 +796,8 @@ impl MemoryService for Neo4jMemoryService {
                 .param("query", req.query.clone())
                 .param("app_name", req.app_name.clone())
                 .param("user_id", req.user_id.clone())
-                .param("limit", limit as i64);
+                .param("limit", limit as i64)
+                .param("now", now);
 
             if let Some(ref pid) = req.project_id {
                 query = query.param("project_id", pid.clone());
@@ -856,6 +937,7 @@ impl MemoryService for Neo4jMemoryService {
                 neo4rs::query(
                     "MATCH (e:MemoryEntry {app_name: $app_name, user_id: $user_id}) \
                      RETURN e.content AS content, e.author AS author, e.timestamp AS timestamp, \
+                            coalesce(e.memory_id, e.id) AS memory_id, e.expires_at AS expires_at, \
                             e.session_id AS session_id, e.project_id AS project_id \
                      ORDER BY e.timestamp, e.id",
                 )
@@ -942,6 +1024,62 @@ impl MemoryService for Neo4jMemoryService {
         Ok(())
     }
 
+    #[instrument(skip_all, fields(app_name = %app_name, user_id = %user_id))]
+    async fn delete_memory(&self, app_name: &str, user_id: &str, memory_id: &str) -> Result<u64> {
+        let failed =
+            |e: neo4rs::Error| adk_core::AdkError::memory(format!("delete_memory failed: {e}"));
+        let mut rows = self
+            .graph
+            .execute(
+                neo4rs::query(
+                    "MATCH (e:MemoryEntry {app_name: $app_name, user_id: $user_id}) \
+                     WHERE coalesce(e.memory_id, e.id) = $memory_id \
+                     DETACH DELETE e \
+                     RETURN count(e) AS deleted_count",
+                )
+                .param("app_name", app_name.to_string())
+                .param("user_id", user_id.to_string())
+                .param("memory_id", memory_id.to_string()),
+            )
+            .await
+            .map_err(failed)?;
+        let removed = match rows.next().await.map_err(failed)? {
+            Some(row) => row.get::<i64>("deleted_count").unwrap_or(0) as u64,
+            None => 0,
+        };
+        Ok(removed)
+    }
+
+    #[instrument(skip_all)]
+    async fn purge_expired(&self) -> Result<u64> {
+        let failed =
+            |e: neo4rs::Error| adk_core::AdkError::memory(format!("purge_expired failed: {e}"));
+        let mut rows = self
+            .graph
+            .execute(
+                neo4rs::query(
+                    "MATCH (e:MemoryEntry) WHERE e.expires_at <= $now \
+                     DETACH DELETE e \
+                     RETURN count(e) AS deleted_count",
+                )
+                .param("now", chrono::Utc::now().timestamp_millis()),
+            )
+            .await
+            .map_err(failed)?;
+        let removed = match rows.next().await.map_err(failed)? {
+            Some(row) => row.get::<i64>("deleted_count").unwrap_or(0) as u64,
+            None => 0,
+        };
+        // A session whose entries all expired is left without any.
+        self.graph
+            .run(neo4rs::query(
+                "MATCH (s:MemorySession) WHERE NOT (s)-[:FROM_SESSION]->() DELETE s",
+            ))
+            .await
+            .map_err(failed)?;
+        Ok(removed)
+    }
+
     #[instrument(skip_all)]
     async fn health_check(&self) -> Result<()> {
         let _ = self
@@ -964,7 +1102,10 @@ fn row_to_memory_entry(row: &neo4rs::Row) -> Option<MemoryEntry> {
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or_default();
 
-    Some(MemoryEntry { content, author, timestamp })
+    let mut entry = MemoryEntry::new(content, author).with_timestamp(timestamp);
+    entry.id = row.get::<String>("memory_id").ok();
+    entry.expires_at = row.get::<i64>("expires_at").ok().and_then(DateTime::from_timestamp_millis);
+    Some(entry)
 }
 
 /// Collect adjacent entries from FOLLOWS traversal, deduplicating by ID.
@@ -977,6 +1118,8 @@ fn collect_adjacent_entries(
     let adj_contents: Vec<String> = row.get("adj_contents").unwrap_or_default();
     let adj_authors: Vec<String> = row.get("adj_authors").unwrap_or_default();
     let adj_timestamps: Vec<String> = row.get("adj_timestamps").unwrap_or_default();
+    let adj_memory_ids: Vec<String> = row.get("adj_memory_ids").unwrap_or_default();
+    let adj_expires_at: Vec<i64> = row.get("adj_expires_at").unwrap_or_default();
 
     for (i, adj_id) in adj_ids.iter().enumerate() {
         if !seen_ids.insert(adj_id.clone()) {
@@ -992,7 +1135,14 @@ fn collect_adjacent_entries(
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .unwrap_or_default();
 
-        entries.push(MemoryEntry { content, author, timestamp });
+        let mut entry = MemoryEntry::new(content, author).with_timestamp(timestamp);
+        entry.id = adj_memory_ids.get(i).cloned();
+        // -1 stands for an entry without an expiry; see `search`.
+        entry.expires_at = adj_expires_at
+            .get(i)
+            .filter(|at| **at >= 0)
+            .and_then(|at| DateTime::from_timestamp_millis(*at));
+        entries.push(entry);
     }
 }
 

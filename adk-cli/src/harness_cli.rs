@@ -14,7 +14,7 @@ use adk_cli::harness::ultracode::{
 };
 use adk_cli::harness::{
     ConsolePrompter, HarnessArgs, HarnessLauncher, KernelSettings, OPERATOR_SCOPE,
-    ResolvedHarnessArgs, SearchArg, TurnOutcome,
+    ResolvedHarnessArgs, RubricArgs, SearchArg, TurnOutcome, exhausted_hint, goal_banner,
 };
 use adk_core::audit_log::AuditRecorder;
 use adk_core::{
@@ -48,6 +48,9 @@ pub use up::up;
 
 /// Exit code of a run that left calls held for a decision (spec 3.1 §8.1).
 pub const EXIT_HELD: i32 = 3;
+
+/// Exit code of a run that ended on an error, such as a model error or an exhausted budget.
+pub const EXIT_FAILED: i32 = 1;
 
 /// The user's harness config file.
 fn user_config() -> Option<std::path::PathBuf> {
@@ -464,6 +467,12 @@ impl Setup {
         if let Some(cache) = &model.cache_capable {
             builder = builder.cache_capable(cache.clone());
         }
+        // Auto review: in auto mode the session's model reviews what the mode holds, in a
+        // context of its own, before the person is asked (autonomy parity item 2).
+        if self.resolved.auto_review {
+            builder =
+                builder.auto_review(Arc::new(adk_core::ModelApprover::new(model.llm.clone())));
+        }
         if let Ok(trust) = FileWorkspaceTrustStore::in_home() {
             builder = builder.workspace_trust(Arc::new(trust));
         }
@@ -506,6 +515,9 @@ impl Setup {
             if let Some((embedder, _)) = &self.embedder {
                 builder = builder.memory_embedder(embedder.clone());
             }
+        }
+        if let Some(config) = &self.resolved.compaction {
+            builder = builder.intra_compaction(config.clone());
         }
         // Snapshots before each turn (spec 3.1 §7.27, §13 Q11): records in harness.db and
         // objects beside it, in memory with --ephemeral; a harness served from a shared store
@@ -939,7 +951,7 @@ async fn latest_in_workspace(
     keep: impl Fn(&dyn adk_session::State) -> bool,
 ) -> Result<Option<String>> {
     let mut listed = sessions
-        .list(adk_session::ListRequest {
+        .list_active(adk_session::ListRequest {
             app_name: APP_NAME.to_string(),
             user_id: user.to_string(),
             limit: None,
@@ -1130,7 +1142,22 @@ pub async fn code(
         println!("The turn ended after a denial (session {}).", outcome.session_id);
     }
     println!("session: {}", outcome.session_id);
-    Ok(if outcome.interrupted { 130 } else { 0 })
+    Ok(turn_exit(&outcome))
+}
+
+/// The exit code of a one-shot turn that held no call: `130` when interrupted, [`EXIT_FAILED`]
+/// when the run ended on an error, which is printed again as the last line, else `0`.
+fn turn_exit(outcome: &TurnOutcome) -> i32 {
+    if outcome.interrupted {
+        return 130;
+    }
+    match &outcome.error {
+        Some(error) => {
+            eprintln!("the run failed: {error}");
+            EXIT_FAILED
+        }
+        None => 0,
+    }
 }
 
 /// `adk-rust --voice`: the harness over a realtime session (spec 3.1 §8.1, §7.17, H5).
@@ -1223,7 +1250,9 @@ fn persistent(setup: &Setup) -> bool {
 /// Arguments of `adk-rust goal`.
 pub struct GoalArgs {
     pub goal: String,
-    pub until: String,
+    pub until: Option<String>,
+    /// `--rubric`, `--rubric-from-goal` and their options, else the `[goal]` table.
+    pub rubric: RubricArgs,
     pub max_iters: u32,
     /// How long one run of the check may take (`--check-timeout`).
     pub check_timeout: std::time::Duration,
@@ -1231,8 +1260,8 @@ pub struct GoalArgs {
     pub resume: bool,
 }
 
-/// `adk-rust goal`: the harness goal engine, iterating until `until` passes
-/// (spec 3.1 §8.1, §7.11).
+/// `adk-rust goal`: the harness goal engine, iterating until `until` passes and the rubric's
+/// grader passes every criterion, whichever the goal has (spec 3.1 §8.1, §7.11).
 ///
 /// `Harness::start_goal` starts the goal; with `harness.db` it is a durable run that parks
 /// on a held call and continues with `--resume` once the call is decided, in the same
@@ -1305,14 +1334,8 @@ pub async fn goal(
         if goal.resume {
             println!("no unfinished goal in this workspace; starting fresh.");
         }
-        println!("goal:  {}", goal.goal);
-        println!("until: {}  (budget: {} iterations)\n", goal.until, goal.max_iters);
-        let spec = GoalSpec {
-            goal: goal.goal.clone(),
-            until: goal.until.clone(),
-            max_iterations: goal.max_iters,
-            check_timeout: goal.check_timeout,
-        };
+        let spec = goal_spec(&goal, &workspace)?;
+        println!("{}", goal_banner(&spec));
         launcher.run_goal(spec).await?
     };
     let state = launcher.goal().await?;
@@ -1335,6 +1358,10 @@ pub async fn goal(
 /// shared stores for the kernel's background worker, and this terminal follows it over the
 /// control plane until it ends, holds a call no one here decides, or Ctrl-C detaches —
 /// which leaves it running.
+///
+/// The goal runs as this user, authenticated as a local goal is, so the session's mode and
+/// the user's standing rules apply on the kernel (spec 3.1 §9.2 I6); `--yes` approves the
+/// goal's held calls through the inbox while this terminal follows it.
 #[cfg(feature = "persist")]
 async fn goal_on_kernel(
     setup: &Setup,
@@ -1355,26 +1382,35 @@ async fn goal_on_kernel(
         .await?
         .with_console(console.clone())
         .with_run_store(db.runs.clone())
-        .with_goal_queue(adk_kernel::QueueClass::BACKGROUND);
-    let spec = GoalSpec {
-        goal: goal.goal.clone(),
-        until: goal.until.clone(),
-        max_iterations: goal.max_iters,
-        check_timeout: goal.check_timeout,
-    };
+        .with_goal_queue(adk_kernel::QueueClass::BACKGROUND)
+        .with_authenticated_goals();
+    let spec = goal_spec(&goal, &setup.resolved.workspace)?;
+    let banner = goal_banner(&spec);
     let mut cursor = Some(chrono::Utc::now());
     let pid = launcher.enqueue_goal(spec).await?;
     let session = launcher.session_id().unwrap_or_default().to_string();
+    let unattended = setup.resolved.yes.then_some(setup.resolved.allow_unsandboxed);
     println!("goal mode on the kernel at {}", client.endpoint());
-    println!("goal:  {}", goal.goal);
-    println!("until: {}  (budget: {} iterations)", goal.until, goal.max_iters);
+    println!(
+        "mode {} as {}, in the kernel's shell{}",
+        launcher.mode().await?,
+        setup.user,
+        if unattended.is_some() {
+            "; --yes approves held calls while this terminal follows"
+        } else {
+            ""
+        }
+    );
+    print!("{banner}");
     println!("process {pid} · session {session}");
     println!(
-        "Ctrl-C detaches; the goal keeps running. Follow it again with `adk-rust attach          --session {session}`.\n"
+        "Ctrl-C detaches; the goal keeps running. Follow it again with `adk-rust attach \
+         --session {session}`.\n"
     );
     let terminal = console.is_terminal().then_some(&console);
     let followed =
-        crate::kernel_cli::follow(&client, terminal, &session, &mut cursor, Some(&pid)).await?;
+        crate::kernel_cli::follow(&client, terminal, unattended, &session, &mut cursor, Some(&pid))
+            .await?;
     let state = launcher.goal().await?;
     if let (Some(mirror), Some(state)) = (&mirror, &state) {
         write_goal_mirror(mirror, state)?;
@@ -1386,7 +1422,9 @@ async fn goal_on_kernel(
         }
         Followed::Held(calls) => {
             println!(
-                "\n{calls} call(s) wait for a decision. The goal waits on the kernel: decide                  with `adk-rust approvals` or from any surface."
+                "\n{calls} call(s) wait for a decision. The goal waits on the kernel: \
+                 `adk-rust approvals list` shows them, `adk-rust approvals approve ID` resumes \
+                 it, or decide from any surface."
             );
             EXIT_HELD
         }
@@ -1397,27 +1435,44 @@ async fn goal_on_kernel(
     })
 }
 
+/// The goal `goal` asks for in `workspace`: its `--until` command and its rubric.
+fn goal_spec(goal: &GoalArgs, workspace: &Path) -> Result<GoalSpec> {
+    let rubric = goal.rubric.resolve(&goal.goal, workspace)?;
+    if goal.until.is_none() && rubric.is_none() {
+        bail!(
+            "a goal needs a check: --until CMD, --rubric FILE, --rubric-from-goal, or a [goal] \
+             rubric in .adk/harness.toml"
+        );
+    }
+    let mut spec = GoalSpec::new(goal.goal.clone())
+        .with_max_iterations(goal.max_iters)
+        .with_check_timeout(goal.check_timeout);
+    if let Some(until) = &goal.until {
+        spec = spec.with_until(until.clone());
+    }
+    if let Some(rubric) = rubric {
+        spec = spec.with_rubric(rubric);
+    }
+    Ok(spec)
+}
+
 /// Reports how a goal stands and returns the exit code: `0` met, `1` otherwise.
 fn goal_exit(state: Option<&GoalState>, outcome: &TurnOutcome) -> i32 {
     match state {
         Some(state) if state.status == GoalStatus::Done => {
-            println!(
-                "\ngoal met after {} iteration(s): `{}` passed.",
-                state.iteration, state.until
-            );
+            println!("\n{}", state.outcome().unwrap_or_default());
             0
         }
         Some(state) if state.status == GoalStatus::Exhausted => {
-            println!(
-                "\nbudget exhausted after {} iteration(s); `{}` still failing. Resume later \
-                 with --resume and a higher --max-iters.",
-                state.iteration, state.until
-            );
+            println!("\n{}\n{}", state.outcome().unwrap_or_default(), exhausted_hint(state));
             1
         }
         Some(state) => {
             if outcome.ended_by_denial {
                 println!("\nThe turn ended after a denial.");
+            }
+            if let Some(error) = &outcome.error {
+                eprintln!("\nthe run failed: {error}");
             }
             println!(
                 "\nthe goal is {:?} at iteration {}; continue with --resume.",
@@ -1425,7 +1480,12 @@ fn goal_exit(state: Option<&GoalState>, outcome: &TurnOutcome) -> i32 {
             );
             1
         }
-        None => 1,
+        None => {
+            if let Some(error) = &outcome.error {
+                eprintln!("\nthe run failed: {error}");
+            }
+            1
+        }
     }
 }
 
@@ -1457,6 +1517,8 @@ fn write_goal_mirror(mirror: &OutputFile, state: &GoalState) -> Result<()> {
         "iteration": state.iteration,
         "status": serde_json::to_value(state.status)?,
         "lastCheck": state.last_check,
+        "evaluations": state.evaluations,
+        "lastGrade": state.last_grade,
     }))?;
     mirror.write(text.as_bytes())
 }
@@ -1975,6 +2037,10 @@ impl UltraAgents for HarnessUltra {
             }
             Ok(outcome) if outcome.interrupted => TurnStatus::Interrupted,
             Ok(outcome) if outcome.ended_by_denial => TurnStatus::Failed,
+            Ok(TurnOutcome { error: Some(error), .. }) => {
+                println!("  implement failed: {error}");
+                TurnStatus::Failed
+            }
             Ok(_) => TurnStatus::Completed,
             Err(error) => {
                 println!("  implement failed: {error}");

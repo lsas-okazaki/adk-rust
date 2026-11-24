@@ -7,10 +7,11 @@ license.workspace = true
 authors.workspace = true
 description = "Agent surfaces for ADK-Rust: one engine that turns a kernel's sessions, decisions and activity into plain words for every surface, and the surfaces that show them"
 repository.workspace = true
+homepage.workspace = true
 documentation = "https://docs.rs/adk-surface"
 readme = "README.md"
 # The web home's built assets ship in the crate; its TypeScript source does not.
-include = ["src/**/*", "assets/**/*", "Cargo.toml", "README.md"]
+include = ["src/**/*", "assets/**/*", "Cargo.toml", "README.md", "LICENSE"]
 keywords = ["adk", "agent", "approvals", "ui", "kernel"]
 categories = ["asynchronous", "web-programming"]
 
@@ -22,7 +23,7 @@ default = []
 # with `ServerBuilder::add_api_routes`, the feed over server-sent events, and the OpenAPI
 # document the TypeScript types are generated from; and the page itself, built from
 # `web/` and embedded, mounted with `ServerBuilder::add_root_routes` (§10 S1).
-web = ["dep:axum", "dep:rust-embed", "dep:mime_guess"]
+web = ["dep:axum", "dep:rust-embed", "dep:mime_guess", "dep:png"]
 # The terminal (spec 3.3 §5.2): full-screen by default, `inline` in the scrollback, and JSON
 # lines for CI, all on the engine. Light and dark from the §9 tokens, detected from the
 # terminal's background unless set.
@@ -35,24 +36,35 @@ channels = ["adk-kernel/channels"]
 # Telegram-only build stays lean. WhatsApp is a webhook the host mounts, its body signed with
 # HMAC-SHA256; Slack (Socket Mode) and Discord (the Gateway) are WebSockets over
 # tokio-tungstenite; Matrix is `/sync` long polling over `reqwest`.
-whatsapp = ["channels", "dep:axum", "dep:hmac", "dep:sha2"]
+whatsapp = ["channels", "dep:axum", "dep:hmac"]
 slack = ["channels", "dep:tokio-tungstenite", "adk-core/rustls"]
 discord = ["channels", "dep:tokio-tungstenite", "adk-core/rustls"]
 matrix = ["channels"]
+# Microsoft Teams: a bot registered with Azure Bot Service. The Bot Framework's activity
+# webhook the host serves, each request's Bot Connector JWT checked against the connector's
+# OpenID keys (jsonwebtoken on aws-lc-rs, the workspace's crypto provider); the Bot Connector
+# REST API out over `reqwest`.
+teams = ["channels", "dep:axum", "dep:jsonwebtoken"]
 # The phone (spec 3.3 §5.4, §6.1): the web home installed on a phone, its routes, Web Push
 # from the person's own kernel (aes128gcm, the VAPID key signed here with p256), pairing QR
 # codes and "Confirm it's you" (passkeys checked by webauthn-rs, which links the system's
 # OpenSSL). Implies `web`; its wire types compile under `web`.
-mobile = ["web", "dep:web-push-native", "dep:p256", "dep:qrcode", "dep:base64ct", "dep:sha2", "dep:getrandom", "dep:webauthn-rs", "dep:url"]
+mobile = ["web", "dep:web-push-native", "dep:p256", "dep:qrcode", "dep:base64ct", "dep:getrandom", "dep:webauthn-rs"]
 # Voice and video (spec 3.3 §5.6): spoken "allow once" and "deny" through the engine, with a
 # cancel window, the camera and the screen as input only while their switches are on. The
 # runtime drives the harness's realtime session (`adk-realtime`); hosts pass the provider
 # models, so no provider is compiled in here. With `web`, the voice view's socket.
-voice = ["adk-harness/voice", "dep:adk-realtime", "adk-realtime/integration", "dep:sha2", "dep:base64", "axum?/ws"]
+voice = ["adk-harness/voice", "dep:adk-realtime", "adk-realtime/integration", "axum?/ws"]
 # The website's views on the web home (spec 3.5 §7.1, §8.2): the web editor, onboarding, the
 # charter cards, the site view and the weekly review over `adk-website`'s desk, with their own
 # OpenAPI document and generated TypeScript. Implies `web`.
-website = ["web", "dep:adk-website", "dep:base64"]
+website = ["web", "dep:adk-website"]
+# The live camera surface on the real frame pipeline (spec 3.7 §7.13, §8.2, S12):
+# `camera::PipelineCameras` runs each camera through adk-vision's `StreamPipeline` — source,
+# frame governor, privacy, detector, tracker — and reports its state, tracks, watch conditions
+# and zones; the voice screen's camera comes in through `SurfaceCameraSource`. Shown frames are
+# JPEG through `image`, already in the tree through adk-vision.
+vision-camera = ["dep:adk-vision", "adk-vision/surface-camera", "dep:image", "dep:tokio-util"]
 # Gemini Live and the OpenAI Realtime API, for the live voice test and the `voice_home`
 # example only: a host builds its own provider models.
 voice-live = ["voice", "adk-realtime/gemini", "adk-realtime/openai"]
@@ -70,14 +82,17 @@ workflow = ["dep:adk-graph", "adk-graph/time-travel", "adk-harness/web"]
 # Agent-drawn UI (spec 3.3 §6.1, §7.4 rule 5): the A2UI v0.9.1 model, the embedded `forms` 1.0
 # catalog, the validator that keeps approval controls and secrets out of drawings, and the
 # render tools agents draw with (`genui::DrawToolset`).
-genui = ["dep:jsonschema", "dep:sha2", "dep:regex"]
+genui = ["dep:jsonschema", "dep:regex", "dep:hmac"]
 # Apps from MCP servers in a thread (spec 3.3 §6.1 `genui-apps`, wave 4 decision 16): an MCP
 # server's `_meta.ui` app shown sandboxed on a second origin, whose tool calls a person decides
 # and which can never approve anything. Pulls in rmcp through `adk-tool/mcp-apps`.
-genui-apps = ["genui", "web", "adk-harness/mcp", "adk-tool/mcp-apps"]
+genui-apps = ["genui", "web", "adk-harness/mcp", "dep:adk-tool", "adk-tool/mcp-apps"]
 
 [dependencies]
 adk-core.workspace = true
+# Evidence images a decision holds, read where their locator says (spec 3.7 §8.2); already in
+# the tree through adk-runner.
+adk-artifact.workspace = true
 adk-session.workspace = true
 adk-runner.workspace = true
 # The control-plane client, the process table, freezing and the `/proc` ledger.
@@ -87,6 +102,12 @@ adk-kernel.workspace = true
 adk-harness = { workspace = true, features = ["kernel"] }
 # The realtime session a voice conversation runs on (`voice`).
 adk-realtime = { workspace = true, optional = true }
+# The frame pipeline the live camera surface runs cameras through (`vision-camera`).
+adk-vision = { workspace = true, optional = true }
+# Shown camera frames as JPEG (`vision-camera`).
+image = { version = "0.25", optional = true, default-features = false, features = ["jpeg"] }
+# A camera's stream stopped on its own, apart from the host's run (`vision-camera`).
+tokio-util = { version = "0.7", optional = true, default-features = false }
 # The website's desk: its views and the decisions people make on them (`website`).
 adk-website = { workspace = true, optional = true }
 # Graph agents' checkpoints, records and forks (`workflow`).
@@ -99,7 +120,7 @@ adk-tool = { workspace = true, optional = true }
 async-trait.workspace = true
 axum = { version = "0.8", optional = true }
 # Camera and screen frames go to the realtime provider base64-encoded (`voice`).
-base64 = { version = "0.22", optional = true }
+base64 = "0.22"
 chrono.workspace = true
 crossterm = { version = "0.29", optional = true, features = ["event-stream"] }
 futures.workspace = true
@@ -110,12 +131,14 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 mime_guess = { version = "2.0.5", optional = true }
+# "Tighten the crop" and "Add a redaction" on an evidence image (spec 3.7 §8.2, `web`).
+png = { version = "0.18", optional = true }
 # The approvals inbox in full over the kernel's HTTP control plane (`ControlSource`).
 reqwest.workspace = true
 # A drawn field's `regex` check, evaluated again when the form is sent (`genui`).
 regex = { workspace = true, optional = true }
 # Agent messages as Markdown, code blocks highlighted (spec 3.3 §6.1 `tui`).
-pulldown-cmark = { version = "0.13", optional = true, default-features = false }
+pulldown-cmark = { version = "0.13.6", optional = true, default-features = false }
 ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm"] }
 # The web home's built assets, embedded in the binary (spec 3.3 §6.1 `web`).
 rust-embed = { version = "8.9.0", optional = true }
@@ -138,15 +161,17 @@ web-push-native = { version = "=0.5.0", optional = true, default-features = fals
 p256 = { version = "0.13.2", optional = true, default-features = false, features = ["ecdsa", "ecdh", "std"] }
 qrcode = { version = "=0.14.1", optional = true, default-features = false, features = ["svg"] }
 base64ct = { version = "1.8", optional = true, features = ["alloc"] }
-sha2 = { workspace = true, optional = true }
+# Every evidence image a surface shows is checked against its digest (spec 3.7 §8.2).
+sha2.workspace = true
 getrandom = { version = "0.3", optional = true }
 # The WhatsApp webhook's `X-Hub-Signature-256` (`whatsapp`).
 hmac = { version = "0.12", optional = true }
+# The Bot Connector's token on every Teams activity (`teams`).
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"], optional = true }
 # Slack's Socket Mode and Discord's Gateway (`slack`, `discord`).
 tokio-tungstenite = { version = "0.29", optional = true, features = ["rustls-tls-native-roots", "connect"] }
 # "Confirm it's you" (`mobile`): passkey registration and assertions. Its core links OpenSSL.
 webauthn-rs = { version = "=0.5.5", optional = true, default-features = false }
-url = { version = "2", optional = true }
 
 [dev-dependencies]
 # Internal dev-deps are path-only (no version) so cargo strips them from the published
@@ -155,8 +180,14 @@ adk-devtools = { path = "../adk-devtools" }
 # The kernel's chat channel contract suite, run against the Telegram adapter, and its
 # PostgreSQL process store for the governed form's shared-store leg.
 adk-kernel = { path = "../adk-kernel", features = ["channels", "conformance", "postgres"] }
-# The kernel-hosted harness of the scenario tests.
-adk-harness = { path = "../adk-harness", features = ["kernel"] }
+# The kernel-hosted harness of the scenario tests; `vision` for the approve-with-image example.
+adk-harness = { path = "../adk-harness", features = ["kernel", "vision"] }
+# The vision pack's runtime, egress gate and redactors of `vision_home` (spec 3.7 §8.2); the
+# conveyor clip over the in-process RTSP server of `live_camera_home` and the camera tests; a
+# camera on this machine, or ffmpeg's test pattern, switched off and on (`device`).
+adk-vision = { path = "../adk-vision", features = ["rtsp", "stream-fixtures", "device"] }
+# Loads the labelled examples the annotated viewer saves, as `cargo adk eval` does.
+adk-eval = { path = "../adk-eval" }
 adk-model = { path = "../adk-model", default-features = false, features = ["anthropic", "openai", "gemini"] }
 # The provider-free realtime model the voice tests and `scripted_voice_home` script.
 adk-realtime = { path = "../adk-realtime", features = ["scripted"] }
@@ -173,16 +204,22 @@ adk-agent = { path = "../adk-agent" }
 adk-graph = { path = "../adk-graph", features = ["time-travel", "action-http", "sqlite", "postgres"] }
 # The fake Telegram Bot API the chat adapter's tests run against.
 axum = "0.8"
+# The Teams tests' signing key, its JWKS and signed Bot Connector tokens.
+aws-lc-rs = "1.18"
+base64 = "0.22"
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 dotenvy = "0.15"
 proptest = "1.5"
 tempfile = "3"
 # `test-util`: the inbox's timeout tests run on paused time.
 tokio = { workspace = true, features = ["full", "test-util"] }
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }
 # Parses what the terminal surface writes, as a terminal would (spec 3.3 WP-E).
 vt100 = "0.16"
+# The Teams tests' Bot Connector, Microsoft Entra token endpoint and OpenID metadata.
+wiremock = "0.6"
 # The in-process MCP server whose app the hostile-app tests show (`genui-apps`).
-rmcp = { version = "3.1", features = ["client", "server", "elicitation"] }
+rmcp = { version = "3.9", features = ["client", "server", "elicitation"] }
 # The voice view's socket, opened as a browser would (spec 3.3 §5.6).
 tokio-tungstenite = "0.29"
 # What the live voice test's provider says, with `RUST_LOG`.
@@ -197,6 +234,32 @@ webauthn-rs = { version = "=0.5.5", default-features = false, features = ["dange
 [[example]]
 name = "scripted_home"
 required-features = ["web"]
+
+# Approve with the image (spec 3.7 §8.2): a harness with the vision pack holds a call that
+# would send an identity card to Claude, and the web home shows the exact image that would leave.
+[[example]]
+name = "vision_home"
+required-features = ["web"]
+
+# The annotated viewer (spec 3.7 §8.2, X12): a harness with the vision pack reads a page and
+# detects on a photo; the viewer shows each answer and saves a corrected region as an eval case.
+[[example]]
+name = "vision_viewer"
+required-features = ["web"]
+
+# The live camera surface (spec 3.7 §8.2, S12): four scripted cameras as the boards draw them,
+# the Inspector's held line stop with its frame, switch-off, zones and cards on the real routes.
+[[example]]
+name = "scripted_camera_home"
+required-features = ["web"]
+
+# The live camera surface on the real frame pipeline (spec 3.7 §8.2, S12): the conveyor clip
+# over RTSP, two cameras through `StreamPipeline`, a zone, a watch and the governor, which
+# `web/e2e/camera.spec.ts` opens.
+[[example]]
+name = "live_camera_home"
+path = "examples/live_camera_home/main.rs"
+required-features = ["web", "vision-camera"]
 
 # The tray panel over a scripted kernel with two agents (spec 3.3 §5.5).
 [[example]]
@@ -239,6 +302,10 @@ required-features = ["web", "workflow"]
 # `web/e2e/genui.spec.ts` sends and allows once (spec 3.3 §6.1 `genui`, §12).
 [[example]]
 name = "scripted_genui"
+required-features = ["web", "genui"]
+
+[[example]]
+name = "scripted_genui_scenes"
 required-features = ["web", "genui"]
 
 [package.metadata.docs.rs]

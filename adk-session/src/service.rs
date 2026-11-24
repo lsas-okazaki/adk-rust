@@ -1,3 +1,7 @@
+use crate::history::{
+    ForkRequest, HistoryOutcome, HistoryRewrite, ImportSessionRequest, RewriteHistoryRequest,
+    SessionHistory,
+};
 use crate::{Event, Session};
 use adk_core::identity::{AdkIdentity, AppName, SessionId, UserId};
 use adk_core::{AdkError, ErrorCategory, ErrorComponent, Result};
@@ -199,13 +203,13 @@ pub(crate) fn rewind_steps_exceed(identity: &AdkIdentity, steps: usize, events: 
     )
 }
 
-fn rewind_unsupported() -> AdkError {
+/// Builds the error a backend returns for a history operation it cannot perform.
+pub(crate) fn history_unsupported(operation: &str, reason: &str) -> AdkError {
     AdkError::new(
         ErrorComponent::Session,
         ErrorCategory::Unsupported,
-        "session.rewind.unsupported",
-        "this session backend does not support rewind; the in-memory, SQLite, and encrypted \
-         backends do",
+        "session.history.unsupported",
+        format!("this session backend cannot {operation}: {reason}"),
     )
 }
 
@@ -341,7 +345,9 @@ pub trait SessionService: Send + Sync {
     /// Lists the sessions of an app and user, most recently updated first.
     ///
     /// Sessions updated at the same instant are ordered by session ID, descending, so
-    /// `offset`/`limit` pages are stable.
+    /// `offset`/`limit` pages are stable. Archived sessions are listed too, with their
+    /// [`ArchiveMark`](crate::ArchiveMark) in their state;
+    /// [`list_active`](SessionService::list_active) leaves them out.
     async fn list(&self, req: ListRequest) -> Result<Vec<Box<dyn Session>>>;
     /// Delete a session by its identifiers.
     async fn delete(&self, req: DeleteRequest) -> Result<()>;
@@ -451,45 +457,147 @@ pub trait SessionService: Send + Sync {
         ))
     }
 
-    /// Rewinds the session `identity` to `target_event_id`.
+    /// Reads the stored history of the session `identity`: its events, its own state, and the
+    /// state it was created with.
     ///
-    /// Removes every event after the target and rebuilds the session-scoped state from the
-    /// state the session was created with plus the state deltas of the events that remain.
-    /// App and user state are shared with other sessions and are not rewound. Only the session
-    /// that `identity` names changes, even when other apps or users hold a session with the
-    /// same ID.
+    /// The default reads the session with [`get_for_identity`](SessionService::get_for_identity)
+    /// and reports no recorded creation state; every `adk-session` backend that records one
+    /// returns it.
     ///
     /// # Errors
     ///
-    /// Returns `session.rewind.unsupported` ([`Unsupported`](adk_core::ErrorCategory::Unsupported))
-    /// when the backend does not support rewind, `session.not_found` when the session does not
-    /// exist, and `session.event_not_found` when the target is not an event of the session.
+    /// Returns `session.not_found` when the session does not exist, or a backend error.
+    async fn history(&self, identity: &AdkIdentity) -> Result<SessionHistory> {
+        let session = self.get_for_identity(identity).await?;
+        let (_, _, state) = crate::state_utils::extract_state_deltas(&session.state().all());
+        Ok(SessionHistory::new(session.events().all(), state, None))
+    }
+
+    /// Rewrites the history of a session in place: a rewind or an edit.
+    ///
+    /// The backend reads the session, applies [`SessionHistory::rewrite`] to it, and writes the
+    /// result atomically, so a concurrent append either lands before the read or after the
+    /// write. The session's own state is rebuilt from the state it was created with plus the
+    /// state deltas of the events it keeps; the `app:` and `user:` tiers do not change. Only the
+    /// session that `identity` names changes, even when other apps or users hold a session with
+    /// the same ID. The rules every history operation follows are in [`crate::history`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `session.history.unsupported` ([`Unsupported`](adk_core::ErrorCategory::Unsupported))
+    /// when the backend cannot delete events, `session.not_found` when the session does not
+    /// exist, and the errors of [`SessionHistory::rewrite`].
+    async fn rewrite_history(&self, _req: RewriteHistoryRequest) -> Result<HistoryOutcome> {
+        Err(history_unsupported("rewrite history", "it does not implement rewrite_history"))
+    }
+
+    /// Creates a session that already holds events, without applying their state deltas to
+    /// the `app:` and `user:` tiers.
+    ///
+    /// # Errors
+    ///
+    /// Returns `session.history.unsupported` when the backend does not implement it,
+    /// `session.already_exists` ([`Conflict`](adk_core::ErrorCategory::Conflict)) when the session
+    /// exists, and an invalid-input error when an identifier fails validation.
+    async fn import_session(&self, _req: ImportSessionRequest) -> Result<Box<dyn Session>> {
+        Err(history_unsupported("import a session", "it does not implement import_session"))
+    }
+
+    /// Forks a session: creates a session of the same app and user that holds the source's
+    /// events up to [`ForkRequest::at_event_id`], with the state the source had there.
+    ///
+    /// The source does not change. The fork's events keep their IDs and timestamps, its state is
+    /// the source's creation state plus the deltas of the copied events, and it records its
+    /// [`ForkOrigin`](crate::ForkOrigin) under [`FORK_ORIGIN_KEY`](crate::FORK_ORIGIN_KEY). The
+    /// default reads the source with [`history`](SessionService::history) and creates the fork
+    /// with [`import_session`](SessionService::import_session).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_session::{CreateRequest, Event, ForkRequest, InMemorySessionService, SessionService};
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> adk_core::Result<()> {
+    /// let service = InMemorySessionService::new();
+    /// let source = service
+    ///     .create(CreateRequest {
+    ///         app_name: "app".into(),
+    ///         user_id: "alice".into(),
+    ///         session_id: Some("main".into()),
+    ///         state: Default::default(),
+    ///     })
+    ///     .await?;
+    /// let identity = source.try_identity()?;
+    /// let first = Event::new("inv-1");
+    /// let first_id = first.id.clone();
+    /// for event in [first, Event::new("inv-2")] {
+    ///     service
+    ///         .append_event_for_identity(adk_session::AppendEventRequest {
+    ///             identity: identity.clone(),
+    ///             event,
+    ///         })
+    ///         .await?;
+    /// }
+    ///
+    /// let fork = service.fork(ForkRequest::new(identity).at_event(first_id)).await?;
+    /// assert_eq!(fork.session.events().len(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `session.not_found` when the source does not exist, `session.already_exists`
+    /// when the fork's session ID is taken, `session.history.unsupported` from a backend that
+    /// cannot import, and the errors of [`SessionHistory::fork`].
+    async fn fork(&self, req: ForkRequest) -> Result<HistoryOutcome> {
+        let source = self.history(&req.source).await?;
+        let (import, change) = source.fork(&req)?;
+        let session = self.import_session(import).await?;
+        Ok(HistoryOutcome::new(session, change))
+    }
+
+    /// Rewinds the session `identity` to `target_event_id`, removing every event after it.
+    ///
+    /// A [`rewrite_history`](SessionService::rewrite_history) with
+    /// [`HistoryRewrite::RewindTo`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `session.event_not_found` when the target is not an event of the session, and
+    /// the errors of [`rewrite_history`](SessionService::rewrite_history).
     async fn rewind(
         &self,
-        _identity: &AdkIdentity,
-        _target_event_id: &str,
+        identity: &AdkIdentity,
+        target_event_id: &str,
     ) -> Result<Box<dyn Session>> {
-        Err(rewind_unsupported())
+        let rewrite = HistoryRewrite::RewindTo { event_id: target_event_id.to_string() };
+        Ok(self
+            .rewrite_history(RewriteHistoryRequest::new(identity.clone(), rewrite))
+            .await?
+            .session)
     }
 
     /// Rewinds the session `identity` by `steps` events from the end.
     ///
-    /// Rebuilds state as [`rewind`](SessionService::rewind) does. `steps == 0` returns the
-    /// session unchanged, and `steps` equal to the event count removes every event and leaves
-    /// the state the session was created with.
+    /// `steps == 0` returns the session unchanged, and `steps` equal to the event count removes
+    /// every event and leaves the state the session was created with.
     ///
     /// # Errors
     ///
-    /// Returns `session.rewind.unsupported` when the backend does not support rewind,
-    /// `session.not_found` when the session does not exist, and
-    /// `session.rewind.too_many_steps` ([`InvalidInput`](adk_core::ErrorCategory::InvalidInput))
-    /// when `steps` exceeds the event count.
-    async fn rewind_steps(
-        &self,
-        _identity: &AdkIdentity,
-        _steps: usize,
-    ) -> Result<Box<dyn Session>> {
-        Err(rewind_unsupported())
+    /// Returns `session.rewind.too_many_steps` ([`InvalidInput`](adk_core::ErrorCategory::InvalidInput))
+    /// when `steps` exceeds the event count, and the errors of
+    /// [`rewrite_history`](SessionService::rewrite_history).
+    async fn rewind_steps(&self, identity: &AdkIdentity, steps: usize) -> Result<Box<dyn Session>> {
+        if steps == 0 {
+            return self.get_for_identity(identity).await;
+        }
+        let rewrite = HistoryRewrite::RewindSteps { steps };
+        Ok(self
+            .rewrite_history(RewriteHistoryRequest::new(identity.clone(), rewrite))
+            .await?
+            .session)
     }
 
     /// Verify backend connectivity.
@@ -500,4 +608,156 @@ pub trait SessionService: Send + Sync {
     async fn health_check(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Archives the session `identity`: it keeps its events and state, is left out of
+    /// [`list_active`](SessionService::list_active), and takes no new turns until
+    /// [`unarchive`](SessionService::unarchive) (see [`crate::archive`]).
+    ///
+    /// The mark is written to the session's own state under [`ARCHIVE_KEY`](crate::ARCHIVE_KEY)
+    /// by a content-less marker event, through
+    /// [`append_event_for_identity`](SessionService::append_event_for_identity), so it works on
+    /// every backend. Archiving an archived session changes nothing and returns its mark.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_session::{CreateRequest, InMemorySessionService, SessionService};
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> adk_core::Result<()> {
+    /// let service = InMemorySessionService::new();
+    /// let session = service
+    ///     .create(CreateRequest {
+    ///         app_name: "app".into(),
+    ///         user_id: "ana".into(),
+    ///         session_id: Some("s".into()),
+    ///         state: Default::default(),
+    ///     })
+    ///     .await?;
+    /// let identity = session.try_identity()?;
+    /// let first = service.archive(&identity, Some("done".into())).await?;
+    /// let again = service.archive(&identity, None).await?;
+    /// assert_eq!(first, again);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `session.not_found` when the session does not exist, or a backend error.
+    async fn archive(
+        &self,
+        identity: &AdkIdentity,
+        reason: Option<String>,
+    ) -> Result<crate::ArchiveMark> {
+        let session = self.get_for_identity(identity).await?;
+        if let Some(mark) = crate::ArchiveMark::of(session.as_ref()) {
+            return Ok(mark);
+        }
+        let mark = crate::ArchiveMark::new(reason);
+        self.append_event_for_identity(AppendEventRequest {
+            identity: identity.clone(),
+            event: mark.event()?,
+        })
+        .await?;
+        Ok(mark)
+    }
+
+    /// Unarchives the session `identity`: it lists and takes turns again. Unarchiving a
+    /// session that is not archived changes nothing.
+    ///
+    /// The mark is cleared by a content-less marker event that sets
+    /// [`ARCHIVE_KEY`](crate::ARCHIVE_KEY) to `null`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `session.not_found` when the session does not exist, or a backend error.
+    async fn unarchive(&self, identity: &AdkIdentity) -> Result<()> {
+        let session = self.get_for_identity(identity).await?;
+        if crate::ArchiveMark::of(session.as_ref()).is_none() {
+            return Ok(());
+        }
+        self.append_event_for_identity(AppendEventRequest {
+            identity: identity.clone(),
+            event: crate::archive::marker_event(Value::Null),
+        })
+        .await
+    }
+
+    /// Writes the session `identity` out as a portable [`SessionBundle`](crate::SessionBundle):
+    /// its identity, its own state, every event and its archive mark.
+    ///
+    /// # Errors
+    ///
+    /// Returns `session.not_found` when the session does not exist, or a backend error.
+    async fn export_session(&self, identity: &AdkIdentity) -> Result<crate::SessionBundle> {
+        let session = self.get_for_identity(identity).await?;
+        Ok(crate::SessionBundle::of(session.as_ref()))
+    }
+
+    /// Lists the sessions of an app and user that are not archived, in
+    /// [`list`](SessionService::list)'s order; `offset` and `limit` count only these.
+    ///
+    /// This is the listing a person sees: `adk-rust sessions list` and the REST API's
+    /// session list use it. The default reads [`list`](SessionService::list) a page at a
+    /// time and leaves archived sessions out.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`list`](SessionService::list) returns.
+    async fn list_active(&self, req: ListRequest) -> Result<Vec<Box<dyn Session>>> {
+        list_kept(self, req, crate::archive::Keep::Active).await
+    }
+
+    /// Lists the archived sessions of an app and user, in [`list`](SessionService::list)'s
+    /// order; `offset` and `limit` count only these.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`list`](SessionService::list) returns.
+    async fn list_archived(&self, req: ListRequest) -> Result<Vec<Box<dyn Session>>> {
+        list_kept(self, req, crate::archive::Keep::Archived).await
+    }
+}
+
+/// The sessions of `req` that `keep` keeps, with `offset` and `limit` counting only those,
+/// read from `list` a page at a time.
+async fn list_kept<S: SessionService + ?Sized>(
+    service: &S,
+    req: ListRequest,
+    keep: crate::archive::Keep,
+) -> Result<Vec<Box<dyn Session>>> {
+    validate_scope(&req.app_name, &req.user_id)?;
+    let mut skip = req.offset.unwrap_or(0);
+    let limit = req.limit.unwrap_or(usize::MAX);
+    let mut kept = Vec::new();
+    let mut position = 0;
+    while kept.len() < limit {
+        let page = service
+            .list(ListRequest {
+                app_name: req.app_name.clone(),
+                user_id: req.user_id.clone(),
+                limit: Some(crate::archive::LIST_PAGE),
+                offset: Some(position),
+            })
+            .await?;
+        let read = page.len();
+        position += read;
+        for session in page {
+            if !keep.keeps(session.as_ref()) {
+                continue;
+            }
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            if kept.len() < limit {
+                kept.push(session);
+            }
+        }
+        if read < crate::archive::LIST_PAGE {
+            break;
+        }
+    }
+    Ok(kept)
 }

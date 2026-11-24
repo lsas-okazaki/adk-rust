@@ -19,8 +19,10 @@ use std::sync::{Arc, PoisonError, RwLock, atomic::AtomicBool};
 /// single insert, push or assignment, so the data stays whole, and reads and writes go on
 /// using it rather than seeing an empty history or dropping events.
 pub struct MutableSession {
-    /// The original session snapshot (for metadata like id, app_name, user_id)
-    inner: Arc<dyn AdkSession>,
+    /// The session's ID, app name and user ID, taken from the snapshot it was built from.
+    id: String,
+    app_name: String,
+    user_id: String,
     /// Shared mutable state - updated when events are processed
     /// This is the key difference from the old SessionAdapter which used immutable snapshots
     state: Arc<RwLock<HashMap<String, serde_json::Value>>>,
@@ -30,16 +32,22 @@ pub struct MutableSession {
 
 impl MutableSession {
     /// Create a new MutableSession from a session snapshot.
-    /// The state is copied from the session and becomes mutable.
-    pub fn new(session: Arc<dyn AdkSession>) -> Self {
-        // Clone the initial state from the session
-        let initial_state = session.state().all();
-        // Clone the initial events
-        let initial_events = session.events().all();
+    ///
+    /// The state is copied from the session and becomes mutable. The events are moved out of
+    /// the snapshot ([`Session::take_events`](AdkSession::take_events)) when this is its only
+    /// handle, as it is for the session the runner loads, and copied otherwise. The snapshot
+    /// is not kept.
+    pub fn new(mut session: Arc<dyn AdkSession>) -> Self {
+        let initial_events = match Arc::get_mut(&mut session) {
+            Some(owned) => owned.take_events(),
+            None => session.events().all(),
+        };
 
         Self {
-            inner: session,
-            state: Arc::new(RwLock::new(initial_state)),
+            id: session.id().to_string(),
+            app_name: session.app_name().to_string(),
+            user_id: session.user_id().to_string(),
+            state: Arc::new(RwLock::new(session.state().all())),
             events: Arc::new(RwLock::new(initial_events)),
         }
     }
@@ -81,6 +89,12 @@ impl MutableSession {
     pub fn replace_events(&self, new_events: Vec<Event>) {
         let mut events = self.events.write().unwrap_or_else(PoisonError::into_inner);
         *events = new_events;
+    }
+
+    /// Runs `read` over the events without copying them.
+    pub(crate) fn read_events<R>(&self, read: impl FnOnce(&[Event]) -> R) -> R {
+        let events = self.events.read().unwrap_or_else(PoisonError::into_inner);
+        read(&events)
     }
 
     /// Return the number of accumulated events without cloning the full list.
@@ -133,10 +147,39 @@ impl MutableSession {
         // end_timestamp has been summarized and should be replaced by the
         // compacted content.
         let mut compaction_boundary = None;
+        // Turns the compaction kept were answered with the history before it; a provider binds
+        // thinking to that history, so their thinking is not replayed after the summary, unless
+        // the provider wrote the summary itself and accepts it.
+        let mut compacted_at = None;
         for event in events.iter().rev() {
             if let Some(ref compaction) = event.actions.compaction {
                 let mut content = compaction.compacted_content.clone();
-                adk_core::history::strip_native(&mut content);
+                // A provider's own compaction keeps its signed copy for the provider and model
+                // the runner recorded on the event; any other summary carries no native item.
+                let origin = adk_core::intra_compaction::is_native_compaction(&content)
+                    .then(|| {
+                        adk_core::history::ProviderOrigin::of_response(
+                            event.llm_response.provider_metadata.as_ref(),
+                        )
+                    })
+                    .flatten();
+                match &origin {
+                    Some(origin) => adk_core::history::mark_origin(&mut content, Some(origin)),
+                    None => adk_core::history::strip_native(&mut content),
+                }
+                let keeps_thinking = origin.is_some()
+                    && event
+                        .llm_response
+                        .provider_metadata
+                        .as_ref()
+                        .and_then(|metadata| {
+                            metadata.get(crate::intra_compaction::KEEPS_THINKING_KEY)
+                        })
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                if !keeps_thinking {
+                    compacted_at = Some(event.timestamp);
+                }
                 history.push(HistoryContent { content, invocation_id: None });
                 compaction_boundary = Some(compaction.end_timestamp);
                 break;
@@ -217,6 +260,12 @@ impl MutableSession {
                     // Native items replay only from a model turn, to the provider and model
                     // whose origin the event recorded; user turns (A2A input included) never
                     // carry them.
+                    if compacted_at.is_some_and(|at| event.timestamp < at) {
+                        mapped_content.parts.retain(|part| !matches!(part, Part::Thinking { .. }));
+                        if mapped_content.parts.is_empty() {
+                            continue;
+                        }
+                    }
                     if mapped_content.role == "model" {
                         adk_core::history::mark_origin(
                             &mut mapped_content,
@@ -237,8 +286,25 @@ impl MutableSession {
             });
         }
 
-        close_interrupted_tool_calls(history)
+        let long_running = long_running_call_ids(&events);
+        close_interrupted_tool_calls(answer_resumed_calls(history, &long_running))
     }
+}
+
+/// The ids of the calls `events` mark long-running. An agent lists a long-running call in
+/// [`Event::long_running_tool_ids`] by its id or, as `LlmAgent` does, by its tool's name.
+fn long_running_call_ids(events: &[Event]) -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    for event in events.iter().filter(|event| !event.long_running_tool_ids.is_empty()) {
+        for part in event.llm_response.content.iter().flat_map(|content| &content.parts) {
+            if let Part::FunctionCall { name, id: Some(id), .. } = part
+                && event.long_running_tool_ids.iter().any(|listed| listed == id || listed == name)
+            {
+                ids.insert(id.clone());
+            }
+        }
+    }
+    ids
 }
 
 /// How a history view presents events other agents authored.
@@ -451,17 +517,109 @@ fn close_interrupted_tool_calls(history: Vec<HistoryContent>) -> Vec<Content> {
     normalized
 }
 
+/// Rearranges a history whose newest turn answers long-running calls after something else
+/// followed them, the way a caller resumes such a call: the call's interim response and
+/// the model's reply to it sit between the call and the caller's answer.
+///
+/// The history then ends on the turn with the calls and one response per call, the
+/// newest; what came between is left out, so the model answers the caller's result.
+/// Without this, the caller's answer reads as a second response to its call, which every
+/// provider rejects, and [`close_interrupted_tool_calls`] drops it. ADK Python and ADK Go
+/// rearrange the same way (`_rearrange_events_for_latest_function_response`).
+///
+/// Only calls in `long_running` are answered this way: a second response to an ordinary
+/// call is still left out, and an ordinary late response still keeps the turns around it.
+/// The history is also returned unchanged when its newest turn is not only function
+/// responses with ids, when those responses follow their calls directly, or when they
+/// answer calls from more than one turn.
+fn answer_resumed_calls(
+    mut history: Vec<HistoryContent>,
+    long_running: &std::collections::HashSet<String>,
+) -> Vec<HistoryContent> {
+    let Some(newest) = history.len().checked_sub(1) else { return history };
+    let mut answered = std::collections::HashSet::new();
+    for part in &history[newest].content.parts {
+        match part {
+            Part::FunctionResponse { id: Some(id), .. } => {
+                answered.insert(id.clone());
+            }
+            _ => return history,
+        }
+    }
+    if answered.is_empty() || !answered.iter().all(|id| long_running.contains(id)) {
+        return history;
+    }
+
+    let Some(call_turn) = history[..newest].iter().rposition(|entry| {
+        entry.content.parts.iter().any(
+            |part| matches!(part, Part::FunctionCall { id: Some(id), .. } if answered.contains(id)),
+        )
+    }) else {
+        return history;
+    };
+    let call_ids: Vec<String> = history[call_turn]
+        .content
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::FunctionCall { id: Some(id), .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    if !answered.iter().all(|id| call_ids.contains(id)) {
+        return history;
+    }
+
+    // Responses to the turn's other calls may sit in between, as parallel calls answer
+    // one at a time. Anything else, or an earlier response to a call answered now, means
+    // the run moved on before this answer came.
+    let moved_on = history[call_turn + 1..newest]
+        .iter()
+        .flat_map(|entry| &entry.content.parts)
+        .any(|part| match part {
+            Part::FunctionResponse { id: Some(id), .. } => {
+                answered.contains(id) || !call_ids.contains(id)
+            }
+            _ => true,
+        });
+    if !moved_on {
+        return history;
+    }
+
+    // One response per call, the newest, in the order of the calls.
+    let mut responses: Vec<Option<Part>> = vec![None; call_ids.len()];
+    for part in history[call_turn + 1..].iter().flat_map(|entry| &entry.content.parts) {
+        if let Part::FunctionResponse { id: Some(id), .. } = part
+            && let Some(position) = call_ids.iter().position(|call_id| call_id == id)
+        {
+            responses[position] = Some(part.clone());
+        }
+    }
+    let answer = history.swap_remove(newest);
+    history.truncate(call_turn + 1);
+    // A tool-result turn, whoever sent the result: model clients carry function responses
+    // in the `function` role, and a user turn holds only the person's input.
+    history.push(HistoryContent {
+        content: Content {
+            role: "function".to_string(),
+            parts: responses.into_iter().flatten().collect(),
+        },
+        invocation_id: answer.invocation_id,
+    });
+    history
+}
+
 impl adk_core::Session for MutableSession {
     fn id(&self) -> &str {
-        self.inner.id()
+        &self.id
     }
 
     fn app_name(&self) -> &str {
-        self.inner.app_name()
+        &self.app_name
     }
 
     fn user_id(&self) -> &str {
-        self.inner.user_id()
+        &self.user_id
     }
 
     fn state(&self) -> &dyn adk_core::State {
@@ -989,5 +1147,126 @@ mod poisoned_lock_tests {
         later.llm_response.content = Some(Content::new("model").with_text("hi"));
         session.append_event(later);
         assert_eq!(session.events_len(), 2, "a write after the panic is kept");
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use adk_session::{Events, State};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A loaded session that counts how its history leaves it.
+    struct CountingSession {
+        events: Vec<Event>,
+        state: HashMap<String, serde_json::Value>,
+        copies: Arc<AtomicUsize>,
+        takes: Arc<AtomicUsize>,
+    }
+
+    impl CountingSession {
+        fn new(copies: &Arc<AtomicUsize>, takes: &Arc<AtomicUsize>) -> Self {
+            let events = ["first", "second"]
+                .into_iter()
+                .map(|text| {
+                    let mut event = Event::new("inv-1");
+                    event.author = "user".to_string();
+                    event.llm_response.content = Some(Content::new("user").with_text(text));
+                    event
+                })
+                .collect();
+            Self {
+                events,
+                state: HashMap::from([("topic".to_string(), serde_json::json!("billing"))]),
+                copies: Arc::clone(copies),
+                takes: Arc::clone(takes),
+            }
+        }
+    }
+
+    impl Events for CountingSession {
+        fn all(&self) -> Vec<Event> {
+            self.copies.fetch_add(1, Ordering::SeqCst);
+            self.events.clone()
+        }
+        fn len(&self) -> usize {
+            self.events.len()
+        }
+        fn at(&self, index: usize) -> Option<&Event> {
+            self.events.get(index)
+        }
+    }
+
+    impl State for CountingSession {
+        fn get(&self, key: &str) -> Option<serde_json::Value> {
+            self.state.get(key).cloned()
+        }
+        fn set(&mut self, key: String, value: serde_json::Value) {
+            self.state.insert(key, value);
+        }
+        fn all(&self) -> HashMap<String, serde_json::Value> {
+            self.state.clone()
+        }
+    }
+
+    impl AdkSession for CountingSession {
+        fn id(&self) -> &str {
+            "session"
+        }
+        fn app_name(&self) -> &str {
+            "app"
+        }
+        fn user_id(&self) -> &str {
+            "user"
+        }
+        fn state(&self) -> &dyn State {
+            self
+        }
+        fn events(&self) -> &dyn Events {
+            self
+        }
+        fn last_update_time(&self) -> chrono::DateTime<chrono::Utc> {
+            chrono::Utc::now()
+        }
+        fn take_events(&mut self) -> Vec<Event> {
+            self.takes.fetch_add(1, Ordering::SeqCst);
+            std::mem::take(&mut self.events)
+        }
+    }
+
+    fn texts(session: &MutableSession) -> Vec<String> {
+        session
+            .events_snapshot()
+            .iter()
+            .flat_map(|event| event.llm_response.content.iter().flat_map(|c| c.parts.iter()))
+            .filter_map(|part| part.text().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn a_session_held_once_moves_its_history() {
+        let (copies, takes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let session = MutableSession::new(Arc::new(CountingSession::new(&copies, &takes)));
+
+        assert_eq!((copies.load(Ordering::SeqCst), takes.load(Ordering::SeqCst)), (0, 1));
+        assert_eq!(texts(&session), ["first", "second"]);
+        let identity = (
+            adk_core::Session::id(&session),
+            adk_core::Session::app_name(&session),
+            adk_core::Session::user_id(&session),
+        );
+        assert_eq!(identity, ("session", "app", "user"));
+        assert_eq!(adk_core::State::get(&session, "topic"), Some(serde_json::json!("billing")));
+    }
+
+    #[test]
+    fn a_shared_session_keeps_its_history() {
+        let (copies, takes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let shared: Arc<dyn AdkSession> = Arc::new(CountingSession::new(&copies, &takes));
+        let session = MutableSession::new(Arc::clone(&shared));
+
+        assert_eq!((copies.load(Ordering::SeqCst), takes.load(Ordering::SeqCst)), (1, 0));
+        assert_eq!(texts(&session), ["first", "second"]);
+        assert_eq!(shared.events().len(), 2, "the caller's handle keeps its events");
     }
 }

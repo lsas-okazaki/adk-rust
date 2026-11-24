@@ -16,7 +16,7 @@ Command-line launcher for Rust Agent Development Kit (ADK-Rust) agents.
   (`rules`), held calls (`approvals`) and sessions (`sessions`) in one SQLite file; the
   harness as the always-on **agent kernel** (spec 3.2: `up`, `attach`, `ps`, `top`, `kill`,
   `suspend`, `resume`, `freeze`, `unfreeze`, `events`, `proc`, `partitions`); plus a plain chat agent
-  (6 providers), skills, graph checkpoints, signed audit logs, and deploy
+  on any provider below, skills, graph checkpoints, signed audit logs, and deploy
 - **`Launcher` library** — embed a REPL and web server into any custom agent binary;
   `HarnessLauncher` does the same for a `HarnessAgent`
 
@@ -31,7 +31,7 @@ cargo install adk-cli
 # `--ui repl` is the line-by-line REPL.
 cd my-project && adk-rust
 
-# Or pre-configure a provider (the default build compiles Gemini, OpenAI and Anthropic;
+# Or pre-configure a provider (the default build compiles Gemini, OpenAI, Anthropic and Ollama;
 # `cargo install adk-cli --features all-providers` adds the others)
 adk-rust --provider gemini --api-key your-key
 
@@ -42,6 +42,7 @@ adk-rust --session release-notes --mode plan
 # One task, a goal, or an implement-and-review loop on the harness
 adk-rust code "make the failing test pass"
 adk-rust goal "all tests green" --until "cargo test" --resume
+adk-rust goal "write the release notes to NOTES.md" --rubric rubric.md --deliverable NOTES.md
 adk-rust ultracode "add input validation"
 
 # The harness behind the HTTP server, in plan mode, with the approval inbox
@@ -65,13 +66,16 @@ See [The harness in your terminal](../docs/official_docs/harness/cli.md),
 
 | Feature | Default | Enables |
 |---------|---------|---------|
-| `gemini`, `openai`, `anthropic` | yes | The Gemini, OpenAI and Anthropic providers |
+| `gemini`, `openai`, `anthropic`, `ollama` | yes | The Gemini, OpenAI, Anthropic and Ollama providers |
 | `audit` | yes | `adk-rust audit verify` and `audit keygen` (through `adk-auth`'s `signed-audit`) |
+| `encrypted` | yes | `--store-key`, `[store] key` and `adk-rust store status\|rotate-key`: `harness.db` sealed under one key from the OS keychain, a secret provider or the environment |
 | `persist` | yes | Sessions, held calls, durable runs, modes and standing rules in SQLite at `adk-rust/harness.db` (through `adk-session`'s and `adk-harness`'s `sqlite`) |
 | `surface` | yes | The web home of `adk-surface` at `/ui/` on `serve` and `up`, over the harness (spec 3.3 §5.1, §10 S1), with `harness` |
+| `memory-local` | no | The in-process ONNX embedder (`BAAI/bge-small-en-v1.5`) for long-term memory, the default embedder of every provider but Gemini and OpenAI; without it those recall facts by shared words. `ort` downloads the ONNX Runtime binary while building, so it is off by default and `cargo install adk-cli` builds offline |
 | `harness` | yes | The harness: `adk-rust` REPL, `code`, `goal`, `ultracode` and `serve` on `adk-harness`, `sessions`, `rules`, `approvals`, and the `adk_cli::harness` module; the agent kernel's `up`, `attach`, `ps`, `top`, `kill`, `suspend`, `resume`, `freeze`, `unfreeze`, `events`, `proc` and `partitions` on `adk-kernel`, with its daily baselines (`proc-baselines`) |
-| `deepseek`, `groq`, `ollama`, `muse`, `openrouter`, `opencode`, `bedrock`, `azure-ai` | no | The other providers; `opencode` compiles `--provider opencode` (Zen) and `--provider opencode-go` |
-| `all-providers` | no | Every provider |
+| `deepseek`, `groq`, `muse`, `openrouter`, `opencode`, `bedrock`, `azure-ai` | no | The other providers; `opencode` compiles `--provider opencode` (Zen) and `--provider opencode-go` |
+| `mistralrs` | no | `--provider mistralrs --model <hf id or .gguf path>`: mistral.rs in process; a heavy build, GPU through `adk-mistralrs`'s `cuda` or `metal` |
+| `all-providers` | no | Every provider but mistral.rs |
 | `audit-sql` | no | `adk-rust audit export` from SQLite or PostgreSQL audit stores |
 | `graph-sqlite` | no | The SQLite checkpointer for `adk-rust graph` |
 | `gcp-deploy` | no | `adk-rust deploy agent-engine` |
@@ -81,10 +85,23 @@ See [The harness in your terminal](../docs/official_docs/harness/cli.md),
 | `optimize` | no | The `Launcher` CLI's `optimize` subcommand, which parses its arguments and logs that optimization is wired through `adk-eval`'s `PromptOptimizer`; it optimizes nothing itself |
 | `tui` | yes | `adk-rust` with no subcommand as the terminal surface (spec 3.3 §5.2, `adk-surface`'s `tui`): full screen on a capable terminal, `--ui inline`, `--output json` with exit codes, `--theme`, the REPL's slash commands with completion, and `--server` with `--pair` for a kernel on another machine; `--ui repl` keeps the REPL; see [the terminal](../docs/official_docs/surfaces/terminal.md) |
 | `channels` | yes | `adk-rust up` starts the Telegram chat thread when `TELEGRAM_BOT_TOKEN` is set (spec 3.3 §5.3, `adk-surface`'s `channels`), with `harness` and `surface`; see [chat](../docs/official_docs/surfaces/chat.md) |
+| `slack`, `discord`, `matrix` | yes | `adk-rust up` starts each chat adapter when its variables are set (`SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN`; `DISCORD_BOT_TOKEN`; `MATRIX_HOMESERVER` and `MATRIX_ACCESS_TOKEN`); Experimental |
+| `teams` | yes | `adk-rust up` starts Microsoft Teams when `TEAMS_APP_ID` and `TEAMS_APP_PASSWORD` are set (`TEAMS_TENANT_ID` for a single-tenant bot), serving the bot's messaging endpoint `POST /api/messages` on its own listener, `TEAMS_BIND` (`127.0.0.1:3978`); Experimental |
+| `whatsapp` | no | A served site's WhatsApp webhook on its public edge (`adk-rust website`); Experimental |
+| `mobile` | no | `adk-rust up --home-url https://… --auth-token …` serves the home as an installable phone app with Web Push and "Confirm it's you"; links OpenSSL through webauthn-rs |
+| `genui`, `genui-apps` | no | Agent-drawn UI on `serve` and `up`: the render tools for every hosted harness; with `genui-apps`, apps from MCP servers framed on a second origin (`--apps-origin`) |
+| `verb-ui` | no | `up` gives every hosted agent the `verb_*` screen-action tools, which always ask first, and the terminal `/snooze`; Experimental |
+| `voice`, `voice-desktop` | no | `adk-rust --voice` over Gemini Live or the OpenAI Realtime API; `voice-desktop` adds the microphone and speaker (ALSA headers on Linux) |
+| `browser`, `computer-use` | no | `--pack browser` over the WebDriver at `ADK_WEBDRIVER_URL`; the computer-use pack's classes for a harness built in code |
+| `postgres`, `redis` | no | `adk-rust serve --store postgres://…` or `redis://…`: every store shared by replicas, and `--checkpointer` on the same server |
+| `mongodb`, `neo4j`, `firestore` | no | `--checkpointer mongodb://…`, `neo4j://…` or `firestore://…` |
+| `secrets-gcp`, `secrets-aws` | no | `--store-key secret:<provider>/<name>` through `adk-auth`'s secret providers |
 | `scripted-model` | no | Hidden `--model-script` and `--approval-fixture` flags for end-to-end tests: a scripted model and a `record_note` tool that needs approval; with `website`, a hidden `--dns-fixture` for domain claims |
+| `vision` | no | `adk-rust vision …` (spec 3.7 §8.1): the model manifest with licence classes, fetches by revision with SHA-256 checks, licence acceptance from a terminal, `vision run detect\|segment\|read\|describe` through the egress gate of `.adk/vision.toml`, and the egress log; cloud describers and `sam-3.1`; see [the `adk-rust vision` CLI](../docs/official_docs/vision/cli.md) |
+| `vision-local` | no | `vision` with the on-device backends (RF-DETR, EfficientSAM, SAM 2.1, PP-OCRv6, PaddleOCR-VL-1.6) and the face and personal-text redactors; ONNX Runtime is downloaded at build time |
 | `website` | no | `adk-rust website …`, `adk-rust site …` and `adk-rust awp …` (spec 3.5 §8.1): the product spun up and run from the terminal on `adk-website`; an AWP 2.0 site's releases, content, migration and freeze on `adk-site`, and verification, conformance, keys and `business.toml` migration on `adk-awp`; see [Sites and AWP from the command line](../docs/official_docs/deployment/site-cli.md) |
 
-`cargo install adk-cli` builds the default features; add `--features all-providers` for every provider.
+`cargo install adk-cli` builds the default features, offline; add `--features all-providers` for every provider.
 
 ## Supported Providers
 
@@ -92,7 +109,7 @@ Every provider `adk_model::ModelProvider` names, and mistral.rs:
 
 | Provider | Flag | Feature | Default Model | Env Var |
 |----------|------|---------|---------------|---------|
-| Gemini | `--provider gemini` | `gemini` | `gemini-3.7-flash` | `GOOGLE_API_KEY` / `GEMINI_API_KEY` |
+| Gemini | `--provider gemini` | `gemini` | `gemini-3.8-flash` | `GOOGLE_API_KEY` / `GEMINI_API_KEY` |
 | OpenAI | `--provider openai` | `openai` | `gpt-5.6-terra` | `OPENAI_API_KEY` |
 | Anthropic | `--provider anthropic` | `anthropic` | `claude-sonnet-5` | `ANTHROPIC_API_KEY` |
 | DeepSeek | `--provider deepseek` | `deepseek` | `deepseek-flash` | `DEEPSEEK_API_KEY` |
@@ -121,6 +138,11 @@ If no provider is configured, every agent command (`chat`, `serve`, `code`, `goa
 3. Provider and model are saved to `adk-rust/config.json` in the platform config directory (`~/.config` on Linux, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows)
 4. API keys are stored in your OS credential store (Keychain, Credential Manager, Secret Service)
 
+> **Note:** on Linux the keychain is the desktop's Secret Service (GNOME Keyring, KWallet) over
+> D-Bus, reached in pure Rust, so building needs no `libdbus-1-dev`. A host without a Secret
+> Service (a server, a container) keeps API keys in the environment (`GEMINI_API_KEY`,
+> `ANTHROPIC_API_KEY`, ...) and the store key in `--store-key env:<VAR>`.
+
 On subsequent runs, the saved config is used automatically. CLI flags always
 take priority over environment variables, secure credential storage, and saved config.
 
@@ -140,7 +162,7 @@ adk-rust goal         Harness turns until a success-condition command exits 0
 adk-rust ultracode    Implement, then route the review to parallel reviewers or a review board
 adk-rust sessions     Harness sessions (list/show/rm)
 adk-rust rules        Standing rules (list/add/rm)
-adk-rust approvals    Held calls (list/approve/deny), locally or with --server
+adk-rust approvals    Held calls (list/approve/deny): the running kernel's inbox, `harness.db` when no kernel runs, or --server
 adk-rust up           The harness as the agent kernel, in the foreground
 adk-rust attach       A REPL on the running kernel; `adk-rust` attaches when one runs
 adk-rust ps / top     The kernel's processes; `top` by burn rate, refreshing
@@ -152,14 +174,19 @@ adk-rust freeze / unfreeze             The kill switch, on every replica
 adk-rust events       The kernel's event bus (`--follow`)
 adk-rust proc         The kernel's activity ledger, baselines and observations
 adk-rust partitions   The kernel's partitions (list/add/set-mode)
+adk-rust agents       Your own agents on the running kernel (list/show/new/edit/pause/resume/remove)
+adk-rust drivers      The kernel's drivers: MCP servers it supervises (list/mount/unmount/restart)
+adk-rust memory       Long-term memory facts (list/show/forget/accept/undo/export/import)
+adk-rust store        The encrypted store: key status and rotation (`encrypted`)
 adk-rust pair         Pair a phone or terminal with a code (list/revoke; `accept` a chat account's code)
 adk-rust skills       Skill tooling (list/validate/match)
-adk-rust graph        Graph checkpoint inspection (steps/replay/fork/resume)
+adk-rust graph        YAML/JSON workflows (run/validate/schema) and checkpoint inspection (steps/replay/fork/resume)
 adk-rust audit        Signed audit log tools (verify/keygen; export with `audit-sql`)
 adk-rust deploy       Deployment commands
 adk-rust registry     Agent Registry registration and search (`vertex-agent-registry`)
 adk-rust site         An AWP 2.0 site: build/publish/rollback/log, content new, schedule/correct/withdraw/revert, batches/feeds, migrate/freeze (`website`)
 adk-rust awp          AWP 2.0: verify a domain, conformance, keys rotate/delegate, migrate-config (`website`)
+adk-rust vision       Models fetch/verify/accept, run detect/segment/read/describe, egress log (`vision`)
 adk-rust website      An AWP 2.0 website: new (serve, setup code, onboarding), status, review, charter, jobs promote/demote (`website`)
 ```
 
@@ -431,7 +458,7 @@ Serve mode listens on `127.0.0.1`; `with_bind_address` listens elsewhere, togeth
 | `with_session_service(svc)` | Custom `SessionService` (defaults to `InMemorySessionService`) |
 | `with_artifact_service(svc)` | Custom `ArtifactService` for binary artifact storage |
 | `with_memory_service(svc)` | Custom `Memory` service for semantic search |
-| `with_compaction(config)` | Enable runner-level context compaction in serve mode |
+| `with_compaction(config)` | Session event compaction (`EventsCompactionConfig`) in serve mode; history compaction before each model call is on by default |
 | `with_context_cache(config, model)` | Enable automatic prompt cache lifecycle management |
 | `with_security_config(config)` | Custom server security settings: allowed hosts and origins, body size, timeout |
 | `with_bind_address(addr)` | Address serve mode listens on (default `127.0.0.1`) |
@@ -534,7 +561,7 @@ Resolution order (highest wins):
 
 ## Provider-Specific Notes
 
-- **Gemini**: Google Search grounding tool is automatically added
+- **Gemini**: the plain chat agent gets the Google Search grounding tool
 - **Anthropic**: `--thinking-budget` enables extended thinking with the given token budget
 - **Ollama**: No API key needed; make sure `ollama serve` is running locally
 - **Groq**: Free tier available at [console.groq.com](https://console.groq.com)
@@ -554,6 +581,10 @@ Resolution order (highest wins):
 | `adk-rust serve`, `Launcher` serve mode, and `serve::run_serve` listen on `127.0.0.1` | `serve --host 0.0.0.0` or `Launcher::with_bind_address`, with allowed hosts and origins |
 | `adk-rust audit verify`, `audit keygen`, and `audit export` are new | — |
 | `StreamPrinter` escapes terminal control characters in model and tool output | — |
+| `memory-local` is no longer a default feature, so `cargo install adk-cli` builds offline | `--features memory-local` for the in-process embedder |
+| The Linux keychain reaches the Secret Service in pure Rust; building needs no `libdbus-1-dev` | — |
+| `adk-rust approvals` decides on the running kernel's approvals inbox | — |
+| The `adk-rust` umbrella's `cli-deepseek` and `cli-groq` features are removed; `cli` compiles both providers | Use `cli`; this crate's `deepseek` and `groq` features are unchanged |
 
 See the [2.x to 3.0 migration guide](../docs/official_docs/migration/2.x-to-3.0.md) and the [changelog](../CHANGELOG.md) for the full list.
 

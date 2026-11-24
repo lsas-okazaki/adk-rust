@@ -175,8 +175,8 @@ ledger and counts against the same [run budget](../core/runner.md#run-budgets).
 | `LlmAgent` and `CodeActAgent` turns | `ModelCallScope::for_run` | The calling agent |
 | `LlmConditionalAgent` routing | `ModelCallScope::for_run` | The routing agent |
 | Post-run compaction (`EventsCompactionConfig`) | `ModelCallScope`, made current around the summarizer | The agent whose context is compacted |
-| Intra-invocation compaction (`IntraCompactionConfig`) | `ModelCallScope`, made current around the summarizer | The agent about to run |
-| Token-limit compaction (`context-compaction` feature) | `ModelCallScope`, made current around the strategy | The agent about to run |
+| Auto-compaction (`IntraCompactionConfig`) | `ModelCallScope`, made current around the summarizer | The agent whose history is compacted |
+| Auto-compaction with a strategy (`context-compaction` feature) | `ModelCallScope`, made current around the strategy | The agent whose history is compacted |
 | MCP sampling (`mcp-sampling` feature) | `ModelCallScope` of the run whose tool call is in flight | The agent that called the MCP tool |
 
 The built-in summarizers (`LlmEventSummarizer`, `SummarisationCompaction`) and
@@ -217,9 +217,9 @@ per character, not per token. They go through `ModelCallScope::meter`, or
 
 | Step | Spend ledger | Run budget |
 |------|--------------|------------|
-| Before the call | Reserves `UsageCall::max_cost_micro_usd`, or the unbounded hold when no price is known | Refuses when a limit is reached, or when no price is known under a cost cap (`budget.cost_unknown`) |
-| After the call | Commits `MeteredUsage::cost_micro_usd` in micro-USD | Counts the cost and tokens, and every unit in `BudgetTracker::units` |
-| Call failed | Releases the hold | Counts nothing |
+| Before the call | Reserves `UsageCall::max_cost_micro_usd`, or the unbounded hold when no price is known | Refuses when a limit is reached, when no price is known under a cost cap (`budget.cost_unknown`), or when `UsageCall::units` would take a unit past `RunBudget::max_units` (`budget.units`); otherwise holds those units |
+| After the call | Commits `MeteredUsage::cost_micro_usd` in micro-USD | Counts the cost and tokens, and every unit in `BudgetTracker::units`, in place of the units held |
+| Call failed | Releases the hold | Counts nothing; returns the units held |
 
 | Call | Unit | Price | Vendor key |
 |------|------|-------|------------|
@@ -227,16 +227,63 @@ per character, not per token. They go through `ModelCallScope::meter`, or
 | `MuseAsrClient::transcribe` | `audioMillis` reported | $0.18 per hour, whole seconds rounded down; the hold covers the WAV file's duration, or the 10-minute file limit when the header cannot be read | `muse` |
 | `TranscribeTool` | `audioMillis` sent | The provider's `AudioBilling` rate; none for the bundled cloud providers | The provider's |
 | `SpeakTool` | `characters` sent | The provider's `AudioBilling` rate; none for the bundled cloud providers | The provider's |
+| `VisionRuntime::analyze_video` with `SamVideoTracker` | `frames` of the clip, per concept request | $0.20 per 1,000 frames, at least 50 frames per request (`sam-3.1`) | `muse` |
 
 `adk_model::pricing::PricingCatalog::unit_cost_micro_usd` prices a `UsageVector` from the
-catalog's per-unit prices (`muse-image-1.0`, `muse-voice-transcribe-1.0`, `sam-3.1`). Units are
+catalog's per-unit prices (`muse-image-1.0`, `muse-voice-transcribe-1.0`, `sam-3.1` images and
+video frames). Units are
 never ledger amounts: the ledger stays in micro-USD, and a unit call is not a model call.
+
+A `UnitRate` prices one unit: `micro_usd` per `per` units, billed in whole multiples of its
+granularity, and at least `minimum_per_request` units for any request that uses the unit at
+all. `UsageUnit::Frames` counts video frames analysed.
+
+```rust
+use adk_core::{UnitRate, UsageUnit};
+
+// $0.20 per 1,000 frames, at least 50 frames per request.
+let rate = UnitRate::new(UsageUnit::Frames, 200_000, 1_000).with_minimum_per_request(50);
+assert_eq!(rate.cost_micro_usd(12), 10_000);
+assert_eq!(rate.cost_micro_usd(900), 180_000);
+```
+
+A run that caps a unit holds each declaring call against the cap before it is sent. A run
+capped at 20 images that makes 30 calls of one image each sends 20, refuses the 21st with
+`budget.units` before any request, and commits 20 holds to the ledger:
+
+```rust
+use std::sync::Arc;
+
+use adk_core::{
+    BudgetTracker, MeteredUsage, ModelCallScope, RunBudget, UsageCall, UsageUnit, UsageVector,
+};
+
+async fn segment_all(images: &[Vec<u8>]) -> adk_core::Result<usize> {
+    let tracker = Arc::new(BudgetTracker::new(RunBudget::new().max_units(UsageUnit::Images, 20)));
+    let scope = ModelCallScope::new().with_budget(tracker);
+    let one = UsageVector::new().with(UsageUnit::Images, 1);
+    let mut segmented = 0;
+    for _image in images {
+        let call = UsageCall::new("meta", "sam-3.1")
+            .with_max_cost_micro_usd(2_500)
+            .with_units(one.clone());
+        // The 21st call returns `budget.units` here, before the closure runs.
+        scope
+            .meter(call, async {
+                Ok(((), MeteredUsage::new(one.clone()).with_cost_micro_usd(2_500)))
+            })
+            .await?;
+        segmented += 1;
+    }
+    Ok(segmented)
+}
+```
 
 | Behaviour | Detail |
 |-----------|--------|
 | Inside a tool | `LlmAgent`, `CodeActAgent` and the realtime runtimes make the run's scope current around every tool call (`ModelCallScope::within_tool`), so media calls a tool makes count against the run and its agent |
 | Unknown price | Refused under any covering ledger limit, and under a budget cost cap unless the budget `allow_unpriced_models()`; without a cap the ledger commits the run's per-call spend estimate |
-| Local models | Report no `AudioBilling` and are not metered |
+| Local models | The bundled local audio providers report no `AudioBilling` and are not metered. A local backend that meters itself declares `with_max_cost_micro_usd(0)` and commits its units at zero cost, so per-unit caps and unit counts cover local and remote calls alike |
 | Kernel totals | A harness-hosted process's spend is read from its run budget, so media cost reaches the partition's daily total and `Quotas::daily_spend_cap` |
 | Outside a run | Unmetered unless a scope is made current |
 

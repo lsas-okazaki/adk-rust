@@ -15,7 +15,7 @@ use async_openai::types::chat::{
     CreateChatCompletionResponse, FinishReason as OaiFinishReason, FunctionCall, FunctionObject,
     ImageDetail, ImageUrl, InputAudio, InputAudioFormat,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Fallback tool-call id for a `Part` that carries none.
 ///
@@ -334,16 +334,14 @@ pub(crate) fn json_schema_format(
     }
 }
 
-/// Convert ADK tools to OpenAI ChatCompletionTools.
+/// Convert ADK tools to OpenAI ChatCompletionTools, in declaration order.
 pub fn convert_tools(
-    tools: &HashMap<String, serde_json::Value>,
+    tools: &adk_core::ToolDeclarations,
     adapter: &dyn SchemaAdapter,
     cache: &SchemaCache,
 ) -> Vec<ChatCompletionTools> {
-    let mut tools = tools.iter().collect::<Vec<_>>();
-    tools.sort_unstable_by_key(|(name, _)| *name);
     tools
-        .into_iter()
+        .iter()
         .map(|(name, decl)| {
             let description = decl.get("description").and_then(|d| d.as_str()).map(String::from);
 
@@ -384,6 +382,9 @@ pub fn from_openai_response(resp: &CreateChatCompletionResponse) -> LlmResponse 
             && !text.is_empty()
         {
             parts.push(Part::Text { text: text.clone() });
+        }
+        if let Some(refusal) = choice.message.refusal.as_ref().filter(|r| !r.is_empty()) {
+            parts.push(Part::Text { text: refusal.clone() });
         }
 
         // Add tool calls with IDs
@@ -426,7 +427,12 @@ pub fn from_openai_response(resp: &CreateChatCompletionResponse) -> LlmResponse 
         meta
     });
 
+    let refused = resp
+        .choices
+        .first()
+        .is_some_and(|c| c.message.refusal.as_ref().is_some_and(|r| !r.is_empty()));
     let finish_reason = resp.choices.first().and_then(|c| c.finish_reason).map(|fr| match fr {
+        _ if refused => FinishReason::Refusal,
         OaiFinishReason::Stop => FinishReason::Stop,
         OaiFinishReason::Length => FinishReason::MaxTokens,
         OaiFinishReason::ToolCalls => FinishReason::Stop,
@@ -473,8 +479,8 @@ pub(crate) fn from_raw_openai_response(
     declared_tools: &HashSet<String>,
 ) -> LlmResponse {
     let choice = json.get("choices").and_then(|c| c.get(0));
-    // The model declined in `message.refusal`: the refusal is the answer text, and the turn
-    // finishes with `Safety`.
+    // The model declined in `message.refusal`: the refusal is the response's text, and the turn
+    // finishes with `Refusal` (https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create).
     let refusal = choice
         .and_then(|choice| choice.pointer("/message/refusal"))
         .and_then(serde_json::Value::as_str)
@@ -544,7 +550,7 @@ pub(crate) fn from_raw_openai_response(
 
     // Parse finish reason
     let finish_reason = if refusal.is_some() {
-        Some(FinishReason::Safety)
+        Some(FinishReason::Refusal)
     } else {
         choice.and_then(|c| c.get("finish_reason")).and_then(|v| v.as_str()).map(|fr| match fr {
             "stop" | "tool_calls" | "function_call" => FinishReason::Stop,
@@ -1276,7 +1282,7 @@ mod tests {
     fn test_convert_tools() {
         use super::super::schema_adapter::OpenAiSchemaAdapter;
 
-        let mut tools = HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "get_weather".to_string(),
             serde_json::json!({
@@ -1302,27 +1308,25 @@ mod tests {
     }
 
     #[test]
-    fn convert_tools_has_deterministic_name_order() {
+    fn convert_tools_keeps_declaration_order() {
         use super::super::schema_adapter::OpenAiSchemaAdapter;
 
         let adapter = OpenAiSchemaAdapter;
         let cache = SchemaCache::for_adapter(std::sync::Arc::new(OpenAiSchemaAdapter));
-        for _ in 0..32 {
-            let tools = HashMap::from([
-                ("zeta".to_string(), serde_json::json!({})),
-                ("alpha".to_string(), serde_json::json!({})),
-                ("middle".to_string(), serde_json::json!({})),
-            ]);
-            let names = convert_tools(&tools, &adapter, &cache)
-                .into_iter()
-                .map(|tool| match tool {
-                    ChatCompletionTools::Function(tool) => tool.function.name,
-                    ChatCompletionTools::Custom(_) => panic!("expected a function tool"),
-                })
-                .collect::<Vec<_>>();
+        let tools = adk_core::ToolDeclarations::from_iter([
+            ("zeta".to_string(), serde_json::json!({})),
+            ("alpha".to_string(), serde_json::json!({})),
+            ("middle".to_string(), serde_json::json!({})),
+        ]);
+        let names = convert_tools(&tools, &adapter, &cache)
+            .into_iter()
+            .map(|tool| match tool {
+                ChatCompletionTools::Function(tool) => tool.function.name,
+                ChatCompletionTools::Custom(_) => panic!("expected a function tool"),
+            })
+            .collect::<Vec<_>>();
 
-            assert_eq!(names, ["alpha", "middle", "zeta"]);
-        }
+        assert_eq!(names, ["zeta", "alpha", "middle"]);
     }
 
     /// Regression test for issue #395.

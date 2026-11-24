@@ -24,7 +24,7 @@
 //! # }
 //! ```
 //!
-//! [`Gemini::new`] uses `gemini-3.7-flash`; [`Gemini::with_model`] takes any [`Model`].
+//! [`Gemini::new`] uses `gemini-3.8-flash`; [`Gemini::with_model`] takes any [`Model`].
 //!
 //! ## Crate organization
 //!
@@ -48,10 +48,11 @@
 //!
 //! | Feature | Enables |
 //! |---------|---------|
-//! | `studio` (default) | Marker only; the AI Studio backend is always compiled |
 //! | `vertex` | Vertex AI constructors such as `Gemini::with_google_cloud_adc` |
 //! | `interactions` | The Interactions API module and client methods |
 //! | `backtrace` | `snafu`'s `backtraces-impl-backtrace-crate` feature |
+//!
+//! No feature is on by default. The AI Studio backend is always compiled; it has no feature.
 
 /// Backend abstraction for Gemini API providers (AI Studio REST vs Vertex AI).
 pub mod backend;
@@ -115,7 +116,7 @@ pub use client::GeminiBuilder;
 pub use client::Model;
 
 /// Core primitive types for building requests and parsing responses
-pub use models::{Blob, Content, FileDataRef, Message, Modality, Part, Role};
+pub use models::{Blob, Content, FileDataRef, Message, Modality, Part, Role, VideoMetadata};
 
 // ========== Content Generation ==========
 // Types for generating text, images, and audio content
@@ -125,11 +126,11 @@ pub use generation::{
     model::CitationSource, model::FinishReason, model::GenerateContentRequest,
     model::GenerationConfig, model::GenerationResponse, model::GroundingChunk,
     model::GroundingMetadata, model::GroundingSegment, model::GroundingSupport,
-    model::LogprobsCandidate, model::LogprobsResult, model::MultiSpeakerVoiceConfig,
-    model::PrebuiltVoiceConfig, model::PromptFeedback, model::PromptTokenDetails,
-    model::SearchEntryPoint, model::SpeakerVoiceConfig, model::SpeechConfig, model::ThinkingConfig,
-    model::ThinkingLevel, model::TopLogprobsCandidates, model::UsageMetadata, model::VoiceConfig,
-    model::WebGroundingChunk,
+    model::LogprobsCandidate, model::LogprobsResult, model::MediaResolution,
+    model::MultiSpeakerVoiceConfig, model::PrebuiltVoiceConfig, model::PromptFeedback,
+    model::PromptTokenDetails, model::SearchEntryPoint, model::SpeakerVoiceConfig,
+    model::SpeechConfig, model::ThinkingConfig, model::ThinkingLevel, model::TopLogprobsCandidates,
+    model::UsageMetadata, model::VoiceConfig, model::WebGroundingChunk,
 };
 
 // ========== Text Embeddings ==========

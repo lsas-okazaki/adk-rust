@@ -4,6 +4,58 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+/// The error code of a callback or plugin that panicked: the step it guards fails closed.
+pub const CALLBACK_PANICKED_CODE: &str = "callback.panicked";
+
+/// Awaits a callback's `future`, turning a panic into a `callback.panicked` error, so a
+/// callback that decides whether a step happens — a before-tool callback, a before-tool
+/// plugin — fails that step closed with a reason instead of unwinding through the agent.
+///
+/// `callback` names the callback in the error, such as `before-tool callback`.
+///
+/// # Example
+///
+/// ```rust
+/// use adk_core::{CALLBACK_PANICKED_CODE, guard_callback};
+///
+/// # futures::executor::block_on(async {
+/// let ok = guard_callback("before-tool callback", async { Ok(1) }).await;
+/// assert_eq!(ok.unwrap(), 1);
+///
+/// let panicked = guard_callback::<()>("before-tool callback", async { panic!("boom") }).await;
+/// let error = panicked.unwrap_err();
+/// assert_eq!(error.code, CALLBACK_PANICKED_CODE);
+/// assert!(error.message.contains("boom"));
+/// # });
+/// ```
+///
+/// # Errors
+///
+/// Returns the callback's own error, or `callback.panicked` when it panicked.
+pub async fn guard_callback<T>(
+    callback: &str,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    use futures::FutureExt;
+    match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+        Ok(result) => result,
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no message".to_string());
+            tracing::error!(callback = callback, panic = %detail, "a callback panicked; its step fails closed");
+            Err(crate::AdkError::new(
+                crate::ErrorComponent::Agent,
+                crate::ErrorCategory::Internal,
+                CALLBACK_PANICKED_CODE,
+                format!("the {callback} panicked ({detail}); the step it guards did not run"),
+            ))
+        }
+    }
+}
+
 // Agent callbacks
 /// Callback invoked before an agent runs. Return `Ok(Some(content))` to short-circuit.
 pub type BeforeAgentCallback = Box<
@@ -231,6 +283,34 @@ pub trait InvocationHooks: std::fmt::Debug + Send + Sync {
         _error: &crate::AdkError,
     ) -> Result<Option<LlmResponse>> {
         Ok(None)
+    }
+
+    /// Whether [`on_model_error`](Self::on_model_error) can answer a failed model call.
+    ///
+    /// An agent keeps a copy of every request it sends, for this hook, while any of the run's
+    /// hooks returns `true`. The default is `true`; an implementation whose `on_model_error`
+    /// always returns `Ok(None)` returns `false`, so the agent sends the request without
+    /// copying the conversation first.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_core::InvocationHooks;
+    ///
+    /// /// Observes tool calls only.
+    /// #[derive(Debug)]
+    /// struct ToolAudit;
+    ///
+    /// impl InvocationHooks for ToolAudit {
+    ///     fn handles_model_errors(&self) -> bool {
+    ///         false
+    ///     }
+    /// }
+    ///
+    /// assert!(!ToolAudit.handles_model_errors());
+    /// ```
+    fn handles_model_errors(&self) -> bool {
+        true
     }
 
     /// Runs before each tool call. `ctx.tool_name()` and `ctx.tool_input()` describe the call.

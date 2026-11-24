@@ -1,7 +1,8 @@
 # Realtime Examples
 
-Four runnable examples in the [`examples/`](https://github.com/zavora-ai/adk-rust/tree/main/examples)
-directory. `realtime_tools` is a headless OpenAI console probe; the three web examples use
+Four runnable examples in [adk-playground](https://github.com/zavora-ai/adk-playground), and
+eleven smaller ones [in this repository](#in-this-repository).
+`realtime_tools` is a headless OpenAI console probe; the three web examples use
 the [server-side bridge](building-web-apps.md) and run on OpenAI or Gemini. Set the
 relevant key first:
 
@@ -19,10 +20,6 @@ on `IntegratedRealtimeRunner` with weather, calculator, and time tools, with ses
 persistence, memory storage, and transcript aggregation wired in. Requires
 `OPENAI_API_KEY`.
 
-```bash
-cargo run --manifest-path examples/realtime_tools/Cargo.toml
-```
-
 ---
 
 ## `realtime_voice` — *Mindfulness with Mia*
@@ -38,10 +35,7 @@ also has a server-side `get_weather` tool.
 |-------|------|
 | ![Mindfulness with Mia — light theme](images/mia-light.png) | ![Mindfulness with Mia — dark theme](images/mia-dark.png) |
 
-```bash
-cargo run --manifest-path examples/realtime_voice/Cargo.toml
-# → http://localhost:3033
-```
+It serves on `http://localhost:3033`.
 
 Read it for: Web Audio capture and playback, knowledge-graph memory, agent-curated memory.
 
@@ -62,17 +56,11 @@ A customer-support agent on OpenAI or Gemini with a themed (system, light, dark)
 |-------|------|
 | ![Customer Service Agent — light theme](images/customer-service-light.png) | ![Customer Service Agent — dark theme](images/customer-service-dark.png) |
 
-```bash
-cargo run --manifest-path examples/customer_service/Cargo.toml
-# → http://localhost:3066
-
-# headless smoke test (asks for a refund by text and checks that process_refund runs):
-cargo run --manifest-path examples/customer_service/Cargo.toml -- probe openai
-cargo run --manifest-path examples/customer_service/Cargo.toml -- probe gemini
-
-# enable Gemini native affective dialogue:
-CS_AFFECTIVE=1 cargo run --manifest-path examples/customer_service/Cargo.toml
-```
+| Run with | Result |
+|----------|--------|
+| no arguments | The web app on `http://localhost:3066` |
+| `probe openai` or `probe gemini` | A headless smoke test: asks for a refund by text and checks that `process_refund` runs |
+| `CS_AFFECTIVE=1` in the environment | Gemini native affective dialogue |
 
 Read it for: video input, mixing multimodal + tools + affect in one agent.
 
@@ -89,15 +77,33 @@ target language in the UI, speak, and hear and read the translation.
 |-------|------|
 | ![Live Translation — light theme](images/translation-light.png) | ![Live Translation — dark theme](images/translation-dark.png) |
 
-```bash
-cargo run --manifest-path examples/live_translation/Cargo.toml
-# → http://localhost:3055
-# headless connectivity probe (validates endpoint, auth, and model):
-cargo run --manifest-path examples/live_translation/Cargo.toml -- probe openai
-cargo run --manifest-path examples/live_translation/Cargo.toml -- probe gemini
-```
+| Run with | Result |
+|----------|--------|
+| no arguments | The web app on `http://localhost:3055` |
+| `probe openai` or `probe gemini` | A headless connectivity probe that validates the endpoint, auth, and model |
 
 Read it for: using the dedicated translation models and a focused, minimal bridge.
+
+---
+
+## In this repository
+
+`adk-realtime/examples/` holds eleven programs, each run from a clone with the features it
+requires:
+
+| Example | Run with | Shows | Needs |
+|---------|----------|-------|-------|
+| `openai_session_update` | `cargo run -p adk-realtime --features openai --example openai_session_update` | A mid-session persona change through `session.update`, without dropping the connection | `OPENAI_API_KEY` |
+| `gemini_context_mutation` | `cargo run -p adk-realtime --features gemini --example gemini_context_mutation` | The same change on Gemini Live, by session resumption | `GOOGLE_API_KEY` |
+| `vertex_live_voice` | `cargo run -p adk-realtime --features vertex-live --example vertex_live_voice` | Gemini Live on Vertex AI with Application Default Credentials: a text prompt, text deltas and audio chunks | `GOOGLE_CLOUD_PROJECT`, ADC; `GOOGLE_CLOUD_REGION` (default `us-central1`) |
+| `vertex_live_tools` | `cargo run -p adk-realtime --features vertex-live --example vertex_live_tools` | Tool calls during a Vertex AI Live session | `GOOGLE_CLOUD_PROJECT`, ADC |
+| `debug_gemini` | `cargo run -p adk-realtime --features gemini --example debug_gemini` | A connectivity check for Gemini Live | `GEMINI_API_KEY` |
+| `livekit_bridge` | `cargo run -p adk-realtime --features livekit,openai --example livekit_bridge` | A LiveKit room bridged to OpenAI Realtime | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `OPENAI_API_KEY` |
+| `livekit_gemini_bridge` | `cargo run -p adk-realtime --features livekit,gemini --example livekit_gemini_bridge` | The same bridge to Gemini Live, resampling the room's 24 kHz audio to 16 kHz | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `GEMINI_API_KEY` |
+| `debug_livekit_auth` | `cargo run -p adk-realtime --features livekit --example debug_livekit_auth` | A LiveKit access token and a room connection | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` |
+| `openai_webrtc` | `cargo run -p adk-realtime --features openai-webrtc --example openai_webrtc` | OpenAI Realtime over WebRTC instead of WebSocket (needs `cmake`) | `OPENAI_API_KEY` |
+| `heygen_avatar` | `cargo run -p adk-realtime --features heygen-avatar --example heygen_avatar` | A HeyGen LiveAvatar configuration and how it attaches to a `RealtimeAgent`; it prints the configuration and opens no session | `HEYGEN_API_KEY` (optional) |
+| `did_avatar` | `cargo run -p adk-realtime --features did-avatar --example did_avatar` | A D-ID Realtime Agents avatar configuration, whose own model and voice answer; it prints the configuration and opens no session | `DID_API_KEY`, `DID_AGENT_ID` (both optional) |
 
 ---
 

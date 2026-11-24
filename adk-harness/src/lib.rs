@@ -19,7 +19,7 @@
 //! | [`TodoList`], [`WriteTodosTool`], [`UpdateTodoTool`] | §7.6 |
 //! | [`InstructionsConfig`], [`ProjectInstructions`], [`WorkspaceTrustStore`] | §7.7 |
 //! | `SkillsConfig` (feature `skills`) | §7.8 |
-//! | [`ShellIsolation`], [`HarnessBashTool`], [`ShellLedger`]; `ContainerBashTool`, `ContainerConfig` (feature `docker`) | §7.9 |
+//! | [`ShellIsolation`], [`HarnessBashTool`], [`ShellLedger`]; `ContainerBashTool`, `ContainerConfig` (feature `docker`); `RemoteShellConfig`, the remote sandbox shell over any `SandboxClient` (feature `remote-shell`) | §7.9 |
 //! | `SpendReport`, `LoopGuard`, `harness.*` span attributes (feature `observe`) | §7.13 |
 //! | `RbacMap`, `ShellCredential`, `EphemeralAuditLog` (feature `auth`) | §7.14 |
 //! | `MemoryConfig`, `FileMemory`, `memory_*` tools (feature `memory`) | §7.15 |
@@ -32,13 +32,14 @@
 //! | [`coding::CodingAgent`] | §7.19 |
 //! | [`Preset`], [`personal::PersonalAgent`], [`personal::PersonalWorkspace`], [`personal::PersonalSettings`] | spec 3.3 §10 H1 |
 //! | [`take_over::TakeOver`], [`take_over::TakeOverRequest`], [`take_over::TakeOverAnswer`] | spec 3.3 §8.2, §10 H2 |
-//! | [`WebConfig`], [`SearchProvider`], [`ProviderWebTools`], [`WebSearchPath`], `web_fetch`, `web_search`, `SearxngSearch`, `DeepSeekSearch` (feature `web`) | §7.20 |
+//! | [`WebConfig`], [`UrlProvenance`], [`SearchProvider`], [`ProviderWebTools`], [`WebSearchPath`], `web_fetch`, `web_search`, `SearxngSearch`, `DeepSeekSearch` (feature `web`) | §7.20 |
 //! | [`McpInteractionConfig`], `HarnessElicitationHandler`, `HarnessSamplingHandler`, `mcp_*_resource` (feature `mcp`) | §7.21 |
 //! | [`EffortPolicy`], [`Effort`] | §7.23 |
 //! | `encrypted::{StoreKeySource, StoreKeyring, StoreEnvelope, StoreRotation}` (feature `encrypted`) | §7.12 |
 //! | `packs::payments::{PaymentsPack, PaymentMandate}` (feature `payments`) | §7.16 |
 //! | `packs::browser::BrowserPack` (feature `browser`) | §7.24 |
 //! | `packs::computer_use::ComputerUsePack` (feature `computer-use`) | §7.24 |
+//! | `packs::computer_use::PreviewedPlan`, `ScreenPlanPrompt`, `ScreenPlanAnswer` (feature `computer-use`) | spec 3.7 Q8 |
 //! | `packs::voice::{VoiceSurface, VoiceConfig, VoiceEvent, SpokenDecision}` (feature `voice`) | §7.17 |
 //! | `website::*`, `Preset::Website` (feature `website`) | spec 3.5 §7.1, §7.3, §7.10, §7.11, §7.18 |
 //! | [`snapshot::Snapshots`], [`SnapshotConfig`], [`RewindTarget`], [`RewindPlan`], [`RewindReport`], `Harness::{rewind_plan, rewind, redo_plan, rewind_turns, snapshot_now}` | §7.27 |
@@ -48,11 +49,11 @@
 //!
 //! ```rust,ignore
 //! use std::sync::Arc;
-//! use adk_harness::{HarnessAgent, HarnessMode};
+//! use adk_harness::{HarnessAgent, HarnessMode, Workspace};
 //!
 //! let harness = HarnessAgent::builder("harness")
 //!     .model(model)
-//!     .workspace(adk_devtools::Workspace::new(".").allow_bash(true))
+//!     .workspace(Workspace::new(".").allow_bash(true))
 //!     .mode(HarnessMode::Ask)
 //!     .prompter(Arc::new(my_terminal_prompter))
 //!     .build()?
@@ -130,6 +131,9 @@ pub mod personal;
 #[path = "presets/preset.rs"]
 mod preset;
 
+/// The directory the harness works in, re-exported so a harness needs no direct
+/// `adk-devtools` dependency.
+pub use adk_devtools::Workspace;
 pub use agent::{HARNESS_UNGOVERNED_CODE, HarnessAgent, HarnessInfo, HarnessLayer, HarnessRuntime};
 #[cfg(all(feature = "kernel", feature = "web"))]
 pub use agents::screen_agent_definition;
@@ -154,6 +158,10 @@ pub use approvals::{
 pub use approvals::{
     CHANGE_SET_MAX_BYTES, ChangeSet, ChangeSetAnswer, ChangeSetCall, ChangeSetFile,
     ChangeSetPrompt, RenderedChangeSet,
+};
+#[cfg(feature = "computer-use")]
+pub use approvals::{
+    RenderedScreenPlan, SCREEN_PLAN_MAX_BYTES, ScreenPlanAnswer, ScreenPlanPrompt,
 };
 #[cfg(feature = "observe")]
 pub use builder::LoopGuard;
@@ -191,8 +199,9 @@ pub use goal::GoalEngine;
 #[cfg(feature = "sqlite")]
 pub use goal::SqliteGoalStore;
 pub use goal::{
-    GOAL_QUEUE, GOAL_STALL_WINDOW, GOAL_STATE_KEY, GOAL_TARGET, GoalRecord, GoalSpec, GoalState,
-    GoalStatus, GoalStore, InMemoryGoalStore, UNTIL_CHECK_AGENT, UntilCheckAgent,
+    DEFAULT_CHECK_TIMEOUT, DEFAULT_GOAL_ITERATIONS, GOAL_QUEUE, GOAL_STALL_WINDOW, GOAL_STATE_KEY,
+    GOAL_TARGET, GoalRecord, GoalRubric, GoalSpec, GoalState, GoalStatus, GoalStore,
+    InMemoryGoalStore, UNTIL_CHECK_AGENT, UntilCheckAgent,
 };
 #[cfg(feature = "runner")]
 pub use harness::{CANCELLED_BY_MODE_CHANGE_STATUS, CloseReport, Harness, HarnessDecision};
@@ -264,7 +273,7 @@ pub use plan_graph::{
     ActivePlan, PLAN_GATE_TOOL, PlanGraphShape, PlanGraphs, PlanRunStatus, compile_plan,
     plan_review_node, plan_step_node,
 };
-pub use policy::OriginClasses;
+pub use policy::{CallClasses, OriginClasses};
 pub use policy::{
     HARNESS_POLICY_REF, HarnessPolicy, Isolation, MODE_TABLE, ModeCell, PolicySwitches,
     TableDecision, TableRow, ToolClassRegistry, ToolKind, apply_rule, decision_cell,
@@ -279,6 +288,10 @@ pub use read_records::PostgresReadRecords;
 pub use read_records::RedisReadRecords;
 #[cfg(feature = "sqlite")]
 pub use read_records::SqliteReadRecords;
+#[cfg(any(feature = "docker", feature = "remote-shell"))]
+pub use shell::ContainerBashTool;
+#[cfg(feature = "remote-shell")]
+pub use shell::RemoteShellConfig;
 #[cfg(feature = "sqlite")]
 pub use shell::SqliteShellLedger;
 #[cfg(feature = "sqlite")]
@@ -290,7 +303,7 @@ pub use shell::{
     ShellPidRecord, ShellPidRegistry, ShellStatus, ShellSupervisor, reap_orphaned_shells,
 };
 #[cfg(feature = "docker")]
-pub use shell::{ContainerBashTool, ContainerConfig, DEFAULT_CONTAINER_IMAGE};
+pub use shell::{ContainerConfig, DEFAULT_CONTAINER_IMAGE};
 pub use shell::{
     InMemoryShellLedger, IsolationStatus, SANDBOX_UNAVAILABLE_CODE, ShellConfig, ShellIsolation,
     ShellLedger, ShellLedgerEntry,
@@ -322,4 +335,6 @@ pub use toolset::HarnessToolset;
 pub use web::WebSearchPath;
 #[cfg(feature = "web")]
 pub use web::{DeepSeekSearch, SearxngSearch};
-pub use web::{ProviderWebTools, SearchDomains, SearchHit, SearchProvider, WebConfig};
+pub use web::{
+    ProviderWebTools, SearchDomains, SearchHit, SearchProvider, UrlProvenance, WebConfig,
+};

@@ -81,6 +81,7 @@ after a stop is never one of them (S-I10). `adk-rust pair revoke` ends it.
 | `e` | Edit the call's arguments as JSON, then allow; policy checks the edited call again |
 | `n` | Deny, with an optional reason |
 | `?` | Details: the whole call and how it got here |
+| `o` | On a decision with images: opens it in the home (`TerminalSurface::home`); the box shows the full digest, what was covered and each region's box as text ([Approve with the Image](approve-with-image.md)) |
 | `Esc` | Never decides: closes the details or a view, and switches between answering by key and typing |
 
 The keys answer the oldest open decision of the shown thread. It is the one box drawn; the
@@ -105,6 +106,12 @@ thread. A message typed while a decision is open is queued and shown above the m
 "Queued", "Sent after this card is answered"; `↑` in the empty message box takes the newest one
 back before it is sent.
 
+A message typed while a turn runs reaches that turn: the agent takes it after its current tool
+step, before its next model call, and the thread shows it where the turn took it. Until then
+it is listed above the message box, and `↑` does not take it back, since the turn may take it
+at any moment. A turn that ends first leaves it queued, and it goes as the next message, once.
+See [Steering a running turn](index.md#steering-a-running-turn).
+
 A decision no longer open shows once in the thread, at the place it was asked, with how it was
 answered: "✓ Decided · Write file invoice.txt · You said yes in the terminal at 06:45", also
 when it was answered in the home or on the phone. Inline prints it once. Other notices pass: one
@@ -119,7 +126,7 @@ as a refused key, stays until the next key.
 | `Ctrl-G` | Your agents: add, change, pause and remove the agents you add, over `/agent`; see [Your Agents](agents.md#in-the-terminal) |
 | `Ctrl-K` | Stop all |
 | `PgUp` `PgDn` | Scroll the thread, or the call in a decision box |
-| `↑` | Take back the newest queued message, before it is sent |
+| `↑` | Take back the newest queued message, before it is sent; not one a running turn holds |
 | `/` | Commands: the terminal's own and the REPL's, completed as you type; see [Commands](#commands) |
 | `Ctrl-C` | Leave; a kernel's agents carry on, and its decisions stay in the inbox. A command still on its way, such as a Stop all, is waited for (up to 5 seconds), and the terminal says what it did not send |
 

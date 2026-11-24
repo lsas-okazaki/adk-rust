@@ -1,8 +1,9 @@
 //! DeepSeek client implementation.
 //!
 //! Supports the current DeepSeek models (`deepseek-flash`, `deepseek-v4-pro`).
-//! `deepseek-v4-flash`, `deepseek-v4-flash-vision-exp`, `deepseek-chat` and
-//! `deepseek-reasoner` aliases were retired on 2026-07-24.
+//! `deepseek-chat` and `deepseek-reasoner` were retired on 2026-07-24. The
+//! `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` models were retired on 2026-09-10;
+//! their names are still accepted and served by `deepseek-flash`.
 
 use super::config::{DeepSeekConfig, ThinkingMode};
 use super::convert::{
@@ -274,6 +275,10 @@ impl Llm for DeepSeekClient {
         )
     }
 
+    fn context_window(&self) -> Option<u64> {
+        crate::pricing::PricingCatalog::standard().context_window(Some("deepseek"), self.name())
+    }
+
     fn name(&self) -> &str {
         &self.config.model
     }
@@ -305,7 +310,8 @@ impl Llm for DeepSeekClient {
             &mut request.contents,
             &adk_core::history::ProviderOrigin::new("deepseek", &self.config.model),
         );
-        let usage_span = adk_telemetry::llm_generate_span("deepseek", &self.config.model, stream);
+        let usage_span =
+            crate::telemetry::inference_span("deepseek", &self.config.model, stream, &request);
         let api_url = self.api_url();
         let api_key = self.config.api_key.clone();
         let chat_request = self.build_request(&request, stream)?;
@@ -352,6 +358,10 @@ impl Llm for DeepSeekClient {
                                 adk_core::upstream_excerpt(&error_text)
                             ),
                         ).with_upstream_status(status_code).with_provider("deepseek");
+                        let error = crate::error_metadata::classify_quota(
+                            error,
+                            crate::error_metadata::body_reports_exhausted_quota(&error_text),
+                        );
                         return Err(crate::retry::with_retry_after(
                             crate::error_metadata::from_body(error, &error_text),
                             retry_after,

@@ -148,6 +148,7 @@ async fn edit_is_offered_only_over_the_call_s_own_arguments() {
                 edited_args: Some(json!({ "amount": 400, "card": "****4242" })),
                 reason: None,
                 expanded: true,
+                evidence: Vec::new(),
             },
         )
         .await
@@ -287,7 +288,14 @@ async fn signing_in(
 /// Asks the agent to sign in and returns the take-over card it raises.
 async fn take_over_card(engine: &SurfaceEngine, app: &axum::Router) -> Value {
     engine
-        .execute(&web(), Command::Send { session_id: "s1".into(), text: "sign me in".into() })
+        .execute(
+            &web(),
+            Command::Send {
+                session_id: "s1".into(),
+                text: "sign me in".into(),
+                images: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     for _ in 0..400 {

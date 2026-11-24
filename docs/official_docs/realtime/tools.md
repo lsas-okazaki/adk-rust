@@ -44,6 +44,7 @@ fn process_refund_def() -> ToolDefinition {
             },
             "required": ["order_id", "reason"]
         })),
+        behavior: None,
     }
 }
 
@@ -80,6 +81,31 @@ configuration error.
 
 > Handlers share the runner's task: a handler that blocks the thread stalls the session
 > (see [Tool concurrency](#tool-concurrency)).
+
+## Waiting for a result: `ToolBehavior`
+
+A Gemini Live function declaration can state whether the model waits for the tool's
+result. `ToolDefinition::behavior` sets it, and `None` leaves the choice to the session:
+
+| Model | `None` (default) | `Some(ToolBehavior::Blocking)` | `Some(ToolBehavior::NonBlocking)` |
+|-------|------------------|--------------------------------|-----------------------------------|
+| `gemini-3.8-live` | Declared `BLOCKING`: the turn waits for the result and answers with it | `BLOCKING` | `NON_BLOCKING`: the turn ends at the call, and the model takes the result when it arrives, usually in a later turn |
+| `gemini-3.8-live-extended-thinking` | Declared `NON_BLOCKING`, the only behavior it accepts | Refused by the model (1007) | `NON_BLOCKING` |
+| `gemini-3.1-flash-live-preview` and others | No behavior declared; the model's default applies (3.1 Flash Live waits for every result) | `BLOCKING` | `NON_BLOCKING`, where the model supports it |
+
+Gemini 3.8 Live runs a declaration without a `behavior` as non-blocking, so the session states
+`BLOCKING` itself. The OpenAI Realtime API has no such setting and ignores the field.
+
+```rust
+use adk_realtime::config::{ToolBehavior, ToolDefinition};
+
+/// The conversation continues while the note is posted.
+fn notify_team_def() -> ToolDefinition {
+    ToolDefinition::new("notify_team")
+        .with_description("Post a note to the team channel.")
+        .with_behavior(ToolBehavior::NonBlocking)
+}
+```
 
 ## Bridged tools: any `adk_core::Tool`
 
@@ -231,11 +257,23 @@ fn build(model: BoxedModel) -> adk_realtime::Result<RealtimeRunner> {
 | Arguments are not a JSON object | `{"error": "Tool '<name>' was not run: its arguments are not valid JSON (...)"}` — the tool does not run with `{}` |
 | The policy denies the call | `{"error": "Tool '<name>' denied by policy: <reason>"}` |
 | The call needs confirmation and no decision exists | `{"error": "Tool '<name>' requires confirmation"}`; `RealtimeAgent` also emits an event carrying the `ToolConfirmationRequest`, and the request is recorded in the approval store |
-| The tool runs past its timeout (default five minutes) | `{"error": "Tool '<name>' timed out after ..."}` |
+| The tool runs past its timeout (default five minutes) | `{"error": "Tool '<name>' timed out after ..."}`; a `NonIdempotent` ADK tool under `RealtimeAgent` is answered `{"status": "outcome_unknown", "detail": "Tool '<name>' timed out after .... The call may have taken effect; ..."}`, as `LlmAgent` answers it |
+| The run's action ledger already holds the call (`RealtimeAgent`) | `{"status": "already_succeeded", ...}`, `{"status": "already_failed", ...}`, or `outcome_unknown` — the tool does not run again |
+| The run's tool-call budget is spent (`RealtimeAgent`) | `{"error": "not run: <budget error>"}`; the session ends with the `budget.*` error |
 | An ADK tool fails | `{"error": "tool '<name>' failed: <component>.<category> (<code>)"}` — the message stays out unless `expose_tool_error_messages(true)` is set |
 | A native handler fails | `{"error": "tool '<name>' failed"}` — the message stays out unless `expose_tool_error_messages(true)` is set |
 | The result screen withholds the result | `{"status": "result_withheld", "error": "tool '<name>' ran, but its result was withheld: <reason>; ..."}` |
 | The kill switch is frozen | Nothing — the session ends with a `governance.frozen` error |
+
+`RealtimeAgent` brackets a `ToolEffect::NonIdempotent` call with the run's action ledger
+(`RunConfig::action_ledger`), as `LlmAgent` does: the call is begun under its
+`ToolContext::idempotency_key()` after authorization, the kill switch is checked again after the
+ledger write, and the outcome is recorded when the tool returns. A call the provider issues twice
+under the same call ID runs once, and a call that timed out keeps its begun record, so a replay
+is answered `outcome_unknown` instead of running again. Each call also counts against the run's
+`RunBudget::max_tool_calls`. `IntegratedRealtimeRunner` does the same for its ADK tools under
+the `tool_governance` configuration (`action_ledger`, `budget_tracker`). A `RealtimeRunner`
+native handler is neither ledgered nor counted against a budget.
 
 `RealtimeAgent` and `IntegratedRealtimeRunner` record each answer in the session with the
 [tool result status](../tools/function-tools.md#tool-result-status) `LlmAgent` gives it: `not_run`, `refused`, `held`,
@@ -316,6 +354,48 @@ returning `Ok(result)` to deliver, possibly rewritten, or `Err(reason)` to withh
 
 The session keeps running while a call is held, so a decision recorded in the approval store
 authorizes the call when the model issues it again.
+
+## Screening the model's output
+
+With the `guardrails` feature, `output_guardrails` screens each completed model turn with an
+`adk-guardrail` `GuardrailSet`, as `LlmAgent` screens final text:
+
+```toml
+[dependencies]
+adk-realtime = { version = "3.0.0", features = ["openai", "integration", "guardrails"] }
+adk-guardrail = "3.0.0"
+```
+
+| Runtime | What is screened | A transform | A block |
+|---------|------------------|-------------|---------|
+| `RealtimeAgent` | The model's completed text and transcripts, before the final event reaches the client or the session | Rewrites the text | Interrupts the response, ends the run with the guardrail's error and closes the session |
+| `IntegratedRealtimeRunner` | Each completed turn's text, or its audio transcript when it produced no text, before it reaches the session and memory | Replaces the persisted text | Interrupts the response, persists nothing of the turn, and `next_event` returns `RealtimeError::OutputBlocked { guardrail, reason }` |
+
+The screen runs on the completed turn: the text and transcript deltas streamed before it have
+already reached the client, and a block replaces the turn's closing event with the error.
+
+```rust
+use adk_guardrail::{GuardrailSet, PiiRedactor};
+use adk_realtime::model::BoxedModel;
+use adk_realtime::{IntegratedRealtimeRunner, RealtimeAgent};
+
+fn agent(model: BoxedModel) -> adk_core::Result<RealtimeAgent> {
+    RealtimeAgent::builder("voice")
+        .model(model)
+        .output_guardrails(GuardrailSet::new().with(PiiRedactor::new()))
+        .build()
+}
+
+fn runner(model: BoxedModel) -> adk_realtime::Result<IntegratedRealtimeRunner> {
+    IntegratedRealtimeRunner::builder()
+        .model(model)
+        .identity("voice", "user-1", "session-1")
+        .output_guardrails(GuardrailSet::new().with(PiiRedactor::new()))
+        .build()
+}
+```
+
+`RealtimeRunner` has no output guardrails.
 
 ## Tool callbacks on the direct agent
 

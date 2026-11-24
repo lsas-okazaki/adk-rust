@@ -39,7 +39,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
 
     let agent = LlmAgentBuilder::new("my_agent")
         .instruction("You are a helpful assistant.")
@@ -180,7 +180,7 @@ use std::sync::Arc;
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
 
     // 1. Agent with templated instruction
     let agent = LlmAgentBuilder::new("personalized")
@@ -246,8 +246,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 | `{var?}` | `{user_name?}` | Optional (empty if missing) |
 | `{artifact.file}` | `{artifact.resume.pdf}` | Artifact content |
 
-A required `{var}` that is missing from state fails the turn with `State variable 'var' not found`;
-use `{var?}` when the value may be absent.
+A required `{var}` that is missing from state fails the turn with an `InvalidInput` error, code
+`agent.instruction.state_missing`, whose message begins `State variable 'var' not found`; use
+`{var?}` when the value may be absent.
 
 Text that is not a placeholder stays as written, so an instruction can quote code:
 
@@ -257,6 +258,50 @@ Text that is not a placeholder stays as written, so an instruction can quote cod
 | `\{name}` | Unchanged — a brace after `\` opens no placeholder |
 | `{{name}}`, `{{ name }}` | Unchanged — doubled braces open no placeholder |
 | `{"key": 1}`, `{1}` | Unchanged — the content is not a variable name |
+
+The escapes reach the model as written, backslash and doubled braces included. Text you do not
+control, such as a skill file that quotes a tool call as `set_target {window_id}`, has no
+escapes, so `instruction()` reads `{window_id}` as a placeholder. Send it with
+`static_instruction`, which reads no placeholders:
+
+```rust
+use adk_rust::prelude::*;
+use adk_rust::Launcher;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
+
+    let api_key = std::env::var("GOOGLE_API_KEY")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
+    let skill = std::fs::read_to_string("skills/blender-direct/SKILL.md")?;
+
+    let agent = LlmAgentBuilder::new("trainer")
+        // Sent as written: `{window_id}` in the skill stays `{window_id}`.
+        .static_instruction(skill)
+        // Templated: `{learner_name?}` reads session state.
+        .instruction("Teach at the learner's pace. The learner is {learner_name?}.")
+        .model(Arc::new(model))
+        .build()?;
+
+    Launcher::new(Arc::new(agent)).run().await?;
+    Ok(())
+}
+```
+
+The agent sends its instructions as `system` contents in this order:
+
+| Order | Source | Templated |
+|-------|--------|-----------|
+| 1 | `static_instruction` | No |
+| 2 | `global_instruction`, or `global_instruction_provider` | The template is; a provider's text is not |
+| 3 | `instruction`, or `instruction_provider` | The template is; a provider's text is not |
+
+`static_instruction` is the same in every request, so it stays in a provider's prompt cache. A
+skill selected by `with_skills` is added to the user message, not the instruction, and is not
+templated either. `CodeActAgentBuilder::static_instruction` places the text after any selected
+skill and before the global instruction.
 
 **Output Example:**
 
@@ -338,7 +383,7 @@ use std::sync::Arc;
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
 
     // Tool 1: Weather lookup
     let weather_tool = FunctionTool::new(
@@ -424,7 +469,7 @@ use std::sync::Arc;
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
 
     let extractor = LlmAgentBuilder::new("entity_extractor")
         .instruction("Extract entities from the given text.")
@@ -619,35 +664,59 @@ Intercept agent behavior. See [Callbacks](../callbacks/callbacks.md) for every c
 
 ## Builder Reference
 
+Every `LlmAgentBuilder` method. Methods marked with a feature exist, or take effect, only with that
+`adk-agent` feature; `adk-rust`'s `standard` tier turns on `guardrails`, `enhanced-plugins` and
+`skills`.
+
 | Method | Description |
 |--------|-------------|
 | `new(name)` | Creates builder with agent name |
 | `model(Arc<dyn Llm>)` | Sets the LLM (required) |
 | `description(text)` | Agent description |
 | `instruction(text)` | System prompt, with `{var}` templating |
-| `instruction_provider(provider)` | Computes the system prompt per request |
+| `static_instruction(text)` | System prompt sent as written, before the global instruction; no templating |
+| `instruction_provider(provider)` | Computes the system prompt per request; sent as written, without templating |
 | `global_instruction(text)` | Instruction sent before `instruction`, for this agent only |
+| `global_instruction_provider(provider)` | Computes the global instruction per request |
+| `with_skills(index)` | Injects the best-matching skill of a `SkillIndex` into each user message (`skills`; see [Agent Skills](../skills/agent-skills.md)) |
+| `with_skills_from_root(root)`, `with_auto_skills()` | Loads the skill index from `root`, or from `.` (`skills`) |
+| `with_skill_policy(SelectionPolicy)` | Skill selection (`skills`; default: the top skill scoring at least 1.0) |
+| `with_skill_budget(chars)` | Cuts an injected skill body at `chars` characters (`skills`; default: 2,000) |
 | `sub_agent(Arc<dyn Agent>)` | Adds a transfer target (see [Multi-Agent Systems](multi-agent.md)) |
+| `disallow_transfer_to_parent(bool)`, `disallow_transfer_to_peers(bool)` | Removes the parent, or the parent's other sub-agents, from the transfer targets; the runner refuses such a transfer (see [Transfer Restrictions](multi-agent.md#transfer-restrictions)) |
 | `tool(Arc<dyn Tool>)` | Adds a static tool |
 | `toolset(Arc<dyn Toolset>)` | Adds a dynamic toolset resolved per invocation |
 | `strict_toolsets(bool)` | Fails the turn when a toolset cannot resolve its tools (default: skip it) |
+| `input_schema(json)` | Records a JSON Schema for the agent's input; `LlmAgent` does not check messages against it |
 | `output_schema(json)` | JSON schema for structured output |
 | `output_type::<T>()` | Derives `output_schema` from a `schemars::JsonSchema` type |
 | `output_max_retries(n)` | Correction retries after a reply fails the schema (default: 3) |
 | `output_key(key)` | Saves response to state |
 | `include_contents(mode)` | History visibility |
+| `generate_content_config(GenerateContentConfig)` | Default generation settings for every request, merged with the request's own |
+| `temperature(f32)`, `top_p(f32)`, `top_k(i32)`, `max_output_tokens(i32)` | Set one field of the default `GenerateContentConfig` |
 | `max_iterations(n)` | Maximum LLM round-trips (default: 100) |
 | `history_processor(processor)` | Rewrites the agent's history before each model request; the turn continues from the result (see [History Processors](../callbacks/callbacks.md#history-processors)) |
+| `before_callback(callback)`, `after_callback(callback)` | Agent callbacks, around the agent's run (see [Agent Callbacks](../callbacks/callbacks.md#agent-callbacks)) |
+| `before_model_callback(callback)`, `after_model_callback(callback)` | Model callbacks, around each model request (see [Model Callbacks](../callbacks/callbacks.md#model-callbacks)) |
+| `before_tool_callback(callback)`, `after_tool_callback(callback)` | Tool callbacks, around each tool call (see [Tool Callbacks](../callbacks/callbacks.md#tool-callbacks)) |
+| `after_tool_callback_full(callback)` | V2 rich after-tool callback with tool, args, and response |
+| `on_tool_error(callback)` | Register fallback handler for tool failures |
 | `tool_timeout(Duration)` | Per-call tool timeout (default: 5 minutes) |
+| `tool_confirmation_policy(ToolConfirmationPolicy)` | Sets which calls are held for approval: `Never` (default), `Always`, or `PerTool(names)` (see [Tool Authorization](../security/tool-authorization.md#tool-confirmation-policy)) |
 | `require_tool_confirmation(name)` | Holds calls to the tool for approval (see [Tool Authorization](../security/tool-authorization.md)) |
+| `require_tool_confirmation_for_all()` | Holds every call for approval (`ToolConfirmationPolicy::Always`) |
 | `tool_execution_strategy(strategy)` | Tool dispatch mode: `Sequential`, `Parallel`, or `Auto` |
 | `parallelize_agent_delegations(bool)` | Overlap consecutive agent-delegation calls without parallelizing ordinary tools |
 | `default_retry_budget(RetryBudget)` | Retry failed read-only and idempotent tools up to N times with exponential backoff |
 | `tool_retry_budget(name, RetryBudget)` | Per-tool retry override |
 | `circuit_breaker_threshold(u32)` | Disable tool after N consecutive failures |
-| `on_tool_error(callback)` | Register fallback handler for tool failures |
 | `expose_tool_error_messages(bool)` | Send every tool and tool-callback error message to the model (default: component, category, and code, plus the message of a rejection) |
-| `after_tool_callback_full(callback)` | V2 rich after-tool callback with tool, args, and response |
+| `input_guardrails(GuardrailSet)` | Screens each user message before it is saved (`guardrails`; see [Guardrails](../security/guardrails.md#integration-with-agents)) |
+| `output_guardrails(GuardrailSet)` | Screens each model turn before the client or the session sees it (`guardrails`) |
+| `tool_guardrails(ToolGuardrailSet)` | Screens each tool call's arguments and result (`guardrails`; see [Tool Guardrails](../security/guardrails.md#tool-guardrails)) |
+| `enhanced_plugin(plugin)`, `enhanced_plugins(plugins)` | Plugins that inspect and change tool calls, tool results, model requests and responses (`enhanced-plugins`; see [Enhanced plugins](../core/plugins.md#enhanced-plugins)) |
+| `sandbox_config(SandboxConfig)` | Attaches a workspace configuration that a `SandboxRunner` provisions; it adds no tools itself (`sandbox`) |
 | `build()` | Creates the agent |
 
 ### Iteration Control
@@ -935,7 +1004,7 @@ use std::sync::Arc;
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
 
     // Weather tool
     let weather = FunctionTool::new(

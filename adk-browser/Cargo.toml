@@ -7,14 +7,16 @@ license.workspace = true
 authors.workspace = true
 description = "Browser automation tools for Rust Agent Development Kit (ADK-Rust) agents using WebDriver"
 repository = "https://github.com/zavora-ai/adk-rust"
+homepage.workspace = true
 documentation = "https://docs.rs/adk-browser"
 readme = "README.md"
+exclude = ["tests/"]
 keywords = ["adk", "browser", "automation", "webdriver", "selenium"]
 categories = ["web-programming", "development-tools"]
 
 [dependencies]
 adk-core.workspace = true
-thirtyfour = "0.35"
+thirtyfour = { version = "0.38", default-features = false, features = ["reqwest", "rustls", "component"] }
 tokio = { workspace = true, features = ["net", "sync", "time"] }
 async-trait.workspace = true
 serde.workspace = true
@@ -22,7 +24,8 @@ serde_json.workspace = true
 tracing.workspace = true
 base64 = "0.22"
 url = "2.5"
+# Crops and resizes screenshots for zoom and Claude's image limits.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio-test = "0.4"

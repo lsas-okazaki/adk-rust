@@ -244,9 +244,13 @@ pub struct ToolClassRegistry {
     classes: BTreeMap<String, ToolKind>,
     /// Hosts the web tools reach without approval (spec 3.1 §7.20).
     web_allowlist: Vec<String>,
+    /// The fetch filter: hosts outside it are denied whatever the mode or rules.
+    fetch_domains: Option<crate::web::SearchDomains>,
     /// Classes of tools that publishers the harness does not own declare through a
     /// trusted manifest (spec 3.2 §7.7).
     origin_classes: Vec<Arc<dyn OriginClasses>>,
+    /// Classes of the harness's own tools decided per call (spec 3.7 X15).
+    call_classes: Vec<Arc<dyn CallClasses>>,
 }
 
 /// Classes tools of a publisher the harness does not own, from a declaration the user
@@ -282,6 +286,41 @@ pub trait OriginClasses: std::fmt::Debug + Send + Sync {
     /// The class of a call to `tool` that `source` publishes, or `None` when `source` is
     /// not one this classes.
     fn class_of(&self, source: &str, tool: &str) -> Option<ToolKind>;
+}
+
+/// Classes a pack's own tools per call, from the call's arguments (spec 3.7 X15): the vision
+/// pack's tools are `Read` when they stay on the device and `External` when they send an
+/// image off it. Consulted for the harness's own agents and static tools, before the
+/// registered classes.
+///
+/// # Example
+///
+/// ```rust
+/// use std::sync::Arc;
+/// use adk_core::ToolEffect;
+/// use adk_harness::{CallClasses, Isolation, ToolClassRegistry, ToolKind};
+/// use serde_json::{Value, json};
+///
+/// #[derive(Debug)]
+/// struct ByBackend;
+///
+/// impl CallClasses for ByBackend {
+///     fn class_of_call(&self, tool: &str, args: &Value) -> Option<ToolKind> {
+///         (tool == "vision_describe").then(|| match args["backend"].as_str() {
+///             Some("local") => ToolKind::Read,
+///             _ => ToolKind::External { effect: ToolEffect::ReadOnly, trusted_origin: false },
+///         })
+///     }
+/// }
+///
+/// let registry = ToolClassRegistry::harness_defaults("harness").with_call_classes(Arc::new(ByBackend));
+/// let local = json!({ "backend": "local" });
+/// let kind = registry.classify("harness", "vision_describe", None, &local, ToolEffect::ReadOnly, Isolation::Host, false);
+/// assert_eq!(kind, ToolKind::Read);
+/// ```
+pub trait CallClasses: std::fmt::Debug + Send + Sync {
+    /// The class of a call to `tool` with `args`, or `None` for a tool it does not class.
+    fn class_of_call(&self, tool: &str, args: &Value) -> Option<ToolKind>;
 }
 
 impl ToolClassRegistry {
@@ -360,6 +399,14 @@ impl ToolClassRegistry {
         self
     }
 
+    /// Classes the harness's own tools that `classes` knows per call, from their arguments
+    /// (spec 3.7 X15).
+    #[must_use]
+    pub fn with_call_classes(mut self, classes: Arc<dyn CallClasses>) -> Self {
+        self.call_classes.push(classes);
+        self
+    }
+
     /// Classes the tools of publishers `classes` knows by their approved declarations
     /// (spec 3.2 §7.7); consulted for every origin other than the harness's own.
     #[must_use]
@@ -371,6 +418,31 @@ impl ToolClassRegistry {
     /// The hosts the web tools reach without approval.
     pub fn web_allowlist(&self) -> &[String] {
         &self.web_allowlist
+    }
+
+    /// Sets the fetch filter ([`WebConfig::fetch_domains`](crate::web::WebConfig)): a web
+    /// call whose `url` names a host outside it is denied before anyone is asked, in every
+    /// mode and under every standing rule.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_harness::ToolClassRegistry;
+    /// use adk_harness::web::SearchDomains;
+    ///
+    /// let registry = ToolClassRegistry::harness_defaults("harness")
+    ///     .with_fetch_domains(Some(SearchDomains::Blocked(vec!["pastebin.com".into()])));
+    /// assert!(registry.fetch_domains().is_some());
+    /// ```
+    #[must_use]
+    pub fn with_fetch_domains(mut self, filter: Option<crate::web::SearchDomains>) -> Self {
+        self.fetch_domains = filter;
+        self
+    }
+
+    /// The fetch filter, if one is set.
+    pub fn fetch_domains(&self) -> Option<&crate::web::SearchDomains> {
+        self.fetch_domains.as_ref()
     }
 
     /// Whether the web call `tool` with `args` names an allowlisted host: `web_search` by
@@ -426,6 +498,11 @@ impl ToolClassRegistry {
     ) -> ToolKind {
         let static_origin = origin.is_none_or(|origin| origin.source == STATIC_TOOL_ORIGIN);
         if static_origin && self.agents.contains(agent) {
+            if let Some(kind) =
+                self.call_classes.iter().find_map(|classes| classes.class_of_call(tool, args))
+            {
+                return kind;
+            }
             match self.classes.get(tool) {
                 Some(ToolKind::Shell(_)) => {
                     return if args.get("unsandboxed").and_then(Value::as_bool) == Some(true) {
@@ -935,6 +1012,8 @@ pub(crate) struct ShellView {
     pub(crate) status: IsolationStatus,
     pub(crate) allow_unsandboxed_retry: bool,
     pub(crate) fail_if_unavailable: bool,
+    /// The enforcer refuses writes to root-level protected paths by name.
+    pub(crate) guards_protected_names: bool,
 }
 
 pub(crate) struct PolicyInner {
@@ -1166,6 +1245,18 @@ impl HarnessPolicy {
                 crate::web::url_host(url).unwrap_or_default()
             ));
         }
+        // The fetch filter is a ceiling: no approval or standing rule widens it.
+        if matches!(kind, ToolKind::Web { .. })
+            && let Some(filter) = self.inner.registry.fetch_domains()
+            && let Some(url) = request.args.get("url").and_then(Value::as_str)
+            && let Some(host) = crate::web::url_host(url)
+            && !filter.permits(&host)
+        {
+            return Some(format!(
+                "harness.web.domain_not_allowed: '{host}' is outside the harness's fetch filter \
+                 ({filter}), which no approval widens"
+            ));
+        }
         None
     }
 
@@ -1323,9 +1414,11 @@ impl HarnessPolicy {
         let protected = protected_path.is_some();
         let row = TableRow::of(&kind, protected);
         let mut switches = self.inner.switches;
-        // Unapproved sandboxed commands need every protected path in place at this call (I26).
+        // Unapproved sandboxed commands need every protected path in place at this call (I26),
+        // unless the enforcer keeps a missing or symlinked one from being created or replaced.
         if matches!(row, TableRow::ShellOsSandbox | TableRow::ShellContainer)
             && switches.sandbox_protects_paths
+            && !(row == TableRow::ShellOsSandbox && self.inner.shell.guards_protected_names)
         {
             switches.sandbox_protects_paths =
                 crate::shell::protected_paths_hold(self.inner.workspace.root());
@@ -1643,6 +1736,92 @@ impl ToolPolicy for HarnessPolicy {
 
     fn policy_ref(&self) -> Option<String> {
         Some(HARNESS_POLICY_REF.to_string())
+    }
+}
+
+/// Auto review: the harness's reviewer, asked only about a call the harness itself holds
+/// in Auto mode that a standing rule could answer (autonomy parity item 2).
+///
+/// A call that is non-waivable — by the table, by tool name, or by a protected path in its
+/// arguments — and every call in another mode, including Auto decided as Ask without
+/// authenticated identity, is left to a person without a verdict.
+pub(crate) struct AutoReview {
+    inner: Arc<dyn adk_core::ToolReviewer>,
+    policy: HarnessPolicy,
+    non_waivable_tools: BTreeSet<String>,
+    non_waivable_prefixes: Vec<String>,
+    root: std::path::PathBuf,
+}
+
+impl std::fmt::Debug for AutoReview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AutoReview").field("inner", &self.inner).finish_non_exhaustive()
+    }
+}
+
+impl AutoReview {
+    pub(crate) fn new(
+        inner: Arc<dyn adk_core::ToolReviewer>,
+        policy: HarnessPolicy,
+        non_waivable_tools: BTreeSet<String>,
+        non_waivable_prefixes: Vec<String>,
+        root: std::path::PathBuf,
+    ) -> Self {
+        Self { inner, policy, non_waivable_tools, non_waivable_prefixes, root }
+    }
+}
+
+#[async_trait]
+impl adk_core::ToolReviewer for AutoReview {
+    fn reviewer(&self) -> adk_core::principal::SubjectRef {
+        self.inner.reviewer()
+    }
+
+    fn timeout(&self) -> std::time::Duration {
+        self.inner.timeout()
+    }
+
+    async fn covers(&self, review: &adk_core::ToolReview) -> bool {
+        if crate::agent::names_non_waivable(
+            &review.fingerprint,
+            &self.non_waivable_tools,
+            &self.non_waivable_prefixes,
+            &self.root,
+        ) {
+            return false;
+        }
+        let mut request =
+            ToolPolicyRequest::new(review.request.tool_name.clone(), review.request.args.clone())
+                .with_effect(review.effect)
+                .with_agent_name(review.agent_name.clone())
+                .with_identity(
+                    review.scope.app_name.clone(),
+                    review.scope.user_id.clone(),
+                    review.scope.session_id.clone(),
+                )
+                .with_invocation_id(review.invocation_id.clone());
+        request.acting = review.request.acting.as_deref().cloned();
+        // The re-check records nothing and runs no hooks, as the prompting handler's does.
+        let evaluated = self
+            .policy
+            .evaluate_full(
+                &request,
+                review.request.origin.as_ref(),
+                review.request.function_call_id.as_deref(),
+                false,
+            )
+            .await;
+        evaluated.mode == HarnessMode::Auto
+            && matches!(evaluated.decision, PolicyDecision::RequireApproval { .. })
+            && !evaluated.base.is_non_waivable()
+            && self.inner.covers(review).await
+    }
+
+    async fn review(
+        &self,
+        review: &adk_core::ToolReview,
+    ) -> adk_core::Result<adk_core::ReviewVerdict> {
+        self.inner.review(review).await
     }
 }
 

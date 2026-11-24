@@ -317,34 +317,21 @@ impl ChatterboxTtsProvider {
             });
         }
 
-        let mut builder = Session::builder().map_err(|e| AudioError::Tts {
-            provider: "Chatterbox".into(),
-            message: format!("failed to create session builder: {e}"),
-        })?;
+        let mut builder = adk_core::onnx::ort_environment()
+            .and_then(|environment| Session::builder(&environment))
+            .map_err(|e| AudioError::Tts {
+                provider: "Chatterbox".into(),
+                message: format!("failed to create session builder: {e}"),
+            })?;
 
-        builder = match config.execution_provider {
-            OnnxExecutionProvider::Cuda => builder
-                .with_execution_providers([
-                    ort::execution_providers::CUDAExecutionProvider::default().build(),
-                ])
-                .map_err(|e| AudioError::Tts {
+        let ep = config.execution_provider;
+        if let Some(provider) = ep.dispatch() {
+            builder =
+                builder.with_execution_providers([provider]).map_err(|e| AudioError::Tts {
                     provider: "Chatterbox".into(),
-                    message: format!("CUDA execution provider failed: {e}"),
-                })?,
-            OnnxExecutionProvider::CoreMl => builder
-                .with_execution_providers([
-                    ort::execution_providers::CoreMLExecutionProvider::default().build(),
-                ])
-                .map_err(|e| AudioError::Tts {
-                    provider: "Chatterbox".into(),
-                    message: format!("CoreML execution provider failed: {e}"),
-                })?,
-            OnnxExecutionProvider::DirectMl => {
-                tracing::warn!("DirectML not available, falling back to CPU");
-                builder
-            }
-            OnnxExecutionProvider::Cpu => builder,
-        };
+                    message: format!("{ep} execution provider failed: {e}"),
+                })?;
+        }
 
         builder.commit_from_file(onnx_path).map_err(|e| AudioError::Tts {
             provider: "Chatterbox".into(),

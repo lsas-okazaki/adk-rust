@@ -4,6 +4,10 @@ A prebuilt AWP 2.0 website for ADK-Rust (spec 3.5 Part C). It onboards its owner
 or migrates itself, passes its own launch gate, and then works towards the owner's goals with
 a team of eight agents inside the authority, budget and guardrails of its charter.
 
+[![Crates.io](https://img.shields.io/crates/v/adk-website.svg)](https://crates.io/crates/adk-website)
+[![Documentation](https://docs.rs/adk-website/badge.svg)](https://docs.rs/adk-website)
+[![License](https://img.shields.io/crates/l/adk-website.svg)](https://github.com/zavora-ai/adk-rust/blob/main/LICENSE)
+
 > **Note:** `adk-website` is **Experimental** (see `STABILITY.md`). Its API may change without
 > notice while spec 3.5 lands.
 
@@ -48,6 +52,7 @@ is for each kind of site.
 | `measurement` | KPI sources that are not drivers: the beacon, host logs, the commerce, action and spend ledgers, agent search at the edge, AEO | §7.12, §7.11 |
 | `workflows` | The probe, the upkeep watch, the weekly review, a push to the content repository and the weekly learning run as kernel runs | §7.20, §7.8.2, §7.15 |
 | `observability` | Spans, metrics and the site view | §7.24 |
+| `audit` | The product's audit records: onboarding, charter drafts, alarms, the weekly review, status changes and rollbacks, payments | §9.3 |
 | `ui` | `WebsiteDesk`: the setup code, onboarding, the charter cards, the site view, the weekly review and the web editor as views in plain words, and the decisions people make on them, saved across restarts with a `DeskStore`; `adk-surface`'s `website` feature serves them on the web home | §7.8.2, §7.16, §7.18, §7.21, §7.24, §8.2 |
 
 ## Site kinds
@@ -112,6 +117,13 @@ async fn start() -> adk_core::Result<()> {
 ```
 
 ## The binary
+
+Install the `adk-website` binary from crates.io, or from a clone of the repository:
+
+```bash
+cargo install adk-website
+cargo install --path adk-website
+```
 
 | Command | Does |
 |---------|------|

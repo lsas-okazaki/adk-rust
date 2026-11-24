@@ -39,9 +39,10 @@ Every drawing is checked on the server before any surface shows it. A refused dr
 tool error that tells the agent why, and the thread shows a plain notice such as "Finance
 tried to show something that looks like a decision. It wasn't shown."
 
-> **Note:** the `adk-ui` crate is retired (spec 3.3 decision 11). Its 2.2.0 release is built on
-> `adk-core` 2, so an ADK-Rust 3 agent cannot register its tools; see
-> [Moving from adk-ui](../surfaces/genui.md#moving-from-adk-ui) for each tool's replacement.
+> **Note:** `adk-ui` 2 is retired (spec 3.3 decision 11). Its 2.2 releases are built on `adk-core` 2,
+> so an ADK-Rust 3 agent cannot register its tools; see
+> [Moving from adk-ui 2](../surfaces/genui.md#moving-from-adk-ui-2) for each tool's replacement.
+> `adk-ui` 3 adds [extension catalogs](../surfaces/genui.md#extension-catalogs) to `genui` instead.
 
 ## UI protocols in adk-server
 
@@ -69,8 +70,8 @@ tier, features, and limitations, and the `/api/ui/initialize`, `/api/ui/message`
 ## AG-UI decisions
 
 A protocol-native AG-UI run (`uiProtocol: "ag_ui"`, `uiTransport: "protocol_native"`)
-carries calls held for approval as AG-UI interrupts (spec 3.3 §10 S2), following the
-interrupt-aware run lifecycle of the AG-UI 1.1 draft
+carries calls held for approval as AG-UI interrupts (spec 3.3 §10 S2), following AG-UI
+1.0's interrupt-aware run lifecycle
 ([Interrupts](https://docs.ag-ui.com/concepts/interrupts)). With an approval service
 (`ServerBuilder::with_approval_service`), every call the run holds is submitted to the
 inbox, and the run ends with one interrupt per held call instead of a success:
@@ -109,6 +110,20 @@ inbox, and the run ends with one interrupt per held call instead of a success:
   }
 }
 ```
+
+**AG-UI 1.0 clients.** A run input that names `"protocolVersion": "1.0"` gets AG-UI 1.0's
+run shape; one that names none keeps the earlier one:
+
+| | Without `protocolVersion` | With `"protocolVersion": "1.0"` |
+|---|---|---|
+| `RUN_STARTED` | | Echoes `"protocolVersion": "1.0"`; the echoed input carries no `null` fields |
+| A run that finishes | `RUN_FINISHED` without `outcome` | `outcome: {"type": "success"}` |
+| A run that stops on held calls | `RUN_FINISHED` with the interrupts | `STATE_SNAPSHOT` and `MESSAGES_SNAPSHOT` (the held calls as the assistant's `toolCalls`) first; each interrupt's `metadata` says `"ag-ui:tool-execution": "server"` |
+| `TOOL_CALL_START` | | `metadata: {"ag-ui:tool-execution": "server"}`: every tool runs on the server |
+| `RUN_ERROR` | Names the thread and run; may follow with `RUN_FINISHED` | No `threadId`, `runId` or `null` code, and nothing follows it |
+| `TOOL_CALL_RESULT`, reasoning | `toolCallName`; reasoning in the `assistant` role | No `toolCallName`; reasoning in the `reasoning` role |
+| A resume | Answers any open interrupts | Must answer every open interrupt at once and name no other, else `RUN_ERROR` `approval.invalid_resume` |
+| New input while interrupts are open | Starts a run | `RUN_ERROR` `approval.interrupts_open` |
 
 | Field | Value |
 |-------|-------|

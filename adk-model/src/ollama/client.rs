@@ -166,10 +166,7 @@ impl OllamaModel {
     }
 
     /// Convert ADK tool declarations to Ollama tools.
-    fn convert_tools(
-        &self,
-        tools: &std::collections::HashMap<String, serde_json::Value>,
-    ) -> Vec<ToolInfo> {
+    fn convert_tools(&self, tools: &adk_core::ToolDeclarations) -> Vec<ToolInfo> {
         tools
             .iter()
             .map(|(name, decl)| {
@@ -266,6 +263,15 @@ impl Llm for OllamaModel {
         &self.model_name
     }
 
+    // A local server forwards a cloud model (`…-cloud`) to ollama.com, as pricing assumes.
+    fn data_locality(&self) -> adk_core::DataLocality {
+        if self.model_name.contains("cloud") {
+            adk_core::DataLocality::Remote
+        } else {
+            adk_core::DataLocality::of_url(&self.config.host)
+        }
+    }
+
     // OllamaModel uses the default GenericSchemaAdapter from the Llm trait.
     // This explicit override documents the intentional adapter selection.
     fn schema_adapter(&self) -> &dyn SchemaAdapter {
@@ -293,7 +299,8 @@ impl Llm for OllamaModel {
             &mut request.contents,
             &adk_core::history::ProviderOrigin::new("ollama", &self.model_name),
         );
-        let usage_span = adk_telemetry::llm_generate_span("ollama", &self.model_name, stream);
+        let usage_span =
+            crate::telemetry::inference_span("ollama", &self.model_name, stream, &request);
         let model = self.model_name.clone();
         crate::generation_config::reject_unsupported(
             "ollama",

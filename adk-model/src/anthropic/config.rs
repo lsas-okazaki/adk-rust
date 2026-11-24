@@ -19,6 +19,11 @@ pub enum ThinkingMode {
     /// Control depth via `effort` on `AnthropicConfig`, and whether the thinking text is
     /// returned via [`AnthropicConfig::with_thinking_display`].
     Adaptive,
+    /// No thinking before the response, only short updates between tool calls: the way to
+    /// turn thinking off on Claude Sonnet 5.5, which rejects disabled thinking. The API
+    /// accepts it at effort `high` or below; Claude Fable 5.x and Opus 5.5 always think, so
+    /// lower `effort` on those instead.
+    BetweenTools,
 }
 
 /// Effort level controlling response thoroughness.
@@ -92,7 +97,7 @@ pub struct AnthropicConfig {
     /// yields an empty key.
     #[serde(skip_serializing, default)]
     pub api_key: String,
-    /// Model name (e.g., `"claude-opus-5"`, `"claude-sonnet-5"`).
+    /// Model name (e.g., `"claude-opus-5"`, `"claude-sonnet-5-5"`).
     pub model: String,
     /// Maximum tokens to generate. `None` uses
     /// [`anthropic_default_max_tokens`](crate::catalog::anthropic_default_max_tokens)
@@ -181,6 +186,19 @@ pub struct AnthropicConfig {
     /// When `None`, all available tools are loaded.
     #[serde(skip)]
     pub tool_search: Option<ToolSearchConfig>,
+
+    /// Whether a conversation keeps the `tools` array it started with and sends later tool
+    /// changes as `tool_addition` / `tool_removal` blocks (beta `inline-tools-2026-09-15`), so a
+    /// tool added mid-conversation does not miss the prompt cache. Applies to the Claude API
+    /// models that support mid-conversation tool changes.
+    #[serde(default)]
+    pub inline_tool_changes: bool,
+
+    /// Whether requests continue a message thread the API keeps (beta
+    /// `message-threads-2026-08-12`), so each sends only the messages since the previous
+    /// response. Threads are not ZDR eligible.
+    #[serde(default)]
+    pub message_threads: bool,
 }
 
 impl std::fmt::Debug for AnthropicConfig {
@@ -205,6 +223,8 @@ impl std::fmt::Debug for AnthropicConfig {
             .field("beta_features", &self.beta_features)
             .field("api_version", &self.api_version)
             .field("tool_search", &self.tool_search)
+            .field("inline_tool_changes", &self.inline_tool_changes)
+            .field("message_threads", &self.message_threads)
             .finish()
     }
 }
@@ -235,6 +255,8 @@ impl Default for AnthropicConfig {
             beta_features: Vec::new(),
             api_version: None,
             tool_search: None,
+            inline_tool_changes: false,
+            message_threads: false,
         }
     }
 }
@@ -301,7 +323,7 @@ impl AnthropicConfig {
     /// ```rust
     /// use adk_model::anthropic::{AnthropicClient, AnthropicConfig};
     ///
-    /// let config = AnthropicConfig::new("sk-ant-xxx", "claude-sonnet-5")
+    /// let config = AnthropicConfig::new("sk-ant-xxx", "claude-sonnet-5-5")
     ///     .allow_insecure_http()
     ///     .with_base_url("http://10.60.1.20:8080/api/v1/llm/anthropic");
     /// let client = AnthropicClient::new(config)?;
@@ -434,6 +456,49 @@ impl AnthropicConfig {
     /// ```
     pub fn with_tool_search(mut self, config: ToolSearchConfig) -> Self {
         self.tool_search = Some(config);
+        self
+    }
+
+    /// Sends tools added, redefined or removed mid-conversation as inline tool changes, so the
+    /// conversation's `tools` array, and the cached prefix it opens, stays as first sent.
+    ///
+    /// The client remembers each conversation's tools in memory for an hour; a conversation it
+    /// does not remember, or whose history changed, sends its tools as they are.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_model::anthropic::AnthropicConfig;
+    ///
+    /// let config = AnthropicConfig::new("sk-ant-xxx", "claude-sonnet-5-5")
+    ///     .with_inline_tool_changes(true);
+    /// assert!(config.inline_tool_changes);
+    /// ```
+    pub fn with_inline_tool_changes(mut self, enabled: bool) -> Self {
+        self.inline_tool_changes = enabled;
+        self
+    }
+
+    /// Continues a message thread the API keeps for each conversation, so a request sends only
+    /// the messages since the previous response: smaller requests and a steadier time to first
+    /// token in long tool loops, at the same price.
+    ///
+    /// The session stays the source of truth: a request continues its thread only when the
+    /// conversation it sends starts with exactly what the thread holds, and creates a new one
+    /// otherwise. A conversation that carries a compaction is sent without a thread, and a
+    /// thread the API cannot continue is replaced by sending the whole conversation. Threads
+    /// are not ZDR eligible.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_model::anthropic::AnthropicConfig;
+    ///
+    /// let config = AnthropicConfig::new("sk-ant-xxx", "claude-sonnet-5-5").with_message_threads(true);
+    /// assert!(config.message_threads);
+    /// ```
+    pub fn with_message_threads(mut self, enabled: bool) -> Self {
+        self.message_threads = enabled;
         self
     }
 }

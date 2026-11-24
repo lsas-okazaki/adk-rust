@@ -137,7 +137,7 @@ impl OpenAICompatibleConfig {
 
     /// Fireworks AI preset.
     ///
-    /// Default model: `accounts/fireworks/models/kimi-k2p6`
+    /// Default model: `accounts/fireworks/models/kimi-k3`
     pub fn fireworks(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
             .with_provider_name("fireworks")
@@ -146,7 +146,7 @@ impl OpenAICompatibleConfig {
 
     /// Together AI preset.
     ///
-    /// Default model: `MiniMaxAI/MiniMax-M2.7`
+    /// Default model: `moonshotai/Kimi-K3.1-Pro`
     pub fn together(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
             .with_provider_name("together")
@@ -155,7 +155,7 @@ impl OpenAICompatibleConfig {
 
     /// Mistral AI preset.
     ///
-    /// Default model: `mistral-medium-latest`
+    /// Default model: `mistral-large-latest`
     pub fn mistral(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
             .with_provider_name("mistral")
@@ -191,7 +191,7 @@ impl OpenAICompatibleConfig {
 
     /// xAI (Grok) preset.
     ///
-    /// Default model: `grok-4.6`
+    /// Default model: `grok-4.7`
     pub fn xai(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model).with_provider_name("xai").with_base_url("https://api.x.ai/v1")
     }
@@ -221,30 +221,31 @@ impl OpenAICompatibleConfig {
             .with_base_url("https://api.orcarouter.ai/v1")
     }
 
-    /// Cheaper Inference preset.
+    /// Vultr Serverless Inference preset.
     ///
-    /// Cheaper Inference serves models from several vendors behind one
-    /// OpenAI-compatible endpoint; model IDs are bare, such as `gpt-5.4-mini`
-    /// or `claude-sonnet-5`.
+    /// Vultr serves open models (GLM, Qwen, DeepSeek, MiniMax, Nemotron and others) behind
+    /// one OpenAI-compatible endpoint with Bearer auth; `GET /v1/models` lists the IDs a
+    /// subscription can use, with each model's modalities and supported parameters. Rate
+    /// limits apply per subscription and per model.
     ///
-    /// Default model suggestion: `gpt-5.4-mini`
+    /// Default model suggestion: `qwen3.8-27b` (tool calling and vision)
     ///
     /// # Example
     ///
     /// ```
     /// use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
     ///
-    /// let config = OpenAICompatibleConfig::cheaper_inference("ci_live_...", "gpt-5.4-mini");
-    /// assert_eq!(config.base_url.as_deref(), Some("https://api.cheaperinference.com/v1"));
+    /// let config = OpenAICompatibleConfig::vultr("vultr-inference-key", "qwen3.8-27b");
+    /// assert_eq!(config.base_url.as_deref(), Some("https://api.vultrinference.com/v1"));
     ///
     /// let model = OpenAICompatible::new(config)?;
     /// # let _ = model;
     /// # Ok::<(), adk_core::AdkError>(())
     /// ```
-    pub fn cheaper_inference(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn vultr(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
-            .with_provider_name("cheaper-inference")
-            .with_base_url("https://api.cheaperinference.com/v1")
+            .with_provider_name("vultr")
+            .with_base_url("https://api.vultrinference.com/v1")
     }
 
     /// API Route preset.
@@ -273,7 +274,7 @@ impl OpenAICompatibleConfig {
     /// Google Gemini (OpenAI-compatible) preset.
     ///
     /// Targets Gemini's OpenAI-compatibility endpoint, letting you use a Gemini
-    /// API key and a Gemini model (e.g. `gemini-3.7-flash`) through the OpenAI
+    /// API key and a Gemini model (e.g. `gemini-3.8-flash`) through the OpenAI
     /// Chat Completions wire format. Use a `GEMINI_API_KEY` for the `api_key`.
     ///
     /// For native Gemini features (thinking levels, server-side tools, the
@@ -281,7 +282,7 @@ impl OpenAICompatibleConfig {
     /// This preset is for callers who want a single OpenAI-compatible code path
     /// across providers.
     ///
-    /// Default model suggestion: `gemini-3.7-flash`.
+    /// Default model suggestion: `gemini-3.8-flash`.
     pub fn gemini(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
             .with_provider_name("gemini")
@@ -290,7 +291,7 @@ impl OpenAICompatibleConfig {
 
     /// MiniMax preset.
     ///
-    /// Default model: `MiniMax-M2.7` (case-sensitive)
+    /// Default model: `MiniMax-M3` (case-sensitive)
     pub fn minimax(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
             .with_provider_name("minimax")
@@ -308,7 +309,7 @@ impl OpenAICompatibleConfig {
 
     /// Zhipu AI (GLM) preset.
     ///
-    /// Default model: `glm-5.2`
+    /// Default model: `glm-5.3`
     pub fn zhipu(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::new(api_key, model)
             .with_provider_name("zhipu")
@@ -358,6 +359,9 @@ pub(crate) struct ErrorCodes {
     pub(crate) stream_error: &'static str,
     /// Status-specific codes that take precedence over `api_error`.
     pub(crate) status: &'static [(u16, &'static str)],
+    /// Non-success HTTP status whose body says the account is out of quota or credit,
+    /// whatever the status.
+    pub(crate) quota_exhausted: &'static str,
 }
 
 impl ErrorCodes {
@@ -369,6 +373,7 @@ impl ErrorCodes {
         incomplete_stream: "model.openai_compat.incomplete_stream",
         stream_error: "model.openai_compat.stream_error",
         status: &[],
+        quota_exhausted: "model.openai_compat.quota_exhausted",
     };
 
     fn for_status(&self, status: u16) -> &'static str {
@@ -771,7 +776,7 @@ pub(crate) fn build_request_json(
     cache: &SchemaCache,
 ) -> Result<serde_json::Value, AdkError> {
     let bare_model = model.strip_prefix("models/").unwrap_or(model);
-    if matches!(bare_model, "gemini-3.6-flash" | "gemini-3.7-flash")
+    if matches!(bare_model, "gemini-3.6-flash" | "gemini-3.7-flash" | "gemini-3.8-flash")
         && request.config.as_ref().is_some_and(|config| {
             config.temperature.is_some() || config.top_p.is_some() || config.top_k.is_some()
         })
@@ -987,10 +992,16 @@ async fn send_request(
             .and_then(|value| value.to_str().ok())
             .and_then(crate::retry::parse_retry_after);
         let body = http_resp.text().await.unwrap_or_default();
+        // OpenAI answers HTTP 429 both for a rate limit and for an account with no credit.
+        let quota_exhausted = crate::error_metadata::body_reports_exhausted_quota(&body);
         let error = AdkError::new(
             ErrorComponent::Model,
             crate::retry::category_for_status_code(status_code),
-            error_codes.for_status(status_code),
+            if quota_exhausted {
+                error_codes.quota_exhausted
+            } else {
+                error_codes.for_status(status_code)
+            },
             format!(
                 "{provider_name} API error (HTTP {status}): {}",
                 adk_core::upstream_excerpt(&body)
@@ -998,6 +1009,7 @@ async fn send_request(
         )
         .with_upstream_status(status_code)
         .with_provider(provider_name);
+        let error = crate::error_metadata::classify_quota(error, quota_exhausted);
         return Err(crate::retry::with_retry_after(
             crate::error_metadata::from_body(error, &body),
             retry_after,
@@ -1050,6 +1062,17 @@ impl Llm for OpenAICompatible {
             request,
             crate::pricing::request_output_cap(request),
         )
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        crate::pricing::PricingCatalog::standard()
+            .context_window(Some(&self.provider_name), self.name())
+    }
+
+    // A server at a loopback address, such as vLLM or LM Studio on this machine, keeps the
+    // request on it.
+    fn data_locality(&self) -> adk_core::DataLocality {
+        adk_core::DataLocality::of_url(self.completion_url.as_deref().unwrap_or(&self.base_url))
     }
 
     fn name(&self) -> &str {
@@ -1119,7 +1142,7 @@ impl Llm for OpenAICompatible {
             &SCHEMA_CACHE,
         )?;
 
-        let usage_span = adk_telemetry::llm_generate_span(&provider_name, &model, stream);
+        let usage_span = crate::telemetry::inference_span(&provider_name, &model, stream, &request);
 
         if stream {
             // ── Streaming path ──────────────────────────────────────
@@ -1155,7 +1178,7 @@ impl Llm for OpenAICompatible {
                 // A finish reason or `[DONE]` marks a complete response; without one the
                 // answer or a tool call may be truncated.
                 let mut finished = false;
-                // The model declined in `delta.refusal`, so the turn finishes with `Safety`.
+                // The model declined in `delta.refusal`, so the turn finishes with `Refusal`.
                 let mut refused = false;
                 let mut ended = false;
 
@@ -1336,7 +1359,7 @@ impl Llm for OpenAICompatible {
                                 }
                                 finished = true;
                                 let finish_reason = Some(if refused {
-                                    FinishReason::Safety
+                                    FinishReason::Refusal
                                 } else {
                                     parse_finish_reason(fr)
                                 });
@@ -1717,7 +1740,7 @@ mod tests {
             model: crate::catalog::OPENAI_DEFAULT.to_string(),
             contents: Vec::new(),
             config: None,
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
         request.tools.insert(
@@ -1756,7 +1779,7 @@ mod tests {
             model: crate::catalog::OPENAI_DEFAULT.to_string(),
             contents: Vec::new(),
             config: None,
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
 
@@ -1782,7 +1805,7 @@ mod tests {
             model: crate::catalog::OPENAI_DEFAULT.to_string(),
             contents: Vec::new(),
             config: None,
-            tools: HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             previous_response_id: None,
         };
 
@@ -1802,23 +1825,25 @@ mod tests {
 
     #[test]
     fn gemini_37_compatible_path_rejects_sampling_locally() {
-        let mut request = LlmRequest::new("gemini-3.7-flash", Vec::new());
-        request.config =
-            Some(adk_core::GenerateContentConfig { top_p: Some(0.9), ..Default::default() });
-        let cache = SchemaCache::for_adapter(Arc::new(GenericSchemaAdapter));
+        for model in ["gemini-3.7-flash", "gemini-3.8-flash"] {
+            let mut request = LlmRequest::new(model, Vec::new());
+            request.config =
+                Some(adk_core::GenerateContentConfig { top_p: Some(0.9), ..Default::default() });
+            let cache = SchemaCache::for_adapter(Arc::new(GenericSchemaAdapter));
 
-        let error = build_request_json(
-            "gemini-3.7-flash",
-            &request,
-            &None,
-            ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
-            None,
-            &GenericSchemaAdapter,
-            &cache,
-        )
-        .expect_err("sampling should be rejected before network I/O");
+            let error = build_request_json(
+                model,
+                &request,
+                &None,
+                ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
+                None,
+                &GenericSchemaAdapter,
+                &cache,
+            )
+            .expect_err("sampling should be rejected before network I/O");
 
-        assert_eq!(error.code, "model.gemini.sampling_unsupported");
+            assert_eq!(error.code, "model.gemini.sampling_unsupported", "{model}");
+        }
     }
 
     #[test]
@@ -1834,15 +1859,15 @@ mod tests {
     }
 
     #[test]
-    fn cheaper_inference_preset_sets_endpoint_and_provider() {
-        let config = OpenAICompatibleConfig::cheaper_inference("test-key", "gpt-5.4-mini");
-        assert_eq!(config.provider_name, "cheaper-inference");
-        assert_eq!(config.model, "gpt-5.4-mini");
-        assert_eq!(config.base_url.as_deref(), Some("https://api.cheaperinference.com/v1"));
+    fn vultr_preset_sets_endpoint_and_provider() {
+        let config = OpenAICompatibleConfig::vultr("test-key", "qwen3.8-27b");
+        assert_eq!(config.provider_name, "vultr");
+        assert_eq!(config.model, "qwen3.8-27b");
+        assert_eq!(config.base_url.as_deref(), Some("https://api.vultrinference.com/v1"));
         assert_eq!(config.api_key, "test-key");
 
         let client = OpenAICompatible::new(config).expect("client builds");
-        assert_eq!(client.name(), "gpt-5.4-mini");
+        assert_eq!(client.name(), "qwen3.8-27b");
     }
 
     #[test]

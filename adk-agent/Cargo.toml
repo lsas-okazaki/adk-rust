@@ -12,6 +12,7 @@ documentation = "https://docs.rs/adk-agent"
 keywords = ["ai", "agent", "adk", "llm", "workflow"]
 categories = ["api-bindings", "asynchronous"]
 readme = "README.md"
+exclude = ["tests/", "examples/"]
 
 [package.metadata.docs.rs]
 features = ["guardrails", "enhanced-plugins", "skills-progressive-disclosure", "team-tools", "codeact", "coding", "sandbox", "ambient", "record-payloads"]
@@ -45,8 +46,8 @@ tokio-util = { version = "0.7", optional = true }
 tempfile = { version = "3", optional = true }
 
 [features]
-default = ["skills"]
-guardrails = ["adk-guardrail"]
+default = []
+guardrails = ["dep:adk-guardrail"]
 enhanced-plugins = ["dep:adk-plugin"]
 skills = ["dep:adk-skill"]
 # Google ADK-style L1/L2/L3 skill tools. Existing `skills` continues to use
@@ -72,10 +73,14 @@ reqwest = { workspace = true }
 # Internal dev-deps are path-only (no version) so cargo strips them from the
 # published manifest — they can never block or reorder a crates.io publish.
 adk-auth = { path = "../adk-auth", features = ["signed-audit"] }
+# Model Armor guardrails against a mock endpoint in the live guardrail test.
+adk-guardrail = { path = "../adk-guardrail", features = ["model-armor"] }
+google-cloud-auth = { version = "1.8", default-features = false, features = ["default-rustls-provider"] }
 adk-model = { path = "../adk-model", features = ["anthropic", "gemini", "gemini-interactions", "openai"] }
 adk-plugin = { path = "../adk-plugin" }
-adk-runner = { path = "../adk-runner" }
-adk-session = { path = "../adk-session" }
+adk-runner = { path = "../adk-runner", features = ["context-compaction"] }
+# `sqlite`: the live archive test keeps its conversation in a SQLite store.
+adk-session = { path = "../adk-session", features = ["sqlite"] }
 adk-tool = { path = "../adk-tool" }
 anyhow = "1"
 dotenvy = "0.15"
@@ -89,3 +94,8 @@ tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "test
 tracing-subscriber = { workspace = true }
 # Mock provider endpoints for the built-in tool governance tests.
 wiremock = "0.6"
+# The GenAI span tests export through an OpenTelemetry layer into an in-memory exporter.
+adk-telemetry = { path = "../adk-telemetry", features = ["otlp"] }
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
+tracing-opentelemetry = "0.33"

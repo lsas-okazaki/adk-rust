@@ -306,6 +306,7 @@ fn call(tool: &str) -> ToolConfirmationRequest {
         args: json!({ "to": "[client email]" }),
         origin: None,
         acting: None,
+        evidence: Vec::new(),
     }
 }
 
@@ -367,7 +368,7 @@ async fn spoken(
 }
 
 fn send(text: &str) -> Command {
-    Command::Send { session_id: "s1".into(), text: text.into() }
+    Command::Send { session_id: "s1".into(), text: text.into(), images: Vec::new() }
 }
 
 fn decide(request: &ApprovalRequest, version: u64, answer: Answer) -> Command {
@@ -378,6 +379,7 @@ fn decide(request: &ApprovalRequest, version: u64, answer: Answer) -> Command {
         edited_args: None,
         reason: None,
         expanded: true,
+        evidence: Vec::new(),
     }
 }
 

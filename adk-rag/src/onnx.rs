@@ -2,10 +2,10 @@
 //! §10 R1).
 //!
 //! [`OnnxEmbeddingProvider`] runs a sentence-transformer ONNX model — `BAAI/bge-small-en-v1.5`
-//! by default, 384 dimensions — on the `ort` runtime `adk-audio` already pins. The model
-//! and its tokenizer are fetched once into the Hugging Face hub cache (`HF_HOME`, else
-//! `~/.cache/huggingface`) and read from there afterwards, so embedding needs no network
-//! and no provider key. It is the recall embedder of the fully local harness.
+//! by default, 384 dimensions — on ONNX Runtime through `ort`, at the one version every ADK-Rust
+//! crate pins. The model and its tokenizer are fetched once into the Hugging Face hub cache
+//! (`HF_HOME`, else `~/.cache/huggingface`) and read from there afterwards, so embedding needs
+//! no network and no provider key. It is the recall embedder of the fully local harness.
 //!
 //! | Step | Default |
 //! |---|---|
@@ -126,6 +126,31 @@ impl OnnxEmbeddingConfig {
         self
     }
 
+    /// Whether the model and tokenizer files are on this machine, in `local_dir` or the
+    /// Hugging Face hub cache, so [`OnnxEmbeddingProvider::new`] fetches nothing. A caller
+    /// that is about to wait on a first fetch (about 130 MB for the default model) can say
+    /// so first.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_rag::OnnxEmbeddingConfig;
+    ///
+    /// let config = OnnxEmbeddingConfig::default().with_local_dir("/nonexistent");
+    /// assert!(!config.is_fetched());
+    /// ```
+    pub fn is_fetched(&self) -> bool {
+        match &self.local_dir {
+            Some(dir) => {
+                dir.join(&self.model_file).is_file() && dir.join(&self.tokenizer_file).is_file()
+            }
+            None => {
+                let repo = hf_hub::Cache::from_env().model(self.model_id.clone());
+                repo.get(&self.model_file).is_some() && repo.get(&self.tokenizer_file).is_some()
+            }
+        }
+    }
+
     /// Sets the pooling.
     #[must_use]
     pub fn with_pooling(mut self, pooling: OnnxPooling) -> Self {
@@ -187,8 +212,11 @@ impl OnnxEmbeddingProvider {
             .map_err(|e| error(format!("failed to configure truncation: {e}")))?;
         tokenizer.with_padding(Some(PaddingParams::default()));
 
-        let mut builder = Session::builder()
-            .and_then(|builder| builder.with_optimization_level(GraphOptimizationLevel::Level3))
+        let mut builder = adk_core::onnx::ort_environment()
+            .and_then(|environment| Session::builder(&environment))
+            .and_then(|builder| {
+                builder.with_optimization_level(GraphOptimizationLevel::Level3).map_err(Into::into)
+            })
             .map_err(|e| error(format!("failed to create the session builder: {e}")))?;
         if let Some(threads) = config.threads {
             builder = builder

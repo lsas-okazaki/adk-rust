@@ -56,6 +56,21 @@ describe("a drawing", () => {
     expect(note?.querySelector("code")?.textContent).toBe("send_invoice");
   });
 
+  it("gives assistive technology what the drawing names, and says each drawing once", () => {
+    const surface = invoiceForm();
+    const labelled = (node: DrawnNode): DrawnNode =>
+      node.key === "body"
+        ? { ...node, accessibility: { label: "Invoice number", description: "Due in 30 days", live: "polite" } }
+        : { ...node, children: node.children?.map(labelled) };
+    const { container } = render(<DrawnView surface={{ ...surface, root: surface.root && labelled(surface.root) }} onSend={async () => undefined} />);
+    const named = container.querySelector('[aria-label="Invoice number"]');
+    expect(named?.getAttribute("aria-description")).toBe("Due in 30 days");
+    expect(named?.getAttribute("aria-live")).toBe("polite");
+    expect(named?.getAttribute("role")).toBe("group");
+    const announced = container.querySelector('.drawn > p[aria-live="polite"]');
+    expect(announced?.textContent).toContain("Invoice INV-10");
+  });
+
   it("shows agent text as text: no markup, no control characters", () => {
     const surface = { ...timesheetCard(), title: "<b>Total</b>‮\u001b[31m" };
     const { container } = render(<DrawnView surface={surface} />);
@@ -81,6 +96,27 @@ describe("a drawing", () => {
     );
     expect(screen.getByText("Earlier version · 10:02")).toBeTruthy();
     expect(screen.getByText("Finance changed this form at 10:05")).toBeTruthy();
+  });
+
+  it("folds the earlier versions no form was sent from into one control on the latest", () => {
+    const shown = lines([drawn(1, 1), drawn(2, 2), drawn(3, 3)]);
+    expect(shown.map((line) => line.kind)).toEqual(["drawn"]);
+    const latest = shown[0] as Extract<(typeof shown)[number], { kind: "drawn" }>;
+    expect(latest.surface.version).toBe(3);
+    expect(latest.earlier?.map((surface) => surface.version)).toEqual([1, 2]);
+    render(<DrawnView surface={latest.surface} earlier={latest.earlier} />);
+    expect(screen.getByText("Earlier versions · 2")).toBeTruthy();
+  });
+
+  it("shows its title once when its first words already say it", () => {
+    const surface = { ...invoiceForm(), title: "Invoice INV-10" };
+    const heading = { key: "h", component: "Text", text: "Invoice inv-10", variant: "h2" };
+    const { container, rerender } = render(
+      <DrawnView surface={{ ...surface, root: { key: "root", component: "Column", children: [heading] } }} />,
+    );
+    expect(container.querySelector(".drawn-title")).toBeNull();
+    rerender(<DrawnView surface={surface} />);
+    expect(container.querySelector(".drawn-title")?.textContent).toBe("Invoice INV-10");
   });
 });
 
@@ -281,6 +317,35 @@ describe("the ported A2UI parts", () => {
     expect(getPath(setPath({ rows: [{ a: 1 }] }, "/rows/0/a", 2), "/rows/0/a")).toBe(2);
   });
 
+  it("reads A2UI 1.0 into the same surfaces, one createSurface carrying the drawing", () => {
+    const store = new SurfaceStore();
+    applyMessages(
+      store,
+      parseJsonl(
+        [
+          JSON.stringify({
+            version: "1.0",
+            createSurface: {
+              surfaceId: "s",
+              catalogId: "https://adk-rust.com/a2ui/catalogs/forms/1.0/catalog.json",
+              components: [
+                { id: "root", component: "Text", text: { "@path": "/to" }, "@accessibility": { label: "To" }, extra: { "@@type": "x" } },
+              ],
+              dataModel: { to: "ana" },
+            },
+          }),
+          JSON.stringify({ version: "1.0", updateDataModel: { surfaceId: "s", path: "/to", value: null } }),
+        ].join("\n"),
+      ),
+    );
+    const surface = store.get("s");
+    expect(surface?.components.get("root")).toEqual({ id: "root", component: "Text", text: { path: "/to" }, accessibility: { label: "To" }, extra: { "@type": "x" } });
+    expect(surface?.dataModel).toEqual({});
+    expect(() => parseJsonl('{"version":"1.0","updateDataModel":{"surfaceId":"s","path":"/a"}}')).toThrow(/requires value/);
+    expect(() => parseJsonl('{"version":"1.0","updateComponents":{"surfaceId":"s","components":[{"id":"r","component":"Text","text":{"@x":1}}]}}')).toThrow(/reserved key/);
+    expect(() => parseJsonl('{"version":"2.0","deleteSurface":{"surfaceId":"s"}}')).toThrow(/line 1/);
+  });
+
   it("never follows a link to this computer or a script", () => {
     expect(sanitizeUrl("https://example.com/a", "anchor")).toBe("https://example.com/a");
     expect(sanitizeUrl("http://127.0.0.1:8080/", "anchor")).toBeNull();
@@ -305,6 +370,33 @@ function bridge(answer: (request: AppRequest) => Promise<AppAnswer>) {
   };
   return { bridge: new AppBridge(host), posted, prompts, heights };
 }
+
+describe("an app's bridge", () => {
+  it("tells the app the page's scheme, styles and width, and when they change or the frame goes", async () => {
+    const posted: JsonRpc[] = [];
+    const host: BridgeHost = {
+      post: (message) => posted.push(message),
+      ask: async () => ({ result: { hostContext: { displayMode: "inline", containerDimensions: { maxHeight: 640 } } } }),
+      resize: () => undefined,
+      prompt: () => undefined,
+      theme: () => "dark",
+      styles: () => ({ "--color-text-primary": "#111" }),
+      width: () => 480,
+      toolInput: {},
+      toolResult: {},
+    };
+    const bridge = new AppBridge(host);
+    await bridge.receive({ jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    const context = (posted[0] as { result: { hostContext: Record<string, unknown> } }).result.hostContext;
+    expect(context.theme).toBe("dark");
+    expect(context.styles).toEqual({ variables: { "--color-text-primary": "#111" } });
+    expect(context.containerDimensions).toEqual({ maxHeight: 640, width: 480 });
+    bridge.contextChanged();
+    expect((posted[1] as { method: string }).method).toBe("ui/notifications/host-context-changed");
+    bridge.teardown();
+    expect((posted[2] as { method: string }).method).toBe("ui/resource-teardown");
+  });
+});
 
 /** The app's frame in `container`, once opened. */
 function framed(container: HTMLElement): Promise<HTMLIFrameElement> {
@@ -479,6 +571,22 @@ describe("an app from an MCP server", () => {
     opened.mockRestore();
   });
 
+  it("saves a file an app offers only when the person presses Save", async () => {
+    const created = vi.fn(() => "blob:forecast");
+    const revoked = vi.fn();
+    Object.assign(URL, { createObjectURL: created, revokeObjectURL: revoked });
+    const clicked = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    const { container } = render(<AppFrame app={weatherApp()} seam={new AppsFixture()} session="s-chief" />);
+    const frame = await framed(container);
+    fromFrame(frame, { jsonrpc: "2.0", id: 3, method: "ui/download-file", params: { contents: [] } });
+    const ask = await screen.findByRole("group", { name: "The Weather app wants to save forecast.csv (14 bytes)" });
+    expect(created).not.toHaveBeenCalled();
+    await userEvent.click(within(ask).getByRole("button", { name: "Save" }));
+    expect(created).toHaveBeenCalledTimes(1);
+    expect(clicked).toHaveBeenCalledTimes(1);
+    clicked.mockRestore();
+  });
+
   it("stands in the thread for its tool call, with the decision of a call it asked for under it", () => {
     const at = new Date().toISOString();
     const entries: FeedEntry[] = [
@@ -506,5 +614,138 @@ describe("an app from an MCP server", () => {
     expect(within(place).getByText("Turn on rain alerts for Nairobi")).toBeTruthy();
     expect(app.querySelector('[class*="decision"]')).toBeNull();
     expect(screen.getAllByText("Turn on rain alerts for Nairobi")).toHaveLength(1);
+  });
+});
+
+// Extension catalogs (spec 3.3 §6.1 `genui`): charts the home draws natively, and a host's
+// renderers of extension components, which get the checked properties and never a way to send.
+import { ChartView, compact, fitLabels, niceTicks } from "../src/genui/ChartView";
+import type { DrawnChart, DrawnNode } from "../src/generated/api";
+import type { ExtensionRendererProps } from "../src/genui/DrawnView";
+
+const chart = (kind: DrawnChart["kind"], extra: Partial<DrawnChart> = {}): DrawnChart => ({
+  kind,
+  x: { type: "category", labels: ["Jan", "Feb", "Mar"] },
+  series: [{ name: "Revenue", y: [4, 7, 5] }],
+  summary: `${kind} chart of Revenue, 3 points, from 4 to 7`,
+  ...extra,
+});
+
+const leaf = (key: string, text: string, variant?: string): DrawnNode => ({ key, component: "Text", text, variant });
+
+describe("a chart an extension component drew", () => {
+  it("draws every kind as a labelled SVG with no links", () => {
+    const kinds: DrawnChart["kind"][] = ["line", "area", "bar", "scatter", "pie", "sparkline"];
+    for (const kind of kinds) {
+      const { container, unmount } = render(<ChartView chart={chart(kind)} />);
+      const svg = container.querySelector("svg");
+      expect(svg?.getAttribute("role")).toBe("img");
+      expect(svg?.getAttribute("aria-label")).toBe(`${kind} chart of Revenue, 3 points, from 4 to 7`);
+      expect(container.querySelector("a, [href], foreignObject, script")).toBeNull();
+      expect(container.querySelector('[class*="decision"], [class*="pill"]')).toBeNull();
+      unmount();
+    }
+  });
+
+  it("offers its numbers as a table a screen reader can walk", () => {
+    const { container } = render(<ChartView chart={chart("bar")} />);
+    const details = container.querySelector("details.drawn-chart-data");
+    expect(details?.querySelector("summary")?.textContent).toBe("Show the data");
+    const rows = [...(details?.querySelectorAll("tbody tr") ?? [])].map((row) => [...row.children].map((cell) => cell.textContent));
+    expect(rows.length).toBe(3);
+    expect(rows.every((row) => row.length === 2)).toBe(true);
+    expect(details?.querySelector("caption")?.textContent).toBe("bar chart of Revenue, 3 points, from 4 to 7");
+  });
+
+  it("writes its words as text and names each point's value", () => {
+    const tricky = chart("bar", {
+      x: { type: "category", labels: ["<b>Jan</b>", "Feb‮", "Mar"] },
+      series: [
+        { name: "Revenue", y: [4, 7, 5] },
+        { name: "Cost", y: [3, 2, 1] },
+      ],
+      yLabel: "USD",
+    });
+    const { container } = render(<ChartView chart={tricky} />);
+    expect(container.querySelector("b")).toBeNull();
+    expect(container.textContent).toContain("<b>Jan</b>");
+    expect(container.textContent).toContain("Feb\\u{202e}");
+    expect([...container.querySelectorAll("title")].map((title) => title.textContent)).toContain("Revenue · <b>Jan</b>: 4");
+    expect(container.querySelectorAll(".drawn-chart-legend li")).toHaveLength(2);
+  });
+
+  it("fits long category labels to the room between them, keeping the whole label to hover", () => {
+    const labels = ["0.4.0", "0.5.0", "0.6.0", "0.7.0", "0.8.0", "1.0.0", "2.0.0", "2.1.0", "2.2.0", "3.0.0 (unreleased)"];
+    const fitted = fitLabels(labels.map((text, index) => ({ at: 52 + index * 57, text })), 572);
+    expect(fitted[0].text).toBe("0.4.0");
+    expect(fitted[9].text).toBe("3.0.0…");
+    expect(fitted[9].full).toBe("3.0.0 (unreleased)");
+    const long = chart("bar", { x: { type: "category", labels }, series: [{ name: "Entries", y: labels.map((_, i) => i + 1) }] });
+    const { container } = render(<ChartView chart={long} />);
+    const titled = [...container.querySelectorAll("text.drawn-chart-tick")].find((tick) => tick.querySelector("title"));
+    expect(titled?.querySelector("title")?.textContent).toBe("3.0.0 (unreleased)");
+    expect(titled?.lastChild?.textContent).toBe("3.0.0…");
+  });
+
+  it("reads numbers compactly on round ticks", () => {
+    expect(compact(950)).toBe("950");
+    expect(compact(12_500)).toBe("12.5k");
+    expect(compact(3_400_000)).toBe("3.4M");
+    expect(niceTicks(0, 7)).toEqual([0, 2, 4, 6, 8]);
+  });
+});
+
+describe("an extension component", () => {
+  const metric: DrawnNode = {
+    key: "open",
+    component: "Metric",
+    extension: { catalog: "https://example.com/insight.json", component: "Metric", props: { label: "Open incidents", value: 3 } },
+    children: [
+      { key: "open#1", component: "Row", children: [leaf("open#2", "Open incidents", "caption"), leaf("open#3", "3", "h3")] },
+    ],
+  };
+  const surface = () => ({ ...timesheetCard(), title: undefined, root: metric });
+
+  it("is drawn as its home view where no renderer is set", () => {
+    const { container } = render(<DrawnView surface={surface()} />);
+    expect(within(container).getByText("Open incidents")).toBeTruthy();
+    expect(within(container).getByText("3")).toBeTruthy();
+    expect(container.querySelector(".drawn-extension")).toBeNull();
+  });
+
+  it("is drawn by the host's renderer from its checked properties, with no way to send", () => {
+    const seen: unknown[] = [];
+    const renderers = {
+      "https://example.com/insight.json": {
+        Metric: (props: ExtensionRendererProps) => {
+          seen.push(Object.keys(props).sort());
+          return <strong className="host-metric">{String(props.props.value)} open</strong>;
+        },
+      },
+    };
+    const { container } = render(<DrawnView surface={surface()} renderers={renderers} />);
+    expect(container.querySelector(".host-metric")?.textContent).toBe("3 open");
+    expect(seen[0]).toEqual(["children", "node", "props", "renderChild"]);
+    const other = { "https://example.com/other.json": renderers["https://example.com/insight.json"] };
+    const { container: fallback } = render(<DrawnView surface={surface()} renderers={other} />);
+    expect(fallback.querySelector(".host-metric")).toBeNull();
+  });
+
+  it("hands a renderer the nodes it holds, drawn by the home", () => {
+    const pages: DrawnNode = {
+      key: "root",
+      component: "Pages",
+      extension: { catalog: "https://example.com/insight.json", component: "Pages", props: {}, children: ["note"] },
+      children: [{ key: "root#1", component: "Tabs", tabs: ["Note"], children: [leaf("note", "Sent on the 10th")] }],
+    };
+    const renderers = {
+      "https://example.com/insight.json": {
+        Pages: ({ children, renderChild }: ExtensionRendererProps) => (
+          <section className="host-pages">{children.map((child) => renderChild(child))}</section>
+        ),
+      },
+    };
+    const { container } = render(<DrawnView surface={{ ...timesheetCard(), title: undefined, root: pages }} renderers={renderers} />);
+    expect(container.querySelector(".host-pages")?.textContent).toBe("Sent on the 10th");
   });
 });

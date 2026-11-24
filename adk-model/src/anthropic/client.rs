@@ -47,10 +47,21 @@ pub struct AnthropicClient {
     request_adapter: Option<RequestAdapter>,
     /// Latest rate-limit information from the most recent API response.
     latest_rate_limit: Arc<RwLock<RateLimitInfo>>,
+    /// The tools each conversation started with, for inline tool changes.
+    tool_ledgers: Arc<super::tool_changes::ToolLedgers>,
+    /// The message thread each conversation can continue.
+    threads: Arc<super::threads::Threads>,
+}
+
+/// The identifier from `claude-` on, so a platform ID such as `anthropic.claude-sonnet-5-5`
+/// or `us.anthropic.claude-opus-4-7-v1` follows the first-party model's contract.
+fn claude_id(model: &str) -> &str {
+    model.find("claude-").map_or(model, |start| &model[start..])
 }
 
 impl AnthropicClient {
     fn rejects_sampling(model: &str) -> bool {
+        let model = claude_id(model);
         [
             "claude-fable-5",
             "claude-mythos-5",
@@ -65,8 +76,75 @@ impl AnthropicClient {
         .any(|prefix| model.starts_with(prefix))
     }
 
+    /// Whether `model` compacts on demand (beta `compact-2026-09-04`), per the Claude API's
+    /// "Compaction on demand" model list: the identifier itself or a dated snapshot of it.
+    fn compacts_on_demand(model: &str) -> bool {
+        const MODELS: [&str; 16] = [
+            "claude-fable-5-2",
+            "claude-mythos-5-2",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5",
+            "claude-haiku-5-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+        ];
+        let model = claude_id(model);
+        MODELS.iter().any(|id| {
+            model.strip_prefix(id).is_some_and(|rest| {
+                rest.is_empty()
+                    || rest.strip_prefix('-').is_some_and(|date| {
+                        date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+        })
+    }
+
+    /// Whether `model` accepts tool definitions in a mid-conversation message (beta
+    /// `inline-tools-2026-09-15`): every model with mid-conversation tool changes but Claude
+    /// Sonnet 5.
+    fn supports_inline_tools(model: &str) -> bool {
+        let model = claude_id(model);
+        [
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        ]
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+    }
+
+    /// The tool ledgers inline tool changes use for this client's requests, if enabled.
+    fn inline_tool_ledgers(&self) -> Option<Arc<super::tool_changes::ToolLedgers>> {
+        let first_party = self.config.base_url.as_deref().is_none_or(|url| {
+            crate::provider::url_host(url).as_deref() == Some("api.anthropic.com")
+        });
+        (self.config.inline_tool_changes && first_party && Self::supports_inline_tools(&self.model))
+            .then(|| self.tool_ledgers.clone())
+    }
+
+    /// The thread store message threads use for this client's requests, if enabled. An
+    /// endpoint that refuses threads gets each conversation sent without one.
+    fn thread_store(&self) -> Option<Arc<super::threads::Threads>> {
+        self.config.message_threads.then(|| self.threads.clone())
+    }
+
     fn supports_fast_mode(model: &str) -> bool {
-        model.starts_with("claude-opus-5") || model.starts_with("claude-opus-4-8")
+        let model = claude_id(model);
+        ["claude-opus-5", "claude-opus-4-8", "claude-fable-5-2", "claude-mythos-5-2"]
+            .iter()
+            .any(|prefix| model.starts_with(prefix))
     }
 
     /// The effort control `model` has (spec 3.1 §7.23): Claude 4.6 and later take
@@ -167,6 +245,8 @@ impl AnthropicClient {
             retry_config: RetryConfig::default(),
             request_adapter: None,
             latest_rate_limit: Arc::new(RwLock::new(RateLimitInfo::default())),
+            tool_ledgers: Arc::default(),
+            threads: Arc::default(),
         })
     }
 
@@ -351,7 +431,7 @@ impl AnthropicClient {
                 ErrorCategory::InvalidInput,
                 "model.anthropic.fast_mode_unsupported",
                 format!(
-                    "model '{model}' does not support Anthropic fast mode; use claude-opus-5-5, claude-opus-5, or claude-opus-4-8, or disable fast_mode"
+                    "model '{model}' does not support Anthropic fast mode; use claude-opus-5-5, claude-fable-5-2, claude-mythos-5-2, claude-opus-5, or claude-opus-4-8, or disable fast_mode"
                 ),
             )
             .with_provider("anthropic"));
@@ -368,44 +448,6 @@ impl AnthropicClient {
             reject_unsupported("anthropic", request.config.as_ref(), supports)?;
         }
 
-        let mut system_parts: Vec<String> = Vec::new();
-        let mut messages = Vec::new();
-
-        for content in &request.contents {
-            if content.role == "system" {
-                // Requirement 1.1: Extract system-role content text parts
-                let text: String = content
-                    .parts
-                    .iter()
-                    .filter_map(|p| match p {
-                        Part::Text { text } => Some(text.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !text.is_empty() {
-                    system_parts.push(text);
-                }
-            } else {
-                let message =
-                    convert::content_to_message(content, anthropic_config.prompt_caching)?;
-                // A turn with no blocks (only whitespace, or reasoning the API cannot verify)
-                // would fail this request and every later one; the turns around it merge.
-                let empty = match &message.content {
-                    adk_anthropic::MessageParamContent::String(text) => text.trim().is_empty(),
-                    adk_anthropic::MessageParamContent::Array(blocks) => blocks.is_empty(),
-                };
-                if !empty {
-                    messages.push(message);
-                }
-            }
-        }
-
-        // Requirement 1.3: Concatenate multiple system entries with newline separators
-        // Requirement 1.4: Omit system parameter when no system content found
-        let system_prompt =
-            if system_parts.is_empty() { None } else { Some(system_parts.join("\n")) };
-
         let mut tools = if request.tools.is_empty() {
             Vec::new()
         } else {
@@ -417,7 +459,7 @@ impl AnthropicClient {
                     .iter()
                     .filter(|(name, _)| tool_search.matches(name).unwrap_or(false))
                     .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect::<std::collections::HashMap<_, _>>()
+                    .collect::<adk_core::ToolDeclarations>()
             } else {
                 request.tools.clone()
             };
@@ -428,7 +470,7 @@ impl AnthropicClient {
                 static ADAPTER: AnthropicSchemaAdapter = AnthropicSchemaAdapter;
                 static SCHEMA_CACHE: LazyLock<SchemaCache> =
                     LazyLock::new(|| SchemaCache::for_adapter(Arc::new(AnthropicSchemaAdapter)));
-                convert::convert_tools(&filtered_tools, &ADAPTER, &SCHEMA_CACHE)?
+                convert::convert_tools(model, &filtered_tools, &ADAPTER, &SCHEMA_CACHE)?
             }
         };
 
@@ -457,6 +499,48 @@ impl AnthropicClient {
                 tools.push(tool);
             }
         }
+        // Computer and browser use take the form this model accepts, and the history's
+        // member calls and results follow that form.
+        super::toolsets::resolve_for_model(model, &mut tools)?;
+        let forms = super::toolsets::ToolsetForms::of(&tools);
+
+        let mut system_parts: Vec<String> = Vec::new();
+        let mut messages = Vec::new();
+
+        for content in &request.contents {
+            if content.role == "system" {
+                // Requirement 1.1: Extract system-role content text parts
+                let text: String = content
+                    .parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        Part::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    system_parts.push(text);
+                }
+            } else {
+                let message =
+                    convert::content_to_message(content, anthropic_config.prompt_caching, forms)?;
+                // A turn with no blocks (only whitespace, or reasoning the API cannot verify)
+                // would fail this request and every later one; the turns around it merge.
+                let empty = match &message.content {
+                    adk_anthropic::MessageParamContent::String(text) => text.trim().is_empty(),
+                    adk_anthropic::MessageParamContent::Array(blocks) => blocks.is_empty(),
+                };
+                if !empty {
+                    messages.push(message);
+                }
+            }
+        }
+
+        // Requirement 1.3: Concatenate multiple system entries with newline separators
+        // Requirement 1.4: Omit system parameter when no system content found
+        let system_prompt =
+            if system_parts.is_empty() { None } else { Some(system_parts.join("\n")) };
 
         let (thinking, effort) = Self::request_posture(model, request, anthropic_config);
 
@@ -507,7 +591,10 @@ impl AnthropicClient {
                 | Some(adk_anthropic::ThinkingConfig::Adaptive { display: slot }) => {
                     *slot = Some(display);
                 }
-                Some(adk_anthropic::ThinkingConfig::Disabled) | None => {}
+                // `between_tools` takes no other field.
+                Some(adk_anthropic::ThinkingConfig::Disabled)
+                | Some(adk_anthropic::ThinkingConfig::BetweenTools)
+                | None => {}
             }
         }
         if let Some(config) = config
@@ -515,7 +602,131 @@ impl AnthropicClient {
         {
             params.stop_sequences = Some(config.stop_sequences.clone());
         }
+        // A response schema becomes structured outputs, never a forced tool call: Claude Fable
+        // 5.1 and later, Opus 5.5 and Sonnet 5.5 reject a forced `tool_choice`.
+        if let Some(schema) = config.and_then(|c| c.response_schema.as_ref()) {
+            match super::schema_adapter::structured_output_schema(schema) {
+                Some(schema) => {
+                    let format = adk_anthropic::OutputFormat::json_schema(schema);
+                    match &mut params.output_config {
+                        Some(output) => output.format = Some(format),
+                        None => {
+                            params.output_config = Some(adk_anthropic::OutputConfig::new(format))
+                        }
+                    }
+                }
+                None => tracing::debug!(
+                    model.name = %model,
+                    "response schema has an open object; it is not sent as structured output"
+                ),
+            }
+        }
+        if let Some(ask) = adk_core::intra_compaction::NativeCompactionRequest::of(request) {
+            let compaction = adk_anthropic::CompactionParam::summarize();
+            params.compaction = Some(match ask.instructions {
+                Some(instructions) => compaction.with_instructions(instructions),
+                None => compaction,
+            });
+            // The API rejects these on a compaction request, where they would do nothing.
+            params.stop_sequences = None;
+            params.output_format = None;
+            params.context_management = None;
+            if let Some(output) = &mut params.output_config {
+                output.format = None;
+            }
+        }
+        keep_compaction_block_first(&mut params.messages);
         Ok(params)
+    }
+}
+
+/// Keeps a compaction block only where the API accepts one — first in the first message — and
+/// sends any other as its summary's text, so a history that placed it elsewhere still reads
+/// the summary instead of failing every request.
+fn keep_compaction_block_first(messages: &mut [adk_anthropic::MessageParam]) {
+    for (message_index, message) in messages.iter_mut().enumerate() {
+        let adk_anthropic::MessageParamContent::Array(blocks) = &mut message.content else {
+            continue;
+        };
+        for (block_index, block) in blocks.iter_mut().enumerate() {
+            if let ContentBlock::Compaction(compaction) = block
+                && (message_index, block_index) != (0, 0)
+            {
+                tracing::debug!("a compaction block that is not first is sent as its summary");
+                *block = ContentBlock::Text(adk_anthropic::TextBlock::new(
+                    adk_core::intra_compaction::compaction_summary_text(&compaction.content),
+                ));
+            }
+        }
+    }
+}
+
+/// Sends `params` and waits for the whole message, through `adapter` when one is set.
+async fn send_unary(
+    client: &Anthropic,
+    params: adk_anthropic::MessageCreateParams,
+    adapter: Option<&RequestAdapter>,
+) -> Result<adk_anthropic::Message, AdkError> {
+    match adapter {
+        Some(adapter) => {
+            let (params, headers) = super::request::prepare(client, params, adapter)?;
+            client.send_with_headers(params, headers).await.map_err(convert_anthropic_error)
+        }
+        None => client.send(params).await.map_err(convert_anthropic_error),
+    }
+}
+
+/// The SSE events of `params`, through `adapter` when one is set.
+async fn open_stream(
+    client: &Anthropic,
+    params: &adk_anthropic::MessageCreateParams,
+    adapter: Option<&RequestAdapter>,
+) -> Result<
+    futures::stream::BoxStream<
+        'static,
+        Result<adk_anthropic::MessageStreamEvent, adk_anthropic::Error>,
+    >,
+    AdkError,
+> {
+    match adapter {
+        Some(adapter) => {
+            let (params, headers) = super::request::prepare(client, params.clone(), adapter)?;
+            client
+                .stream_with_headers(&params, headers)
+                .await
+                .map(|events| events.boxed())
+                .map_err(convert_anthropic_error)
+        }
+        None => client
+            .stream(params)
+            .await
+            .map(|events| events.boxed())
+            .map_err(convert_anthropic_error),
+    }
+}
+
+/// Whether `error` is the API refusing a thread request before the model ran: the thread
+/// expired, was continued elsewhere, or cannot hold the request.
+fn thread_refused(error: &AdkError) -> bool {
+    matches!(error.category, ErrorCategory::NotFound | ErrorCategory::InvalidInput)
+}
+
+/// Records that `plan`'s thread continues from response `id`, whose turn this client will
+/// render from the agent's history as it does `response`. A declined turn is not continued.
+fn record_thread(
+    threads: &super::threads::Threads,
+    plan: &super::threads::ThreadPlan,
+    id: &str,
+    response: &adk_core::LlmResponse,
+    prompt_caching: bool,
+    forms: super::toolsets::ToolsetForms,
+) {
+    if response.error_code.is_some() {
+        return;
+    }
+    let Some(content) = &response.content else { return };
+    if let Ok(reply) = convert::content_to_message(content, prompt_caching, forms) {
+        threads.record(plan, id, reply);
     }
 }
 
@@ -717,12 +928,21 @@ fn extract_retry_hint(e: &adk_anthropic::Error) -> Option<ServerRetryHint> {
 impl Llm for AnthropicClient {
     // The `max_tokens` the client sends, thinking included.
     fn max_cost_micro_usd(&self, request: &adk_core::LlmRequest) -> Option<u64> {
-        crate::pricing::PricingCatalog::standard().max_cost_micro_usd(
+        let output =
+            crate::pricing::request_output_cap(request).unwrap_or(u64::from(self.max_tokens));
+        let executor = crate::pricing::PricingCatalog::standard().max_cost_micro_usd(
             Some("anthropic"),
             self.name(),
             request,
-            Some(crate::pricing::request_output_cap(request).unwrap_or(u64::from(self.max_tokens))),
-        )
+            Some(output),
+        )?;
+        // Advisor calls are billed at the advisor's rates, apart from the executor's usage.
+        let advisor = super::advisor::advisor_cost_bound_micro_usd(request, output)?;
+        Some(executor.saturating_add(advisor))
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        crate::pricing::PricingCatalog::standard().context_window(Some("anthropic"), self.name())
     }
 
     fn name(&self) -> &str {
@@ -754,6 +974,22 @@ impl Llm for AnthropicClient {
         }
     }
 
+    // On-demand compaction is documented for the Claude API; a custom endpoint may not serve
+    // the beta.
+    fn native_compaction(&self) -> Option<adk_core::NativeCompaction> {
+        let first_party = self.config.base_url.as_deref().is_none_or(|url| {
+            crate::provider::url_host(url).as_deref() == Some("api.anthropic.com")
+        });
+        (first_party && Self::compacts_on_demand(&self.model))
+            .then(|| adk_core::NativeCompaction::new("anthropic").keeping_thinking())
+    }
+
+    /// Opens the pooled connections of the request and stream clients with a `GET
+    /// /v1/models` each; no tokens are spent.
+    async fn prewarm(&self) -> Result<(), AdkError> {
+        self.inner().prewarm().await.map_err(convert_anthropic_error)
+    }
+
     #[tracing::instrument(
         name = "model.generate_content",
         skip_all,
@@ -773,7 +1009,8 @@ impl Llm for AnthropicClient {
             &mut request.contents,
             &adk_core::history::ProviderOrigin::new("anthropic", &self.model),
         );
-        let usage_span = adk_telemetry::llm_generate_span("anthropic", &self.model, stream);
+        let usage_span =
+            crate::telemetry::inference_span("anthropic", &self.model, stream, &request);
         let model = self.model.clone();
         let max_tokens = self.max_tokens;
         let client = self.client.clone();
@@ -781,63 +1018,119 @@ impl Llm for AnthropicClient {
         let request_for_retry = request.clone();
         let anthropic_config = self.config.clone();
         let request_adapter = self.request_adapter.clone();
+        let tool_ledgers = self.inline_tool_ledgers();
+        let threads = self.thread_store();
 
         let response_stream = try_stream! {
             if stream {
                 // Streaming mode
                 let client_ref = &client;
                 let model_ref = model.as_str();
-                let event_stream = execute_with_retry(&retry_config, is_retryable_model_error, || {
+                let (event_stream, plan, forms) = execute_with_retry(&retry_config, is_retryable_model_error, || {
                     let request = request_for_retry.clone();
                     let cfg = &anthropic_config;
                     let adapter = request_adapter.as_ref();
+                    let ledgers = tool_ledgers.as_deref();
+                    let threads = threads.as_deref();
                     async move {
                         let mut params = Self::build_message_params(model_ref, max_tokens, &request, cfg)?;
                         params.stream = true;
-                        if let Some(adapter) = adapter {
-                            let (params, headers) = super::request::prepare(client_ref, params, adapter)?;
-                            client_ref
-                                .stream_with_headers(&params, headers)
-                                .await
-                                .map(|events| events.boxed())
-                                .map_err(convert_anthropic_error)
-                        } else {
-                            client_ref
-                                .stream(&params)
-                                .await
-                                .map(|events| events.boxed())
-                                .map_err(convert_anthropic_error)
+                        let forms = super::toolsets::ToolsetForms::of(params.tools.as_deref().unwrap_or_default());
+                        if let Some(ledgers) = ledgers {
+                            ledgers.apply(&mut params);
+                        }
+                        let plan = threads.and_then(|threads| threads.prepare(&mut params));
+                        match open_stream(client_ref, &params, adapter).await {
+                            Ok(events) => Ok((events, plan, forms)),
+                            Err(error) => match (plan, threads) {
+                                (Some(plan), Some(threads)) if thread_refused(&error) => {
+                                    if !plan.continues {
+                                        threads.unthread(&plan);
+                                    }
+                                    let events = open_stream(client_ref, &plan.unthreaded(), adapter).await?;
+                                    Ok((events, None, forms))
+                                }
+                                _ => Err(error),
+                            },
                         }
                     }
                 })
                 .await?;
 
-                let mut responses = super::streaming::responses(event_stream);
+                // The thread continues from this response's id, once it completes.
+                let message_id = Arc::new(std::sync::Mutex::new(None::<String>));
+                let seen = message_id.clone();
+                let event_stream = event_stream.inspect(move |event| {
+                    if let Ok(adk_anthropic::MessageStreamEvent::MessageStart(start)) = event {
+                        *seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(start.message.id.clone());
+                    }
+                });
+                let mut responses = super::streaming::responses(event_stream, forms);
                 while let Some(response) = responses.next().await {
-                    yield response?;
+                    let response = response?;
+                    // Recorded before the complete turn is yielded: a caller stops reading once
+                    // it has the final turn.
+                    if !response.partial
+                        && response.content.is_some()
+                        && let (Some(threads), Some(plan)) = (&threads, &plan)
+                        && let Some(id) = message_id
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone()
+                    {
+                        record_thread(threads, plan, &id, &response, anthropic_config.prompt_caching, forms);
+                    }
+                    yield response;
                 }
             } else {
                 // Non-streaming mode
                 let client_ref = &client;
                 let model_ref = model.as_str();
-                let message = execute_with_retry(&retry_config, is_retryable_model_error, || {
+                let (message, plan, forms) = execute_with_retry(&retry_config, is_retryable_model_error, || {
                     let request = request_for_retry.clone();
                     let cfg = &anthropic_config;
                     let adapter = request_adapter.as_ref();
+                    let ledgers = tool_ledgers.as_deref();
+                    let threads = threads.as_deref();
                     async move {
-                        let params = Self::build_message_params(model_ref, max_tokens, &request, cfg)?;
-                        if let Some(adapter) = adapter {
-                            let (params, headers) = super::request::prepare(client_ref, params, adapter)?;
-                            client_ref
-                                .send_with_headers(params, headers)
-                                .await
-                                .map_err(convert_anthropic_error)
-                        } else {
-                            client_ref
-                                .send(params)
-                                .await
-                                .map_err(convert_anthropic_error)
+                        let mut params = Self::build_message_params(model_ref, max_tokens, &request, cfg)?;
+                        let forms = super::toolsets::ToolsetForms::of(params.tools.as_deref().unwrap_or_default());
+                        // A compaction request remembers its tools for the conversation that
+                        // continues from the summary.
+                        let compaction_tools = match ledgers {
+                            Some(ledgers) => {
+                                let tools = params
+                                    .compaction
+                                    .is_some()
+                                    .then(|| ledgers.compaction_tools(&params))
+                                    .flatten();
+                                ledgers.apply(&mut params);
+                                tools.map(|tools| (tools, params.clone()))
+                            }
+                            None => None,
+                        };
+                        let plan = threads.and_then(|threads| threads.prepare(&mut params));
+                        let (message, plan) = match send_unary(client_ref, params, adapter).await {
+                            Ok(message) => (message, plan),
+                            Err(error) => match (plan, threads) {
+                                // A thread error comes before the model runs and uses no tokens;
+                                // the conversation is sent again without a thread.
+                                (Some(plan), Some(threads)) if thread_refused(&error) => {
+                                    if !plan.continues {
+                                        threads.unthread(&plan);
+                                    }
+                                    (send_unary(client_ref, plan.unthreaded(), adapter).await?, None)
+                                }
+                                _ => return Err(error),
+                            },
+                        };
+                        if let (Some(ledgers), Some((tools, sent))) = (ledgers, compaction_tools)
+                            && let Some(ContentBlock::Compaction(block)) = message.content.first()
+                        {
+                            ledgers.continue_after(&sent.model, &sent, block, tools);
                         }
+                        Ok((message, plan, forms))
                     }
                 })
                 .await?;
@@ -850,16 +1143,26 @@ impl Llm for AnthropicClient {
                 // the actual `request-id` header value.
                 Span::current().record("anthropic.request_id", message.id.as_str());
 
-                yield convert::from_anthropic_message(&message).0;
+                let response = convert::from_anthropic_message(&message, forms).0;
+                if let (Some(threads), Some(plan)) = (&threads, plan) {
+                    record_thread(threads, &plan, &message.id, &response, anthropic_config.prompt_caching, forms);
+                }
+                yield response;
             }
         };
 
-        Ok(crate::usage_tracking::with_priced_usage_tracking(
+        let priced = crate::usage_tracking::with_priced_usage_tracking(
             Box::pin(response_stream),
             usage_span,
             "anthropic",
             &self.model,
-        ))
+        );
+        Ok(Box::pin(priced.map(|response| {
+            response.map(|mut response| {
+                super::advisor::add_advisor_cost(&mut response);
+                response
+            })
+        })))
     }
 }
 
@@ -896,7 +1199,7 @@ mod tests {
         LlmRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             contents,
-            tools: std::collections::HashMap::new(),
+            tools: adk_core::ToolDeclarations::new(),
             config: None,
             previous_response_id: None,
         }
@@ -995,6 +1298,127 @@ mod tests {
         );
     }
 
+    fn native_compaction_turn() -> Content {
+        let message = {
+            let mut message = adk_anthropic::Message::new(
+                "msg_compaction".into(),
+                vec![ContentBlock::Compaction(adk_anthropic::CompactionBlock::new(
+                    "Recipe app entities agreed.",
+                    "sig-1",
+                ))],
+                adk_anthropic::Model::Custom("claude-sonnet-5-5".into()),
+                adk_anthropic::Usage::new(0, 0),
+            );
+            message.stop_reason = Some(adk_anthropic::StopReason::Compaction);
+            message
+        };
+        convert::from_anthropic_message(&message, Default::default()).0.content.unwrap()
+    }
+
+    #[test]
+    fn a_native_compaction_request_asks_for_a_summary_without_reply_settings() {
+        let mut request = make_request(vec![
+            Content::new("system").with_text("You plan recipes."),
+            Content::new("user").with_text("Name the entities."),
+            Content::new("model").with_text("Recipe, Ingredient, Step."),
+        ]);
+        request.config = Some(GenerateContentConfig {
+            stop_sequences: vec!["END".to_string()],
+            response_schema: Some(json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+                "additionalProperties": false
+            })),
+            ..Default::default()
+        });
+        adk_core::intra_compaction::NativeCompactionRequest::new()
+            .with_instructions("Keep every entity name.")
+            .apply(&mut request);
+        let config = AnthropicConfig::new("test", "claude-sonnet-5-5");
+
+        let params =
+            AnthropicClient::build_message_params("claude-sonnet-5-5", 4096, &request, &config)
+                .unwrap();
+
+        assert_eq!(
+            params.compaction,
+            Some(
+                adk_anthropic::CompactionParam::summarize()
+                    .with_instructions("Keep every entity name.")
+            )
+        );
+        assert_eq!(params.stop_sequences, None);
+        assert!(params.output_config.as_ref().is_none_or(|output| output.format.is_none()));
+        assert!(params.requires_compaction_beta());
+        assert!(params.system.is_some(), "the summarizer reads the agent's instructions");
+    }
+
+    #[test]
+    fn a_native_compaction_goes_first_as_its_signed_block() {
+        let request = make_request(vec![
+            native_compaction_turn(),
+            Content::new("model").with_text("Recipe needs a title."),
+            Content::new("user").with_text("Now Ingredient."),
+        ]);
+        let config = AnthropicConfig::new("test", "claude-sonnet-5-5");
+
+        let params =
+            AnthropicClient::build_message_params("claude-sonnet-5-5", 4096, &request, &config)
+                .unwrap();
+
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(
+            json["messages"][0]["content"][0],
+            json!({"type": "compaction", "content": "Recipe app entities agreed.", "signature": "sig-1"})
+        );
+        assert_eq!(json["messages"][0]["role"], "assistant");
+        assert!(params.compaction.is_none());
+        assert!(params.requires_compaction_beta());
+    }
+
+    #[test]
+    fn a_compaction_block_that_is_not_first_is_sent_as_its_summary() {
+        let request = make_request(vec![
+            Content::new("user").with_text("Earlier question."),
+            native_compaction_turn(),
+            Content::new("user").with_text("Now Ingredient."),
+        ]);
+        let config = AnthropicConfig::new("test", "claude-sonnet-5-5");
+
+        let params =
+            AnthropicClient::build_message_params("claude-sonnet-5-5", 4096, &request, &config)
+                .unwrap();
+
+        assert!(!params.requires_compaction_beta());
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(
+            json["messages"][1]["content"][0]["text"],
+            adk_core::intra_compaction::compaction_summary_text("Recipe app entities agreed.")
+        );
+    }
+
+    #[test]
+    fn only_first_party_models_that_compact_on_demand_report_native_compaction() {
+        let native = |model: &str, base_url: Option<&str>| {
+            let mut config = AnthropicConfig::new("test-key", model);
+            if let Some(url) = base_url {
+                config = config.with_base_url(url);
+            }
+            AnthropicClient::new(config).unwrap().native_compaction()
+        };
+        assert_eq!(
+            native("claude-sonnet-5-5", None),
+            Some(adk_core::NativeCompaction::new("anthropic").keeping_thinking())
+        );
+        assert!(native("claude-haiku-5-5", None).is_some());
+        assert!(native("claude-opus-4-6-20260101", None).is_some());
+        assert!(native("claude-opus-5-1", None).is_none(), "not a listed model");
+        assert!(native("claude-haiku-4-5", None).is_none());
+        assert!(native("claude-sonnet-5-5", Some("https://api.anthropic.com")).is_some());
+        assert!(native("claude-sonnet-5-5", Some("https://api.deepseek.com/anthropic")).is_none());
+    }
+
     #[test]
     fn claude_5_rejects_sampling_before_network_io() {
         let mut request = make_request(vec![Content::new("user").with_text("hello")]);
@@ -1074,6 +1498,91 @@ mod tests {
             AnthropicClient::build_message_params("claude-opus-5-5", 4096, &request, &config)
                 .expect("request should build");
         assert!(params.thinking.is_none());
+    }
+
+    #[test]
+    fn between_tools_turns_thinking_off_with_no_other_field() {
+        let mut request = make_request(vec![Content::new("user").with_text("hello")]);
+        request.config = Some(GenerateContentConfig {
+            effort: Some(adk_core::Effort::High),
+            ..Default::default()
+        });
+        let config = AnthropicConfig::new("test", "claude-sonnet-5-5")
+            .with_thinking_mode(super::super::config::ThinkingMode::BetweenTools)
+            .with_thinking_display(adk_anthropic::ThinkingDisplay::Summarized);
+        let params =
+            AnthropicClient::build_message_params("claude-sonnet-5-5", 4096, &request, &config)
+                .expect("request should build");
+        assert_eq!(
+            serde_json::to_value(params.thinking).unwrap(),
+            json!({"type": "between_tools"})
+        );
+        assert_eq!(params.temperature, None);
+    }
+
+    /// Claude Fable 5.1 and later, Mythos 5.1 and later, Opus 5.5 and Sonnet 5.5 reject a
+    /// forced `tool_choice`; tools and an output schema leave the choice to the model.
+    #[test]
+    fn tools_and_output_schema_never_force_a_tool_choice() {
+        let mut request = make_request(vec![Content::new("user").with_text("weather?")]);
+        request.tools.insert(
+            "get_weather".to_string(),
+            json!({"description": "Weather", "parameters": {"type": "object", "properties": {}}}),
+        );
+        request.config = Some(GenerateContentConfig {
+            response_schema: Some(
+                json!({"type": "object", "properties": {"answer": {"type": "string"}}}),
+            ),
+            ..Default::default()
+        });
+        for model in
+            ["claude-fable-5-2", "claude-mythos-5-2", "claude-opus-5-5", "claude-sonnet-5-5"]
+        {
+            let params = AnthropicClient::build_message_params(
+                model,
+                4096,
+                &request,
+                &AnthropicConfig::new("test", model),
+            )
+            .expect("request should build");
+            assert_eq!(params.tool_choice, None, "{model}");
+            assert_eq!(params.tools.as_ref().map(Vec::len), Some(1), "{model}");
+        }
+    }
+
+    #[test]
+    fn a_response_schema_is_sent_as_structured_output_beside_the_effort() {
+        let mut request = make_request(vec![Content::new("user").with_text("route this")]);
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "choice": {"type": "string", "enum": ["a", "b"]},
+                "confidence": {"type": "number", "minimum": 0}
+            },
+            "required": ["choice", "confidence"]
+        });
+        request.config = Some(GenerateContentConfig {
+            response_schema: Some(schema),
+            effort: Some(adk_core::Effort::Low),
+            ..Default::default()
+        });
+        let params = AnthropicClient::build_message_params(
+            "claude-sonnet-5-5",
+            4096,
+            &request,
+            &AnthropicConfig::new("test", "claude-sonnet-5-5"),
+        )
+        .expect("request should build");
+        let output = serde_json::to_value(params.output_config).unwrap();
+        assert_eq!(output["format"]["type"], "json_schema");
+        assert_eq!(output["format"]["schema"]["additionalProperties"], false);
+        assert_eq!(
+            output["format"]["schema"]["properties"]["confidence"],
+            json!({"type": "number"})
+        );
+        assert!(output.get("effort").is_some(), "{output}");
+        assert!(params.tool_choice.is_none());
+        assert!(params.tools.is_none());
     }
 
     #[test]
@@ -1195,11 +1704,39 @@ mod tests {
             assert_eq!(error.code, "model.anthropic.fast_mode_unsupported");
         }
 
-        for model in ["claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"] {
+        for model in [
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-fable-5-2",
+            "claude-mythos-5-2",
+            "anthropic.claude-opus-5-5",
+        ] {
             let config = AnthropicConfig::new("test", model).with_fast_mode(true);
             let params = AnthropicClient::build_message_params(model, 4096, &request, &config)
-                .expect("supported Opus fast mode should be accepted");
-            assert_eq!(params.speed, Some(adk_anthropic::SpeedMode::Fast));
+                .expect("supported fast mode should be accepted");
+            assert_eq!(params.speed, Some(adk_anthropic::SpeedMode::Fast), "{model}");
+        }
+    }
+
+    #[test]
+    fn platform_model_ids_follow_the_first_party_sampling_contract() {
+        let mut request = make_request(vec![Content::new("user").with_text("hello")]);
+        request.config = Some(GenerateContentConfig { top_p: Some(0.9), ..Default::default() });
+
+        for model in [
+            "anthropic.claude-sonnet-5-5",
+            "global.anthropic.claude-fable-5-2",
+            "us.anthropic.claude-opus-4-7-v1",
+        ] {
+            let error = AnthropicClient::build_message_params(
+                model,
+                4096,
+                &request,
+                &AnthropicConfig::default(),
+            )
+            .expect_err("restricted sampling should be rejected locally");
+            assert_eq!(error.code, "model.anthropic.claude5_sampling_unsupported", "{model}");
         }
     }
 

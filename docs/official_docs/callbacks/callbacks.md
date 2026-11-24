@@ -161,6 +161,11 @@ error's component, category, and code but not its message, except for a rejectio
 | `before_tool` (and runner plugin `before_tool`, enhanced `before_tool_call`) | The tool is not run: `{"error": "tool 'x' was not run: a before-tool callback failed with ..."}` |
 | `after_tool`, `after_tool_full` (and runner plugin `after_tool`, enhanced `after_tool_call`) | The tool already ran, so its result is withheld and the model is told not to call it again: `{"status": "result_withheld", "error": "tool 'x' ran, but its after-tool pipeline failed with ..."}`. The remaining after-tool stages do not run |
 
+A before-tool callback or an enhanced `before_tool_call` plugin that panics fails the call
+closed, as an error does: `adk_core::guard_callback` turns the panic into a `callback.panicked`
+error (`CALLBACK_PANICKED_CODE`), the tool is not run, and the turn goes on. `LlmAgent`,
+`CodeActAgent` and `EnhancedPluginManager` all guard their before-tool stage this way.
+
 ### Model Callbacks
 
 **BeforeModelCallback** uses `BeforeModelResult`:
@@ -174,7 +179,8 @@ error's component, category, and code but not its message, except for a rejectio
 A modified request changes that model call only: the agent builds the next request of the turn
 from its own history again. A callback that compacts the history repeats the work on every
 request, and its result never carries over. Compaction belongs in a
-[history processor](#history-processors).
+[history processor](#history-processors), or in the run's auto-compaction, which is on by
+default.
 
 **AfterModelCallback** uses `Option<LlmResponse>`:
 
@@ -216,12 +222,17 @@ type HistoryProcessor = Box<
 | Receives | The agent's own history: instructions as `system` contents, the conversation, and the turn's calls and responses, with the call IDs the agent generated for a provider that sent none | The request as built, with what toolsets, enhanced plugins, run hooks and earlier callbacks added |
 | Its result | Replaces the history; later steps of the turn append to it | Is sent once; the next request is built from the history again |
 | Runs | Before each model request, ahead of toolsets, plugins, run hooks and callbacks | Before each model request, after toolsets, enhanced plugins and run hooks |
-| Use it for | Compaction, windows over long tool loops | Per-request material: memories, reminders, caching |
+| Use it for | Windows and rewrites of your own over long tool loops | Per-request material: memories, reminders, caching |
 | `Err(e)` | Ends the turn with the error | Ends the turn with the error |
 
 Processors run in the order added, each receiving the previous one's output. What toolsets,
 plugins, run hooks and `before_model` callbacks add to a request never enters the history, so
 it reaches each request once however the history is compacted.
+
+Auto-compaction runs after the processors, on their output: once the request nears the model's
+context window, the run's compactor summarizes the history (see
+[Context Compaction](../sessions/context-compaction.md#auto-compaction-within-a-run)). A
+processor is for a window or a rewrite of your own; auto-compaction needs none.
 
 A provider rejects a function response whose call is not in the request.
 `adk_rust::history::balanced_content_cut` moves a cut back to the nearest point that keeps
@@ -267,7 +278,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 
     let agent = LlmAgentBuilder::new("my_agent")
         .model(model)

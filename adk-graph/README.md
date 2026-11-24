@@ -16,29 +16,31 @@ Graph-based workflow orchestration for Rust Agent Development Kit (ADK-Rust) age
 - **AgentNode**: Wrap LLM agents as graph nodes with custom input/output mappers. Under a `Runner` the agent sees the caller's session — its id, and its state with the graph's state on top, so instruction templates resolve — and `GraphAgent` streams the agent's events to the caller as they are produced, so the session records them. An agent's failure is `GraphError::AgentFailed`, which keeps the agent's `AdkError` category and code
 - **Cyclic Support**: Native support for loops and iterative reasoning (ReAct pattern)
 - **Conditional Routing**: Dynamic edge routing based on state
+- **Decision nodes**: `DecisionNode` routes by a model's typed decision, made with structured output, and writes the route, rationale and confidence to state; its call counts against the run budget
 - **Fan-out / fan-in**: parallel branches run concurrently in a super-step. A node with more than one incoming direct edge is deferred **automatically**, so it runs once after the branches that can still reach it arrive — branches of unequal length, a merge after a conditional branch, a node re-entered by a loop, and an entry node that is also a join run correctly with no configuration. `mark_deferred` sets a `fan_in_timeout` or an *n*-of-*m* `min_predecessors` quorum
 - **State Management**: Typed state with reducers (overwrite, append, sum, custom)
 - **Checkpointing**: Persistent state after each step — memory, SQLite, PostgreSQL, Redis, MongoDB, Neo4j, Firestore — every backend proven by one conformance suite; per-thread versions refuse a second writer with `GraphError::CheckpointConflict` instead of interleaving
 - **Durability modes**: `Sync` (default), `Async`, or `Exit` per run; a step with a declared `NonIdempotent` node writes earlier checkpoints first
 - **Pending writes**: when one node of a parallel step fails, the finished nodes are not run again on resume
 - **Durable Resume**: Automatically resume from the last checkpoint after a crash — skips nodes of every checkpointed step. Execution is at-least-once: a crash mid-step re-runs that step's nodes; see [Execution Guarantees](#execution-guarantees)
-- **Human-in-the-Loop**: Interrupt before/after nodes, dynamic interrupts. A pause is resumable, including one raised inside a subgraph. Every pause of a step reaches the caller, and `NodeContext::resume_value` hands a paused node the answer to that pause alone
+- **Human-in-the-Loop**: Interrupt before/after nodes, dynamic interrupts. A pause is resumable, including one raised inside a subgraph. Every pause of a step reaches the caller, and `NodeContext::resume_value` hands a paused node the answer to that pause alone. Each dynamic pause has a stable id (`Interrupt::id`), may declare a JSON Schema for its answer (`NodeOutput::with_response_schema`, checked on resume), and `ExecutionConfig::strict_resume` accepts answers only under the ids of pending pauses, refusing stale ones with `GraphError::ResumeRejected`
 - **Subgraphs**: run a compiled graph as a node with mapped channels (`SubgraphNode`). A pause inside pauses the parent, and a channel mapping that names a channel neither side declares fails when the parent **compiles**
 - **Routing from inside a node**: `NodeOutput::with_goto` names successors and replaces the node's declared edges; `AgentNode::with_goto_mapper` routes on what the agent answered; `with_goto_parent` hands control to a node of the parent graph
 - **Reliability**: per-node retry with backoff and jitter that never exceeds `max_delay`, a concurrency bound, per-node timeouts, graph-wide `NodeDefaults`, and `with_node_error_handler` to recover once a retry budget is spent. A failure no handler recovers stops the step: queued nodes do not start and sibling retries stop waiting
 - **Invoking a node directly**: `ctx.run_node_with` runs a node the graph has no edge to, sized from state, and records it so a resume does not pay for it twice; concurrent calls under one run id run the child once
 - **As a tool**: `NodeTool` exposes a graph or a single node through the `Tool` trait, so an `LlmAgent` can call a whole graph
-- **Bounded growth**: `RetentionPolicy` limits how many checkpoints a thread keeps, by count or age
+- **Bounded growth**: `RetentionPolicy` limits how many checkpoints a thread keeps, by count or age, after every save or on demand with `Checkpointer::prune`. It never removes what a resume still needs — the newest checkpoint, each pause no run has resumed, each effect-log entry — or a checkpoint it pins; `Checkpointer::delete` removes a whole thread. Every backend runs the same conformance case
 - **Run records**: every checkpoint carries its run, the steps finished since the previous one (each node's start, duration, status, written keys and attempt) and a fork's lineage, so an observer reads a run's history from checkpoints alone; `CompiledGraph::shape` reports the graph's nodes, edges and entry nodes
 - **Fork with edits** (feature: `time-travel`): `TimeTravelHandle::fork` branches a new thread from a checkpoint with channels overwritten, keeps waiting joins, and records the fork's lineage; the source thread is never written
 - **Governed nodes**: `with_governed_node` puts a node's call on the governed path — approval, edits, the kill switch and the action ledger — so it runs at most once per call in its lineage, forks included; a run without an action ledger, or a graph without a checkpointer, does not run it
 - **Strictness, opt-in**: `with_strict_channels` fails the run when a node writes a channel the schema does not declare
 - **Streaming**: Five stream modes (values, updates, messages, custom, debug)
-- **ADK Integration**: Full callback support, works with existing runners
+- **ADK Integration**: `before_agent_callback` and `after_agent_callback` on `GraphAgentBuilder`; a `GraphAgent` runs under any `Runner`
+- **YAML and JSON workflows** (feature: `yaml`): `WorkflowDefinition` reads a workflow file — agent and LLM nodes, `set`, function, action and interrupt nodes, conditional routes over a safe condition language, interrupts and checkpointing — validates it with each issue's path, line and column, and builds it against a `WorkflowRegistry`; `schemas/workflow.schema.json` gives editors completion, and `adk-rust graph run` runs a file. See [YAML Workflows](../docs/official_docs/agents/graph-workflows-yaml.md)
 - **Functional API** (feature: `functional`): Write workflows as async functions with automatic checkpointing
 - **Typed State Reducers**: ReducedValue, UntrackedValue, MessagesValue containers
 - **State Schema Validation**: Type-level validation at workflow boundaries
-- **Proc Macros**: `#[entrypoint]` and `#[task]` (from `adk-rust-macros`) for zero-boilerplate workflow definition
+- **Proc Macros**: `#[entrypoint]` and `#[task]` (from `adk-rust-macros`) generate the workflow agent and the recorded task wrappers
 
 ## Architecture
 
@@ -62,10 +64,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-adk-graph = "3.0"
-adk-agent = "3.0"
-adk-model = "3.0"
-adk-core = "3.0"
+adk-graph = "3.0.0"
+adk-agent = "3.0.0"
+adk-model = "3.0.0"
+adk-core = "3.0.0"
 anyhow = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -106,7 +108,7 @@ fn text_into(channel: &'static str) -> impl Fn(&[Event]) -> HashMap<String, Valu
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 
     // Create LLM agents
     let translator = LlmAgentBuilder::new("translator")
@@ -313,7 +315,9 @@ async fn run(planner: Arc<dyn Agent>, input: State) -> adk_graph::Result<()> {
 ```
 
 `GraphError::Interrupted` carries an `InterruptedExecution`: its `interrupt` is the first pause
-and `interrupts` holds every pause of the step, in node-name order.
+and `interrupts` holds every pause of the step, in node-name order. A dynamic pause carries its
+id (`Interrupt::id`), which answers it as a resume key too; see
+[Interrupt Ids, Typed Answers and Strict Resume](../docs/official_docs/agents/graph-agents.md#interrupt-ids-typed-answers-and-strict-resume).
 
 ### ReAct Agent with Tools
 
@@ -392,7 +396,9 @@ fn node(agent: Arc<dyn Agent>) -> AgentNode {
 ```
 
 Without mappers, the input is the last `messages` entry or the `input` channel, and the output is
-the agent's text.
+one `messages` entry per response the agent completes, with its whole text whether the model
+streamed it or not. A custom output mapper receives every event the agent yielded, streamed
+partial chunks included; the non-partial events carry each response's complete content.
 
 ### FunctionNode
 
@@ -540,7 +546,7 @@ fn harden(graph: CompiledGraph) -> CompiledGraph {
 | Retry when no policy is attached | one attempt |
 | `RetryPolicy::default()` | ten attempts; 1s initial delay doubling to a 60s cap, with full jitter — the nine sleeps average about 151s in total |
 | Concurrency | the whole frontier |
-| Checkpoints kept | every one, until a retention policy is set |
+| Checkpoints kept | every one, until a retention policy is set; a policy keeps the newest, open pauses and effect-log entries |
 | Durability | `Durability::Sync`: each super-step's checkpoint is written before the next starts |
 
 An interrupt is never retried and never reaches an error handler: a pause is not a
@@ -723,22 +729,18 @@ and [Graph Agents](../docs/official_docs/agents/graph-agents.md#governed-nodes).
 
 ## Examples
 
-Standalone examples in this repository:
+Standalone examples, in this repository unless the row names adk-playground:
 
 | Example | Shows |
 |---------|-------|
 | [`graph_runtime`](https://github.com/zavora-ai/adk-rust/tree/main/examples/graph_runtime) | Dispatch, streaming, retries, pauses, and cancellation under a `Runner`, over memory, SQLite, and Redis checkpointers |
 | [`graph_correctness`](https://github.com/zavora-ai/adk-rust/tree/main/examples/graph_correctness) | Joins after conditional branches and loops, agent errors, subgraphs, `run_node` children, and graph tools |
-| [`coding_graph`](https://github.com/zavora-ai/adk-rust/tree/main/examples/coding_graph) | Implement, parallel reviewers, synthesize, and a revise loop |
-| [`graph_goto_routing`](https://github.com/zavora-ai/adk-rust/tree/main/examples/graph_goto_routing) | An `LlmAgent` classifier that names the next node |
-| [`graph_subgraph_claims`](https://github.com/zavora-ai/adk-rust/tree/main/examples/graph_subgraph_claims) | A claim pipeline built from nested graphs |
-| [`graph_resilient_research`](https://github.com/zavora-ai/adk-rust/tree/main/examples/graph_resilient_research) | A graph exposed to an `LlmAgent` as a tool |
+| `coding_graph` in [adk-playground](https://github.com/zavora-ai/adk-playground) | Implement, parallel reviewers, synthesize, and a revise loop |
+| `graph_goto_routing` in [adk-playground](https://github.com/zavora-ai/adk-playground) | An `LlmAgent` classifier that names the next node |
+| `graph_subgraph_claims` in [adk-playground](https://github.com/zavora-ai/adk-playground) | A claim pipeline built from nested graphs |
+| `graph_resilient_research` in [adk-playground](https://github.com/zavora-ai/adk-playground) | A graph exposed to an `LlmAgent` as a tool |
 | [`competitive_graph_resume`](https://github.com/zavora-ai/adk-rust/tree/main/examples/competitive_graph_resume) | Resume from a checkpoint |
-| [`functional_workflow`](https://github.com/zavora-ai/adk-rust/tree/main/examples/functional_workflow) | The Functional API, with no API key |
-
-```bash
-cargo run --manifest-path examples/functional_workflow/Cargo.toml
-```
+| `functional_workflow` in [adk-playground](https://github.com/zavora-ai/adk-playground) | The Functional API, with no API key |
 
 ## Comparison with LangGraph
 
@@ -768,9 +770,14 @@ No feature is enabled by default.
 | `time-travel` | Step, fork, and state history |
 | `action` | `ActionNodeExecutor` for `adk-action` node configurations |
 | `action-http`, `action-rss`, `action-trigger` | HTTP and notification nodes, RSS feeds, cron/webhook trigger runtime |
-| `action-db`, `action-db-mongo`, `action-db-redis`, `action-email`, `action-code` | Placeholders only — see [Action Nodes](#action-nodes) |
-| `action-full` | `action`, `action-trigger`, `action-http`, `action-db`, `action-code`, `action-email`, `action-rss` |
-| `full` | `sqlite` and `action-full` |
+| `action-db`, `action-email` | Placeholders only — see [Action Nodes](#action-nodes) |
+| `action-full` | `action`, `action-trigger`, `action-http`, `action-db`, `action-email`, `action-rss` |
+| `yaml` | `definition`: workflows from YAML or JSON files, their validation and JSON Schema (implies `action`) |
+| `full` | `sqlite`, `action-full` and `yaml` |
+
+Through the `adk-rust` umbrella, its `action` feature enables this crate's `action`, `action-db`,
+and `action-email`, and its `action-http` feature enables `action-http` and `action-rss`.
+`adk-rust` has no `action-db`, `action-email`, `action-rss`, or `action-code` feature.
 
 ## Action Nodes
 
@@ -814,8 +821,8 @@ The Functional API (feature: `functional`) provides a higher-level programming m
 
 ```toml
 [dependencies]
-adk-graph = { version = "3.0", features = ["functional"] }
-adk-rust-macros = "3.0"
+adk-graph = { version = "3.0.0", features = ["functional"] }
+adk-rust-macros = "3.0.0"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```

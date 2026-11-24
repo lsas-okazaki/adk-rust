@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use adk_core::{AdkError, Effort, Result};
+use adk_core::{AdkError, Effort, IntraCompactionConfig, Result};
 use adk_harness::hooks::{HookSet, HookSource};
 use adk_harness::{
     EffortPolicy, HarnessMode, MemberSpec, Pack, Preset, SearchDomains, SnapshotConfig,
@@ -74,6 +74,12 @@ pub struct HarnessArgs {
     /// Let --yes approve an unsandboxed retry of a command the sandbox refused
     #[arg(long)]
     pub allow_unsandboxed: bool,
+
+    /// In auto mode, have the session's model review each call the mode holds (a host
+    /// command, an external tool) and approve, deny or escalate it to you; never decides a
+    /// denied or non-waivable call
+    #[arg(long)]
+    pub auto_review: bool,
 
     /// Refuse to start when the sandbox is unavailable instead of running bash on the
     /// host behind approvals (requires --sandbox)
@@ -443,6 +449,8 @@ struct ConfigFile {
     yes: Option<bool>,
     sandbox: Option<bool>,
     allow_unsandboxed: Option<bool>,
+    /// `auto_review = true`: the model reviews what auto mode holds; the user config only.
+    auto_review: Option<bool>,
     fail_if_unavailable: Option<bool>,
     trust: Option<bool>,
     packs: Option<Vec<String>>,
@@ -464,6 +472,8 @@ struct ConfigFile {
     snapshots: Option<SnapshotsTable>,
     /// `[memory]`: what embeds long-term facts (spec 3.1 §7.32).
     memory: Option<MemoryTable>,
+    /// `[compaction]`: when a run compacts the agent's history before a model call.
+    compaction: Option<CompactionTable>,
     /// `[[hooks]]` tables (spec 3.1 §7.22): the user config's are read by
     /// `HookSet::load_file`, the workspace's by the harness at build, so they are neither
     /// applied here nor reported as unknown.
@@ -480,6 +490,11 @@ struct ConfigFile {
     #[serde(default)]
     #[allow(dead_code)]
     kernel: Option<toml::Value>,
+    /// `[goal]` (spec 3.1 §7.11): the rubric `adk-rust goal` grades against, read through
+    /// `RubricArgs::resolve`, so it is neither applied here nor reported as unknown.
+    #[serde(default)]
+    #[allow(dead_code)]
+    goal: Option<toml::Value>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -530,6 +545,50 @@ struct MemoryTable {
     embedder: Option<String>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
+}
+
+/// The `[compaction]` table: when a run compacts the agent's history before a model call.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct CompactionTable {
+    /// `false` turns auto-compaction off.
+    auto: Option<bool>,
+    /// A fixed threshold in estimated tokens, in place of the window fraction.
+    threshold_tokens: Option<u64>,
+    /// The share of the model's context window a request may reach (default 0.8).
+    window_fraction: Option<f64>,
+    /// How many of the most recent history entries are kept as they are (default 10).
+    keep_recent: Option<usize>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+
+impl CompactionTable {
+    /// `current` with this table's settings applied.
+    fn apply(
+        &self,
+        current: Option<IntraCompactionConfig>,
+        origin: &str,
+        notes: &mut Vec<String>,
+    ) -> IntraCompactionConfig {
+        for key in self.unknown.keys() {
+            notes.push(format!("{origin}: unknown key `compaction.{key}` ignored"));
+        }
+        let mut config = current.unwrap_or_default();
+        if let Some(auto) = self.auto {
+            config.enabled = auto;
+        }
+        if let Some(threshold) = self.threshold_tokens {
+            config.token_threshold = Some(threshold);
+        }
+        if let Some(fraction) = self.window_fraction {
+            config.context_window_fraction = fraction;
+        }
+        if let Some(keep) = self.keep_recent {
+            config.overlap_event_count = keep;
+        }
+        config
+    }
 }
 
 /// The `[shells]` table: background shell limits (spec 3.1 §7.29).
@@ -685,6 +744,9 @@ pub struct ResolvedHarnessArgs {
     pub sandbox: bool,
     /// `--allow-unsandboxed`.
     pub allow_unsandboxed: bool,
+    /// `--auto-review` or `auto_review = true` in the user config: in auto mode, the
+    /// session's model reviews each call the mode holds before you are asked.
+    pub auto_review: bool,
     /// `--fail-if-unavailable`.
     pub fail_if_unavailable: bool,
     /// `--trust`.
@@ -737,6 +799,9 @@ pub struct ResolvedHarnessArgs {
     /// Snapshots before each turn (spec 3.1 §7.27): on by default, `None` with
     /// `--no-snapshots` or `[snapshots] enabled = false` in the user config.
     pub snapshots: Option<SnapshotConfig>,
+    /// `[compaction]` from the user config, then the project file: when a run compacts the
+    /// agent's history. `None` keeps auto-compaction's defaults.
+    pub compaction: Option<IntraCompactionConfig>,
 }
 
 impl HarnessArgs {
@@ -804,6 +869,7 @@ impl HarnessArgs {
         let mut yes = false;
         let mut sandbox = false;
         let mut allow_unsandboxed = false;
+        let mut auto_review = false;
         let mut fail_if_unavailable = false;
         let mut trust = false;
         let mut packs = Vec::new();
@@ -820,6 +886,7 @@ impl HarnessArgs {
         let mut checkpointer = None;
         let mut shells = ShellLimits::default();
         let mut snapshots = Some(SnapshotConfig::default());
+        let mut compaction: Option<IntraCompactionConfig> = None;
         if let Some(user) = &user {
             let origin = user_config.map_or_else(String::new, |path| path.display().to_string());
             if let Some(value) = &user.mode {
@@ -829,6 +896,7 @@ impl HarnessArgs {
             yes = user.yes.unwrap_or(false);
             sandbox = user.sandbox.unwrap_or(false);
             allow_unsandboxed = user.allow_unsandboxed.unwrap_or(false);
+            auto_review = user.auto_review.unwrap_or(false);
             fail_if_unavailable = user.fail_if_unavailable.unwrap_or(false);
             trust = user.trust.unwrap_or(false);
             for pack in user.packs.iter().flatten() {
@@ -875,6 +943,9 @@ impl HarnessArgs {
             }
             if let Some(table) = &user.snapshots {
                 snapshots = table.apply(&origin, &mut notes);
+            }
+            if let Some(table) = &user.compaction {
+                compaction = Some(table.apply(compaction, &origin, &mut notes));
             }
             for key in user.unknown.keys().filter(|key| *key != DEPLOY_TABLE) {
                 notes.push(format!("{origin}: unknown key `{key}` ignored"));
@@ -963,6 +1034,10 @@ impl HarnessArgs {
                 effort = policy;
                 effort_explicit = true;
             }
+            // Compaction, likewise, changes what the model is sent, not what the agent may do.
+            if let Some(table) = &project.compaction {
+                compaction = Some(table.apply(compaction, origin, &mut notes));
+            }
             // A checkpointer location is not a permission, but a workspace file naming one
             // would send plan state to a server the repository chose.
             if project.plan.as_ref().is_some_and(|plan| plan.checkpointer.is_some()) {
@@ -986,6 +1061,7 @@ impl HarnessArgs {
             for (key, set) in [
                 ("yes", project.yes == Some(true)),
                 ("allow_unsandboxed", project.allow_unsandboxed == Some(true)),
+                ("auto_review", project.auto_review == Some(true)),
                 ("trust", project.trust == Some(true)),
                 ("packs", project.packs.as_ref().is_some_and(|packs| !packs.is_empty())),
                 ("members", project.members.as_ref().is_some_and(|members| !members.is_empty())),
@@ -1011,6 +1087,7 @@ impl HarnessArgs {
         yes |= self.yes;
         sandbox |= self.sandbox;
         allow_unsandboxed |= self.allow_unsandboxed;
+        auto_review |= self.auto_review;
         fail_if_unavailable |= self.fail_if_unavailable;
         trust |= self.trust;
         packs.extend(self.packs.iter().copied());
@@ -1053,6 +1130,7 @@ impl HarnessArgs {
             yes,
             sandbox,
             allow_unsandboxed,
+            auto_review,
             fail_if_unavailable,
             trust,
             packs,
@@ -1074,6 +1152,7 @@ impl HarnessArgs {
             shells,
             notes,
             snapshots,
+            compaction,
         })
     }
 }
@@ -1121,6 +1200,7 @@ mod tests {
                 yes: false,
                 sandbox: false,
                 allow_unsandboxed: false,
+                auto_review: false,
                 fail_if_unavailable: false,
                 trust: false,
                 packs: vec![],
@@ -1142,8 +1222,33 @@ mod tests {
                 shells: ShellLimits::default(),
                 notes: vec![],
                 snapshots: Some(SnapshotConfig::default()),
+                compaction: None,
             }
         );
+    }
+
+    /// `[compaction]` in the user config sets auto-compaction; the project file adjusts it.
+    #[test]
+    fn compaction_comes_from_the_user_config_then_the_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        write(&user, "[compaction]\nwindow_fraction = 0.6\nkeep_recent = 4\n");
+        write(&dir.path().join(PROJECT_CONFIG_FILE), "[compaction]\nthreshold_tokens = 50000\n");
+        let resolved = args_in(dir.path()).resolve(HarnessMode::Plan, Some(&user)).unwrap();
+        assert_eq!(
+            resolved.compaction,
+            Some(IntraCompactionConfig {
+                token_threshold: Some(50_000),
+                context_window_fraction: 0.6,
+                overlap_event_count: 4,
+                ..IntraCompactionConfig::default()
+            })
+        );
+
+        write(&user, "[compaction]\nauto = false\n");
+        std::fs::remove_file(dir.path().join(PROJECT_CONFIG_FILE)).unwrap();
+        let resolved = args_in(dir.path()).resolve(HarnessMode::Plan, Some(&user)).unwrap();
+        assert_eq!(resolved.compaction, Some(IntraCompactionConfig::disabled()));
     }
 
     /// `[shells]` in the user config sets the limits; the project file may only lower them
@@ -1167,6 +1272,25 @@ mod tests {
         assert_eq!(unattended.lifetime(), Some(std::time::Duration::from_secs(600)));
         let attended = resolved.shells.apply(adk_harness::BackgroundShellConfig::attended());
         assert_eq!(attended.lifetime(), None, "the REPL sets no lifetime");
+    }
+
+    /// Auto review is off unless the user config or `--auto-review` turns it on; the
+    /// workspace file cannot (autonomy parity item 2).
+    #[test]
+    fn auto_review_comes_from_the_user_config_or_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!args_in(dir.path()).resolve(HarnessMode::Auto, None).unwrap().auto_review);
+
+        let flagged = HarnessArgs { auto_review: true, ..args_in(dir.path()) }
+            .resolve(HarnessMode::Auto, None)
+            .unwrap();
+        assert!(flagged.auto_review);
+
+        let user = dir.path().join("user.toml");
+        write(&user, "auto_review = true\n");
+        let configured = args_in(dir.path()).resolve(HarnessMode::Auto, Some(&user)).unwrap();
+        assert!(configured.auto_review);
+        assert!(configured.notes.is_empty(), "{:?}", configured.notes);
     }
 
     /// Snapshots are on unless the user config or the flag turns them off; the workspace
@@ -1321,14 +1445,25 @@ enabled = false
         write(
             &dir.path().join(PROJECT_CONFIG_FILE),
             "mode = \"auto\"\nyes = true\ntrust = true\nallow_unsandboxed = true\n\
-             members = [\"x=acp:evil\"]\npacks = [\"payments\"]\nsurprise = 1\n",
+             auto_review = true\nmembers = [\"x=acp:evil\"]\npacks = [\"payments\"]\n\
+             surprise = 1\n",
         );
         let resolved = args_in(dir.path()).resolve(HarnessMode::Ask, None).unwrap();
         assert_eq!(resolved.mode, HarnessMode::Ask);
         assert!(!resolved.mode_explicit);
         assert!(!resolved.yes && !resolved.trust && !resolved.allow_unsandboxed);
+        assert!(!resolved.auto_review, "a workspace cannot let a model approve");
         assert!(resolved.members.is_empty() && resolved.packs.is_empty());
-        for key in ["mode", "yes", "trust", "allow_unsandboxed", "members", "packs", "surprise"] {
+        for key in [
+            "mode",
+            "yes",
+            "trust",
+            "allow_unsandboxed",
+            "auto_review",
+            "members",
+            "packs",
+            "surprise",
+        ] {
             assert!(
                 resolved.notes.iter().any(|note| note.contains(&format!("`{key}`"))),
                 "{key}: {:?}",

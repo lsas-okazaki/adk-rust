@@ -7,8 +7,8 @@ use adk_anthropic::{
     Base64ImageSource, Base64PdfSource, CacheControlEphemeral, CacheTtl, ContentBlock,
     ContextManagement, DocumentBlock, ImageBlock, Message, MessageCreateParams, MessageParam,
     MessageRole, Model, PlainTextSource, StopReason, SystemPrompt, TextBlock, ThinkingBlock,
-    ToolParam, ToolResultBlock, ToolResultBlockContent, ToolUnionParam, ToolUseBlock,
-    UrlImageSource, UrlPdfSource,
+    ToolParam, ToolResultBlock, ToolResultBlockContent, ToolUnionParam, UrlImageSource,
+    UrlPdfSource,
 };
 use adk_core::{
     BuiltinToolUse, Content, FinishReason, LlmResponse, Part, SchemaAdapter, SchemaCache,
@@ -16,6 +16,8 @@ use adk_core::{
 };
 use serde_json::Value;
 use std::collections::HashMap;
+
+use super::toolsets::{self, ToolsetForms};
 
 fn image_media_type(mime_type: &str) -> Option<ImageMediaType> {
     match mime_type {
@@ -80,6 +82,7 @@ fn tool_result_content(response: &adk_core::FunctionResponseData) -> ToolResultB
 pub fn content_to_message(
     content: &Content,
     _prompt_caching: bool,
+    forms: ToolsetForms,
 ) -> Result<MessageParam, ConversionError> {
     let role = match content.role.as_str() {
         "user" | "function" | "tool" => MessageRole::User,
@@ -87,7 +90,7 @@ pub fn content_to_message(
         _ => MessageRole::User,
     };
 
-    if let Some(mut blocks) = super::history::restore(content) {
+    if let Some(mut blocks) = super::history::restore(content, forms) {
         blocks.retain(
             |block| !matches!(block, ContentBlock::Text(text) if text.text.trim().is_empty()),
         );
@@ -110,24 +113,26 @@ pub fn content_to_message(
                 }
             }
             Part::FunctionCall { name, args, id, .. } => {
-                let block = ToolUseBlock {
-                    id: id.clone().unwrap_or_else(|| format!("call_{name}")),
-                    name: name.clone(),
-                    input: args.clone(),
-                    cache_control: None,
-                };
-                Some(ContentBlock::ToolUse(block))
+                let id = id.clone().unwrap_or_else(|| format!("call_{name}"));
+                Some(ContentBlock::ToolUse(toolsets::tool_use_from_call(id, name, args, forms)))
             }
             Part::FunctionResponse { function_response, id, .. } => {
+                // Only an answer the agent wrote says the call failed or never ran.
+                let is_error =
+                    part.tool_result_status().is_some_and(adk_core::ToolResultStatus::is_error);
+                let toolset = toolsets::result_toolset(&function_response.name, forms);
+                let content = match toolset {
+                    Some(toolset) => {
+                        toolsets::member_result_content(function_response, toolset, is_error)
+                    }
+                    None => tool_result_content(function_response),
+                };
                 Some(ContentBlock::ToolResult(ToolResultBlock {
                     tool_use_id: id.clone().unwrap_or_else(|| "unknown".to_string()),
-                    content: Some(tool_result_content(function_response)),
-                    // Only an answer the agent wrote says the call failed or never ran.
-                    is_error: part
-                        .tool_result_status()
-                        .is_some_and(adk_core::ToolResultStatus::is_error)
-                        .then_some(true),
+                    content: Some(content),
+                    is_error: is_error.then_some(true),
                     cache_control: None,
+                    toolset_name: toolset.map(str::to_string),
                 }))
             }
             Part::InlineData { mime_type, data, .. } => {
@@ -258,51 +263,77 @@ pub fn content_to_message(
 
 /// Convert ADK tools to adk-anthropic ToolUnionParam format.
 ///
-/// Tools are emitted sorted by name: the declarations come from a `HashMap`, and
-/// a stable order keeps the prompt-cache prefix identical across requests.
+/// Tools are emitted in declaration order, which is the same on every request, so the
+/// prompt-cache prefix stays identical. The declarations of client toolset members collapse
+/// into one entry per toolset, at the position of the first member, in the form `model`
+/// accepts.
 pub fn convert_tools(
-    tools: &HashMap<String, Value>,
+    model: &str,
+    tools: &adk_core::ToolDeclarations,
     adapter: &dyn SchemaAdapter,
     cache: &SchemaCache,
 ) -> Result<Vec<ToolUnionParam>, ConversionError> {
-    let mut tools = tools.iter().collect::<Vec<_>>();
-    tools.sort_unstable_by_key(|(name, _)| *name);
-    tools
-        .into_iter()
-        .map(|(name, decl)| {
-            if let Some(provider_tool) = decl.get("x-adk-anthropic-tool") {
-                return serde_json::from_value::<ToolUnionParam>(provider_tool.clone()).map_err(
-                    |error| {
-                        ConversionError::InvalidToolDeclaration(format!(
-                            "failed to deserialize Anthropic native tool '{name}': {error}"
-                        ))
-                    },
-                );
+    let mut members = toolsets::DeclaredMembers::default();
+    // Where each toolset's entry goes: the position of its first member.
+    let mut slots: Vec<(usize, bool)> = Vec::new();
+    let mut converted = Vec::with_capacity(tools.len());
+    for (name, decl) in tools.iter() {
+        let had_computer = members.has_computer();
+        let had_browser = members.has_browser();
+        if members.record(name, decl)? {
+            if !had_computer && members.has_computer() {
+                slots.push((converted.len(), true));
             }
-
-            let description = decl.get("description").and_then(|d| d.as_str()).map(String::from);
-
-            let input_schema =
-                decl.get("parameters").cloned().unwrap_or_else(|| adapter.empty_schema());
-            let mut normalized_schema = cache.normalize(&input_schema);
-            let strict = decl.get("strict").and_then(Value::as_bool);
-            if strict != Some(true) {
-                super::schema_adapter::nest_composition(&mut normalized_schema);
+            if !had_browser && members.has_browser() {
+                slots.push((converted.len(), false));
             }
+            continue;
+        }
+        converted.push(convert_tool(name, decl, adapter, cache)?);
+    }
+    for (position, computer) in slots.into_iter().rev() {
+        let entry = if computer { members.computer_entry(model)? } else { members.browser_entry() };
+        if let Some(entry) = entry {
+            converted.insert(position, entry);
+        }
+    }
+    Ok(converted)
+}
 
-            let normalized_name = adapter.normalize_tool_name(name);
+fn convert_tool(
+    name: &str,
+    decl: &Value,
+    adapter: &dyn SchemaAdapter,
+    cache: &SchemaCache,
+) -> Result<ToolUnionParam, ConversionError> {
+    if let Some(provider_tool) = decl.get("x-adk-anthropic-tool") {
+        return serde_json::from_value::<ToolUnionParam>(provider_tool.clone()).map_err(|error| {
+            ConversionError::InvalidToolDeclaration(format!(
+                "failed to deserialize Anthropic native tool '{name}': {error}"
+            ))
+        });
+    }
 
-            let mut tool_param = ToolParam::new(normalized_name.into_owned(), normalized_schema);
-            if let Some(desc) = description {
-                tool_param = tool_param.with_description(desc);
-            }
-            if let Some(strict) = strict {
-                tool_param = tool_param.with_strict(strict);
-            }
+    let description = decl.get("description").and_then(|d| d.as_str()).map(String::from);
 
-            Ok(ToolUnionParam::CustomTool(tool_param))
-        })
-        .collect()
+    let input_schema = decl.get("parameters").cloned().unwrap_or_else(|| adapter.empty_schema());
+    let mut normalized_schema = cache.normalize(&input_schema);
+    let strict = decl.get("strict").and_then(Value::as_bool);
+    if strict != Some(true) {
+        super::schema_adapter::nest_composition(&mut normalized_schema);
+    }
+
+    let normalized_name = adapter.normalize_tool_name(name);
+
+    let mut tool_param = ToolParam::new(normalized_name.into_owned(), normalized_schema);
+    if let Some(desc) = description {
+        tool_param = tool_param.with_description(desc);
+    }
+    if let Some(strict) = strict {
+        tool_param = tool_param.with_strict(strict);
+    }
+
+    Ok(ToolUnionParam::CustomTool(tool_param))
 }
 
 /// The part for a provider-executed block: a `server_tool_use` call or one of its results,
@@ -328,8 +359,45 @@ pub(super) fn server_tool_part(block: &ContentBlock) -> Option<Part> {
     }
 }
 
+/// The usage summed over `usage.iterations`, or `None` when the response reports none.
+///
+/// Each iteration is one model call the request made, such as a compaction's summarization
+/// call, with its own `input_tokens`, `output_tokens` and cache counts.
+fn iteration_usage(usage: &adk_anthropic::Usage) -> Option<adk_anthropic::Usage> {
+    let iterations = usage.raw.as_deref()?.get("iterations")?.as_array()?;
+    if iterations.is_empty() {
+        return None;
+    }
+    let count = |iteration: &Value, field: &str| {
+        iteration.get(field).and_then(Value::as_i64).and_then(|n| i32::try_from(n).ok())
+    };
+    let sum = |field: &str| -> i32 {
+        iterations
+            .iter()
+            .filter_map(|iteration| count(iteration, field))
+            .fold(0, i32::saturating_add)
+    };
+    let optional_sum = |field: &str| -> Option<i32> {
+        iterations
+            .iter()
+            .filter_map(|iteration| count(iteration, field))
+            .reduce(i32::saturating_add)
+    };
+    let mut summed = usage.clone();
+    summed.input_tokens = sum("input_tokens");
+    summed.output_tokens = sum("output_tokens");
+    summed.cache_read_input_tokens =
+        optional_sum("cache_read_input_tokens").or(usage.cache_read_input_tokens);
+    summed.cache_creation_input_tokens =
+        optional_sum("cache_creation_input_tokens").or(usage.cache_creation_input_tokens);
+    Some(summed)
+}
+
 /// Convert adk-anthropic Message to ADK LlmResponse.
-pub fn from_anthropic_message(message: &Message) -> (LlmResponse, HashMap<String, String>) {
+pub fn from_anthropic_message(
+    message: &Message,
+    forms: ToolsetForms,
+) -> (LlmResponse, HashMap<String, String>) {
     let mut parts = Vec::new();
 
     for block in &message.content {
@@ -338,9 +406,10 @@ pub fn from_anthropic_message(message: &Message) -> (LlmResponse, HashMap<String
                 parts.push(Part::Text { text: text_block.text.clone() });
             }
             ContentBlock::ToolUse(tool_use) => {
+                let (name, args) = toolsets::call_from_tool_use(tool_use, forms);
                 parts.push(Part::FunctionCall {
-                    name: tool_use.name.clone(),
-                    args: tool_use.input.clone(),
+                    name,
+                    args,
                     id: Some(tool_use.id.clone()),
                     thought_signature: None,
                 });
@@ -367,6 +436,16 @@ pub fn from_anthropic_message(message: &Message) -> (LlmResponse, HashMap<String
             | ContentBlock::TextEditorCodeExecutionToolResult(_) => {
                 parts.extend(server_tool_part(block));
             }
+            // The advisor's result is advice for the executor, kept for replay by
+            // `history::preserve`; its cost is in `usage.iterations`.
+            ContentBlock::Unknown(raw) if raw["type"] == "advisor_tool_result" => {}
+            // Every provider reads the summary as text; `history::preserve` keeps the signed
+            // block, which only this provider reads back.
+            ContentBlock::Compaction(compaction) => {
+                parts.push(Part::Text {
+                    text: adk_core::intra_compaction::compaction_summary_text(&compaction.content),
+                });
+            }
             // No ADK part represents it; `history::preserve` keeps it for replay.
             ContentBlock::Unknown(raw) => {
                 tracing::warn!(
@@ -384,18 +463,24 @@ pub fn from_anthropic_message(message: &Message) -> (LlmResponse, HashMap<String
     let content =
         if parts.is_empty() { None } else { Some(Content { role: "model".to_string(), parts }) };
 
+    // A compaction reports its summarization call in `usage.iterations` and zero at the top
+    // level, so the call is counted from its iterations.
+    let usage = match message.stop_reason {
+        Some(StopReason::Compaction) => iteration_usage(&message.usage),
+        _ => None,
+    }
+    .unwrap_or_else(|| message.usage.clone());
     // Anthropic reports uncached input separately from cache reads and writes.
-    let prompt_token_count = message
-        .usage
+    let prompt_token_count = usage
         .input_tokens
-        .saturating_add(message.usage.cache_read_input_tokens.unwrap_or(0))
-        .saturating_add(message.usage.cache_creation_input_tokens.unwrap_or(0));
+        .saturating_add(usage.cache_read_input_tokens.unwrap_or(0))
+        .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
     let usage_metadata = Some(UsageMetadata {
         prompt_token_count,
-        candidates_token_count: message.usage.output_tokens,
-        total_token_count: prompt_token_count.saturating_add(message.usage.output_tokens),
-        cache_read_input_token_count: message.usage.cache_read_input_tokens,
-        cache_creation_input_token_count: message.usage.cache_creation_input_tokens,
+        candidates_token_count: usage.output_tokens,
+        total_token_count: prompt_token_count.saturating_add(usage.output_tokens),
+        cache_read_input_token_count: usage.cache_read_input_tokens,
+        cache_creation_input_token_count: usage.cache_creation_input_tokens,
         // As received, so fields such as `service_tier` and the `cache_creation` breakdown survive.
         provider_usage: message
             .usage
@@ -412,9 +497,10 @@ pub fn from_anthropic_message(message: &Message) -> (LlmResponse, HashMap<String
         | StopReason::StopSequence
         | StopReason::ToolUse
         | StopReason::PauseTurn
-        | StopReason::PauseRun => FinishReason::Stop,
+        | StopReason::PauseRun
+        | StopReason::Compaction => FinishReason::Stop,
         StopReason::MaxTokens | StopReason::ModelContextWindowExceeded => FinishReason::MaxTokens,
-        StopReason::Refusal => FinishReason::Safety,
+        StopReason::Refusal => FinishReason::Refusal,
         StopReason::Unknown(reason) => {
             tracing::warn!(
                 anthropic.stop_reason = %reason,
@@ -429,6 +515,27 @@ pub fn from_anthropic_message(message: &Message) -> (LlmResponse, HashMap<String
 
     let cache_meta = extract_cache_usage(&message.usage);
 
+    // A classifier refusal arrives as HTTP 200; any text before it is not an answer, so the
+    // turn ends as a failure that names the category and explanation from `stop_details`.
+    let refused = matches!(message.stop_reason, Some(StopReason::Refusal));
+    let details = message.stop_details.as_ref();
+    let refusal_message = refused.then(|| {
+        let category = details.and_then(|details| details.category.as_deref());
+        let explanation = details.and_then(|details| details.explanation.as_deref());
+        match (category, explanation) {
+            (Some(category), Some(explanation)) => {
+                format!("Claude declined the request (category {category}): {explanation}")
+            }
+            (Some(category), None) => format!("Claude declined the request (category {category})"),
+            (None, Some(explanation)) => format!("Claude declined the request: {explanation}"),
+            (None, None) => "Claude declined the request".to_string(),
+        }
+    });
+    let mut provider_metadata = paused.then(|| serde_json::json!({"continue_turn": true}));
+    if let Some(details) = details.and_then(|details| serde_json::to_value(details).ok()) {
+        provider_metadata.get_or_insert_with(|| serde_json::json!({}))["stop_details"] = details;
+    }
+
     (
         LlmResponse {
             content,
@@ -438,9 +545,9 @@ pub fn from_anthropic_message(message: &Message) -> (LlmResponse, HashMap<String
             partial: false,
             turn_complete: !tool_call_turn && !paused,
             interrupted: false,
-            error_code: None,
-            error_message: None,
-            provider_metadata: paused.then(|| serde_json::json!({"continue_turn": true})),
+            error_code: refused.then(|| "refusal".to_string()),
+            error_message: refusal_message,
+            provider_metadata,
             interaction_id: None,
             model: Some(message.model.to_string()).filter(|model| !model.is_empty()),
             provider: None,
@@ -608,6 +715,9 @@ pub fn build_message_params(
         Some(super::config::ThinkingMode::Adaptive) => {
             params.thinking = Some(adk_anthropic::ThinkingConfig::adaptive());
         }
+        Some(super::config::ThinkingMode::BetweenTools) => {
+            params.thinking = Some(adk_anthropic::ThinkingConfig::between_tools());
+        }
         None => {}
     }
 
@@ -674,7 +784,7 @@ mod tests {
         }))
         .unwrap();
 
-        let (response, _) = from_anthropic_message(&message);
+        let (response, _) = from_anthropic_message(&message, ToolsetForms::default());
         let parts = response.content.unwrap().parts;
         let result = parts
             .iter()
@@ -716,7 +826,10 @@ mod tests {
             }],
         };
 
-        let message = serde_json::to_value(content_to_message(&content, false).unwrap()).unwrap();
+        let message = serde_json::to_value(
+            content_to_message(&content, false, ToolsetForms::default()).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(
             message["content"][0]["content"],
@@ -734,7 +847,7 @@ mod tests {
             role: "user".to_string(),
             parts: vec![Part::Text { text: "Hello".to_string() }],
         };
-        let msg = content_to_message(&content, false).unwrap();
+        let msg = content_to_message(&content, false, ToolsetForms::default()).unwrap();
         assert!(matches!(msg.role, MessageRole::User));
     }
 
@@ -744,7 +857,7 @@ mod tests {
             role: "model".to_string(),
             parts: vec![Part::Text { text: "Hi there".to_string() }],
         };
-        let msg = content_to_message(&content, false).unwrap();
+        let msg = content_to_message(&content, false, ToolsetForms::default()).unwrap();
         assert!(matches!(msg.role, MessageRole::Assistant));
     }
 
@@ -757,7 +870,7 @@ mod tests {
                 Part::inline_data("image/png", vec![0x89, 0x50, 0x4E, 0x47]),
             ],
         };
-        let msg = content_to_message(&content, false).unwrap();
+        let msg = content_to_message(&content, false, ToolsetForms::default()).unwrap();
         assert!(matches!(msg.role, MessageRole::User));
 
         // Should have 2 blocks: text + image
@@ -785,7 +898,7 @@ mod tests {
                 ),
             ],
         };
-        let msg = content_to_message(&content, false).unwrap();
+        let msg = content_to_message(&content, false, ToolsetForms::default()).unwrap();
 
         // Audio part should be preserved as textual attachment fallback.
         let json = serde_json::to_value(&msg).unwrap();
@@ -806,7 +919,7 @@ mod tests {
                 Part::inline_data("image/webp", vec![0x52, 0x49]),
             ],
         };
-        let msg = content_to_message(&content, false).unwrap();
+        let msg = content_to_message(&content, false, ToolsetForms::default()).unwrap();
 
         let json = serde_json::to_value(&msg).unwrap();
         let content_blocks = json["content"].as_array().unwrap();
@@ -821,7 +934,7 @@ mod tests {
             role: "user".to_string(),
             parts: vec![Part::inline_data("application/pdf", b"%PDF-1.4".to_vec())],
         };
-        let msg = content_to_message(&content, false).unwrap();
+        let msg = content_to_message(&content, false, ToolsetForms::default()).unwrap();
 
         let json = serde_json::to_value(&msg).unwrap();
         let content_blocks = json["content"].as_array().unwrap();
@@ -837,7 +950,7 @@ mod tests {
             role: "user".to_string(),
             parts: vec![Part::file_data("application/pdf", "https://example.com/test.pdf")],
         };
-        let msg = content_to_message(&content, false).unwrap();
+        let msg = content_to_message(&content, false, ToolsetForms::default()).unwrap();
 
         let json = serde_json::to_value(&msg).unwrap();
         let content_blocks = json["content"].as_array().unwrap();
@@ -856,7 +969,7 @@ mod tests {
                 Part::file_data("image/jpeg", "https://example.com/photo.jpg"),
             ],
         };
-        let msg = content_to_message(&content, false).unwrap();
+        let msg = content_to_message(&content, false, ToolsetForms::default()).unwrap();
 
         let json = serde_json::to_value(&msg).unwrap();
         let content_blocks = json["content"].as_array().unwrap();
@@ -873,7 +986,7 @@ mod tests {
             role: "user".to_string(),
             parts: vec![Part::file_data("image/webp", "https://example.com/image.webp")],
         };
-        let msg = content_to_message(&content, false).unwrap();
+        let msg = content_to_message(&content, false, ToolsetForms::default()).unwrap();
 
         let json = serde_json::to_value(&msg).unwrap();
         let content_blocks = json["content"].as_array().unwrap();
@@ -888,7 +1001,7 @@ mod tests {
             role: "user".to_string(),
             parts: vec![Part::file_data("audio/wav", "https://example.com/audio.wav")],
         };
-        let msg = content_to_message(&content, false).unwrap();
+        let msg = content_to_message(&content, false, ToolsetForms::default()).unwrap();
 
         let json = serde_json::to_value(&msg).unwrap();
         let content_blocks = json["content"].as_array().unwrap();
@@ -900,7 +1013,7 @@ mod tests {
     #[test]
     fn test_convert_tools() {
         use super::super::schema_adapter::AnthropicSchemaAdapter;
-        let mut tools = HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "get_weather".to_string(),
             serde_json::json!({
@@ -916,13 +1029,13 @@ mod tests {
 
         let adapter = AnthropicSchemaAdapter;
         let cache = SchemaCache::for_adapter(std::sync::Arc::new(AnthropicSchemaAdapter));
-        let claude_tools =
-            convert_tools(&tools, &adapter, &cache).expect("tool conversion should succeed");
+        let claude_tools = convert_tools("claude-sonnet-5-5", &tools, &adapter, &cache)
+            .expect("tool conversion should succeed");
         assert_eq!(claude_tools.len(), 1);
     }
 
     #[test]
-    fn convert_tools_order_is_stable_across_maps() {
+    fn convert_tools_keeps_declaration_order() {
         use super::super::schema_adapter::AnthropicSchemaAdapter;
         let names: Vec<String> = (0..12).map(|i| format!("tool_{i:02}")).collect();
         let declaration = |name: &str| {
@@ -931,28 +1044,31 @@ mod tests {
                 "parameters": {"type": "object", "properties": {}}
             })
         };
-        let forward: HashMap<String, Value> =
-            names.iter().map(|name| (name.clone(), declaration(name))).collect();
-        let reverse: HashMap<String, Value> =
-            names.iter().rev().map(|name| (name.clone(), declaration(name))).collect();
-
         let adapter = AnthropicSchemaAdapter;
         let cache = SchemaCache::for_adapter(std::sync::Arc::new(AnthropicSchemaAdapter));
-        let from_forward = convert_tools(&forward, &adapter, &cache).unwrap();
-        let from_reverse = convert_tools(&reverse, &adapter, &cache).unwrap();
+        let converted_names = |tools: &adk_core::ToolDeclarations| -> Vec<String> {
+            convert_tools("claude-sonnet-5-5", tools, &adapter, &cache)
+                .unwrap()
+                .iter()
+                .map(|tool| {
+                    serde_json::to_value(tool).unwrap()["name"].as_str().unwrap().to_string()
+                })
+                .collect()
+        };
+        let forward: adk_core::ToolDeclarations =
+            names.iter().map(|name| (name.clone(), declaration(name))).collect();
+        let reversed: Vec<String> = names.iter().rev().cloned().collect();
+        let reverse: adk_core::ToolDeclarations =
+            reversed.iter().map(|name| (name.clone(), declaration(name))).collect();
 
-        assert_eq!(from_forward, from_reverse);
-        let converted_names: Vec<String> = from_forward
-            .iter()
-            .map(|tool| serde_json::to_value(tool).unwrap()["name"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(converted_names, names);
+        assert_eq!(converted_names(&forward), names);
+        assert_eq!(converted_names(&reverse), reversed);
     }
 
     #[test]
     fn test_convert_tools_supports_native_anthropic_tool_declarations() {
         use super::super::schema_adapter::AnthropicSchemaAdapter;
-        let mut tools = HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "bash".to_string(),
             serde_json::json!({
@@ -965,8 +1081,8 @@ mod tests {
 
         let adapter = AnthropicSchemaAdapter;
         let cache = SchemaCache::for_adapter(std::sync::Arc::new(AnthropicSchemaAdapter));
-        let claude_tools =
-            convert_tools(&tools, &adapter, &cache).expect("tool conversion should succeed");
+        let claude_tools = convert_tools("claude-sonnet-5-5", &tools, &adapter, &cache)
+            .expect("tool conversion should succeed");
         assert_eq!(claude_tools.len(), 1);
         let value = serde_json::to_value(&claude_tools[0]).expect("tool should serialize");
         assert_eq!(value["type"], "bash_20250124");
@@ -976,7 +1092,7 @@ mod tests {
     #[test]
     fn test_convert_tools_supports_dynamic_filtering_web_search() {
         use super::super::schema_adapter::AnthropicSchemaAdapter;
-        let mut tools = HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "web_search".to_string(),
             serde_json::json!({
@@ -994,8 +1110,8 @@ mod tests {
 
         let adapter = AnthropicSchemaAdapter;
         let cache = SchemaCache::for_adapter(std::sync::Arc::new(AnthropicSchemaAdapter));
-        let claude_tools =
-            convert_tools(&tools, &adapter, &cache).expect("tool conversion should succeed");
+        let claude_tools = convert_tools("claude-sonnet-5-5", &tools, &adapter, &cache)
+            .expect("tool conversion should succeed");
 
         assert_eq!(
             claude_tools,
@@ -1010,7 +1126,7 @@ mod tests {
     #[test]
     fn test_convert_tools_sends_direct_allowed_callers() {
         use super::super::schema_adapter::AnthropicSchemaAdapter;
-        let mut tools = HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "web_search".to_string(),
             serde_json::json!({
@@ -1025,8 +1141,8 @@ mod tests {
 
         let adapter = AnthropicSchemaAdapter;
         let cache = SchemaCache::for_adapter(std::sync::Arc::new(AnthropicSchemaAdapter));
-        let claude_tools =
-            convert_tools(&tools, &adapter, &cache).expect("tool conversion should succeed");
+        let claude_tools = convert_tools("claude-sonnet-5-5", &tools, &adapter, &cache)
+            .expect("tool conversion should succeed");
 
         assert_eq!(
             serde_json::to_value(&claude_tools).unwrap(),
@@ -1056,7 +1172,8 @@ mod tests {
                 part.set_tool_result_status(status, None);
             }
             let content = Content { role: "function".to_string(), parts: vec![part] };
-            let message = content_to_message(&content, false).expect("content should convert");
+            let message = content_to_message(&content, false, ToolsetForms::default())
+                .expect("content should convert");
             serde_json::to_value(message).expect("message should serialize")["content"][0].clone()
         };
         let flagged = |status| block(Some(status)).get("is_error").cloned();
@@ -1090,7 +1207,8 @@ mod tests {
             }],
         };
 
-        let message = content_to_message(&content, false).expect("content should convert");
+        let message = content_to_message(&content, false, ToolsetForms::default())
+            .expect("content should convert");
         let json = serde_json::to_value(message).expect("message should serialize");
         let block = &json["content"][0];
         assert_eq!(block["type"], "tool_result");
@@ -1115,6 +1233,7 @@ mod tests {
             ],
             stop_reason: Some(StopReason::EndTurn),
             stop_sequence: None,
+            stop_details: None,
             r#type: "message".to_string(),
             usage: Usage {
                 input_tokens: 10,
@@ -1127,7 +1246,7 @@ mod tests {
             },
         };
 
-        let (response, _cache_meta) = from_anthropic_message(&message);
+        let (response, _cache_meta) = from_anthropic_message(&message, ToolsetForms::default());
         let content = response.content.expect("should have content");
         assert_eq!(content.parts.len(), 2);
 
@@ -1158,6 +1277,7 @@ mod tests {
             ],
             stop_reason: Some(StopReason::EndTurn),
             stop_sequence: None,
+            stop_details: None,
             r#type: "message".to_string(),
             usage: Usage {
                 input_tokens: 5,
@@ -1170,7 +1290,7 @@ mod tests {
             },
         };
 
-        let (response, _) = from_anthropic_message(&message);
+        let (response, _) = from_anthropic_message(&message, ToolsetForms::default());
         let content = response.content.expect("should have content");
         // Empty thinking block should be skipped
         assert_eq!(content.parts.len(), 1);
@@ -1193,6 +1313,7 @@ mod tests {
             ))],
             stop_reason: Some(StopReason::ToolUse),
             stop_sequence: None,
+            stop_details: None,
             r#type: "message".to_string(),
             usage: Usage {
                 input_tokens: 10,
@@ -1205,7 +1326,7 @@ mod tests {
             },
         };
 
-        let (response, _) = from_anthropic_message(&message);
+        let (response, _) = from_anthropic_message(&message, ToolsetForms::default());
         assert!(!response.turn_complete, "tool-call turns must remain open for execution");
         assert!(response.content.is_some_and(|content| content.has_function_calls()));
     }

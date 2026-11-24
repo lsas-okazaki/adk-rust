@@ -108,14 +108,18 @@ default). `adk-rust up` opens it on `harness.db`, or in the `--store` backend ev
 
 The cursor moves past each occurrence after its wake is submitted, and every occurrence keeps its
 key (`cron:kernel:<expression>:<time>`), so a restart or a second replica never fires one twice.
+A sleeper's `missed` policy is a `MissedFirePolicy`
+([cron wakes and missed occurrences](scheduling.md#cron-wakes-and-missed-occurrences)).
 
 ### Cron triggers
 
-A standing trigger on a cron expression (`KernelBuilder::trigger` with `Wake::Cron`) fires
+A standing trigger on a cron expression (`KernelBuilder::trigger` with `Wake::Cron`, whose
+`missed` names a [`MissedFirePolicy`](scheduling.md#cron-wakes-and-missed-occurrences)) fires
 through a watermarked `CronWakeSource` the kernel registers itself: one per expression, named
 `trigger-cron:<expression>`, planned with the widest `missed` policy of the expression's
 triggers, its cursor in the same `CronWatermarkStore`. Every trigger on the expression matches
-each tick once. A registered source that ticks on the expression — a
+each tick once, and starts a run as its own `missed` policy and
+[overlap](scheduling.md#overlapping-firings) allow. A registered source that ticks on the expression — a
 `CronWakeSource::watermarked` one reports it through `WakeSource::cron_expression` — takes the
 kernel's place (spec 3.5 §7.11).
 

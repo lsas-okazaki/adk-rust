@@ -36,6 +36,9 @@ adk-auth = { version = "3.0.0", features = ["signed-audit"] }
 
 # With Web Bot Auth request signatures
 adk-auth = { version = "3.0.0", features = ["web-bot-auth"] }
+
+# With agent identity federation: AWS, Google Cloud and Microsoft Entra (implies sso)
+adk-auth = { version = "3.0.0", features = ["agent-federation"] }
 ```
 
 ## Features
@@ -49,6 +52,7 @@ Core RBAC, scope-based security, and audit logging are always available with no 
 | `token-exchange` | `TokenExchangeBroker`: RFC 8693 token exchange of the agent's credential, or of the subject's token with the agent as actor (`on_behalf_of`), for resource-scoped tokens |
 | `signed-audit` | `signed_audit::AuditLog`: the signed, Merkle-hashed audit log, and `signed_audit::verify` |
 | `web-bot-auth` | `web_bot_auth`: RFC 9421 Ed25519 request signatures, `HttpSignatureVerifier`, `HttpSignatureSigner`, key directories |
+| `agent-federation` | `federation`: `AgentTokenIssuer`, an OIDC issuer for agents; exchanges of its tokens at AWS IAM, Amazon Bedrock AgentCore Identity, Google Cloud and Microsoft Entra Agent ID; `InboundAgentVerifier` for Entra and Google agent tokens (implies `sso`) |
 | `postgres-audit` | `PostgresAuditSink` |
 | `otlp-audit` | `OtlpAuditSink` |
 | `aws-secrets` | `secrets::AwsSecretProvider` (AWS Secrets Manager) |
@@ -280,7 +284,7 @@ while a change to the newest line and lines cut from the end leave no broken lin
 
 Protected and scoped tools record the acting agent on every decision: `agent_id`,
 `on_behalf_of`, and the principal's tenant (`AuditEvent::with_acting_context`).
-`AuditFilter::agent_id` selects one agent's records.
+The `agent_id` field of `AuditFilter` selects one agent's records.
 
 ### Signed audit log (`signed-audit`)
 
@@ -357,15 +361,52 @@ See the [Web Bot Auth guide](../docs/official_docs/security/web-bot-auth.md).
 
 ## Credential Brokers
 
-Both brokers implement `adk_core::CredentialBroker` and mint a `ScopedToken` whose audience is
+Each broker implements `adk_core::CredentialBroker` and mints a `ScopedToken` whose audience is
 the requested resource (RFC 8707); `ScopedToken::authorize_for` refuses any other URL.
 
 | Broker | Feature | Token source |
 |--------|---------|--------------|
 | `SecretCredentialBroker` | none | A `SecretProvider` secret bound to an exact `(AgentId, resource)` pair and its granted scopes |
 | `TokenExchangeBroker` | `token-exchange` | RFC 8693 exchange of the `IdentitySource` credential, or, with `on_behalf_of(SubjectTokenSource)`, of the run's subject's token with the credential as `actor_token`; tokens are cached per subject, delegation chain, agent, resource, and scopes; optional RFC 7009 revocation |
+| `federation::GoogleWorkloadIdentity` | `agent-federation` | Google Cloud workload identity federation of the agent's own token; `https` resources on `googleapis.com` only |
+| `federation::EntraAgentIdentity` | `agent-federation` | Microsoft Entra Agent ID: the agent identity's token for the resource's `.default` scope |
 
 See [Agent Identity](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/security/agent-identity.md).
+
+## Agent Identity Federation (`agent-federation`)
+
+`federation` federates an agent's `AgentId` with cloud identity systems. `AgentTokenIssuer`
+publishes an OpenID Connect discovery document and JWK set and signs short-lived RS256 tokens
+whose subject is the agent; each cloud trusts the issuer URL and fetches its keys itself.
+
+| Type | Role |
+|------|------|
+| `AgentTokenIssuer` | Discovery document, JWK set, and tokens with `iss`, `sub`, `aud`, `iat`, `nbf`, `exp` (10 minutes by default, 1 hour at most) and `jti` |
+| `AgentTokenSigner`, `RsaTokenSigner` | The signing key: a key service behind the trait, or a PKCS#8 RSA key on `aws-lc-rs` that is never printed |
+| `AwsWebIdentity` | `sts:AssumeRoleWithWebIdentity`: temporary credentials of an IAM role |
+| `AgentCoreIdentity` | `bedrock-agentcore:GetWorkloadAccessTokenForJWT`, signed with Signature Version 4 |
+| `GoogleWorkloadIdentity` | Security Token Service exchange for a federated access token |
+| `EntraAgentIdentity` | The blueprint and agent identity exchanges of Microsoft Entra Agent ID |
+| `InboundAgentVerifier` | Validates an Entra or Google agent token and returns its `AgentPrincipal`; `AgentClaimsProfile` adds identity systems |
+
+```rust
+use std::sync::Arc;
+
+use adk_auth::federation::{AgentTokenIssuer, AwsWebIdentity, FederationError};
+use adk_core::AgentPrincipal;
+
+async fn subject_aws_sees(pem: &str, agent: &AgentPrincipal) -> Result<String, FederationError> {
+    let issuer = AgentTokenIssuer::from_rsa_pem("https://agents.acme.example", "agents-1", pem)?;
+    let sts = AwsWebIdentity::new(
+        "us-east-1",
+        "arn:aws:iam::111122223333:role/cashier",
+        Arc::new(issuer),
+    );
+    Ok(sts.assume_role(agent).await?.subject_from_web_identity_token)
+}
+```
+
+See [Agent Identity](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/security/agent-identity.md#identity-federation).
 
 ## Changes in 3.0
 
@@ -378,6 +419,8 @@ See [Agent Identity](https://github.com/zavora-ai/adk-rust/blob/main/docs/offici
 | `PostgresAuditSink` writes `agent_id` and `on_behalf_of` columns | Call `migrate()` once before the first write; until then inserts fail and guarded tools are refused |
 | `PostgresAuditSink` uses SQLx 0.9 | See SQLx compatibility below |
 | HTTP requests to IdPs and token endpoints have connect and request timeouts | — |
+| The `adk-server` feature is removed | Drop it: `auth-bridge` no longer needs `adk-server` |
+| The optional dependencies `axum`, `base64`, `dashmap`, `jsonwebtoken`, and `reqwest` are no longer features | Enable the feature that uses them: `sso`, `auth-bridge`, `signed-audit`, `token-exchange`, or `web-bot-auth` |
 
 See the [2.x to 3.0 migration guide](../docs/official_docs/migration/2.x-to-3.0.md) and the [changelog](../CHANGELOG.md) for the full list.
 
@@ -394,19 +437,18 @@ See the [2.x to 3.0 migration guide](../docs/official_docs/migration/2.x-to-3.0.
 
 ## Examples
 
-Examples live in the [adk-playground](https://github.com/zavora-ai/adk-playground) repo:
+Teaching examples live in the [adk-playground](https://github.com/zavora-ai/adk-playground) repo.
+Two standalone examples in this repository run `adk-auth` against local stand-ins, with no
+identity provider:
+
+| Example | What it exercises |
+|---------|-------------------|
+| [`security_sessions_contracts`](https://github.com/zavora-ai/adk-rust/tree/main/examples/security_sessions_contracts) | `JwtValidator` over a local ES256 JWKS, `SsoAccessControl` with a failing audit sink, and `JwtRequestContextExtractor` in front of `adk-server` |
+| [`tools_hardening`](https://github.com/zavora-ai/adk-rust/tree/main/examples/tools_hardening) | Request timeouts of `JwksCache`, `OidcProvider::from_discovery`, and `TokenExchangeBroker`, and single-flight token exchange |
 
 ```bash
-git clone https://github.com/zavora-ai/adk-playground.git
-cd adk-playground
-
-cargo run --example auth_basic                  # RBAC basics
-cargo run --example auth_audit                  # Audit logging
-cargo run --example auth_bridge                 # Auth bridge with server
-cargo run --example auth_sso --features sso     # SSO integration
-cargo run --example auth_jwt --features sso     # JWT validation
-cargo run --example auth_oidc --features sso    # OIDC discovery
-cargo run --example auth_google --features sso  # Google Identity
+cargo run --manifest-path examples/security_sessions_contracts/Cargo.toml
+cargo run --manifest-path examples/tools_hardening/Cargo.toml
 ```
 
 ## Security Notes

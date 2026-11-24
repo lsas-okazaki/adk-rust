@@ -113,12 +113,20 @@ impl Tool for GatedFileTool {
         self.inner.egress(args)
     }
 
+    fn approval_evidence(&self, args: &serde_json::Value) -> Vec<adk_core::Evidence> {
+        self.inner.approval_evidence(args)
+    }
+
     fn timeout_override(&self) -> Option<Option<Duration>> {
         self.inner.timeout_override()
     }
 
     fn is_concurrency_safe(&self) -> bool {
         self.inner.is_concurrency_safe()
+    }
+
+    fn batch_group(&self) -> Option<adk_core::BatchGroup> {
+        self.inner.batch_group()
     }
 
     fn is_agent_delegation(&self) -> bool {

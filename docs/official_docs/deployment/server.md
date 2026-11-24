@@ -48,7 +48,7 @@ use std::sync::Arc;
 async fn main() -> Result<()> {
     let api_key = std::env::var("GOOGLE_API_KEY")
         .map_err(|_| AdkError::config("GOOGLE_API_KEY is not set"))?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 
     let agent = LlmAgentBuilder::new("my_agent")
         .description("A helpful assistant")
@@ -79,7 +79,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
     let agent: Arc<dyn Agent> = Arc::new(
         LlmAgentBuilder::new("my_agent")
             .description("A helpful assistant")
@@ -179,10 +179,10 @@ POST /api/run_sse
 
 | Field | Meaning |
 |-------|---------|
-| `appName`, `userId`, `sessionId` | The agent and session to run. A session that does not exist is created. |
+| `appName`, `userId`, `sessionId` | The agent and session to run. The session must exist: a missing one answers `404` with code `session.not_found`. Create it first with `POST /api/apps/{app}/users/{user}/sessions`. A run with a UI protocol (`uiProtocol` or the `x-adk-ui-protocol` header set to `a2ui`, `ag_ui` or `mcp_apps`) starts its thread's session when it does not exist. |
 | `newMessage` | The user message: `role` and `parts`, each `{"text"}` or `{"inlineData": {"mimeType", "data"}}` with base64 `data`. |
 | `streaming` | Default `true`: the model streams partial events. `false` produces one event per model response. |
-| `stateDelta` | Optional object merged into the session state before the run; the initial state of a new session. |
+| `stateDelta` | Optional object merged into the session state before the run; the initial state of a session a UI protocol's run starts. |
 
 **Response:** `Content-Type: text/event-stream`, one `data:` line per event:
 
@@ -200,7 +200,7 @@ POST /api/run_sse
   "partial": false,
   "turn_complete": true,
   "finish_reason": "Stop",
-  "model": "gemini-3.7-flash",
+  "model": "gemini-3.8-flash",
   "provider": "gemini",
   "usage_metadata": {
     "prompt_token_count": 56,
@@ -321,6 +321,31 @@ GET /api/apps/{app_name}/users/{user_id}/sessions
 `/api/apps/{app_name}/users/{user_id}/sessions/{session_id}` answers `GET`, `POST` (create), and
 `DELETE` as well, and `POST /api/apps/{app_name}/users/{user_id}/sessions` creates a session with
 a generated ID.
+
+#### Fork, Rewind, and Edit History
+
+| Route | Body | Response |
+|-------|------|----------|
+| `GET …/sessions/{session_id}/history` | — | `200` `{session, version, forkedFrom?}` |
+| `POST …/sessions/{session_id}/fork` | `{eventId?, sessionId?}` | `201` `{session, change}`: the fork |
+| `POST …/sessions/{session_id}/rewind` | exactly one of `{eventId}`, `{steps}`, `{beforeInvocationId}`, plus `expectedVersion?` | `200` `{session, change}` |
+| `POST …/sessions/{session_id}/history/edit` | `{edits: [{op: "replace", event} \| {op: "remove", eventId}], expectedVersion?}` | `200` `{session, change}` |
+
+The routes carry the session routes' authentication: a caller reaches only its own user's
+sessions (`403`). They refuse while a turn runs on the session (`409`
+`session.history.run_active`), while a call waits for a decision (`409`
+`session.history.held_call`), when `expectedVersion` no longer matches (`409`
+`session.history.version_mismatch`), and when the result would split a tool call from its
+response (`400` `session.history.splits_tool_call`). Errors are problem JSON with the code. Each
+change is recorded in the audit trail attached to the server's kill switch: a decision before
+it is applied and its outcome after, naming events by ID with a digest of the changed content.
+`beforeInvocationId` undoes a turn: it removes that invocation and every event after it. See
+[Fork, Rewind, and Edit History](../sessions/history.md).
+
+```bash
+curl -X POST localhost:8080/api/apps/support/users/alice/sessions/s1/rewind \
+  -H 'content-type: application/json' -d '{"beforeInvocationId": "e-91c7"}'
+```
 
 ### Artifact Management
 
@@ -467,8 +492,8 @@ A card belongs to the caller who registered it, recorded as its `owner`:
 - An `AgentRegistryStore` implements `replace_owned` and `delete_owned` with the owner check
   and the write in one atomic step.
 
-`examples/agent_registry` runs the routes in process, and group `H` of
-`examples/server_exposure` serves a registry beside a live agent.
+The `agent_registry` example in [adk-playground](https://github.com/zavora-ai/adk-playground) runs the routes in
+process, and group `H` of `examples/server_exposure` serves a registry beside a live agent.
 
 ## The web home
 
@@ -492,6 +517,13 @@ A browser page served from another origin cannot call the server until that orig
 Using the Fetch API with SSE:
 
 ```javascript
+// The session must exist before a run.
+await fetch('http://localhost:8080/api/apps/my_agent/users/user123/sessions/session456', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: '{}'
+});
+
 async function runAgent(message) {
   const response = await fetch('http://localhost:8080/api/run_sse', {
     method: 'POST',
@@ -562,6 +594,10 @@ def run_agent(message):
                 event = json.loads(line_str[6:])
                 print('Event:', event)
 
+# The session must exist before a run.
+requests.post(
+    'http://localhost:8080/api/apps/my_agent/users/user123/sessions/session456', json={}
+)
 run_agent('What is the capital of France?')
 ```
 
@@ -757,7 +793,7 @@ generic message for the error's category.
 | `cancelled` | `The operation was cancelled` |
 | `internal` | `Internal server error` |
 | `unsupported` | `The operation is not supported` |
-| `resource_exhausted` | `A resource budget is used up` |
+| `resource_exhausted` | `A budget, quota or credit balance is used up` |
 | `conflict` | `The request conflicts with the current state` |
 
 The rule applies to every error response the run and governance endpoints write:
@@ -833,7 +869,7 @@ use std::sync::Arc;
 async fn main() -> Result<()> {
     let api_key = std::env::var("GOOGLE_API_KEY")
         .map_err(|_| AdkError::config("GOOGLE_API_KEY is not set"))?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
     let agent = LlmAgentBuilder::new("my_agent").model(model).build()?;
 
     Launcher::new(Arc::new(agent))
@@ -874,9 +910,9 @@ RUST_LOG=debug cargo run -- serve
 
 ## Best Practices
 
-1. **Sessions**: `/api/run` and `/api/run_sse` create a missing session, and the path-style
-   run route requires one; create it first with `POST /api/sessions` to choose its ID or detect
-   a conflict
+1. **Sessions**: `/api/run`, `/api/run_sse` and the path-style run route need an existing
+   session; create it first with `POST /api/apps/{app}/users/{user}/sessions`. Only a UI
+   protocol's run starts its thread's session
 2. **Error Handling**: Check HTTP status codes, and the `error_code` of the last SSE event
 3. **Streaming**: Use SSE for real-time responses; parse events line by line
 4. **Security**: Configure authentication, and list only the hosts and origins that reach the

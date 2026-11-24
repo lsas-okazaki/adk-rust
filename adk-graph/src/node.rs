@@ -32,6 +32,15 @@ pub struct ExecutionConfig {
     /// node that runs again later, such as in the next pass of a loop or on the
     /// next turn of a [`GraphAgent`](crate::agent::GraphAgent), pauses again.
     pub resume_values: HashMap<String, Value>,
+    /// Answers bind to interrupt ids only (LangGraph's strict resume).
+    ///
+    /// With it, every key of [`resume_values`](Self::resume_values) must be the id of a
+    /// pause pending in the thread ([`Interrupt::id`](crate::interrupt::Interrupt::id)):
+    /// an answer to a pause already answered, to a node by name, or to a question the
+    /// node no longer asks is refused with
+    /// [`GraphError::ResumeRejected`](crate::error::GraphError::ResumeRejected) before any
+    /// node runs. Off by default, where a node name answers that node's pause too.
+    pub strict_resume: bool,
     /// How many super-steps one run may take before it fails with
     /// [`GraphError::RecursionLimitExceeded`](crate::error::GraphError::RecursionLimitExceeded).
     ///
@@ -80,6 +89,7 @@ impl ExecutionConfig {
             thread_id: thread_id.to_string(),
             resume_from: None,
             resume_values: HashMap::new(),
+            strict_resume: false,
             recursion_limit: None,
             metadata: HashMap::new(),
             parent_context: None,
@@ -196,6 +206,26 @@ impl ExecutionConfig {
     #[must_use]
     pub fn with_resume_value(mut self, key: impl Into<String>, value: Value) -> Self {
         self.resume_values.insert(key.into(), value);
+        self
+    }
+
+    /// Accepts answers only under the ids of pending pauses; see
+    /// [`ExecutionConfig::strict_resume`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_graph::node::ExecutionConfig;
+    /// use serde_json::json;
+    ///
+    /// let config = ExecutionConfig::new("refund-42")
+    ///     .strict_resume()
+    ///     .with_resume_value("int_3f2a9c0d41b7e6a85c1d2e3f4a5b6c7d", json!({ "approved": true }));
+    /// assert!(config.strict_resume);
+    /// ```
+    #[must_use]
+    pub fn strict_resume(mut self) -> Self {
+        self.strict_resume = true;
         self
     }
 
@@ -546,6 +576,33 @@ impl NodeOutput {
     pub fn interrupt_with_data(message: &str, data: Value) -> Self {
         Self::new().with_interrupt(crate::interrupt::interrupt_with_data(message, data))
     }
+
+    /// Declares the JSON Schema the answer to this output's dynamic interrupt must
+    /// satisfy; checked when the run resumes, before the node runs again.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_graph::node::{NodeContext, NodeOutput};
+    /// use serde_json::json;
+    ///
+    /// async fn review(ctx: NodeContext) -> adk_graph::Result<NodeOutput> {
+    ///     match ctx.resume_value() {
+    ///         Some(answer) if answer["approved"] == true => Ok(NodeOutput::new()),
+    ///         Some(_) => Ok(NodeOutput::new().with_goto(["rejected"])),
+    ///         None => Ok(NodeOutput::interrupt("approve this refund?").with_response_schema(json!({
+    ///             "type": "object",
+    ///             "properties": { "approved": { "type": "boolean" } },
+    ///             "required": ["approved"]
+    ///         }))),
+    ///     }
+    /// }
+    /// ```
+    #[must_use]
+    pub fn with_response_schema(mut self, schema: Value) -> Self {
+        self.interrupt = self.interrupt.map(|interrupt| interrupt.with_response_schema(schema));
+        self
+    }
 }
 
 /// A node in the graph
@@ -755,11 +812,12 @@ pub trait Node: Send + Sync {
                         yield Ok(StreamEvent::route_dispatched(&name, targets));
                     }
                     if let Some(interrupt) = output.interrupt {
-                        let (message, data) = match interrupt {
-                            crate::interrupt::Interrupt::Dynamic { message, data } => (message, data),
-                            other => (other.to_string(), None),
-                        };
-                        yield Ok(StreamEvent::node_interrupt(&name, &message, data));
+                        yield Ok(match interrupt {
+                            crate::interrupt::Interrupt::Dynamic {
+                                message, data, response_schema, ..
+                            } => StreamEvent::NodeInterrupt { node: name.clone(), message, data, response_schema },
+                            other => StreamEvent::node_interrupt(&name, &other.to_string(), None),
+                        });
                     }
                     yield Ok(StreamEvent::Updates { node: name, updates: output.updates });
                 }
@@ -862,6 +920,10 @@ pub struct AgentNode {
 
 impl AgentNode {
     /// Create a new agent node
+    ///
+    /// Without mappers, the agent's input is the last `messages` entry, or else the
+    /// `input` channel, and its output is a `messages` update with one entry per
+    /// response it completes, whole whether the model streamed it or not.
     pub fn new(agent: Arc<dyn adk_core::Agent>) -> Self {
         let name = agent.name().to_string();
         Self {
@@ -871,6 +933,23 @@ impl AgentNode {
             output_mapper: Box::new(default_output_mapper),
             goto_mapper: None,
         }
+    }
+
+    /// Names the node `name` instead of the agent's name, so one agent can back several
+    /// nodes, or a node id that differs from the agent's name.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use adk_graph::node::AgentNode;
+    /// # fn wire(node: AgentNode) -> AgentNode {
+    /// node.with_name("first_draft")
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
     }
 
     /// Set custom input mapper
@@ -883,6 +962,11 @@ impl AgentNode {
     }
 
     /// Set custom output mapper
+    ///
+    /// The mapper receives every event the agent yielded, in order: a streamed
+    /// response's partial chunks, then the non-partial event that carries its complete
+    /// content. Skip the events whose `llm_response.partial` is set to read each
+    /// response once, whole.
     pub fn with_output_mapper<F>(mut self, mapper: F) -> Self
     where
         F: Fn(&[adk_core::Event]) -> HashMap<String, Value> + Send + Sync + 'static,
@@ -945,31 +1029,40 @@ fn default_input_mapper(state: &State) -> adk_core::Content {
     adk_core::Content::new("user")
 }
 
-/// Default output mapper - extracts text content to "messages"
+/// Default output mapper - one "messages" entry per response the agent completes.
+///
+/// A streamed response is partial chunks followed by one non-partial event carrying
+/// its complete content, so only non-partial events are read, as the runner persists
+/// them. As there, a non-partial event without content takes the chunks streamed
+/// under its id.
 fn default_output_mapper(events: &[adk_core::Event]) -> HashMap<String, Value> {
-    let mut updates = HashMap::new();
-
-    // Collect text from events
+    let text_of = |content: &adk_core::Content| -> String {
+        content.parts.iter().filter_map(adk_core::Part::text).collect()
+    };
+    let mut streamed: HashMap<(&str, &str), String> = HashMap::new();
     let mut messages = Vec::new();
-    let mut text_deltas = adk_core::EventTextDeltas::default();
     for event in events {
-        let event = text_deltas.push(event);
-        if let Some(content) = event.content() {
-            let text = content.parts.iter().filter_map(|p| p.text()).collect::<Vec<_>>().join("");
-
-            if !text.is_empty() {
-                messages.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": text
-                }));
+        let key = (event.invocation_id.as_str(), event.id.as_str());
+        if event.llm_response.partial {
+            if let Some(content) = event.content() {
+                streamed.entry(key).or_default().push_str(&text_of(content));
             }
+            continue;
+        }
+        let chunks = streamed.remove(&key);
+        let text = match event.content() {
+            Some(content) => text_of(content),
+            None => chunks.unwrap_or_default(),
+        };
+        if !text.is_empty() {
+            messages.push(serde_json::json!({"role": "assistant", "content": text}));
         }
     }
 
+    let mut updates = HashMap::new();
     if !messages.is_empty() {
-        updates.insert("messages".to_string(), serde_json::json!(messages));
+        updates.insert("messages".to_string(), Value::Array(messages));
     }
-
     updates
 }
 
@@ -1513,24 +1606,66 @@ mod tests {
     }
 
     #[test]
-    fn default_output_mapper_does_not_repeat_a_complete_snapshot() {
-        let mut partial = adk_core::Event::new("invocation");
-        partial.llm_response.partial = true;
-        partial.set_content(adk_core::Content::new("model").with_text("Hello"));
-        let mut terminal = partial.clone();
-        terminal.llm_response.partial = false;
-        terminal.llm_response.provider_metadata =
+    fn default_output_mapper_writes_each_complete_response_once() {
+        let event = |id: &str, text: Option<&str>, partial: bool| {
+            let mut event = adk_core::Event::with_id(id, "invocation");
+            event.llm_response.partial = partial;
+            if let Some(text) = text {
+                event.set_content(adk_core::Content::new("model").with_text(text));
+            }
+            event
+        };
+        let chunk = |id: &str, text: &str| event(id, Some(text), true);
+        let mut complete = event("r1", Some("Hello world."), false);
+        complete.llm_response.provider_metadata =
             Some(serde_json::json!({"content_complete": true}));
-        terminal.set_content(adk_core::Content::new("model").with_text("Hello world"));
+        let mut preamble = event("r1", Some("Let me check."), false);
+        preamble.llm_response.content.as_mut().unwrap().parts.push(adk_core::Part::FunctionCall {
+            name: "lookup".to_string(),
+            args: serde_json::json!({}),
+            id: Some("call-1".to_string()),
+            thought_signature: None,
+        });
+        let cases = [
+            // A streamed response ends with one event carrying its complete content.
+            vec![chunk("r1", "Hello"), chunk("r1", " world"), chunk("r1", "."), complete],
+            // An ending without content carries the chunks streamed under its id.
+            vec![chunk("r1", "Hello"), chunk("r1", " world."), event("r1", None, false)],
+            // A response beside a tool call, tool progress, then the answer.
+            vec![
+                chunk("r1", "Let me check."),
+                preamble,
+                adk_core::Event::tool_progress("invocation", "agent", "call-1", "stdout", "log\n"),
+                chunk("r2", "Done"),
+                event("r2", Some("Done."), false),
+            ],
+            // A remote agent streams each chunk under an id of its own, then joins them.
+            vec![
+                chunk("a", "Hello"),
+                chunk("b", " world."),
+                event("c", Some("Hello world."), false),
+            ],
+        ];
 
-        let updates = default_output_mapper(&[partial, terminal]);
+        let written: Vec<_> =
+            cases.iter().map(|events| default_output_mapper(events).remove("messages")).collect();
 
+        let assistant = |texts: &[&str]| {
+            Some(serde_json::json!(
+                texts
+                    .iter()
+                    .map(|text| serde_json::json!({"role": "assistant", "content": text}))
+                    .collect::<Vec<_>>()
+            ))
+        };
         assert_eq!(
-            updates.get("messages"),
-            Some(&serde_json::json!([
-                {"role": "assistant", "content": "Hello"},
-                {"role": "assistant", "content": " world"},
-            ]))
+            written,
+            vec![
+                assistant(&["Hello world."]),
+                assistant(&["Hello world."]),
+                assistant(&["Let me check.", "Done."]),
+                assistant(&["Hello world."]),
+            ]
         );
     }
 

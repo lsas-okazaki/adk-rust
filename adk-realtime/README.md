@@ -25,6 +25,10 @@ runner.
   switch, the `ToolPolicy`, and confirmation
 - **Context mutation** — swap instructions and tools mid-session (OpenAI: in-place update; Gemini:
   session resumption)
+- **Telephony** — phone calls for voice agents (`telephony`, `openai-sip`, `livekit-sip`):
+  verified webhooks, accept, reject, transfer and hang up over OpenAI Realtime SIP, inbound and
+  outbound calls over LiveKit SIP for any realtime provider, and governed `transfer_call`, `end_call`, `send_dtmf` and `place_call` tools; a kill-switch
+  freeze hangs up the call
 - **Video avatars** — HeyGen and D-ID providers (`heygen-avatar`, `did-avatar`)
 - **Opt-in dependencies** — no provider or transport is compiled by default
 
@@ -58,9 +62,15 @@ runner.
 |----------|-------|-----------|---------|
 | OpenAI | `gpt-realtime-2.1` | WebSocket | `openai` |
 | OpenAI | `gpt-realtime-2.1` | WebRTC with Opus | `openai-webrtc` |
-| Google Gemini Live | `gemini-3.1-flash-live-preview` | WebSocket | `gemini` |
-| Vertex AI Live | for example `gemini-live-2.5-flash-native-audio` | WebSocket with OAuth2 (ADC) | `vertex-live` |
+| Google Gemini Live | `gemini-3.1-flash-live-preview` (default), `gemini-3.8-live`, `gemini-3.8-live-extended-thinking` | WebSocket | `gemini` |
+| Vertex AI Live | `gemini-3.8-live` | WebSocket with OAuth2 (ADC) | `vertex-live` |
 | LiveKit | any of the above | WebRTC bridge | `livekit` |
+
+| Gemini Live model | Choose it for | Setup |
+|-------------------|---------------|-------|
+| `gemini-3.1-flash-live-preview` | The default (`gemini::DEFAULT_MODEL`) | Optional `RealtimeConfig::with_thinking_level` |
+| `gemini-3.8-live` | The newer model, with built-in reasoning | No thinking level (not sent); tools declared `BLOCKING` |
+| `gemini-3.8-live-extended-thinking` | Configurable background reasoning (low, medium, high) | `RealtimeConfig::with_thinking_level(Effort::…)`; the model requires a level, and ADK sends `medium` unless you set one. Tools run non-blocking; tool calls are unverified, none reached the client in live tests |
 
 ## Quick Start
 
@@ -71,7 +81,7 @@ adk-realtime = { version = "3.0.0", features = ["openai"] }
 
 ### Low-level session
 
-The program sends one text turn and prints the text reply.
+The program sends one text turn and prints the text reply. It needs the `openai` feature.
 
 ```rust
 use adk_realtime::openai::OpenAIRealtimeModel;
@@ -106,6 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### RealtimeAgent
 
 `RealtimeAgent` implements `adk_core::Agent`, so `adk_runner::Runner` runs it like any other agent.
+The example needs the `openai` feature.
 
 ```rust
 use adk_realtime::RealtimeAgent;
@@ -153,9 +164,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The `gemini` feature compiles in more than one rustls crypto provider, so `connect` installs
-`aws-lc-rs` as the process-level provider through `adk_core::ensure_crypto_provider()`; a
-provider the application installed first is kept.
+The Gemini Live, OpenAI Realtime, and LiveKit connects install `aws-lc-rs` as the process-level
+rustls provider through `adk_core::ensure_crypto_provider()`, so an application that also
+compiles `ring` (the `livekit` feature does) needs no setup; a provider the application
+installed first is kept.
 Gemini Live takes 16 kHz mono PCM16 input and returns 24 kHz mono PCM16 output.
 
 ### Vertex AI Live
@@ -172,7 +184,7 @@ use adk_realtime::{RealtimeConfig, RealtimeModel};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Application Default Credentials, for example from `gcloud auth application-default login`.
     let backend = GeminiLiveBackend::vertex_adc(std::env::var("GOOGLE_CLOUD_PROJECT")?, "us-central1")?;
-    let model = GeminiRealtimeModel::new(backend, "gemini-live-2.5-flash-native-audio");
+    let model = GeminiRealtimeModel::new(backend, "gemini-3.8-live");
 
     let session = model.connect(RealtimeConfig::default()).await?;
     session.close().await?;
@@ -217,7 +229,7 @@ adk-realtime = { version = "3.0.0", features = ["livekit", "openai"] }
 `LiveKitConfig` keeps the API key and secret as `secrecy::SecretString` and redacts them in
 `Debug` output.
 
-```rust
+```rust,ignore
 use adk_realtime::livekit::{LiveKitConfig, LiveKitRoomBuilder};
 
 #[tokio::main]
@@ -303,6 +315,7 @@ the runners take them from `tool_governance` on their builders.
 | Held calls | A call the governed path holds, or that a tool's delegate holds (an `AgentTool` whose agent held a call), is answered to the model as `confirmation_pending`, recorded in the session under the runner's agent name (`agent_name`, default `realtime`) and in the run's `ApprovalStore`, and surfaced as `ServerEvent::ToolConfirmationRequested`; `held_calls()` lists them and `resume_held_calls()` runs each one that has a decision under its original call ID. `RealtimeAgent` holds its own call when its delegate holds one and resumes decided calls at the start of a run |
 | Approval binding | A held call's request names the runner's acting agent and the tool's origin: an ADK tool's `Tool::origin()`, or for a native handler `REALTIME_HANDLER_ORIGIN` (`realtime`) with a digest of its `ToolDefinition` (`ToolDefinition::handler_origin`), so an approval never covers another agent's call, a `Tool` of the same name, or a handler redefined since |
 | Concurrent dispatch | `IntegratedRealtimeRunnerBuilder::concurrent_tool_dispatch(true)` runs each dispatch on its own task, so `next_event` keeps reading provider events while a tool runs; off by default |
+| Waiting for results | On `gemini-3.8-live` a tool is declared `BLOCKING`, so the model answers with the result in the turn that called it; `ToolDefinition::with_behavior(ToolBehavior::NonBlocking)` lets the conversation continue while a tool runs. `gemini-3.8-live-extended-thinking` accepts only non-blocking tools; other models keep their own default |
 | Metering | With a `spend_ledger` in the governance config, every response reserves a hold (the run's `LlmSpendEstimate`) when it starts and commits its cost when it ends: `RealtimeUsage::from_response` reads OpenAI's `response.usage` or Gemini's `usageMetadata`, `realtime_pricing(RealtimePricing)` prices it, and without pricing the estimate is committed. A refused hold ends the session with `RealtimeError::SpendRefused`. `RealtimeAgent` yields the usage on an event at each response's end |
 | Output guardrails | `output_guardrails(GuardrailSet)` (feature `guardrails`) screens each completed turn as `LlmAgent` screens final text: a transform replaces the persisted text; a block interrupts the response, persists nothing of the turn and reports `RealtimeError::OutputBlocked` (the agent ends the run with the guardrail's error) |
 
@@ -337,6 +350,9 @@ provider's reason.
 | Server event | Description |
 |--------------|-------------|
 | `SessionCreated`, `SessionUpdated` | Session established or updated |
+| `AudioCommitted`, `AudioCleared` | Input audio buffer committed or cleared |
+| `ItemCreated` | Conversation item created |
+| `OutputItemAdded`, `OutputItemDone` | Response output item added or completed |
 | `AudioDelta`, `AudioDone` | Output audio chunk, end of output audio |
 | `TextDelta`, `TextDone` | Text response chunk, end of text |
 | `TranscriptDelta`, `TranscriptDone` | Transcript of the output audio |
@@ -345,6 +361,7 @@ provider's reason.
 | `ResponseCreated`, `ResponseDone` | Response started, response completed |
 | `ToolConfirmationRequested` | A tool call held for a confirmation decision (emitted by the integrated runner, not a provider) |
 | `SpeechStarted`, `SpeechStopped` | VAD detected speech or silence (OpenAI `speech_started` / `speech_stopped`, Gemini Live `voiceActivity`) |
+| `RateLimitsUpdated` | Rate limit information |
 | `Error` | Provider error |
 | `Unknown` | An event type this version does not model |
 
@@ -355,6 +372,8 @@ provider's reason.
 | `ConversationItemCreate` | Send a text message or tool response |
 | `ResponseCreate`, `ResponseCancel` | Request or cancel a response |
 | `SessionUpdate` | Update the session configuration |
+| `Message` | A message with `adk_core` roles and parts |
+| `UpdateSession` | Mid-session instruction and tool update for the runner to intercept; never serialized to the provider |
 
 ## Audio formats
 
@@ -374,6 +393,9 @@ provider's reason.
 | `vertex-live` | Vertex AI Live API with ADC (implies `gemini`) | GCP credentials |
 | `openai-webrtc` | OpenAI WebRTC transport with Opus (implies `openai`) | cmake |
 | `livekit` | LiveKit WebRTC bridge | a LiveKit server |
+| `telephony` | Provider-neutral call control (`CallControl`, `CallAnswerer`, `OutboundDialer`), `hang_up_on_freeze`, and the call-control tools | |
+| `openai-sip` | OpenAI Realtime SIP: webhook verification, accept, reject, refer, hang up, and a session attached to a call (implies `openai`, `telephony`) | an OpenAI SIP trunk |
+| `livekit-sip` | LiveKit SIP over the server API: trunks, dispatch rules, `participant_joined` webhooks, outbound calls, transfer, hang up (implies `telephony`; no WebRTC stack) | a LiveKit server with SIP |
 | `video-avatar` | Avatar configuration and the `AvatarProvider` trait | |
 | `heygen-avatar` | HeyGen LiveAvatar provider (implies `video-avatar`, `livekit`) | |
 | `did-avatar` | D-ID Realtime Agents provider (implies `video-avatar`) | |

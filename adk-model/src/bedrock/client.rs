@@ -28,7 +28,7 @@ use tracing::{debug, info, instrument};
 /// ```rust,ignore
 /// use adk_model::bedrock::{BedrockClient, BedrockConfig};
 ///
-/// let config = BedrockConfig::new("us-east-1", "us.anthropic.claude-sonnet-4-6");
+/// let config = BedrockConfig::new("us-east-1", "us.anthropic.claude-sonnet-5-5");
 /// let client = BedrockClient::new(config).await?;
 ///
 /// // Use via the Llm trait
@@ -93,7 +93,7 @@ impl BedrockClient {
     /// ```
     /// use adk_model::bedrock::{BedrockClient, BedrockConfig};
     ///
-    /// let config = BedrockConfig::new("us-east-1", "anthropic.claude-sonnet-4-6-v1:0");
+    /// let config = BedrockConfig::new("us-east-1", "us.anthropic.claude-sonnet-5-5");
     /// let client = BedrockClient::new_with_api_key(config, "bedrock-api-key")?;
     /// # Ok::<(), adk_core::AdkError>(())
     /// ```
@@ -123,7 +123,7 @@ impl BedrockClient {
     /// # async fn example() {
     /// let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     /// let sdk = aws_sdk_bedrockruntime::Client::new(&sdk_config);
-    /// let config = BedrockConfig::new("us-east-1", "anthropic.claude-sonnet-4-6-v1:0");
+    /// let config = BedrockConfig::new("us-east-1", "us.anthropic.claude-sonnet-5-5");
     /// let client = BedrockClient::from_client(config, sdk);
     /// # }
     /// ```
@@ -153,7 +153,7 @@ impl BedrockClient {
     /// use adk_model::bedrock::{BedrockClient, BedrockConfig};
     /// use adk_model::HttpTimeouts;
     ///
-    /// let config = BedrockConfig::new("us-east-1", "anthropic.claude-sonnet-4-6-v1:0");
+    /// let config = BedrockConfig::new("us-east-1", "us.anthropic.claude-sonnet-5-5");
     /// let client = BedrockClient::new_with_api_key(config, "bedrock-api-key")?
     ///     .with_timeouts(HttpTimeouts::new(Duration::from_secs(5), Duration::from_secs(120)))?;
     /// # let _ = client;
@@ -202,6 +202,10 @@ impl Llm for BedrockClient {
         )
     }
 
+    fn context_window(&self) -> Option<u64> {
+        crate::pricing::PricingCatalog::standard().context_window(Some("bedrock"), self.name())
+    }
+
     fn name(&self) -> &str {
         &self.model_id
     }
@@ -235,7 +239,8 @@ impl Llm for BedrockClient {
                 "bedrock takes no reasoning effort from this client; the request's effort is ignored"
             );
         }
-        let usage_span = adk_telemetry::llm_generate_span("bedrock", &self.model_id, stream);
+        let usage_span =
+            crate::telemetry::inference_span("bedrock", &self.model_id, stream, &request);
         let bedrock_input = adk_request_to_bedrock(
             &request.contents,
             &request.tools,

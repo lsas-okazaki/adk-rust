@@ -17,8 +17,9 @@ use super::theme::Theme;
 use super::view::fit;
 use crate::engine::Command;
 use crate::genui::{
-    AppView, DrawnActionView, DrawnField, DrawnInput, DrawnNode, DrawnSurface, FormState,
-    FormStatus, RefusedDrawing,
+    AppView, ChartAxis, DepthEffect, DrawnActionView, DrawnChart, DrawnDepth, DrawnField,
+    DrawnInput, DrawnNode, DrawnScene, DrawnSurface, FormState, FormStatus, RefusedDrawing,
+    SceneState,
 };
 use crate::model::{FeedEntry, ThreadItem};
 use crate::words;
@@ -83,6 +84,8 @@ impl Drawings {
                 ThreadItem::Message { .. }
                 | ThreadItem::Activity { .. }
                 | ThreadItem::Result { .. }
+                | ThreadItem::Run { .. }
+                | ThreadItem::Suggestions { .. }
                 | ThreadItem::Decision { .. }
                 | ThreadItem::DrawnSent { .. } => {}
             }
@@ -151,10 +154,150 @@ pub(crate) fn shown_value(field: &DrawnField, value: Option<&Value>) -> String {
     }
 }
 
+/// The most blocks a chart's line takes in the terminal: longer series are averaged down.
+const CHART_BLOCKS: usize = 48;
+
+/// A chart in the terminal (spec 3.3 §6.1 `genui`, extension catalogs): the sentence the server
+/// wrote for it, then a line of blocks for each series on a number or time axis, or a table of
+/// its categories.
+fn chart_rows(chart: &DrawnChart, out: &mut Vec<Row>) {
+    out.push(Row::Text(chart.summary.clone(), true));
+    match &chart.x {
+        ChartAxis::Category { labels } => {
+            let mut header = vec![String::new()];
+            header.extend(chart.series.iter().map(|series| series.name.clone()));
+            out.push(Row::Cells(header, true));
+            for (index, label) in labels.iter().enumerate().take(SHOWN_ROWS) {
+                let mut cells = vec![label.clone()];
+                cells.extend(chart.series.iter().map(|series| {
+                    series.y.get(index).map(ToString::to_string).unwrap_or_default()
+                }));
+                out.push(Row::Cells(cells, false));
+            }
+            if labels.len() > SHOWN_ROWS {
+                out.push(Row::Text(lower_first(&words::show_all(labels.len())), true));
+            }
+        }
+        ChartAxis::Number | ChartAxis::Time => {
+            for series in &chart.series {
+                let line = blocks(&series.y);
+                if series.name.trim().is_empty() {
+                    out.push(Row::Text(line, false));
+                } else {
+                    out.push(Row::Pair(series.name.clone(), line));
+                }
+            }
+        }
+    }
+}
+
+/// A 3D scene in the terminal (spec 3.3 §6.1 `genui`, extension catalogs): the sentence the
+/// server wrote for it and what picking fills, then its text view, or else its labelled
+/// objects with their states, then each panel under the object it is shown beside.
+fn scene_rows(node: &DrawnNode, scene: &DrawnScene, out: &mut Vec<Row>) {
+    out.push(Row::Text(scene.summary.clone(), true));
+    if let Some(select) = &scene.select
+        && !select.note.is_empty()
+    {
+        out.push(Row::Text(select.note.clone(), true));
+    }
+    let child = |key: &str| node.children.iter().find(|child| child.key == key);
+    match scene.text_view.as_deref().and_then(child) {
+        Some(text) => rows(text, out),
+        None => {
+            let labelled: Vec<_> = scene
+                .objects
+                .iter()
+                .filter_map(|object| Some((object.label.as_deref()?, object.state)))
+                .collect();
+            for (label, state) in labelled.iter().take(SHOWN_ROWS) {
+                out.push(Row::Pair(
+                    (*label).to_string(),
+                    state.map(state_word).unwrap_or_default(),
+                ));
+            }
+            if labelled.len() > SHOWN_ROWS {
+                out.push(Row::Text(lower_first(&words::show_all(labelled.len())), true));
+            }
+        }
+    }
+    for panel in &scene.panels {
+        let Some(held) = child(&panel.key) else { continue };
+        let anchor = scene
+            .objects
+            .iter()
+            .find(|object| object.id == panel.anchor)
+            .and_then(|object| object.label.clone())
+            .unwrap_or_else(|| panel.anchor.clone());
+        out.push(Row::Text(anchor, true));
+        rows(held, out);
+    }
+}
+
+/// A scene object's state as a word.
+fn state_word(state: SceneState) -> String {
+    match state {
+        SceneState::Ok => words::STATE_OK,
+        SceneState::Warning => words::STATE_WARNING,
+        SceneState::Critical => words::STATE_CRITICAL,
+        SceneState::Info => words::STATE_INFO,
+    }
+    .to_string()
+}
+
+/// Children presented in depth, in the terminal: a flip card's front and back under those
+/// words, and the others under their titles.
+fn depth_rows(node: &DrawnNode, depth: &DrawnDepth, out: &mut Vec<Row>) {
+    for (index, child) in node.children.iter().enumerate() {
+        let title = match depth.effect {
+            DepthEffect::Flip => {
+                Some(if index == 0 { words::FRONT } else { words::BACK }.to_string())
+            }
+            _ => depth.titles.get(index).cloned(),
+        };
+        if let Some(title) = title {
+            out.push(Row::Text(title, true));
+        }
+        rows(child, out);
+    }
+}
+
+/// `values` as a line of blocks, low to high, at most [`CHART_BLOCKS`] long.
+fn blocks(values: &[serde_json::Number]) -> String {
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let values: Vec<f64> = values.iter().filter_map(serde_json::Number::as_f64).collect();
+    let per = values.len().div_ceil(CHART_BLOCKS).max(1);
+    let averaged: Vec<f64> =
+        values.chunks(per).map(|chunk| chunk.iter().sum::<f64>() / chunk.len() as f64).collect();
+    let (low, high) =
+        averaged.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), value| {
+            (low.min(*value), high.max(*value))
+        });
+    averaged
+        .iter()
+        .map(|value| {
+            let step = if high > low { ((value - low) / (high - low) * 7.0).round() } else { 3.0 };
+            BLOCKS[(step as usize).min(7)]
+        })
+        .collect()
+}
+
 /// The rows of `node`, in order.
 fn rows(node: &DrawnNode, out: &mut Vec<Row>) {
     if let Some(field) = &node.field {
         out.push(Row::Pair(node.text.clone().unwrap_or_default(), shown_value(field, None)));
+        return;
+    }
+    if let Some(chart) = &node.chart {
+        chart_rows(chart, out);
+        return;
+    }
+    if let Some(scene) = &node.scene {
+        scene_rows(node, scene, out);
+        return;
+    }
+    if let Some(depth) = &node.depth {
+        depth_rows(node, depth, out);
         return;
     }
     match node.component.as_str() {
@@ -815,9 +958,22 @@ pub(crate) fn json_lines(session: &str, entry: &FeedEntry) -> Vec<Value> {
                 "by": app.agent.name,
                 "text": app.result_text,
             })),
+            // A run's line, for CI: what ran and how it exited.
+            ThreadItem::Run { tool, call_id, ok, run, .. } => Some(json!({
+                "type": "run",
+                "session": session,
+                "tool": tool,
+                "call": call_id,
+                "ok": ok,
+                "command": run.command,
+                "exit": run.exit_code,
+                "durationMs": run.duration_ms,
+                "stopped": run.stopped,
+            })),
             ThreadItem::Message { .. }
             | ThreadItem::Activity { .. }
             | ThreadItem::Result { .. }
+            | ThreadItem::Suggestions { .. }
             | ThreadItem::Decision { .. } => None,
         })
         .collect()
@@ -832,6 +988,135 @@ mod tests {
     use crate::genui::{DrawnArg, DrawnCheck, DrawnKind, DrawnOption};
     use crate::model::{AgentRef, Avatar};
     use crate::tui::theme::Appearance;
+
+    /// A scene is its summary and what picking fills, then its text view, or else its
+    /// labelled objects with their states; then each panel under its object's label. A flip
+    /// card is its front and back under those words.
+    #[test]
+    fn a_scene_is_its_words_and_a_flip_card_its_two_faces() {
+        use crate::genui::{SceneObject, ScenePanel, SceneSelect, SceneShape};
+        let text = |key: &str, text: &str| DrawnNode {
+            key: key.into(),
+            component: "Text".into(),
+            text: Some(text.into()),
+            ..DrawnNode::default()
+        };
+        let mut scene = DrawnScene::new(crate::genui::SceneKind::Space);
+        scene.summary = "3D scene of Dock 1 and Dock 2, 2 objects".into();
+        let mut one =
+            SceneObject::new("dock-1", SceneShape::Sphere { radius: 1.into() }).labelled("Dock 1");
+        one.state = Some(SceneState::Ok);
+        let two =
+            SceneObject::new("dock-2", SceneShape::Sphere { radius: 1.into() }).labelled("Dock 2");
+        scene.objects = vec![one, two];
+        scene.select = Some(SceneSelect {
+            path: "/dock".into(),
+            note: "Picking one fills Dock. Nothing is sent.".into(),
+        });
+        scene.panels = vec![ScenePanel { anchor: "dock-2".into(), key: "note".into() }];
+        let node = DrawnNode {
+            key: "map#1".into(),
+            component: "Scene".into(),
+            scene: Some(scene.clone()),
+            children: vec![text("note", "Closed since 09:00")],
+            ..DrawnNode::default()
+        };
+        let mut out = Vec::new();
+        rows(&node, &mut out);
+        assert_eq!(
+            out,
+            vec![
+                Row::Text("3D scene of Dock 1 and Dock 2, 2 objects".into(), true),
+                Row::Text("Picking one fills Dock. Nothing is sent.".into(), true),
+                Row::Pair("Dock 1".into(), "OK".into()),
+                Row::Pair("Dock 2".into(), String::new()),
+                Row::Text("Dock 2".into(), true),
+                Row::Text("Closed since 09:00".into(), false),
+            ]
+        );
+
+        // With a text view, its words stand for the objects.
+        scene.text_view = Some("map#2".into());
+        let node = DrawnNode {
+            scene: Some(scene),
+            children: vec![text("note", "Closed since 09:00"), text("map#2", "Dock 1 is fine.")],
+            ..node
+        };
+        let mut out = Vec::new();
+        rows(&node, &mut out);
+        assert_eq!(out[2], Row::Text("Dock 1 is fine.".into(), false));
+
+        let flip = DrawnNode {
+            key: "card#1".into(),
+            component: "Depth".into(),
+            depth: Some(DrawnDepth { effect: DepthEffect::Flip, titles: Vec::new() }),
+            children: vec![text("front", "p95 840 ms"), text("back", "Up from 410 ms")],
+            ..DrawnNode::default()
+        };
+        let mut out = Vec::new();
+        rows(&flip, &mut out);
+        assert_eq!(
+            out,
+            vec![
+                Row::Text("Front".into(), true),
+                Row::Text("p95 840 ms".into(), false),
+                Row::Text("Back".into(), true),
+                Row::Text("Up from 410 ms".into(), false),
+            ]
+        );
+    }
+
+    /// A chart is its summary, then a line of blocks per series on a number or time axis, or
+    /// a table of its categories cut at the shown rows.
+    #[test]
+    fn a_chart_is_its_summary_then_blocks_or_a_table() {
+        use crate::genui::{ChartKind, ChartSeries};
+        let line = DrawnChart {
+            kind: ChartKind::Line,
+            x: ChartAxis::Number,
+            x_label: None,
+            y_label: None,
+            ticks: Vec::new(),
+            series: vec![ChartSeries {
+                name: "Latency".into(),
+                x: (0..4).map(serde_json::Number::from).collect(),
+                y: [1, 8, 4, 8].into_iter().map(serde_json::Number::from).collect(),
+            }],
+            summary: "Line chart of Latency, 4 points, from 1 to 8".into(),
+        };
+        let mut out = Vec::new();
+        chart_rows(&line, &mut out);
+        assert_eq!(
+            out,
+            vec![
+                Row::Text("Line chart of Latency, 4 points, from 1 to 8".into(), true),
+                Row::Pair("Latency".into(), "▁█▄█".into()),
+            ]
+        );
+        let long = blocks(&(0..500).map(serde_json::Number::from).collect::<Vec<_>>());
+        assert!((40..=CHART_BLOCKS).contains(&long.chars().count()), "{long}");
+
+        let labels: Vec<String> = (0..12).map(|i| format!("M{i}")).collect();
+        let bars = DrawnChart {
+            kind: ChartKind::Bar,
+            x: ChartAxis::Category { labels },
+            x_label: None,
+            y_label: None,
+            ticks: Vec::new(),
+            series: vec![ChartSeries {
+                name: "Sales".into(),
+                x: Vec::new(),
+                y: (0..12).map(serde_json::Number::from).collect(),
+            }],
+            summary: "Bar chart of Sales, 12 points, from 0 to 11".into(),
+        };
+        let mut out = Vec::new();
+        chart_rows(&bars, &mut out);
+        assert_eq!(out[1], Row::Cells(vec![String::new(), "Sales".into()], true));
+        assert_eq!(out[2], Row::Cells(vec!["M0".into(), "0".into()], false));
+        assert_eq!(out.len(), 2 + SHOWN_ROWS + 1, "cut at the shown rows, then show all");
+        assert_eq!(out.last(), Some(&Row::Text("show all 12".into(), true)));
+    }
 
     fn field(
         key: &str,
@@ -858,6 +1143,11 @@ mod tests {
             tabs: Vec::new(),
             show_all_text: None,
             children: Vec::new(),
+            chart: None,
+            scene: None,
+            depth: None,
+            extension: None,
+            accessibility: None,
         }
     }
 
@@ -897,6 +1187,11 @@ mod tests {
                     field("amount", "Amount", DrawnInput::Number, json!(4200), Vec::new()),
                     field("copy", "Copy to me", DrawnInput::Checkbox, json!(false), Vec::new()),
                 ],
+                chart: None,
+                scene: None,
+                depth: None,
+                extension: None,
+                accessibility: None,
             }),
             actions: vec![DrawnActionView {
                 id: "send".into(),

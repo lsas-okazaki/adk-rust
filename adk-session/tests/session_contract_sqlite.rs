@@ -103,6 +103,12 @@ async fn test_sqlite_rewind_contract() {
 }
 
 #[tokio::test]
+async fn test_sqlite_history_contract() {
+    let service = in_memory().await;
+    common::history_contract::assert_history_contract(&service, "history_app").await;
+}
+
+#[tokio::test]
 async fn test_sqlite_delete_all_sessions_erases_the_user_tier() {
     let service = in_memory().await;
     common::state_contract::assert_delete_all_sessions_contract(
@@ -125,4 +131,10 @@ mod subject_data {
     adk_core::subject_data_store_conformance_tests!(
         harness = crate::common::subject_data::SessionData(super::FileDatabase::new())
     );
+}
+
+#[tokio::test]
+async fn test_sqlite_archive_contract() {
+    let service = in_memory().await;
+    common::archive_contract::assert_archive_contract(&service, "archive_app").await;
 }

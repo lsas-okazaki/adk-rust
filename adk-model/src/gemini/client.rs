@@ -91,6 +91,62 @@ impl Default for InteractionOptions {
     }
 }
 
+/// A file uploaded through the Gemini File API.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct GeminiFile {
+    /// The resource name, `files/<id>`.
+    pub name: String,
+    /// The URI a `Part::FileData` names.
+    pub uri: String,
+    /// The MIME type Gemini recorded.
+    pub mime_type: Option<String>,
+    /// The size in bytes.
+    pub size_bytes: Option<u64>,
+    /// Whether Gemini has processed it.
+    pub state: GeminiFileState,
+}
+
+impl GeminiFile {
+    fn from_wire(file: &adk_gemini::File) -> Result<Self> {
+        let uri = file.uri.as_ref().map(ToString::to_string).ok_or_else(|| {
+            adk_core::AdkError::model(format!("the File API returned {} without a URI", file.name))
+        })?;
+        Ok(Self {
+            name: file.name.clone(),
+            uri,
+            mime_type: file.mime_type.clone(),
+            size_bytes: file.size_bytes.and_then(|n| u64::try_from(n).ok()),
+            state: match file.state {
+                Some(adk_gemini::FileState::Active) => GeminiFileState::Active,
+                Some(adk_gemini::FileState::Processing) => GeminiFileState::Processing,
+                Some(adk_gemini::FileState::Failed) => GeminiFileState::Failed,
+                _ => GeminiFileState::Unknown,
+            },
+        })
+    }
+}
+
+/// Where Gemini is in processing an uploaded file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GeminiFileState {
+    /// Being processed; a video is not usable yet.
+    Processing,
+    /// Ready to use.
+    Active,
+    /// Processing failed.
+    Failed,
+    /// Not reported, or deleted.
+    Unknown,
+}
+
+/// `true` for a URI Gemini fetches itself: a File API, Cloud Storage or HTTP(S) URI.
+fn is_fetchable_uri(uri: &str) -> bool {
+    let scheme = uri.split_once("://").map(|(s, _)| s.to_ascii_lowercase());
+    matches!(scheme.as_deref(), Some("https" | "http" | "gs"))
+}
+
 /// Gemini model client wrapping the `adk-gemini` crate for the `Llm` trait.
 pub struct GeminiModel {
     client: Gemini,
@@ -567,7 +623,7 @@ impl GeminiModel {
         }
 
         let model = self.model_name.strip_prefix("models/").unwrap_or(&self.model_name);
-        if !matches!(model, "gemini-3.6-flash" | "gemini-3.7-flash") {
+        if !matches!(model, "gemini-3.6-flash" | "gemini-3.7-flash" | "gemini-3.8-flash") {
             return Ok(());
         }
 
@@ -648,7 +704,7 @@ impl GeminiModel {
     ///
     /// let model = GeminiModel::new_with_base_url(
     ///     "api-key",
-    ///     "gemini-3.7-flash",
+    ///     "gemini-3.8-flash",
     ///     "https://gateway.example.com/v1beta/",
     /// )?;
     /// # Ok::<(), adk_core::AdkError>(())
@@ -670,8 +726,9 @@ impl GeminiModel {
 
     /// Create an API-key model with explicit connect and byte-idle timeouts.
     ///
-    /// Existing constructors keep the standalone SDK's defaults. This constructor
-    /// uses the same SDK builder and adds no response-level or total-request timer.
+    /// The other API-key constructors apply [`HttpTimeouts::default`](crate::HttpTimeouts),
+    /// the SDK's own defaults. This constructor uses the same SDK builder and adds no
+    /// response-level or total-request timer.
     ///
     /// # Example
     ///
@@ -680,7 +737,7 @@ impl GeminiModel {
     /// use std::time::Duration;
     ///
     /// let model = GeminiModel::new_with_base_url_and_timeouts(
-    ///     "api-key", "gemini-3.7-flash", "https://gateway.example.com/v1beta/",
+    ///     "api-key", "gemini-3.8-flash", "https://gateway.example.com/v1beta/",
     ///     HttpTimeouts::new(Duration::from_secs(30), Duration::from_secs(300)),
     /// )?;
     /// # Ok::<(), adk_core::AdkError>(())
@@ -747,7 +804,7 @@ impl GeminiModel {
     ///     None,
     ///     "my-project",
     ///     "us-central1",
-    ///     "gemini-3.7-flash",
+    ///     "gemini-3.8-flash",
     ///     "https://us-central1-aiplatform.googleapis.com",
     /// )?;
     /// # Ok::<(), adk_core::AdkError>(())
@@ -874,7 +931,7 @@ impl GeminiModel {
     ///
     /// # #[tokio::main]
     /// # async fn main() -> adk_core::Result<()> {
-    /// let model = GeminiModel::from_env("gemini-3.7-flash")?;
+    /// let model = GeminiModel::from_env("gemini-3.8-flash")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -946,7 +1003,7 @@ impl GeminiModel {
     ///     );
     ///
     /// // Gemini 2.5 — budget-based thinking
-    /// let model = GeminiModel::new(api_key, "gemini-3.7-flash")?
+    /// let model = GeminiModel::new(api_key, "gemini-3.8-flash")?
     ///     .with_thinking_config(
     ///         ThinkingConfig::new().with_thinking_budget(2048)
     ///     );
@@ -985,7 +1042,7 @@ impl GeminiModel {
     /// let store = VertexRagStore::corpus("projects/p/locations/us-central1/ragCorpora/123")
     ///     .with_top_k(5);
     /// let model =
-    ///     GeminiModel::new_google_cloud("api-key", "p", "us-central1", "gemini-3.7-flash")?
+    ///     GeminiModel::new_google_cloud("api-key", "p", "us-central1", "gemini-3.8-flash")?
     ///         .with_vertex_rag_store(store);
     /// # Ok(())
     /// # }
@@ -1023,7 +1080,7 @@ impl GeminiModel {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let model = GeminiModel::new(api_key, "gemini-3.7-flash")?
+    /// let model = GeminiModel::new(api_key, "gemini-3.8-flash")?
     ///     .use_interactions_api(true)?;
     /// ```
     #[cfg(feature = "gemini-interactions")]
@@ -1107,7 +1164,7 @@ impl GeminiModel {
                             converted_parts.push(Part::Text { text: text.clone() });
                         }
                     }
-                    adk_gemini::Part::InlineData { inline_data } => {
+                    adk_gemini::Part::InlineData { inline_data, .. } => {
                         let decoded =
                             BASE64_STANDARD.decode(&inline_data.data).map_err(|error| {
                                 adk_core::AdkError::model(format!(
@@ -1153,7 +1210,7 @@ impl GeminiModel {
                         converted_parts
                             .push(Part::ServerToolResponse { server_tool_response: value });
                     }
-                    adk_gemini::Part::FileData { file_data } => {
+                    adk_gemini::Part::FileData { file_data, .. } => {
                         converted_parts.push(Part::FileData {
                             mime_type: file_data.mime_type.clone(),
                             file_uri: file_data.file_uri.clone(),
@@ -1209,12 +1266,15 @@ impl GeminiModel {
                 | adk_gemini::FinishReason::ImageSafety
                 | adk_gemini::FinishReason::ModelArmor => FinishReason::Safety,
                 adk_gemini::FinishReason::Recitation => FinishReason::Recitation,
+                // https://ai.google.dev/api/generate-content#FinishReason: the function call is
+                // invalid, or names a tool when no tools were enabled.
+                adk_gemini::FinishReason::MalformedFunctionCall
+                | adk_gemini::FinishReason::UnexpectedToolCall => FinishReason::MalformedToolCall,
                 adk_gemini::FinishReason::FinishReasonUnspecified
                 | adk_gemini::FinishReason::Language
                 | adk_gemini::FinishReason::Other
-                | adk_gemini::FinishReason::MalformedFunctionCall
-                | adk_gemini::FinishReason::UnexpectedToolCall
                 | adk_gemini::FinishReason::TooManyToolCalls => FinishReason::Other,
+                _ => FinishReason::Other,
             });
         // A blocked prompt has no candidates: it ends the turn as a safety stop, and
         // `error_code` marks it as a failure rather than an empty answer.
@@ -1310,7 +1370,7 @@ impl GeminiModel {
     }
 
     fn build_gemini_tools(
-        tools: &std::collections::HashMap<String, serde_json::Value>,
+        tools: &adk_core::ToolDeclarations,
         adapter: &dyn SchemaAdapter,
         cache: &SchemaCache,
     ) -> Result<(Vec<adk_gemini::Tool>, adk_gemini::ToolConfig)> {
@@ -1491,11 +1551,27 @@ impl GeminiModel {
             }
         }
 
+        // System contents become Gemini's `systemInstruction`, as adk-python and adk-go send
+        // the agent's instruction. A request on a context cache keeps them as leading user
+        // turns: the cache already carries a system instruction, and Gemini takes only one.
+        let on_cache = req.config.as_ref().is_some_and(|config| config.cached_content.is_some());
+        if !on_cache {
+            let instruction: Vec<&str> = req
+                .contents
+                .iter()
+                .filter(|content| content.role == "system")
+                .flat_map(|content| content.parts.iter().filter_map(Part::text))
+                .filter(|text| !text.trim().is_empty())
+                .collect();
+            if !instruction.is_empty() {
+                builder = builder.with_system_instruction(instruction.join("\n\n"));
+            }
+        }
+
         // Add contents using proper builder methods
-        for content in &req.contents {
+        for content in &join_function_responses(&req.contents) {
             match content.role.as_str() {
-                // System contents stay leading user turns: a `system_instruction` would
-                // conflict with the context cache, which already carries one.
+                "system" if !on_cache => {}
                 "user" | "system" => {
                     // For user messages, build gemini Content with potentially multiple parts
                     let mut gemini_parts = Vec::new();
@@ -1508,13 +1584,32 @@ impl GeminiModel {
                                     thought_signature: None,
                                 });
                             }
-                            Part::InlineData { data, mime_type, .. } => {
+                            Part::InlineData { data, mime_type, annotations, .. } => {
                                 let encoded = attachment::encode_base64(data);
                                 gemini_parts.push(adk_gemini::Part::InlineData {
                                     inline_data: adk_gemini::Blob {
                                         mime_type: mime_type.clone(),
                                         data: encoded,
                                     },
+                                    video_metadata: super::options::video_metadata(
+                                        annotations.as_ref(),
+                                    ),
+                                });
+                            }
+                            // Gemini fetches File API, Cloud Storage and HTTP(S) URIs itself;
+                            // any other scheme (`artifact://`, `file://`) would fail the
+                            // request, so it stays a text reference.
+                            Part::FileData { mime_type, file_uri, annotations }
+                                if is_fetchable_uri(file_uri) =>
+                            {
+                                gemini_parts.push(adk_gemini::Part::FileData {
+                                    file_data: adk_gemini::FileDataRef {
+                                        mime_type: mime_type.clone(),
+                                        file_uri: file_uri.clone(),
+                                    },
+                                    video_metadata: super::options::video_metadata(
+                                        annotations.as_ref(),
+                                    ),
                                 });
                             }
                             Part::FileData { mime_type, file_uri, .. } => {
@@ -1657,6 +1752,7 @@ impl GeminiModel {
         // Add generation config
         if let Some(config) = req.config {
             let has_schema = config.response_schema.is_some();
+            let options = super::options::GeminiRequestOptions::from_config(&config);
             let gen_config = adk_gemini::GenerationConfig {
                 temperature: config.temperature,
                 top_p: config.top_p,
@@ -1682,6 +1778,7 @@ impl GeminiModel {
                     None
                 },
                 thinking_config: thinking_config.clone(),
+                media_resolution: options.media_resolution,
                 ..Default::default()
             };
             builder = builder.with_generation_config(gen_config);
@@ -1826,7 +1923,7 @@ impl GeminiModel {
     pub async fn create_cached_content(
         &self,
         system_instruction: &str,
-        tools: &std::collections::HashMap<String, serde_json::Value>,
+        tools: &adk_core::ToolDeclarations,
         ttl_seconds: u32,
     ) -> Result<String> {
         let mut cache_builder = self
@@ -1864,6 +1961,102 @@ impl GeminiModel {
             .await
             .map_err(|(_, e)| adk_core::AdkError::model(format!("cache deletion failed: {e}")))?;
         Ok(())
+    }
+
+    /// Uploads `bytes` through the Gemini File API, for media above the 20 MB a request may
+    /// carry inline; a `Part::FileData` naming the returned [`GeminiFile::uri`] then goes
+    /// out as native `fileData`. A video is usable once its state is
+    /// [`GeminiFileState::Active`] ([`wait_for_file`](Self::wait_for_file)). Files expire
+    /// after 48 hours. AI Studio only: Vertex AI reads Cloud Storage URIs instead.
+    ///
+    /// # Errors
+    ///
+    /// An invalid MIME type, the upload's failure, or an answer without a file URI.
+    pub async fn upload_file(
+        &self,
+        bytes: Vec<u8>,
+        mime_type: &str,
+        display_name: Option<&str>,
+    ) -> Result<GeminiFile> {
+        let parsed: mime::Mime = mime_type.parse().map_err(|_| {
+            adk_core::AdkError::model(format!("`{mime_type}` is not a valid MIME type"))
+        })?;
+        let mut builder = self.client.create_file(bytes).with_mime_type(parsed);
+        if let Some(name) = display_name {
+            builder = builder.display_name(name);
+        }
+        let handle = builder
+            .upload()
+            .await
+            .map_err(|e| adk_core::AdkError::model(format!("file upload failed: {e}")))?;
+        GeminiFile::from_wire(handle.get_file_meta())
+    }
+
+    /// The File API's current view of an uploaded file.
+    ///
+    /// # Errors
+    ///
+    /// The lookup's failure, or an answer without a file URI.
+    pub async fn get_file(&self, name: &str) -> Result<GeminiFile> {
+        let handle = self
+            .client
+            .get_file(name)
+            .await
+            .map_err(|e| adk_core::AdkError::model(format!("file lookup failed: {e}")))?;
+        GeminiFile::from_wire(handle.get_file_meta())
+    }
+
+    /// Polls an uploaded file every `interval` until Gemini has processed it.
+    ///
+    /// # Errors
+    ///
+    /// A file whose processing failed, one still processing after `timeout`, and the
+    /// lookup's failure.
+    pub async fn wait_for_file(
+        &self,
+        name: &str,
+        interval: std::time::Duration,
+        timeout: std::time::Duration,
+    ) -> Result<GeminiFile> {
+        let started = std::time::Instant::now();
+        loop {
+            let file = self.get_file(name).await?;
+            match file.state {
+                GeminiFileState::Active => return Ok(file),
+                GeminiFileState::Failed => {
+                    return Err(adk_core::AdkError::model(format!(
+                        "Gemini could not process file {name}; check that it is a supported format"
+                    )));
+                }
+                GeminiFileState::Processing | GeminiFileState::Unknown => {}
+            }
+            if started.elapsed() >= timeout {
+                return Err(adk_core::AdkError::new(
+                    adk_core::ErrorComponent::Model,
+                    adk_core::ErrorCategory::Timeout,
+                    "model.gemini.file_processing_timeout",
+                    format!("file {name} was still processing after {timeout:?}"),
+                ));
+            }
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    /// Deletes an uploaded file.
+    ///
+    /// # Errors
+    ///
+    /// The deletion's failure.
+    pub async fn delete_file(&self, name: &str) -> Result<()> {
+        let handle = self
+            .client
+            .get_file(name)
+            .await
+            .map_err(|e| adk_core::AdkError::model(format!("file lookup failed: {e}")))?;
+        handle
+            .delete()
+            .await
+            .map_err(|(_, e)| adk_core::AdkError::model(format!("file deletion failed: {e}")))
     }
 
     /// Drives a single turn through the Interactions API (Beta), non-streaming.
@@ -2159,6 +2352,10 @@ impl Llm for GeminiModel {
         )
     }
 
+    fn context_window(&self) -> Option<u64> {
+        crate::pricing::PricingCatalog::standard().context_window(Some("gemini"), self.name())
+    }
+
     fn name(&self) -> &str {
         &self.model_name
     }
@@ -2214,7 +2411,11 @@ impl Llm for GeminiModel {
         );
         adk_telemetry::info!("Generating content");
         self.validate_request_contract(&req)?;
-        let usage_span = adk_telemetry::llm_generate_span("gemini", &self.model_name, stream);
+        #[cfg(feature = "gemini-vertex")]
+        let provider = if self.vertex_backend { "gemini-vertex" } else { "gemini" };
+        #[cfg(not(feature = "gemini-vertex"))]
+        let provider = "gemini";
+        let usage_span = crate::telemetry::inference_span(provider, &self.model_name, stream, &req);
 
         // Dispatch on the configured transport. The default `GenerateContent`
         // path is unchanged; the Interactions path (task 7.3/7.4) is only
@@ -2288,7 +2489,7 @@ mod native_tool_tests {
 
     #[test]
     fn test_build_gemini_tools_supports_native_tool_metadata() {
-        let mut tools = std::collections::HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "google_search".to_string(),
             serde_json::json!({
@@ -2322,7 +2523,7 @@ mod native_tool_tests {
 
     #[test]
     fn test_build_gemini_tools_sets_flag_for_builtin_only() {
-        let mut tools = std::collections::HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "google_search".to_string(),
             serde_json::json!({
@@ -2347,7 +2548,7 @@ mod native_tool_tests {
 
     #[test]
     fn test_build_gemini_tools_no_flag_for_function_only() {
-        let mut tools = std::collections::HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "lookup_weather".to_string(),
             serde_json::json!({
@@ -2376,7 +2577,7 @@ mod native_tool_tests {
 
     #[test]
     fn test_build_gemini_tools_merges_native_tool_config() {
-        let mut tools = std::collections::HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "google_maps".to_string(),
             serde_json::json!({
@@ -2420,7 +2621,7 @@ mod native_tool_tests {
         // dialect fields ($schema, additionalProperties) in the response schema.
         // This test verifies that the response schema is normalized the same way
         // parameters are — stripping unsupported keywords.
-        let mut tools = std::collections::HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "read_file".to_string(),
             serde_json::json!({
@@ -2492,7 +2693,7 @@ impl CacheCapable for GeminiModel {
     async fn create_cache(
         &self,
         system_instruction: &str,
-        tools: &std::collections::HashMap<String, serde_json::Value>,
+        tools: &adk_core::ToolDeclarations,
         ttl_seconds: u32,
     ) -> Result<String> {
         self.create_cached_content(system_instruction, tools, ttl_seconds).await
@@ -2503,8 +2704,49 @@ impl CacheCapable for GeminiModel {
     }
 }
 
+/// Joins adjacent `function` contents into one. Gemini expects the responses to a turn of
+/// parallel calls in a single content, one function response per call, as adk-python and
+/// adk-go send them; the history holds one content per tool result.
+fn join_function_responses(contents: &[Content]) -> Vec<Content> {
+    let mut joined: Vec<Content> = Vec::with_capacity(contents.len());
+    for content in contents {
+        if content.role == "function"
+            && let Some(last) = joined.last_mut()
+            && last.role == "function"
+        {
+            last.parts.extend(content.parts.iter().cloned());
+            continue;
+        }
+        joined.push(content.clone());
+    }
+    joined
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn parallel_function_responses_travel_in_one_content() {
+        let response = |id: &str| Part::FunctionResponse {
+            function_response: adk_core::FunctionResponseData::new(
+                "tool",
+                serde_json::json!({"ok": id}),
+            ),
+            id: Some(id.to_string()),
+            annotations: None,
+        };
+        let contents = vec![
+            Content::new("user").with_text("both"),
+            Content { role: "function".to_string(), parts: vec![response("c1")] },
+            Content { role: "function".to_string(), parts: vec![response("c2")] },
+            Content::new("model").with_text("done"),
+            Content { role: "function".to_string(), parts: vec![response("c3")] },
+        ];
+        let joined = join_function_responses(&contents);
+        let shape: Vec<(&str, usize)> =
+            joined.iter().map(|content| (content.role.as_str(), content.parts.len())).collect();
+        assert_eq!(shape, vec![("user", 1), ("function", 2), ("model", 1), ("function", 1)]);
+    }
     use super::*;
     use adk_core::AdkError;
     use std::{
@@ -3010,6 +3252,7 @@ mod tests {
                                 mime_type: "image/png".to_string(),
                                 data: encoded,
                             },
+                            video_metadata: None,
                         },
                     ]),
                 },
@@ -3387,15 +3630,17 @@ mod interactions_transport_tests {
     }
     #[test]
     fn gemini_37_rejects_sampling_before_network_io() {
-        let model = GeminiModel::new("test-key", "gemini-3.7-flash").expect("construct model");
-        let mut request = LlmRequest::new("gemini-3.7-flash", Vec::new());
-        request.config =
-            Some(GenerateContentConfig { temperature: Some(0.2), ..Default::default() });
+        for name in ["gemini-3.7-flash", "gemini-3.8-flash"] {
+            let model = GeminiModel::new("test-key", name).expect("construct model");
+            let mut request = LlmRequest::new(name, Vec::new());
+            request.config =
+                Some(GenerateContentConfig { temperature: Some(0.2), ..Default::default() });
 
-        let error = model
-            .validate_request_contract(&request)
-            .expect_err("sampling must be rejected locally");
-        assert_eq!(error.code, "model.gemini.sampling_unsupported");
+            let error = model
+                .validate_request_contract(&request)
+                .expect_err("sampling must be rejected locally");
+            assert_eq!(error.code, "model.gemini.sampling_unsupported", "{name}");
+        }
     }
 
     #[test]

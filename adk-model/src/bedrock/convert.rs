@@ -15,7 +15,6 @@ use aws_sdk_bedrockruntime::types::{
 };
 use aws_smithy_types::Document;
 use serde_json::Value;
-use std::collections::HashMap;
 
 use super::super::attachment;
 
@@ -43,7 +42,7 @@ pub(crate) struct BedrockConverseInput {
 /// system content and after tool definitions to enable Bedrock prompt caching.
 pub(crate) fn adk_request_to_bedrock(
     contents: &[Content],
-    tools: &HashMap<String, Value>,
+    tools: &adk_core::ToolDeclarations,
     config: Option<&GenerateContentConfig>,
     prompt_caching: Option<&BedrockCacheConfig>,
 ) -> Result<BedrockConverseInput, String> {
@@ -454,16 +453,14 @@ fn mime_to_bedrock_document_format(mime_type: &str) -> Option<DocumentFormat> {
 /// typically contains `description` and `parameters` fields.
 ///
 /// When `prompt_caching` is provided, a `CachePoint` block is appended after
-/// the tool definitions. Tools are sorted by name so the cached prefix is
-/// identical across requests built from the same `HashMap`.
+/// the tool definitions. Tools keep their declaration order, which is the same on every
+/// request, so the cached prefix is identical.
 fn adk_tools_to_bedrock(
-    tools: &HashMap<String, Value>,
+    tools: &adk_core::ToolDeclarations,
     prompt_caching: Option<&BedrockCacheConfig>,
 ) -> ToolConfiguration {
-    let mut sorted_tools = tools.iter().collect::<Vec<_>>();
-    sorted_tools.sort_unstable_by_key(|(name, _)| *name);
-    let mut bedrock_tools: Vec<Tool> = sorted_tools
-        .into_iter()
+    let mut bedrock_tools: Vec<Tool> = tools
+        .iter()
         .filter_map(|(name, decl)| {
             let description = decl.get("description").and_then(|d| d.as_str()).map(String::from);
 
@@ -637,14 +634,18 @@ fn bedrock_image_format_to_mime(format: &BedrockImageFormat) -> &'static str {
 }
 
 /// Map Bedrock `StopReason` to ADK `FinishReason`.
+///
+/// Values: <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html#API_runtime_Converse_ResponseSyntax>.
 fn bedrock_stop_reason_to_adk(stop_reason: &StopReason) -> FinishReason {
     match stop_reason {
         StopReason::EndTurn => FinishReason::Stop,
-        StopReason::MaxTokens => FinishReason::MaxTokens,
+        StopReason::MaxTokens | StopReason::ModelContextWindowExceeded => FinishReason::MaxTokens,
         StopReason::ToolUse => FinishReason::Stop,
         StopReason::StopSequence => FinishReason::Stop,
         StopReason::ContentFiltered => FinishReason::Safety,
         StopReason::GuardrailIntervened => FinishReason::Safety,
+        StopReason::MalformedToolUse => FinishReason::MalformedToolCall,
+        StopReason::MalformedModelOutput => FinishReason::Other,
         _ => FinishReason::Other,
     }
 }
@@ -848,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_configuration_order_is_stable_across_maps() {
+    fn tool_configuration_keeps_declaration_order() {
         let names: Vec<String> = (0..12).map(|i| format!("tool_{i:02}")).collect();
         let declaration = |name: &str| {
             serde_json::json!({
@@ -856,24 +857,24 @@ mod tests {
                 "parameters": {"type": "object", "properties": {}}
             })
         };
-        let forward: HashMap<String, Value> =
+        let converted_names = |tools: &adk_core::ToolDeclarations| -> Vec<String> {
+            adk_tools_to_bedrock(tools, None)
+                .tools()
+                .iter()
+                .map(|tool| match tool {
+                    Tool::ToolSpec(spec) => spec.name().to_string(),
+                    other => panic!("unexpected tool entry {other:?}"),
+                })
+                .collect()
+        };
+        let forward: adk_core::ToolDeclarations =
             names.iter().map(|name| (name.clone(), declaration(name))).collect();
-        let reverse: HashMap<String, Value> =
-            names.iter().rev().map(|name| (name.clone(), declaration(name))).collect();
+        let reversed: Vec<String> = names.iter().rev().cloned().collect();
+        let reverse: adk_core::ToolDeclarations =
+            reversed.iter().map(|name| (name.clone(), declaration(name))).collect();
 
-        let from_forward = adk_tools_to_bedrock(&forward, None);
-        let from_reverse = adk_tools_to_bedrock(&reverse, None);
-
-        assert_eq!(from_forward, from_reverse);
-        let converted_names: Vec<String> = from_forward
-            .tools()
-            .iter()
-            .map(|tool| match tool {
-                Tool::ToolSpec(spec) => spec.name().to_string(),
-                other => panic!("unexpected tool entry {other:?}"),
-            })
-            .collect();
-        assert_eq!(converted_names, names);
+        assert_eq!(converted_names(&forward), names);
+        assert_eq!(converted_names(&reverse), reversed);
     }
 
     #[test]
@@ -895,7 +896,9 @@ mod tests {
             },
         ];
 
-        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+        let result =
+            adk_request_to_bedrock(&contents, &adk_core::ToolDeclarations::new(), None, None)
+                .unwrap();
         assert_eq!(result.system.len(), 1);
         assert_eq!(result.messages.len(), 1);
     }
@@ -917,7 +920,9 @@ mod tests {
             },
         ];
 
-        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+        let result =
+            adk_request_to_bedrock(&contents, &adk_core::ToolDeclarations::new(), None, None)
+                .unwrap();
         assert_eq!(result.messages.len(), 3);
         assert_eq!(result.messages[0].role, ConversationRole::User);
         assert_eq!(result.messages[1].role, ConversationRole::Assistant);
@@ -936,7 +941,9 @@ mod tests {
             }],
         }];
 
-        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+        let result =
+            adk_request_to_bedrock(&contents, &adk_core::ToolDeclarations::new(), None, None)
+                .unwrap();
         assert_eq!(result.messages.len(), 1);
 
         let blocks = &result.messages[0].content;
@@ -959,7 +966,9 @@ mod tests {
             ],
         }];
 
-        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+        let result =
+            adk_request_to_bedrock(&contents, &adk_core::ToolDeclarations::new(), None, None)
+                .unwrap();
         assert_eq!(result.messages.len(), 1);
 
         let blocks = &result.messages[0].content;
@@ -997,7 +1006,7 @@ mod tests {
             },
         ];
 
-        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+        let result = adk_request_to_bedrock(&contents, &adk_core::ToolDeclarations::default(), None, None).unwrap();
         assert_eq!(result.messages.len(), 2);
 
         let call_id = match &result.messages[0].content[0] {
@@ -1038,7 +1047,7 @@ mod tests {
             },
         ];
 
-        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+        let result = adk_request_to_bedrock(&contents, &adk_core::ToolDeclarations::default(), None, None).unwrap();
 
         match (&result.messages[0].content[0], &result.messages[1].content[0]) {
             (ContentBlock::ToolUse(call), ContentBlock::ToolResult(response)) => {
@@ -1071,7 +1080,7 @@ mod tests {
             ],
         }];
 
-        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+        let result = adk_request_to_bedrock(&contents, &adk_core::ToolDeclarations::default(), None, None).unwrap();
         let ids: Vec<String> = result.messages[0]
             .content
             .iter()
@@ -1099,7 +1108,9 @@ mod tests {
             }],
         }];
 
-        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+        let result =
+            adk_request_to_bedrock(&contents, &adk_core::ToolDeclarations::new(), None, None)
+                .unwrap();
         assert_eq!(result.messages.len(), 1);
 
         let blocks = &result.messages[0].content;
@@ -1127,7 +1138,9 @@ mod tests {
             }],
         }];
 
-        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+        let result =
+            adk_request_to_bedrock(&contents, &adk_core::ToolDeclarations::new(), None, None)
+                .unwrap();
 
         let ContentBlock::ToolResult(tool_result) = &result.messages[0].content[0] else {
             panic!("tool result expected");
@@ -1186,7 +1199,9 @@ mod tests {
             },
         ];
 
-        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+        let result =
+            adk_request_to_bedrock(&contents, &adk_core::ToolDeclarations::new(), None, None)
+                .unwrap();
 
         assert_eq!(result.messages.len(), 2);
         assert_eq!(result.messages[0].role, ConversationRole::Assistant);
@@ -1197,7 +1212,7 @@ mod tests {
 
     #[test]
     fn test_tool_config_conversion() {
-        let mut tools = HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "get_weather".to_string(),
             serde_json::json!({
@@ -1227,7 +1242,9 @@ mod tests {
             ..Default::default()
         };
 
-        let result = adk_request_to_bedrock(&[], &HashMap::new(), Some(&config), None).unwrap();
+        let result =
+            adk_request_to_bedrock(&[], &adk_core::ToolDeclarations::new(), Some(&config), None)
+                .unwrap();
         let inf = result.inference_config.unwrap();
         assert_eq!(inf.temperature, Some(0.7));
         assert_eq!(inf.top_p, Some(0.9));
@@ -1241,7 +1258,9 @@ mod tests {
             stop_sequences: vec!["END".to_string(), "STOP".to_string()],
             ..Default::default()
         };
-        let result = adk_request_to_bedrock(&[], &HashMap::new(), Some(&config), None).unwrap();
+        let result =
+            adk_request_to_bedrock(&[], &adk_core::ToolDeclarations::new(), Some(&config), None)
+                .unwrap();
         assert_eq!(
             result.inference_config.unwrap().stop_sequences,
             Some(vec!["END".to_string(), "STOP".to_string()])
@@ -1258,6 +1277,22 @@ mod tests {
         assert_eq!(
             bedrock_stop_reason_to_adk(&StopReason::GuardrailIntervened),
             FinishReason::Safety
+        );
+        assert_eq!(
+            bedrock_stop_reason_to_adk(&StopReason::MalformedToolUse),
+            FinishReason::MalformedToolCall
+        );
+        assert_eq!(
+            bedrock_stop_reason_to_adk(&StopReason::ModelContextWindowExceeded),
+            FinishReason::MaxTokens
+        );
+        assert_eq!(
+            bedrock_stop_reason_to_adk(&StopReason::MalformedModelOutput),
+            FinishReason::Other
+        );
+        assert_eq!(
+            bedrock_stop_reason_to_adk(&StopReason::from("a_reason_from_a_later_release")),
+            FinishReason::Other
         );
     }
 
@@ -1297,7 +1332,8 @@ mod tests {
 
     #[test]
     fn test_empty_contents_produces_no_messages() {
-        let result = adk_request_to_bedrock(&[], &HashMap::new(), None, None).unwrap();
+        let result =
+            adk_request_to_bedrock(&[], &adk_core::ToolDeclarations::new(), None, None).unwrap();
         assert!(result.messages.is_empty());
         assert!(result.system.is_empty());
         assert!(result.inference_config.is_none());
@@ -1484,7 +1520,7 @@ mod tests {
             role: "system".to_string(),
             parts: vec![Part::Text { text: "You are helpful.".to_string() }],
         }];
-        let mut tools = HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "get_weather".to_string(),
             serde_json::json!({
@@ -1511,8 +1547,13 @@ mod tests {
         }];
         let cache_config = BedrockCacheConfig::default();
 
-        let result =
-            adk_request_to_bedrock(&contents, &HashMap::new(), None, Some(&cache_config)).unwrap();
+        let result = adk_request_to_bedrock(
+            &contents,
+            &adk_core::ToolDeclarations::new(),
+            None,
+            Some(&cache_config),
+        )
+        .unwrap();
         // System should have text + CachePoint
         assert_eq!(result.system.len(), 2);
         assert!(result.system[0].is_text());
@@ -1527,15 +1568,20 @@ mod tests {
         }];
         let cache_config = BedrockCacheConfig::default();
 
-        let result =
-            adk_request_to_bedrock(&contents, &HashMap::new(), None, Some(&cache_config)).unwrap();
+        let result = adk_request_to_bedrock(
+            &contents,
+            &adk_core::ToolDeclarations::new(),
+            None,
+            Some(&cache_config),
+        )
+        .unwrap();
         // No system blocks, so no CachePoint
         assert!(result.system.is_empty());
     }
 
     #[test]
     fn test_cache_point_injected_after_tools() {
-        let mut tools = HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "get_weather".to_string(),
             serde_json::json!({
@@ -1561,8 +1607,13 @@ mod tests {
         }];
         let cache_config = BedrockCacheConfig { ttl: BedrockCacheTtl::OneHour };
 
-        let result =
-            adk_request_to_bedrock(&contents, &HashMap::new(), None, Some(&cache_config)).unwrap();
+        let result = adk_request_to_bedrock(
+            &contents,
+            &adk_core::ToolDeclarations::new(),
+            None,
+            Some(&cache_config),
+        )
+        .unwrap();
         assert_eq!(result.system.len(), 2);
         let cache_point = result.system[1].as_cache_point().unwrap();
         assert_eq!(*cache_point.r#type(), CachePointType::Default);
@@ -1577,8 +1628,13 @@ mod tests {
         }];
         let cache_config = BedrockCacheConfig { ttl: BedrockCacheTtl::FiveMinutes };
 
-        let result =
-            adk_request_to_bedrock(&contents, &HashMap::new(), None, Some(&cache_config)).unwrap();
+        let result = adk_request_to_bedrock(
+            &contents,
+            &adk_core::ToolDeclarations::new(),
+            None,
+            Some(&cache_config),
+        )
+        .unwrap();
         assert_eq!(result.system.len(), 2);
         let cache_point = result.system[1].as_cache_point().unwrap();
         assert_eq!(*cache_point.r#type(), CachePointType::Default);
@@ -1596,7 +1652,9 @@ mod tests {
             ],
         }];
 
-        let result = adk_request_to_bedrock(&contents, &HashMap::new(), None, None).unwrap();
+        let result =
+            adk_request_to_bedrock(&contents, &adk_core::ToolDeclarations::new(), None, None)
+                .unwrap();
         assert_eq!(result.messages.len(), 1);
         let blocks = &result.messages[0].content;
         assert_eq!(blocks.len(), 2);

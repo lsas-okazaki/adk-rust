@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import type { DrawnActionView, DrawnField, DrawnNode, DrawnSurface, FormState } from "../generated/api";
-import { FORM_CHANGED_SEND_AGAIN, NOT_SENT_YET, SENDING } from "../generated/words";
+import { EARLIER_VERSIONS, FORM_CHANGED_SEND_AGAIN, NOT_SENT_YET, SENDING } from "../generated/words";
 import { ApiError } from "../client";
 import { Avatar } from "../components/Avatar";
 import { visible } from "../safe";
 import type { Values } from "./bindings";
 import { firstFailure } from "./bindings";
+import { ChartView } from "./ChartView";
+import { DepthView } from "./DepthView";
+import { SceneFrame } from "./scene/SceneFrame";
 import { fieldsOf, initialValues } from "./store";
 import "./genui.css";
 
@@ -15,6 +18,30 @@ export const SHOWN_ROWS = 10;
 
 /** What sending a form asks of the page: the action and the values, by data path. */
 export type SendForm = (actionId: string, values: Values) => Promise<void>;
+
+/**
+ * What a host renderer of an extension component gets (spec 3.3 §6.1 `genui`, extension
+ * catalogs): the node, the component's properties as the server resolved and checked them, the
+ * nodes its slots hold, and a way to draw one as the home does. It gets no way to send or to
+ * change a value: an extension component only shows, and the fields and buttons it holds are
+ * drawn by the home's own code through `renderChild`.
+ */
+export interface ExtensionRendererProps {
+  /** The extension component's node; its one child is what the home shows for it. */
+  node: DrawnNode;
+  /** Its properties, resolved and checked on the server. Draw from these and nothing else. */
+  props: Record<string, unknown>;
+  /** The nodes its slots hold, in slot order. */
+  children: DrawnNode[];
+  /** Draws a held node as the home draws it, its fields and buttons included. */
+  renderChild: (node: DrawnNode) => ReactNode;
+}
+
+/** A host's renderer of one extension component. */
+export type ExtensionRenderer = (props: ExtensionRendererProps) => ReactNode;
+
+/** Host renderers by catalog id, then component type. */
+export type ExtensionRenderers = Record<string, Record<string, ExtensionRenderer>>;
 
 /**
  * Something an agent drew (spec 3.3 §6.1 `genui`, §7.4 rule 5): a form, card, table or screen
@@ -28,15 +55,19 @@ export type SendForm = (actionId: string, values: Values) => Promise<void>;
 export function DrawnView({
   surface,
   superseded = false,
+  earlier,
   changed = false,
   state,
   onSend,
   below,
   sent,
+  renderers,
 }: {
   surface: DrawnSurface;
   /** A newer version replaces this one: it is drawn collapsed under "Earlier version · 10:02". */
   superseded?: boolean;
+  /** Earlier versions of the surface shown under it as one folded control, oldest first. */
+  earlier?: DrawnSurface[];
   /** An earlier version is in the thread: "Finance changed this form at 10:05" goes above it. */
   changed?: boolean;
   /** The form's state once sent. */
@@ -47,6 +78,11 @@ export function DrawnView({
   below?: ReactNode;
   /** The call its Send asked for, as the decision shows it: the values the person sent. */
   sent?: { actionId: string; args: Record<string, unknown> };
+  /**
+   * A host's renderers of extension components; a component without one is drawn as the home
+   * draws it. The web home sets none.
+   */
+  renderers?: ExtensionRenderers;
 }) {
   if (surface.deleted) {
     return <p className="drawn-changed">{visible(surface.changedText)}</p>;
@@ -55,17 +91,48 @@ export function DrawnView({
     return (
       <details className="drawn-earlier">
         <summary>{visible(surface.earlierText)}</summary>
-        <DrawnCard surface={surface} state={state} readOnly />
+        <DrawnCard surface={surface} state={state} renderers={renderers} readOnly />
       </details>
     );
   }
   return (
     <div className="drawn-place">
       {changed && <p className="drawn-changed">{visible(surface.changedText)}</p>}
-      <DrawnCard surface={surface} state={state} onSend={onSend} sent={sent} />
+      <DrawnCard surface={surface} state={state} onSend={onSend} sent={sent} renderers={renderers} />
+      {earlier && earlier.length > 0 && (
+        <details className="drawn-earlier">
+          <summary>
+            {earlier.length === 1 ? visible(earlier[0].earlierText) : `${EARLIER_VERSIONS} · ${earlier.length}`}
+          </summary>
+          {[...earlier].reverse().map((version) => (
+            <div key={version.version} className="drawn-earlier-one">
+              {earlier.length > 1 && <p className="drawn-changed">{visible(version.earlierText)}</p>}
+              <DrawnCard surface={version} renderers={renderers} readOnly />
+            </div>
+          ))}
+        </details>
+      )}
       {below}
     </div>
   );
+}
+
+/** Folds case, spaces and punctuation, so "Release 2026.11" and "release 2026.11" match. */
+const folded = (text: string) => text.toLowerCase().replace(/[\s\p{P}]+/gu, " ").trim();
+
+/**
+ * Whether the drawing's first words already say `title`: its first leaf, following first
+ * children, is text with the same words. The title is then shown once, by the drawing.
+ */
+export function opensWith(root: DrawnNode | null | undefined, title: string): boolean {
+  let node = root ?? undefined;
+  for (let depth = 0; node && depth < 8; depth += 1) {
+    if (node.text && (node.component === "Text" || (node.children?.length ?? 0) === 0)) {
+      return folded(node.text) === folded(title);
+    }
+    node = node.children?.[0];
+  }
+  return false;
 }
 
 function DrawnCard({
@@ -73,12 +140,14 @@ function DrawnCard({
   state,
   onSend,
   sent,
+  renderers,
   readOnly = false,
 }: {
   surface: DrawnSurface;
   state?: FormState;
   onSend?: SendForm;
   sent?: { actionId: string; args: Record<string, unknown> };
+  renderers?: ExtensionRenderers;
   readOnly?: boolean;
 }) {
   const [typedHere, setValues] = useState<Values>(() => initialValues(surface.root));
@@ -142,14 +211,17 @@ function DrawnCard({
   const refused = state?.status === "refused";
   const failing = Object.keys(errors).length > 0;
   const inline = refused ? state?.text : touched && !sending && !failing && !problem ? NOT_SENT_YET : undefined;
-  const context: RenderContext = { values, errors, locked, sending, change, send, surface, inline };
+  const context: RenderContext = { values, errors, locked, sending, change, send, surface, inline, renderers };
   return (
     <section className="drawn" aria-label={surface.title ?? surface.drawnText}>
+      <Announce surface={surface} />
       <header className="drawn-by">
         <Avatar agent={surface.agent} size="sm" />
         <span>{visible(surface.drawnText)}</span>
       </header>
-      {surface.title && <h3 className="drawn-title">{visible(surface.title)}</h3>}
+      {surface.title && !opensWith(surface.root, surface.title) && (
+        <h3 className="drawn-title">{visible(surface.title)}</h3>
+      )}
       {surface.root && <div className="drawn-body">{render(surface.root, context, true)}</div>}
       {state && !refused ? (
         <p className="drawn-status" role="status">
@@ -229,6 +301,8 @@ interface RenderContext {
   surface: DrawnSurface;
   /** Beside the buttons: "Not sent yet", or why the agent cannot use the tool. */
   inline?: string;
+  /** A host's renderers of extension components. */
+  renderers?: ExtensionRenderers;
 }
 
 /** Numbers, dates and codes such as `[CLIENT]` read in mono (spec 3.3 §9). */
@@ -253,7 +327,66 @@ function asTable(nodes: DrawnNode[], at: number): { header: DrawnNode; list: Dra
   return rows.every((row) => row.component === "Row") ? { header, list } : undefined;
 }
 
+/** The node keyed `key` in `nodes` or below them. */
+function byKey(nodes: DrawnNode[], key: string): DrawnNode | undefined {
+  for (const node of nodes) {
+    if (node.key === key) return node;
+    const found = byKey(node.children ?? [], key);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/** An extension component: the host's renderer of it, or what the home shows for it. */
+function ExtensionNode({ node, context, root }: { node: DrawnNode; context: RenderContext; root: boolean }) {
+  const extension = node.extension;
+  const renderer = extension ? context.renderers?.[extension.catalog]?.[extension.component] : undefined;
+  const view = node.children ?? [];
+  if (extension && renderer) {
+    const held = (extension.children ?? []).flatMap((key) => {
+      const found = byKey(view, key);
+      return found ? [found] : [];
+    });
+    const props = extension.props && typeof extension.props === "object" ? (extension.props as Record<string, unknown>) : {};
+    return (
+      <div className="drawn-extension" data-component={extension.component}>
+        {renderer({ node, props, children: held, renderChild: (child) => render(child, context) })}
+      </div>
+    );
+  }
+  return <>{view.map((child) => render(child, context, root))}</>;
+}
+
 function render(node: DrawnNode, context: RenderContext, root = false): ReactNode {
+  if (node.extension) return <ExtensionNode key={node.key} node={node} context={context} root={root} />;
+  if (node.chart) return <ChartView key={node.key} chart={node.chart} />;
+  if (node.scene) {
+    const path = node.scene.select?.path;
+    return (
+      <SceneFrame
+        key={node.key}
+        node={node}
+        scene={node.scene}
+        renderChild={(child) => render(child, context)}
+        memoryKey={`${context.surface.surfaceId}/${node.key}`}
+        version={context.surface.version}
+        values={context.values}
+        change={context.change}
+        disabled={context.locked || context.sending}
+        field={path ? fieldsOf(context.surface.root).find((field) => field.field?.path === path) : undefined}
+      />
+    );
+  }
+  if (node.depth)
+    return (
+      <DepthView
+        key={node.key}
+        node={node}
+        depth={node.depth}
+        errors={context.errors}
+        renderChild={(child) => render(child, context)}
+      />
+    );
   switch (node.component) {
     case "Text":
       return <DrawnText key={node.key} node={node} />;
@@ -280,8 +413,51 @@ function render(node: DrawnNode, context: RenderContext, root = false): ReactNod
     case "Button":
       return <ButtonNode key={node.key} node={node} context={context} />;
     default:
-      return node.field ? <Field key={node.key} node={node} context={context} /> : null;
+      if (!node.field) return null;
+      // A field keeps its visible label; an accessibility label or description names the group.
+      return node.accessibility ? (
+        <div key={node.key} className="drawn-field-group" {...a11y(node, true)} aria-hidden={undefined}>
+          <Field node={node} context={context} />
+        </div>
+      ) : (
+        <Field key={node.key} node={node} context={context} />
+      );
   }
+}
+
+/**
+ * What assistive technology reads for `node` (A2UI 1.0 `@accessibility`, resolved and checked
+ * on the server): its label and description, how its changes are announced, and whether it is
+ * hidden from screen readers. A labelled container is a named group.
+ */
+export function a11y(node: DrawnNode, container = false): Record<string, string | boolean | undefined> {
+  const attributes = node.accessibility;
+  if (!attributes) return {};
+  return {
+    role: container && attributes.label ? "group" : undefined,
+    "aria-label": attributes.label ? visible(attributes.label) : undefined,
+    "aria-description": attributes.description ? visible(attributes.description) : undefined,
+    "aria-live": attributes.live ?? undefined,
+    "aria-hidden": attributes.hidden || undefined,
+  };
+}
+
+/**
+ * Says each drawing once to a screen reader, when it arrives or a new version replaces it:
+ * "Finance drew Invoice INV-10", not every change as it renders.
+ */
+function Announce({ surface }: { surface: DrawnSurface }) {
+  const [said, setSaid] = useState("");
+  const version = surface.version;
+  useEffect(() => {
+    const what = surface.title ? `${surface.drawnText}: ${surface.title}` : surface.drawnText;
+    setSaid(visible(version > 1 ? `${what} (version ${version})` : what));
+  }, [surface.surfaceId, version]); // eslint-disable-line react-hooks/exhaustive-deps
+  return (
+    <p className="visually-hidden" aria-live="polite">
+      {said}
+    </p>
+  );
 }
 
 function DrawnText({ node }: { node: DrawnNode }) {
@@ -291,11 +467,23 @@ function DrawnText({ node }: { node: DrawnNode }) {
     case "h3":
     case "h4":
     case "h5":
-      return <p className={`drawn-heading drawn-${node.variant}`}>{textOf(node)}</p>;
+      return (
+        <p className={`drawn-heading drawn-${node.variant}`} {...a11y(node)}>
+          {textOf(node)}
+        </p>
+      );
     case "caption":
-      return <span className="drawn-caption">{textOf(node)}</span>;
+      return (
+        <span className="drawn-caption" {...a11y(node)}>
+          {textOf(node)}
+        </span>
+      );
     default:
-      return <p className="drawn-text">{textOf(node)}</p>;
+      return (
+        <p className="drawn-text" {...a11y(node)}>
+          {textOf(node)}
+        </p>
+      );
   }
 }
 
@@ -311,7 +499,11 @@ function Column({ node, context }: { node: DrawnNode; context: RenderContext }) 
       out.push(render(children[at], context));
     }
   }
-  return <div className="drawn-column">{out}</div>;
+  return (
+    <div className="drawn-column" {...a11y(node, true)}>
+      {out}
+    </div>
+  );
 }
 
 function Row({ node, context }: { node: DrawnNode; context: RenderContext }) {
@@ -328,7 +520,7 @@ function Row({ node, context }: { node: DrawnNode; context: RenderContext }) {
   const buttons = children.length > 0 && children.every((child) => child.component === "Button");
   if (buttons && context.locked) return null;
   return (
-    <div className={buttons ? "drawn-actions" : "drawn-row"} data-justify={node.variant ?? undefined}>
+    <div className={buttons ? "drawn-actions" : "drawn-row"} data-justify={node.variant ?? undefined} {...a11y(node, true)}>
       {children.map((child) => render(child, context))}
       {buttons && context.inline && (
         <span className="drawn-status-inline" role="status">
@@ -428,6 +620,8 @@ function ButtonNode({ node, context }: { node: DrawnNode; context: RenderContext
       disabled={context.sending || !action}
       aria-busy={context.sending || undefined}
       onClick={() => action && context.send(action)}
+      {...a11y(node)}
+      aria-hidden={undefined}
     >
       {context.sending ? SENDING : textOf(node)}
     </button>

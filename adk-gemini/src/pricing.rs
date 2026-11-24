@@ -39,7 +39,49 @@ pub struct GeminiPricing {
 }
 
 impl GeminiPricing {
+    /// Gemini 4 Hydrogen (GA). One rate at every prompt size; implicit caching only, so there
+    /// is no storage charge.
+    pub const GEMINI_4_HYDROGEN: Self = Self {
+        input: 1.50,
+        input_long: 1.50,
+        output: 7.50,
+        output_long: 7.50,
+        cache_input: 0.075,
+        cache_input_long: 0.075,
+        cache_storage_per_hour: 0.0,
+    };
+
+    /// Gemini 4 Carbon and Gemini 4 Argon (GA) introductory pricing through November 30, 2026.
+    ///
+    /// From December 1, 2026 these rates double to $4.00 input, $20.00 output and $0.20
+    /// cache. Implicit caching only, so there is no storage charge.
+    pub const GEMINI_4_CARBON: Self = Self {
+        input: 2.00,
+        input_long: 2.00,
+        output: 10.00,
+        output_long: 10.00,
+        cache_input: 0.10,
+        cache_input_long: 0.10,
+        cache_storage_per_hour: 0.0,
+    };
+
+    /// Gemini 3.8 Flash (GA) introductory pricing through December 31, 2026.
+    ///
+    /// From January 1, 2027 these rates double to $1.50 input, $7.50 output,
+    /// $0.15 cache and $1.00/hour storage.
+    pub const GEMINI_38_FLASH: Self = Self {
+        input: 0.75,
+        input_long: 0.75,
+        output: 3.75,
+        output_long: 3.75,
+        cache_input: 0.075,
+        cache_input_long: 0.075,
+        cache_storage_per_hour: 0.50,
+    };
+
     /// Gemini 3.7 Flash introductory pricing through December 31, 2026.
+    ///
+    /// Deprecated: the Gemini API routes requests to Gemini 3.8 Flash at its rates.
     ///
     /// From January 1, 2027 these rates double to $1.50 input, $7.50 output,
     /// $0.15 cache and $1.00/hour storage.
@@ -176,7 +218,22 @@ impl GeminiPricing {
         cache_storage_per_hour: 0.0,
     };
 
-    /// Gemini 3.1 Flash Live Preview (realtime model).
+    /// Gemini 3.8 Live and Gemini 3.8 Live Extended Thinking (realtime models).
+    ///
+    /// Text input $0.75/MTok, audio input $3.00/MTok, image/video input $1.00/MTok.
+    /// Text output $4.50/MTok, audio output $12.00/MTok, thinking tokens included.
+    /// Rates here use text input/output; for audio use the audio-specific rates directly.
+    pub const GEMINI_38_LIVE: Self = Self {
+        input: 0.75,
+        input_long: 0.75,
+        output: 4.50,
+        output_long: 4.50,
+        cache_input: 0.0,
+        cache_input_long: 0.0,
+        cache_storage_per_hour: 0.0,
+    };
+
+    /// Gemini 3.1 Flash Live Preview (realtime model), priced in one table with Gemini 3.8 Live.
     ///
     /// Text input $0.75/MTok, audio input $3.00/MTok, image/video input $1.00/MTok.
     /// Text output $4.50/MTok, audio output $12.00/MTok.
@@ -374,12 +431,15 @@ impl GeminiPricing {
     /// ```rust,ignore
     /// use adk_gemini::pricing::GeminiPricing;
     ///
-    /// let p = GeminiPricing::for_model_id("gemini-3.7-flash").unwrap();
+    /// let p = GeminiPricing::for_model_id("gemini-3.8-flash").unwrap();
     /// assert_eq!(p.input, 0.75);
     /// ```
     pub fn for_model_id(model_id: &str) -> Option<Self> {
         let bare = model_id.strip_prefix("models/").unwrap_or(model_id);
         let pricing = match bare {
+            "gemini-4-hydrogen" => Self::GEMINI_4_HYDROGEN,
+            "gemini-4-carbon" | "gemini-4-argon" => Self::GEMINI_4_CARBON,
+            "gemini-3.8-flash" => Self::GEMINI_38_FLASH,
             "gemini-3.7-flash" => Self::GEMINI_37_FLASH,
             "gemini-3.6-flash" => Self::GEMINI_36_FLASH,
             "gemini-3.5-flash" => Self::GEMINI_35_FLASH,
@@ -387,6 +447,7 @@ impl GeminiPricing {
             "gemini-3.1-pro-preview" => Self::GEMINI_31_PRO_PREVIEW,
             "gemini-3.1-flash-lite" => Self::GEMINI_31_FLASH_LITE,
             "gemini-3.1-flash-image" => Self::GEMINI_31_FLASH_IMAGE,
+            "gemini-3.8-live" | "gemini-3.8-live-extended-thinking" => Self::GEMINI_38_LIVE,
             "gemini-3.1-flash-live-preview" => Self::GEMINI_31_FLASH_LIVE,
             "gemini-3-flash-preview" => Self::GEMINI_3_FLASH_PREVIEW,
             "gemini-3-pro-image" => Self::GEMINI_3_PRO_IMAGE,
@@ -518,9 +579,9 @@ mod tests {
         assert!((emb.input - 0.20).abs() < 1e-9);
         // Custom models with no published pricing
         assert!(GeminiPricing::for_model(&Model::Custom("models/x".into())).is_none());
-        let current = GeminiPricing::for_model(&Model::gemini_3_7_flash()).unwrap();
-        assert_eq!(current.input, GeminiPricing::GEMINI_37_FLASH.input);
-        assert_eq!(current.output, GeminiPricing::GEMINI_37_FLASH.output);
+        let current = GeminiPricing::for_model(&Model::gemini_3_8_flash()).unwrap();
+        assert_eq!(current.input, GeminiPricing::GEMINI_38_FLASH.input);
+        assert_eq!(current.output, GeminiPricing::GEMINI_38_FLASH.output);
     }
 
     /// Every model reachable through a `Model` factory must resolve to a price.
@@ -529,6 +590,7 @@ mod tests {
     fn factory_models_all_resolve_to_pricing() {
         use crate::client::Model;
         for model in [
+            Model::gemini_3_8_flash(),
             Model::gemini_3_7_flash(),
             Model::gemini_3_6_flash(),
             Model::gemini_3_5_flash_lite(),
@@ -552,11 +614,15 @@ mod tests {
         assert!(GeminiPricing::for_model_id("gemini-nonexistent").is_none());
     }
 
-    /// Anchor values from <https://ai.google.dev/gemini-api/docs/pricing>
-    /// (paid tier, standard) verified 2026-08-23. Update only against the page.
+    /// Anchor values from <https://aistudio.google.com/docs/pricing>
+    /// (paid tier, standard) verified 2026-11-17. Update only against the page.
     #[test]
     fn published_rates_match_vendor_page() {
         for (id, input, output, cache) in [
+            ("gemini-4-hydrogen", 1.50, 7.50, 0.075),
+            ("gemini-4-carbon", 2.00, 10.00, 0.10),
+            ("gemini-4-argon", 2.00, 10.00, 0.10),
+            ("gemini-3.8-flash", 0.75, 3.75, 0.075),
             ("gemini-3.7-flash", 0.75, 3.75, 0.075),
             ("gemini-3.6-flash", 0.75, 3.75, 0.075),
             ("gemini-3.5-flash", 1.50, 9.00, 0.15),
@@ -578,6 +644,21 @@ mod tests {
                 "{id} cache {} != {cache}",
                 p.cache_input
             );
+        }
+    }
+
+    /// Anchor values from <https://aistudio.google.com/docs/pricing#gemini-3.8-live>
+    /// (paid tier, text rates) verified 2026-11-17: one table prices all three Live models.
+    #[test]
+    fn live_rates_match_vendor_page() {
+        for id in [
+            "gemini-3.8-live",
+            "models/gemini-3.8-live-extended-thinking",
+            "gemini-3.1-flash-live-preview",
+        ] {
+            let p = GeminiPricing::for_model_id(id).unwrap_or_else(|| panic!("{id} missing"));
+            assert_eq!((p.input, p.output, p.cache_input), (0.75, 4.50, 0.0), "{id}");
+            assert_eq!((p.input_long, p.output_long), (p.input, p.output), "{id}");
         }
     }
 

@@ -14,12 +14,13 @@ Tool system for Rust Agent Development Kit (ADK-Rust) agents (FunctionTool, MCP,
 - **FunctionTool** - Create tools from async Rust functions
 - **StatefulTool\<S\>** - Wrap shared state (`Arc<S>`) with a tool handler
 - **SimpleToolContext** - Lightweight `ToolContext` for non-agent callers (testing, MCP servers)
+- **AdvisorTool** - Let an agent consult a stronger or different model for advice mid-task; the consultation runs under the run's budget, spend ledger and kill switch, attributed to `advisor:{agent}`, with a per-run cap ([Advisor tool](../docs/official_docs/tools/advisor.md))
 - **AgentTool** - Use an agent as a callable tool; the delegate runs in non-streaming mode and shares the caller's budget, governance, policy, approvals and ledgers, but not its handoff targets, context cache or invocation toolsets
 - **GoogleSearchTool** - Web search via Gemini's grounding
-- **Provider-native wrappers** - Typed declarations for Gemini, Anthropic, and OpenAI built-in tools, each declaring a `ToolEffect`: search, URL context, Maps and file search are `ReadOnly`; code execution, computer use, image generation, shell, apply-patch and MCP tools are `NonIdempotent`
+- **Provider-native wrappers** - Typed declarations for Gemini, Anthropic, and OpenAI built-in tools, each declaring a `ToolEffect`: search, URL context, Maps, file search and Claude's advisor (`AnthropicAdvisorTool`) are `ReadOnly`; code execution, computer use, image generation, shell, apply-patch and MCP tools are `NonIdempotent`
 - **McpToolset** - Model Context Protocol integration (local and remote servers)
 - **MCP Apps** - Declare the `io.modelcontextprotocol/ui` extension, read each tool's `_meta.ui` and its `ui://` app, and keep app-only tools from the model (feature: `mcp-apps`; [MCP Tools](../docs/official_docs/tools/mcp-tools.md#mcp-apps))
-- **McpServer** - Publish a set of tools as a Streamable HTTP MCP server with an MCP Server Card (SEP-2127) and an AI Catalog entry (feature: `mcp-server`, experimental)
+- **McpServer** - Publish a set of tools as an MCP server over Streamable HTTP, with an MCP Server Card (SEP-2127) and an AI Catalog entry, or over stdio; an `McpTaskHost` follows calls that continue as tasks (SEP-2663) and an executor may answer `input_required` (SEP-2322) (feature: `mcp-server`, experimental)
 - **McpServerManager** - Multi-server lifecycle management with health monitoring and auto-restart; each server runs in a Job Object on Windows and leads a process group of its own on Unix, so stopping it ends every process it started
 - **BasicToolset / FilteredToolset / MergedToolset / PrefixedToolset** - Group, filter, combine, and namespace toolsets
 - **ExitLoopTool** - Control flow for loop agents
@@ -37,23 +38,23 @@ Tool system for Rust Agent Development Kit (ADK-Rust) agents (FunctionTool, MCP,
 
 ```toml
 [dependencies]
-adk-tool = "3.0"
+adk-tool = "3.0.0"
 
 # Or, for local MCP servers via stdio:
-# adk-tool = { version = "3.0", features = ["mcp"] }
+# adk-tool = { version = "3.0.0", features = ["mcp"] }
 
 # Or, for remote MCP servers via HTTP (implies `mcp`):
-# adk-tool = { version = "3.0", features = ["http-transport"] }
+# adk-tool = { version = "3.0.0", features = ["http-transport"] }
 
 # Or, to publish tools as an MCP server (implies `mcp`):
-# adk-tool = { version = "3.0", features = ["mcp-server"] }
+# adk-tool = { version = "3.0.0", features = ["mcp-server"] }
 ```
 
 Or use the meta-crate:
 
 ```toml
 [dependencies]
-adk-rust = { version = "3.0", features = ["tools"] }
+adk-rust = { version = "3.0.0", features = ["tools"] }
 ```
 
 ## Quick Start
@@ -152,7 +153,7 @@ async fn get_weather(_ctx: Arc<dyn ToolContext>, args: Value) -> Result<Value> {
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let model = GeminiModel::new(std::env::var("GOOGLE_API_KEY")?, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(std::env::var("GOOGLE_API_KEY")?, "gemini-3.8-flash")?;
     let tool = FunctionTool::new("get_weather", "Get current weather for a city", get_weather)
         .with_parameters_schema::<WeatherParams>();
 
@@ -636,8 +637,8 @@ Managed servers select lifecycle and task policy in `mcp.json`:
 }
 ```
 
-`discover` requires the stateless 2026 lifecycle. `auto` probes discovery and
-falls back only on `METHOD_NOT_FOUND`. The default is `initialize`.
+`discover` requires the stateless 2026 lifecycle. `auto` probes discovery and falls back to
+`initialize` as described in [Protocol revisions](#protocol-revisions). The default is `initialize`.
 Stateless MRTR elicitation is driven automatically and
 bounded by `maxInputRounds`; opaque `requestState` is echoed without inspection.
 
@@ -781,11 +782,11 @@ error's message only when its category is a rejection; a tool that ran and faile
 
 ### MCP examples and guides
 
-[`examples/mcp_manager`](https://github.com/zavora-ai/adk-rust/tree/main/examples/mcp_manager)
+The `mcp_manager` example in [adk-playground](https://github.com/zavora-ai/adk-playground)
 runs a real Rust stdio server locally and verifies
 discovery, tool execution, dynamic registry changes, persistence, and shutdown
 without a package download or network dependency.
-[`examples/mcp_elicitation`](https://github.com/zavora-ai/adk-rust/tree/main/examples/mcp_elicitation)
+The `mcp_elicitation` example there
 demonstrates a server asking its client application for additional information.
 
 The [MCP guide](https://github.com/zavora-ai/adk-rust/tree/main/docs/official_docs/mcp)
@@ -793,6 +794,20 @@ covers client construction, server authoring,
 dynamic management, security, testing, resources, prompts, completion,
 reconnect-safe subscriptions with `ResourceNotificationHandler`, elicitation,
 and tasks.
+
+## Advisor
+
+```rust
+use std::sync::Arc;
+
+use adk_core::Llm;
+use adk_tool::AdvisorTool;
+
+// Add to the worker agent with `.tool(Arc::new(advisor(stronger_model)))`.
+fn advisor(stronger_model: Arc<dyn Llm>) -> AdvisorTool {
+    AdvisorTool::builder(stronger_model).max_consultations_per_run(3).max_output_tokens(2_048).build()
+}
+```
 
 ## Google Search
 
@@ -861,6 +876,7 @@ fn python_tool() -> Result<MontyPythonCodeTool, Box<dyn std::error::Error>> {
 | `http-transport` | Remote MCP servers via streamable HTTP, with bearer, API-key, OAuth2, and brokered auth (implies `mcp`) |
 | `mcp-server` | `McpServer`: publish tools over MCP Streamable HTTP with a Server Card and an AI Catalog entry (implies `mcp`; experimental) |
 | `mcp-sampling` | `LlmSamplingHandler` for server-initiated `sampling/createMessage`; deprecated upstream (implies `mcp`) |
+| `mcp-apps` | MCP Apps on the client: declares the `io.modelcontextprotocol/ui` extension, keeps each tool's `_meta.ui`, leaves app-only tools out of the model's tools, and reads `ui://` apps (implies `mcp`) |
 | `memory-tools` | `LoadMemoryTool` and `PreloadMemoryTool` over `adk-memory` |
 | `graph-memory-tools` | `GraphMemoryToolset`, `RememberTool`, and `RelateTool` (implies `memory-tools`) |
 | `code` | Code execution tools over the `adk-code` substrate |
@@ -873,7 +889,21 @@ fn python_tool() -> Result<MontyPythonCodeTool, Box<dyn std::error::Error>> {
 | `example-store` | Vertex AI Example Store client (v1beta1 data plane) and `ExampleStoreProvider` few-shot retrieval |
 | `vertex-agent-registry` | Google Agent Registry client and `AgentSearchTool` |
 
-No feature is enabled by default.
+No feature is enabled by default. The optional dependencies `adk-gcp`, `google-cloud-auth`, and
+`reqwest` are no longer features in 3.0; enable `http-transport`, `slack`, `example-store`, or
+`vertex-agent-registry`, which use them.
+
+## Changes in 3.0
+
+| Change | Migration |
+|--------|-----------|
+| `#[tool]` tools, and `FunctionTool` and `StatefulTool` with `with_parameters_schema::<T>()`, validate arguments against the schema; an undeclared key, a broken bound, or a missing required field fails with `tool.invalid_arguments` | Opt a tool out with `#[tool(lenient_args)]` or `with_lenient_args(true)` |
+| `SimpleClient::inner` returns the shared connection, with no mutex | `client.inner().peer()` instead of `client.inner().lock().await.peer()` |
+| `should_refresh_connection` takes the `rmcp::ServiceError`, not its text | Pass the error |
+| `McpServerManager` reports a handshake in progress as `ServerStatus::Starting`, and one that exceeds `with_startup_timeout` (30 seconds) as `FailedToStart` | Raise the timeout for a server that downloads a package on its first start |
+| A delegation past `AgentTool::timeout` is a `Timeout` error in every failure mode, and `Propagate` keeps the delegate's category and code | — |
+
+See the [2.x to 3.0 migration guide](../docs/official_docs/migration/2.x-to-3.0.md#adk-tool-and-adk-rust-macros).
 
 ## Toolset Composition
 
@@ -930,27 +960,25 @@ including `McpToolset` and `BrowserToolset`. `PrefixedToolset` forwards each wra
 
 ## rmcp compatibility
 
-ADK-Rust 3 uses `rmcp` 3, the official Rust SDK (`adk-tool` requires `rmcp = "3.1"`; the
-workspace lockfile resolves 3.5.1). `McpToolset::new(client)`
+ADK-Rust 3 uses `rmcp` 3, the official Rust SDK (`adk-tool` requires `rmcp = "3.9"`; the
+workspace lockfile resolves 3.10.0). `McpToolset::new(client)`
 remains the primary adapter. Advanced server authoring, transports, protocol
 extensions, and SDK types are available through `adk_tool::mcp::rmcp`, keeping
 them on the same version used internally.
 
 ### Protocol revisions
 
-The default connection sends `initialize` and advertises `2025-11-25`, the latest
-revision with an `initialize` handshake (rmcp's `ProtocolVersion::LATEST_WITH_INITIALIZE`).
-Servers of both generations answer it, so one client reaches both.
+The default connection sends `initialize` advertising `2026-07-28` (rmcp's
+`ProtocolVersion::LATEST`), and a server answers with the newest revision it supports that has an
+`initialize` handshake, such as `2025-11-25`, so one client reaches servers of both generations.
 
-`2026-07-28` also adds a stateless `server/discover` handshake. It is opt-in,
-because a server that predates it is free to refuse an unknown method with
-something other than `METHOD_NOT_FOUND`, and the SDK treats only that one code
-as proof of a legacy peer. Select it per connection:
+`2026-07-28` also adds a stateless `server/discover` handshake. It is opt-in. Select it per
+connection:
 
 | Mode | Sends first | Against an older server |
 |------|-------------|-------------------------|
 | `Initialize` (default) | `initialize` | Works |
-| `Auto` | `server/discover` | Falls back only on `METHOD_NOT_FOUND` |
+| `Auto` | `server/discover` | Falls back to `initialize` when the server answers the probe with a JSON-RPC error other than a 2026 rejection (missing client capability, header mismatch), or does not answer within 10 seconds |
 | `Discover` | `server/discover` | Fails; no fallback |
 
 ```rust
@@ -995,7 +1023,7 @@ count against the scope attached with `McpToolset::with_sampling_scope`, or are
 unmetered without one. A request the budget or spend ledger refuses returns that error
 unchanged.
 
-When migrating code that imports `rmcp` types directly, align it to `rmcp 3.1`
+When migrating code that imports `rmcp` types directly, align it to `rmcp 3.9`
 or import the SDK through `adk_tool::mcp::rmcp`.
 
 ## Related Crates

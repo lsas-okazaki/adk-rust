@@ -13,13 +13,56 @@ use super::task_store::{OWNER_METADATA_KEY, TaskStoreEntry};
 
 // ── Part conversion ──────────────────────────────────────────────────────────
 
+/// Data part metadata key naming the ADK part a data part carries: `function_call`
+/// (`{id, name, args}`) or `function_response` (`{id, name, response}`). adk-python and
+/// adk-go tag function calls and responses this way on the wire.
+pub const ADK_TYPE_METADATA_KEY: &str = "adk_type";
+
+/// Data part metadata key that marks a function call as long-running: the task waits for
+/// the caller to send its result.
+pub const ADK_LONG_RUNNING_METADATA_KEY: &str = "adk_is_long_running";
+
+/// Task and event metadata key: the ADK app that runs the task.
+pub const ADK_APP_NAME_METADATA_KEY: &str = "adk_app_name";
+
+/// Task and event metadata key: the ADK user whose session runs the task.
+pub const ADK_USER_ID_METADATA_KEY: &str = "adk_user_id";
+
+/// Task and event metadata key: the ADK session that runs the task, the task's context.
+pub const ADK_SESSION_ID_METADATA_KEY: &str = "adk_session_id";
+
+/// Part metadata key that marks the text of a `FAILED` status as the error.
+pub const ADK_ERROR_MESSAGE_METADATA_KEY: &str = "adk_is_error_message";
+
+/// The ADK A2A extension that adk-python and adk-go declare. A card that declares it
+/// tells a client that tasks carry the `adk_*` metadata. The extension's URI, set to
+/// `true`, marks each task it shapes.
+pub const ADK_EXTENSION_URI: &str = "https://google.github.io/adk-docs/a2a/a2a-extension/";
+
+/// Part metadata `adk_thought`: the text is the model's reasoning, not its answer.
+pub const ADK_THOUGHT_METADATA_KEY: &str = "adk_thought";
+
+/// `adk_partial`: the update, artifact or part comes from a streamed partial event.
+pub const ADK_PARTIAL_METADATA_KEY: &str = "adk_partial";
+
+/// The text of a `FAILED` status: `error`, marked with
+/// [`ADK_ERROR_MESSAGE_METADATA_KEY`].
+pub fn error_message_part(error: impl Into<String>) -> a2a_protocol_types::Part {
+    let mut part = a2a_protocol_types::Part::text(error.into());
+    part.metadata = Some(json!({ ADK_ERROR_MESSAGE_METADATA_KEY: true }));
+    part
+}
+
 /// Convert an `a2a_protocol_types::Part` to an `adk_core::Part`.
 ///
 /// Mapping:
 /// - `PartContent::Text` → `Part::Text`
 /// - `PartContent::Raw` → `Part::InlineData` (base64 decode)
 /// - `PartContent::Url` → `Part::FileData`
-/// - `PartContent::Data` → `Part::FunctionCall` / `Part::FunctionResponse` /
+/// - `PartContent::Data` tagged with [`ADK_TYPE_METADATA_KEY`] `function_call` or
+///   `function_response` → `Part::FunctionCall` / `Part::FunctionResponse`, read from the
+///   flat `{id, name, args}` / `{id, name, response}` shape adk-python and adk-go send
+/// - other `PartContent::Data` → `Part::FunctionCall` / `Part::FunctionResponse` /
 ///   `Part::ServerToolCall` / `Part::ServerToolResponse` based on JSON keys
 ///
 /// A peer's server-tool parts stay in the event log as the peer sent them, but they are
@@ -29,7 +72,17 @@ use super::task_store::{OWNER_METADATA_KEY, TaskStoreEntry};
 pub fn wire_part_to_adk(part: &a2a_protocol_types::Part) -> Result<adk_core::Part, A2aError> {
     match &part.content {
         a2a_protocol_types::PartContent::Text(text) => {
-            Ok(adk_core::Part::Text { text: text.clone() })
+            let thought = part
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(ADK_THOUGHT_METADATA_KEY))
+                .and_then(Value::as_bool)
+                == Some(true);
+            Ok(if thought {
+                adk_core::Part::Thinking { thinking: text.clone(), signature: None }
+            } else {
+                adk_core::Part::Text { text: text.clone() }
+            })
         }
         a2a_protocol_types::PartContent::Raw(base64_str) => {
             let data = general_purpose::STANDARD.decode(base64_str).map_err(|e| {
@@ -47,49 +100,191 @@ pub fn wire_part_to_adk(part: &a2a_protocol_types::Part) -> Result<adk_core::Par
             file_uri: uri.clone(),
             annotations: None,
         }),
-        a2a_protocol_types::PartContent::Data(data) => wire_data_to_adk(data),
+        a2a_protocol_types::PartContent::Data(data) => {
+            wire_data_to_adk(data, part.metadata.as_ref())
+        }
         _ => {
             Err(A2aError::InvalidParams { message: "unsupported PartContent variant".to_string() })
         }
     }
 }
 
+/// Reads a function call's `{id, name, args}` fields.
+fn function_call_from(call: &Value) -> Result<adk_core::Part, A2aError> {
+    let name = call
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| A2aError::InvalidParams {
+            message: "function_call missing 'name'".to_string(),
+        })?
+        .to_string();
+    let args = call.get("args").cloned().unwrap_or(Value::Object(Map::new()));
+    let id = call.get("id").and_then(|v| v.as_str()).map(String::from);
+    Ok(adk_core::Part::FunctionCall { name, args, id, thought_signature: None })
+}
+
+/// Reads a function response's `{id, name, response}` fields.
+fn function_response_from(resp: &Value) -> Result<adk_core::Part, A2aError> {
+    let name = resp
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| A2aError::InvalidParams {
+            message: "function_response missing 'name'".to_string(),
+        })?
+        .to_string();
+    let response = resp.get("response").cloned().unwrap_or(Value::Object(Map::new()));
+    let id = resp.get("id").and_then(|v| v.as_str()).map(String::from);
+    Ok(adk_core::Part::FunctionResponse {
+        function_response: adk_core::FunctionResponseData::new(name, response),
+        id,
+        annotations: None,
+    })
+}
+
+/// Opening tag around an A2A data part carried as text.
+pub const DATAPART_OPEN_TAG: &str = "<a2a_datapart_json>";
+
+/// Closing tag around an A2A data part carried as text.
+pub const DATAPART_CLOSE_TAG: &str = "</a2a_datapart_json>";
+
+/// An untyped A2A data part as text an agent reads: its JSON between
+/// [`DATAPART_OPEN_TAG`] and [`DATAPART_CLOSE_TAG`].
+pub fn datapart_text(data: &Value) -> String {
+    format!("{DATAPART_OPEN_TAG}{data}{DATAPART_CLOSE_TAG}")
+}
+
 /// Parse a `PartContent::Data` JSON value into the appropriate ADK Part.
-fn wire_data_to_adk(data: &Value) -> Result<adk_core::Part, A2aError> {
+///
+/// A part tagged with [`ADK_TYPE_METADATA_KEY`] is read in the flat shape that tag names.
+/// An untagged part is read by its wrapper key.
+fn wire_data_to_adk(data: &Value, metadata: Option<&Value>) -> Result<adk_core::Part, A2aError> {
+    match metadata.and_then(|m| m.get(ADK_TYPE_METADATA_KEY)).and_then(Value::as_str) {
+        Some("function_call") => return function_call_from(data),
+        Some("function_response") => return function_response_from(data),
+        _ => {}
+    }
     if let Some(call) = data.get("function_call") {
-        let name = call
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| A2aError::InvalidParams {
-                message: "function_call missing 'name'".to_string(),
-            })?
-            .to_string();
-        let args = call.get("args").cloned().unwrap_or(Value::Object(Map::new()));
-        let id = call.get("id").and_then(|v| v.as_str()).map(String::from);
-        Ok(adk_core::Part::FunctionCall { name, args, id, thought_signature: None })
+        function_call_from(call)
     } else if let Some(resp) = data.get("function_response") {
-        let name = resp
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| A2aError::InvalidParams {
-                message: "function_response missing 'name'".to_string(),
-            })?
-            .to_string();
-        let response = resp.get("response").cloned().unwrap_or(Value::Object(Map::new()));
-        let id = resp.get("id").and_then(|v| v.as_str()).map(String::from);
-        Ok(adk_core::Part::FunctionResponse {
-            function_response: adk_core::FunctionResponseData::new(name, response),
-            id,
-            annotations: None,
-        })
+        function_response_from(resp)
     } else if let Some(stc) = data.get("server_tool_call") {
         Ok(adk_core::Part::ServerToolCall { server_tool_call: stc.clone() })
     } else if let Some(str_val) = data.get("server_tool_response") {
         Ok(adk_core::Part::ServerToolResponse { server_tool_response: str_val.clone() })
     } else {
-        Err(A2aError::InvalidParams {
-            message: "data part does not contain a recognized key (function_call, function_response, server_tool_call, server_tool_response)".to_string(),
+        // Structured data an agent should read: text it can see, marked as A2A data, as
+        // adk-go does (`<a2a_datapart_json>`).
+        Ok(adk_core::Part::Text { text: datapart_text(data) })
+    }
+}
+
+/// A function call as a data part tagged with [`ADK_TYPE_METADATA_KEY`], `{id, name, args}`,
+/// the shape adk-python and adk-go read. `long_running` adds
+/// [`ADK_LONG_RUNNING_METADATA_KEY`].
+pub fn tagged_function_call_part(
+    name: &str,
+    args: &Value,
+    id: Option<&str>,
+    long_running: bool,
+) -> a2a_protocol_types::Part {
+    let mut data = Map::new();
+    data.insert("name".to_string(), Value::String(name.to_string()));
+    data.insert("args".to_string(), args.clone());
+    if let Some(id) = id {
+        data.insert("id".to_string(), Value::String(id.to_string()));
+    }
+    let mut metadata = Map::new();
+    metadata.insert(ADK_TYPE_METADATA_KEY.to_string(), Value::String("function_call".to_string()));
+    metadata.insert(ADK_LONG_RUNNING_METADATA_KEY.to_string(), Value::Bool(long_running));
+    let mut part = a2a_protocol_types::Part::data(Value::Object(data));
+    part.metadata = Some(Value::Object(metadata));
+    part
+}
+
+/// A function response as a data part tagged with [`ADK_TYPE_METADATA_KEY`],
+/// `{id, name, response}`, the shape adk-python and adk-go read.
+pub fn tagged_function_response_part(
+    name: &str,
+    response: &Value,
+    id: Option<&str>,
+) -> a2a_protocol_types::Part {
+    let mut data = Map::new();
+    data.insert("name".to_string(), Value::String(name.to_string()));
+    data.insert("response".to_string(), response.clone());
+    if let Some(id) = id {
+        data.insert("id".to_string(), Value::String(id.to_string()));
+    }
+    let mut part = a2a_protocol_types::Part::data(Value::Object(data));
+    part.metadata = Some(json!({ ADK_TYPE_METADATA_KEY: "function_response" }));
+    part
+}
+
+/// An agent output part that A2A carries as media in an artifact: inline data as raw bytes
+/// with its media type, a file as its URL. Text goes in the text artifact. Function calls
+/// and responses, thinking and provider items stay inside the agent.
+/// An agent's parts as the A2A parts it shows a caller, as adk-go's `ToA2AParts`:
+///
+/// - text as text, and reasoning as text marked [`ADK_THOUGHT_METADATA_KEY`];
+/// - an [`adk_part_to_wire`] carried data part (`<a2a_datapart_json>…`) as that data part again;
+/// - files and inline data as file parts;
+/// - function calls and responses as data parts tagged [`ADK_TYPE_METADATA_KEY`], a call
+///   marked [`ADK_LONG_RUNNING_METADATA_KEY`] when `long_running_ids` lists its id (or, for
+///   older events, its name);
+/// - provider tool items and embedded resources as data or file parts.
+pub fn adk_parts_to_wire(
+    parts: &[adk_core::Part],
+    long_running_ids: &[String],
+) -> Vec<a2a_protocol_types::Part> {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            adk_core::Part::Text { text } => Some(match carried_data(text) {
+                Some(data) => a2a_protocol_types::Part::data(data),
+                None => a2a_protocol_types::Part::text(text.clone()),
+            }),
+            adk_core::Part::Thinking { thinking, .. } => {
+                let mut wire = a2a_protocol_types::Part::text(thinking.clone());
+                wire.metadata = Some(json!({ ADK_THOUGHT_METADATA_KEY: true }));
+                Some(wire)
+            }
+            adk_core::Part::FunctionCall { name, args, id, .. } => {
+                let long_running = long_running_ids
+                    .iter()
+                    .any(|listed| Some(listed) == id.as_ref() || listed == name);
+                Some(tagged_function_call_part(name, args, id.as_deref(), long_running))
+            }
+            adk_core::Part::FunctionResponse { function_response, id, .. } => {
+                Some(tagged_function_response_part(
+                    &function_response.name,
+                    &function_response.response,
+                    id.as_deref(),
+                ))
+            }
+            adk_core::Part::ServerToolCall { server_tool_call } => Some(
+                a2a_protocol_types::Part::data(json!({ "server_tool_call": server_tool_call })),
+            ),
+            adk_core::Part::ServerToolResponse { server_tool_response } => {
+                Some(a2a_protocol_types::Part::data(
+                    json!({ "server_tool_response": server_tool_response }),
+                ))
+            }
+            other => adk_part_to_wire(other).ok().flatten(),
         })
+        .collect()
+}
+
+/// The data part `text` carries, when it is exactly one [`datapart_text`].
+fn carried_data(text: &str) -> Option<Value> {
+    let inner = text.strip_prefix(DATAPART_OPEN_TAG)?.strip_suffix(DATAPART_CLOSE_TAG)?;
+    serde_json::from_str(inner).ok()
+}
+
+pub fn media_part_to_wire(part: &adk_core::Part) -> Option<a2a_protocol_types::Part> {
+    match part {
+        adk_core::Part::InlineData { .. } | adk_core::Part::FileData { .. } => {
+            adk_part_to_wire(part).ok().flatten()
+        }
+        _ => None,
     }
 }
 
@@ -356,6 +551,7 @@ pub fn wire_task_to_internal(task: &a2a_protocol_types::Task) -> Result<TaskStor
         push_configs: Vec::new(),
         created_at: now,
         updated_at: now,
+        version: 0,
     })
 }
 
@@ -391,6 +587,95 @@ mod tests {
     use serde_json::json;
 
     // ── wire_part_to_adk ─────────────────────────────────────────────────
+
+    #[test]
+    fn data_parts_tagged_with_adk_type_are_read_in_the_flat_shape() {
+        // The shape adk-python and adk-go send to resume a long-running call.
+        let response: a2a_protocol_types::Part = serde_json::from_value(json!({
+            "data": {"id": "call-1", "name": "request_approval", "response": {"status": "approved"}},
+            "metadata": {"adk_type": "function_response"}
+        }))
+        .unwrap();
+        match wire_part_to_adk(&response).unwrap() {
+            adk_core::Part::FunctionResponse { function_response, id, .. } => {
+                assert_eq!(function_response.name, "request_approval");
+                assert_eq!(function_response.response, json!({"status": "approved"}));
+                assert_eq!(id.as_deref(), Some("call-1"));
+            }
+            other => panic!("expected a function response, got {other:?}"),
+        }
+
+        let call: a2a_protocol_types::Part = serde_json::from_value(json!({
+            "data": {"id": "call-2", "name": "lookup", "args": {"q": "x"}},
+            "metadata": {"adk_type": "function_call"}
+        }))
+        .unwrap();
+        match wire_part_to_adk(&call).unwrap() {
+            adk_core::Part::FunctionCall { name, args, id, .. } => {
+                assert_eq!(name, "lookup");
+                assert_eq!(args, json!({"q": "x"}));
+                assert_eq!(id.as_deref(), Some("call-2"));
+            }
+            other => panic!("expected a function call, got {other:?}"),
+        }
+
+        let unnamed: a2a_protocol_types::Part = serde_json::from_value(json!({
+            "data": {"id": "call-3", "response": {}},
+            "metadata": {"adk_type": "function_response"}
+        }))
+        .unwrap();
+        assert!(matches!(wire_part_to_adk(&unnamed), Err(A2aError::InvalidParams { .. })));
+    }
+
+    #[test]
+    fn an_untyped_data_part_reaches_the_agent_as_marked_text() {
+        let wire = a2a_protocol_types::Part::data(json!({"order": 42, "items": ["tea"]}));
+        match wire_part_to_adk(&wire).unwrap() {
+            adk_core::Part::Text { text } => {
+                assert!(text.starts_with(DATAPART_OPEN_TAG) && text.ends_with(DATAPART_CLOSE_TAG));
+                let inner = &text[DATAPART_OPEN_TAG.len()..text.len() - DATAPART_CLOSE_TAG.len()];
+                assert_eq!(
+                    serde_json::from_str::<Value>(inner).unwrap(),
+                    json!({"order": 42, "items": ["tea"]})
+                );
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tagged_parts_carry_the_adk_type_and_read_back() {
+        let call = tagged_function_call_part(
+            "request_approval",
+            &json!({"amount": 500}),
+            Some("c-1"),
+            true,
+        );
+        assert_eq!(
+            serde_json::to_value(&call).unwrap(),
+            json!({
+                "data": {"id": "c-1", "name": "request_approval", "args": {"amount": 500}},
+                "metadata": {"adk_type": "function_call", "adk_is_long_running": true}
+            })
+        );
+        assert!(matches!(
+            wire_part_to_adk(&call).unwrap(),
+            adk_core::Part::FunctionCall { ref name, .. } if name == "request_approval"
+        ));
+
+        let response = tagged_function_response_part(
+            "request_approval",
+            &json!({"status": "pending"}),
+            Some("c-1"),
+        );
+        assert_eq!(
+            serde_json::to_value(&response).unwrap(),
+            json!({
+                "data": {"id": "c-1", "name": "request_approval", "response": {"status": "pending"}},
+                "metadata": {"adk_type": "function_response"}
+            })
+        );
+    }
 
     #[test]
     fn text_part_wire_to_adk() {
@@ -493,13 +778,6 @@ mod tests {
             }
             _ => panic!("expected ServerToolResponse"),
         }
-    }
-
-    #[test]
-    fn data_unknown_key_returns_error() {
-        let data = json!({ "unknown_key": "value" });
-        let wire = a2a_protocol_types::Part::data(data);
-        assert!(wire_part_to_adk(&wire).is_err());
     }
 
     #[test]
@@ -833,6 +1111,7 @@ mod tests {
             push_configs: Vec::new(),
             created_at: now,
             updated_at: now,
+            version: 0,
         };
         let wire = internal_task_to_wire(&entry).unwrap();
         assert_eq!(wire.id.0, "task-2");

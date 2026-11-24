@@ -8,9 +8,11 @@ authors.workspace = true
 description = "ADK-Rust graph, auth, and wire contracts for computer-use-mcp"
 homepage.workspace = true
 repository.workspace = true
+documentation = "https://docs.rs/adk-computer-use"
 keywords = ["ai", "agent", "computer-use", "mcp", "automation"]
 categories = ["api-bindings", "asynchronous"]
 readme = "README.md"
+exclude = ["tests/", "examples/", "fixtures/"]
 
 [dependencies]
 adk-core.workspace = true
@@ -25,8 +27,8 @@ serde_json.workspace = true
 chrono.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
-rmcp = { version = "3.1", features = ["client"] }
+tokio = { workspace = true, features = ["sync", "time"] }
+rmcp = { version = "3.9", features = ["client"] }
 uuid.workspace = true
 tracing.workspace = true
 
@@ -37,11 +39,18 @@ proptest = "1.5"
 # release order. Cargo strips path-only dev-dependencies when packaging.
 # See scripts/check-publish-order.py.
 adk-agent = { path = "../adk-agent" }
-adk-model = { path = "../adk-model", features = ["gemini"] }
+adk-browser = { path = "../adk-browser" }
+adk-model = { path = "../adk-model", features = ["gemini", "anthropic"] }
 adk-runner = { path = "../adk-runner" }
 adk-session = { path = "../adk-session" }
 futures.workspace = true
-tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
+# The in-process computer-use-mcp stand-in the actuator tests drive.
+rmcp = { version = "3.9", features = ["client", "server"] }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+# The recorded WebDriver server the live browser tests drive (adk-browser/tests/support).
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
+url = "2.5"
 
 # Portable, dependency-free graph showcase (runs on any platform, no server).
 [[example]]

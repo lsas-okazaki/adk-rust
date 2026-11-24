@@ -42,6 +42,7 @@
 //! ```
 
 use crate::service::*;
+use crate::text::ArtifactReference;
 use adk_core::{Content, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -49,6 +50,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
+use std::time::Duration;
 
 /// Sentinel query the realtime runner uses at session start; we answer it with
 /// the compact profile card rather than a topic match.
@@ -139,6 +141,8 @@ pub struct GraphMemoryService {
     profile_entities: usize,
     /// Max observations per entity shown in the profile card.
     profile_observations: usize,
+    /// How long an episodic turn lives when it carries no expiry of its own.
+    default_ttl: Option<Duration>,
 }
 
 impl GraphMemoryService {
@@ -151,12 +155,12 @@ impl GraphMemoryService {
         let pool = SqlitePool::connect_with(options)
             .await
             .map_err(|e| adk_core::AdkError::memory(format!("sqlite connection failed: {e}")))?;
-        Ok(Self { pool, profile_entities: 12, profile_observations: 5 })
+        Ok(Self { pool, profile_entities: 12, profile_observations: 5, default_ttl: None })
     }
 
     /// Build from an existing pool.
     pub fn from_pool(pool: SqlitePool) -> Self {
-        Self { pool, profile_entities: 12, profile_observations: 5 }
+        Self { pool, profile_entities: 12, profile_observations: 5, default_ttl: None }
     }
 
     /// Override how many entities / observations-per-entity the profile card includes.
@@ -166,12 +170,35 @@ impl GraphMemoryService {
         self
     }
 
+    /// Expires each episodic turn written without an expiry `ttl` after it is written.
+    ///
+    /// The TTL covers the episodic log that [`MemoryService`] writes. Entities, observations
+    /// and relations are curated through the graph operations and end with
+    /// [`invalidate_observation`](Self::invalidate_observation) or
+    /// [`delete_entities`](Self::delete_entities).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_memory::GraphMemoryService;
+    /// use std::time::Duration;
+    ///
+    /// let kg = GraphMemoryService::new("sqlite:kg.db")
+    ///     .await?
+    ///     .with_default_ttl(Duration::from_secs(90 * 24 * 3600));
+    /// ```
+    pub fn with_default_ttl(mut self, ttl: Duration) -> Self {
+        self.default_ttl = Some(ttl);
+        self
+    }
+
     const REGISTRY_TABLE: &'static str = "_adk_kg_migrations";
 
-    const MIGRATIONS: &'static [(i64, &'static str, &'static str)] = &[(
-        1,
-        "create bi-temporal knowledge-graph + episodic tables",
-        "\
+    const MIGRATIONS: &'static [(i64, &'static str, &'static str)] = &[
+        (
+            1,
+            "create bi-temporal knowledge-graph + episodic tables",
+            "\
 CREATE TABLE IF NOT EXISTS kg_entities (\
     app_name TEXT NOT NULL, user_id TEXT NOT NULL, \
     name TEXT NOT NULL, entity_type TEXT NOT NULL, updated_at TEXT NOT NULL, \
@@ -196,7 +223,23 @@ CREATE TABLE IF NOT EXISTS kg_episodic (\
     author TEXT NOT NULL, text TEXT NOT NULL, timestamp TEXT NOT NULL\
 );\
 CREATE INDEX IF NOT EXISTS idx_kg_epi ON kg_episodic(app_name, user_id);",
-    )];
+        ),
+        (
+            2,
+            "add memory_id and expires_at to the episodic log",
+            "\
+ALTER TABLE kg_episodic ADD COLUMN memory_id TEXT;\
+ALTER TABLE kg_episodic ADD COLUMN expires_at INTEGER;\
+UPDATE kg_episodic SET memory_id = lower(hex(randomblob(16))) WHERE memory_id IS NULL;\
+CREATE INDEX IF NOT EXISTS idx_kg_epi_memory_id ON kg_episodic(app_name, user_id, memory_id);\
+CREATE INDEX IF NOT EXISTS idx_kg_epi_expires_at ON kg_episodic(expires_at);",
+        ),
+        (
+            3,
+            "keep the artifacts an episodic turn refers to",
+            "ALTER TABLE kg_episodic ADD COLUMN artifacts TEXT;",
+        ),
+    ];
 
     /// Apply schema migrations (idempotent).
     pub async fn migrate(&self) -> Result<()> {
@@ -661,13 +704,15 @@ CREATE INDEX IF NOT EXISTS idx_kg_epi ON kg_episodic(app_name, user_id);",
         // and injection-safe regardless of token count.
         const WINDOW: i64 = 200;
         let rows = sqlx::query(
-            "SELECT author, text, timestamp FROM kg_episodic \
-             WHERE app_name=?1 AND user_id=?2 \
+            "SELECT memory_id, author, text, artifacts, timestamp, expires_at FROM kg_episodic \
+             WHERE app_name=?1 AND user_id=?2 AND (expires_at IS NULL OR expires_at > ?4) \
              ORDER BY id DESC LIMIT ?3",
         )
         .bind(app_name)
         .bind(user_id)
         .bind(WINDOW)
+        // Mirrors `expiry::is_expired`: a turn is live while `expires_at > now`.
+        .bind(Utc::now().timestamp_millis())
         .fetch_all(&self.pool)
         .await
         .map_err(map_sql)?;
@@ -683,15 +728,7 @@ CREATE INDEX IF NOT EXISTS idx_kg_epi ON kg_episodic(app_name, user_id);",
                 if overlap == 0 {
                     return None;
                 }
-                let author: String = r.get("author");
-                Some((
-                    overlap,
-                    MemoryEntry {
-                        content: Content::new(author.clone()).with_text(text),
-                        author,
-                        timestamp: parse_ts(&r.get::<String, _>("timestamp")),
-                    },
-                ))
+                Some((overlap, episodic_entry(&r, text)))
             })
             .collect();
         scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
@@ -751,6 +788,27 @@ fn row_to_relation(r: sqlx::sqlite::SqliteRow) -> Relation {
     }
 }
 
+/// A row of `kg_episodic` (`memory_id`, `author`, `artifacts`, `timestamp`, `expires_at`) as
+/// a memory: its text, then a `Part::FileData` for each artifact it refers to.
+fn episodic_entry(row: &sqlx::sqlite::SqliteRow, text: String) -> MemoryEntry {
+    let author: String = row.get("author");
+    let mut content = Content::new(author.clone());
+    if !text.is_empty() {
+        content = content.with_text(text);
+    }
+    let artifacts: Vec<ArtifactReference> = row
+        .get::<Option<String>, _>("artifacts")
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    content.parts.extend(artifacts.iter().map(ArtifactReference::to_part));
+    let mut entry = MemoryEntry::new(content, author)
+        .with_timestamp(parse_ts(&row.get::<String, _>("timestamp")));
+    entry.id = row.get("memory_id");
+    entry.expires_at =
+        row.get::<Option<i64>, _>("expires_at").and_then(DateTime::from_timestamp_millis);
+    entry
+}
+
 fn parse_ts(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now())
 }
@@ -771,6 +829,10 @@ impl MemoryService for GraphMemoryService {
     /// Cheap ingest: record each turn into the episodic log. Distilling turns
     /// into entities/relations is deliberately left to an out-of-band
     /// consolidation pass so the realtime write path stays fast.
+    ///
+    /// A turn keeps its text and the artifacts it refers to
+    /// ([`artifact_references`](crate::text::artifact_references)), never inline bytes; a
+    /// turn with neither is skipped.
     async fn add_session(
         &self,
         app_name: &str,
@@ -778,15 +840,27 @@ impl MemoryService for GraphMemoryService {
         session_id: &str,
         entries: Vec<MemoryEntry>,
     ) -> Result<()> {
+        let now = Utc::now();
         let mut tx = self.begin().await?;
         for e in entries {
             let text = content_text(&e.content);
-            if text.is_empty() {
+            let artifacts = crate::text::artifact_references(&e.content);
+            if text.is_empty() && artifacts.is_empty() {
                 continue;
             }
+            let artifacts = if artifacts.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&artifacts).map_err(|err| {
+                    adk_core::AdkError::memory(format!("artifact references: {err}"))
+                })?)
+            };
+            let e = crate::expiry::stamp(e, self.default_ttl, now);
             sqlx::query(
-                "INSERT INTO kg_episodic (app_name, user_id, session_id, author, text, timestamp) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO kg_episodic \
+                 (app_name, user_id, session_id, author, text, timestamp, memory_id, expires_at, \
+                  artifacts) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )
             .bind(app_name)
             .bind(user_id)
@@ -794,6 +868,9 @@ impl MemoryService for GraphMemoryService {
             .bind(&e.author)
             .bind(&text)
             .bind(e.timestamp.to_rfc3339())
+            .bind(&e.id)
+            .bind(e.expires_at.map(|at| at.timestamp_millis()))
+            .bind(artifacts)
             .execute(&mut *tx)
             .await
             .map_err(map_sql)?;
@@ -817,22 +894,17 @@ impl MemoryService for GraphMemoryService {
                 return Ok(SearchResponse { memories: Vec::new() });
             }
             return Ok(SearchResponse {
-                memories: vec![MemoryEntry {
-                    content: Content::new("memory").with_text(card),
-                    author: "memory".to_string(),
-                    timestamp: Utc::now(),
-                }],
+                memories: vec![MemoryEntry::new(Content::new("memory").with_text(card), "memory")],
             });
         }
 
         // Topic query: graph facts first, then raw-turn recall.
         let mut memories = Vec::new();
         for r in self.search_nodes(&req.app_name, &req.user_id, &req.query, limit).await? {
-            memories.push(MemoryEntry {
-                content: Content::new("memory").with_text(result_to_sentence(&r)),
-                author: "memory".to_string(),
-                timestamp: Utc::now(),
-            });
+            memories.push(MemoryEntry::new(
+                Content::new("memory").with_text(result_to_sentence(&r)),
+                "memory",
+            ));
         }
         if memories.len() < limit {
             let remaining = limit - memories.len();
@@ -849,11 +921,8 @@ impl MemoryService for GraphMemoryService {
     /// turn, authored `graph` except for turns.
     async fn export_user(&self, app_name: &str, user_id: &str) -> Result<Vec<UserMemory>> {
         let graph_entry = |text: String, timestamp: &str| UserMemory {
-            entry: MemoryEntry {
-                content: Content::new("model").with_text(text),
-                author: "graph".to_string(),
-                timestamp: parse_ts(timestamp),
-            },
+            entry: MemoryEntry::new(Content::new("model").with_text(text), "graph")
+                .with_timestamp(parse_ts(timestamp)),
             session_id: None,
             project_id: None,
         };
@@ -900,20 +969,16 @@ impl MemoryService for GraphMemoryService {
             memories.push(graph_entry(text, &row.get::<String, _>("valid_from")));
         }
         for row in query(
-            "SELECT session_id, author, text, timestamp FROM kg_episodic \
+            "SELECT session_id, memory_id, author, text, artifacts, timestamp, expires_at \
+             FROM kg_episodic \
              WHERE app_name=?1 AND user_id=?2",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(map_sql)?
         {
-            let author: String = row.get("author");
             memories.push(UserMemory {
-                entry: MemoryEntry {
-                    content: Content::new(author.clone()).with_text(row.get::<String, _>("text")),
-                    author,
-                    timestamp: parse_ts(&row.get::<String, _>("timestamp")),
-                },
+                entry: episodic_entry(&row, row.get("text")),
                 session_id: Some(row.get("session_id")),
                 project_id: None,
             });
@@ -953,6 +1018,31 @@ impl MemoryService for GraphMemoryService {
         Ok(())
     }
 
+    /// Deletes the episodic turn `memory_id`. Graph facts carry no memory id; they end with
+    /// [`invalidate_observation`](Self::invalidate_observation) or
+    /// [`delete_entities`](Self::delete_entities).
+    async fn delete_memory(&self, app_name: &str, user_id: &str, memory_id: &str) -> Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM kg_episodic WHERE app_name=?1 AND user_id=?2 AND memory_id=?3",
+        )
+        .bind(app_name)
+        .bind(user_id)
+        .bind(memory_id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sql)?;
+        Ok(result.rows_affected())
+    }
+
+    async fn purge_expired(&self) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM kg_episodic WHERE expires_at <= ?1")
+            .bind(Utc::now().timestamp_millis())
+            .execute(&self.pool)
+            .await
+            .map_err(map_sql)?;
+        Ok(result.rows_affected())
+    }
+
     async fn health_check(&self) -> Result<()> {
         sqlx::query("SELECT 1").execute(&self.pool).await.map_err(map_sql)?;
         Ok(())
@@ -972,11 +1062,69 @@ mod tests {
     }
 
     fn entry(author: &str, text: &str) -> MemoryEntry {
-        MemoryEntry {
-            content: Content::new(author).with_text(text),
-            author: author.to_string(),
-            timestamp: Utc::now(),
-        }
+        MemoryEntry::new(Content::new(author).with_text(text), author.to_string())
+    }
+
+    #[tokio::test]
+    async fn episodic_turns_keep_their_artifact_references() {
+        let kg = svc().await;
+        let frame = "artifact://inspector/u1/s1/vision-ab12.png#0";
+        let captioned = entry("model", "torn seal on carton 117, conveyor 1")
+            .with_id("caption-1")
+            .with_artifact(frame, "image/png");
+        // Inline bytes are not a reference; inline data naming its source is.
+        let mut inline = entry("model", "a page").with_id("page-1");
+        inline.content.parts.push(adk_core::Part::InlineData {
+            mime_type: "image/png".into(),
+            data: vec![1, 2, 3],
+            uri: Some("artifact://inspector/u1/s1/page.png#2".into()),
+            annotations: None,
+        });
+        let mut bare = MemoryEntry::new(Content::new("model"), "model").with_id("frame-only");
+        bare.content.parts.push(ArtifactReference::new(frame, "image/png").to_part());
+        let empty = MemoryEntry::new(Content::new("model"), "model");
+        kg.add_session("app", "u1", "s1", vec![captioned, inline, bare, empty]).await.unwrap();
+
+        let found = kg
+            .search(SearchRequest {
+                query: "torn seal".into(),
+                user_id: "u1".into(),
+                app_name: "app".into(),
+                limit: Some(5),
+                min_score: None,
+                project_id: None,
+            })
+            .await
+            .unwrap();
+        let caption = found.memories.iter().find(|m| m.id.as_deref() == Some("caption-1")).unwrap();
+        assert_eq!(
+            crate::text::extract_text(&caption.content),
+            "torn seal on carton 117, conveyor 1"
+        );
+        assert_eq!(caption.artifact_references(), vec![ArtifactReference::new(frame, "image/png")]);
+
+        let exported = kg.export_user("app", "u1").await.unwrap();
+        let by_id = |id: &str| {
+            exported.iter().find(|m| m.entry.id.as_deref() == Some(id)).map(|m| &m.entry).unwrap()
+        };
+        assert_eq!(
+            by_id("page-1").artifact_references(),
+            vec![ArtifactReference::new("artifact://inspector/u1/s1/page.png#2", "image/png")]
+        );
+        assert!(
+            by_id("page-1")
+                .content
+                .parts
+                .iter()
+                .all(|p| !matches!(p, adk_core::Part::InlineData { .. }))
+        );
+        assert_eq!(
+            by_id("frame-only").content.parts,
+            vec![ArtifactReference::new(frame, "image/png").to_part()]
+        );
+        assert_eq!(exported.len(), 3, "a turn with no text and no artifact is skipped");
+
+        assert_eq!(kg.delete_memory("app", "u1", "caption-1").await.unwrap(), 1);
     }
 
     #[tokio::test]

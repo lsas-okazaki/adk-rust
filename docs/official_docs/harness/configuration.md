@@ -24,6 +24,7 @@ required; everything else has a default.
 | `tool_timeout(duration)` | 300 s | Timeout of one tool call |
 | `history_max_events(n)` | all | Most recent events loaded per run |
 | `compaction(config)` / `without_compaction()` | interval 10, overlap 4 | Event compaction for the harness's runner |
+| `intra_compaction(config)` / `without_intra_compaction()` | on, at 80% of the model's window | Auto-compaction before each model call; see [Context Compaction](../sessions/context-compaction.md#auto-compaction-within-a-run) |
 | `tool(tool)` / `toolset(toolset)` | none | Extra tools, governed as `External` |
 | `customize_llm(f)` | none | The escape hatch to the underlying `LlmAgentBuilder`; its rustdoc states what it can bypass |
 
@@ -39,6 +40,7 @@ required; everything else has a default.
 | `confirmation_handler(handler)` | the prompting handler | Replaces the confirmation handler |
 | `approval_store(store)` | in memory | Where held calls and decisions are kept |
 | `approval_service(service)` | none | The approval inbox held calls are submitted to |
+| `auto_review(reviewer)` | off | In `auto`, a `ToolReviewer` such as `ModelApprover` decides the calls the mode holds before a person; see [Auto review](modes-and-approvals.md#auto-review) |
 | `confirmation_timeout(duration)` | 300 s | How long a person may take; a call nobody decides in time waits in the approval store |
 | `trust_mcp_read_only_hints(bool)` | `false` | Trusts an MCP server's `readOnlyHint` for external tools |
 | `require_authenticated_identity()` | off | Standing rules and `auto` apply only to authenticated users (served harnesses) |
@@ -119,7 +121,8 @@ works in, so it may only tighten (spec 3.1 §9.2 I3):
 | `fail_if_unavailable = true` | Refuses to build without the sandbox |
 | `[deploy]` | Not by the harness: deployment tooling reads it |
 | `[ultracode]` | Not by the harness: `adk-rust ultracode` reads it, tighten-only — see below |
-| `yes`, `allow_unsandboxed`, `trust`, `packs`, `members` | Never: they would loosen what the agent may do. Set them in code |
+| `[compaction]` | Not by the harness: the CLI reads it — see below; in code, use `intra_compaction` |
+| `yes`, `allow_unsandboxed`, `auto_review`, `trust`, `packs`, `members` | Never: they would loosen what the agent may do. Set them in code |
 
 Ignored keys and a looser mode are logged as warnings and listed in `HarnessConfig::notes`.
 A missing file is the default configuration.
@@ -150,6 +153,26 @@ fn main() -> anyhow::Result<()> {
 
 The CLI reads the same file with the same rule, plus `<config dir>/adk-rust/harness.toml`
 for settings only you may make; see [Configuration files](cli.md#configuration-files).
+
+### `[compaction]`
+
+A run compacts the agent's history before a model call once the request nears the model's
+context window. The CLI reads a `[compaction]` table that changes when: the user config first,
+then `.adk/harness.toml`, which may set it too, since it changes what the model is sent rather
+than what the agent may do.
+
+| Key | Default | Effect |
+|---|---|---|
+| `auto` | `true` | `false` turns auto-compaction off |
+| `threshold_tokens` | none | A fixed threshold in estimated tokens, in place of the window fraction |
+| `window_fraction` | `0.8` | The share of the model's context window a request may reach |
+| `keep_recent` | `10` | The most recent history entries kept as they are, within half the threshold |
+
+```toml
+[compaction]
+window_fraction = 0.6
+keep_recent = 6
+```
 
 ### `[ultracode]`
 
@@ -204,7 +227,7 @@ On the umbrella crate:
 | `harness-browser`, `harness-computer-use` | The browser and computer-use packs: `HarnessAgentBuilder::pack_browser`, `pack_computer_use`; see [Browser and computer use](packs.md) |
 | `harness-voice`, `harness-managed` | The voice pack, which the builder refuses with `not yet implemented` until it lands, and the managed form |
 | `harness-encrypted`, `harness-memory-local` | The encrypted store and the local ONNX embedder (spec 3.1 §7.12, §7.15.2) |
-| `mistralrs`, `cli-mistralrs` | `adk-mistralrs` in the umbrella, and `adk-rust --provider mistralrs`; a heavy build, in no tier |
+| `mistralrs`, `cli-mistralrs` | `adk_rust::mistralrs`, the `adk-mistralrs` re-export, and `adk-rust --provider mistralrs`; a heavy build, in no tier |
 
 ```toml
 [dependencies]
@@ -242,7 +265,7 @@ On `adk-harness`:
 
 | File | Purpose |
 |---|---|
-| `src/main.rs` | Builds the harness over SQLite sessions in `.adk/state.db`, with `ConsolePrompter` and `.config(HarnessConfig::discover(".")?)`, and runs it with `HarnessLauncher` |
+| `src/main.rs` | Builds the harness over SQLite in `.adk/state.db` — sessions, the approval service and its store, the action ledger, standing rules, and the kernel's stores through `HarnessLauncher::with_kernel_stores` — with `ConsolePrompter` and `.config(HarnessConfig::discover(".")?)`, and runs it with `HarnessLauncher` |
 | `.adk/harness.toml` | The project file, with a `[deploy]` table |
 | `AGENTS.md` | Project instructions, loaded once you trust the workspace |
 | `.skills/example/SKILL.md` | An example skill, valid for `adk-rust skills validate` |
@@ -256,7 +279,15 @@ cp .env.example .env     # add GOOGLE_API_KEY
 cargo test               # the scripted smoke test
 cargo run                # the REPL, ask mode, approvals in the terminal
 cargo run -- serve       # the harness on 127.0.0.1:8080
+cargo run -- up          # the agent kernel, its state in .adk/state.db
+cargo run -- goal "make the tests pass" --until "cargo test"
 ```
+
+`serve` and `up` take `--port` (default 8080) and `--host`, not `adk-rust up`'s `--bind`.
+The project depends on `adk-rust` with `autonomy` and `cli`. For an agent that runs unattended
+from the start — `auto` mode, the OS sandbox, a budget, a spend cap, a signed audit log and a
+cron trigger — scaffold `--template autonomous` instead ([Build an autonomous
+agent](../autonomy/index.md)).
 
 The template takes the `telemetry`, `mcp` and other addons, and refuses `server` (the
 launcher serves) and `docker` (the launcher refuses a non-loopback address without an

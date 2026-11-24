@@ -22,9 +22,9 @@
 //! | `lancedb`    | `LanceDBVectorStore` via lancedb          |
 //! | `pgvector`   | `PgVectorStore` via sqlx                  |
 //! | `agent-retrieval` | `AgentRetrievalStore` via Agent Retrieval (Vector Search 2.0) |
-//! | `surrealdb`  | `SurrealVectorStore` via surrealdb        |
 //! | `vertex-rag` | Vertex AI RAG Engine client + retrieval tool |
-//! | `full`       | `gemini`, `openai`, `qdrant`, `lancedb`, `pgvector`, `surrealdb` |
+//! | `onnx`       | `OnnxEmbeddingProvider`: a sentence-transformer ONNX model run in process |
+//! | `full`       | `gemini`, `openai`, `qdrant`, `lancedb`, `pgvector` |
 //!
 //! ## Example
 //!
@@ -106,8 +106,6 @@ pub mod openai;
 pub mod pgvector;
 #[cfg(feature = "qdrant")]
 pub mod qdrant;
-#[cfg(feature = "surrealdb")]
-pub mod surrealdb;
 #[cfg(feature = "vertex-rag")]
 pub mod vertex_rag;
 
@@ -139,8 +137,6 @@ pub use openai::OpenAIEmbeddingProvider;
 pub use pgvector::PgVectorStore;
 #[cfg(feature = "qdrant")]
 pub use qdrant::QdrantVectorStore;
-#[cfg(feature = "surrealdb")]
-pub use surrealdb::SurrealVectorStore;
 #[cfg(feature = "vertex-rag")]
 pub use vertex_rag::{
     RetrieveContextsRequest, VertexAiRagRetrievalTool, VertexRagConfig, VertexRagEngineClient,

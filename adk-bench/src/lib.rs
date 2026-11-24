@@ -17,6 +17,11 @@
 //! - **Memory**: peak RSS during the measurement phase and its growth per agent (Linux, macOS)
 //! - **External comparison**: peak RSS and token overhead as reported by each harness
 //! - **Regression detection**: baselines compared with a configurable tolerance
+//! - **Long history** ([`long_history`]): per-turn and per-iteration framework cost as a
+//!   session grows to thousands of events, with a scripted model and no API key
+//! - **Vision** (`vision` feature): per `adk-vision` backend, cold load, p50 and p95 per image
+//!   at three input sizes, throughput, peak RSS, accuracy on the vision eval sets and cost
+//!   per 1,000 images, published with the machine and versions
 //!
 //! `cargo adk bench` is the command-line front end.
 //!
@@ -41,9 +46,12 @@ pub mod error;
 pub mod external;
 pub mod formatter;
 pub mod instrumented_llm;
+pub mod long_history;
 pub mod memory;
 pub mod metrics;
 pub mod runner;
+#[cfg(feature = "vision")]
+pub mod vision;
 pub mod workload;
 
 /// Task quality adapters for established benchmark suites.
@@ -59,6 +67,9 @@ pub use external::{
 };
 pub use formatter::{ComparisonResult, format_comparison, format_result};
 pub use instrumented_llm::{DeterministicConfig, InstrumentedLlm, LlmCallRecord};
+pub use long_history::{
+    LongHistoryBench, LongHistoryConfig, LongHistoryMode, LongHistoryReport, run_long_history,
+};
 pub use metrics::{
     BenchmarkResult, ConcurrencyLevel, DurationStats, MemoryMetrics, MetricCollector, RunMetadata,
     ThroughputMetrics, compute_stats,
