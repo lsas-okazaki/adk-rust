@@ -55,6 +55,91 @@ fn code_in_plan_mode_writes_nothing() {
     assert!(!ws.path().join("made-by-bash").exists(), "plan mode ran bash:\n{shown}");
 }
 
+/// A run that ends on a model error exits `1` with the error, so CI and unattended callers
+/// see the failure: the empty script fails the first model call.
+#[test]
+fn code_exits_1_when_the_run_fails() {
+    let home = tempfile::tempdir().unwrap();
+    let ws = workspace();
+    let output = run(
+        &[
+            "code",
+            "write a note",
+            "--yes",
+            "--no-memory",
+            "--dir",
+            &dir_arg(ws.path()),
+            "--model-script",
+            "[]",
+        ],
+        home.path(),
+        ws.path(),
+    );
+    let shown = text(&output);
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(shown.contains("\nthe run failed: "), "{shown}");
+}
+
+/// A model that declines ends the run as a failure, not as an answer: `code` exits `1` with
+/// the refusal, and the write the turn asked for never runs.
+#[test]
+fn code_exits_1_when_the_model_refuses() {
+    let home = tempfile::tempdir().unwrap();
+    let ws = workspace();
+    let script = r#"[{"refusal": "I can't help with that request."}]"#;
+    let output = run(
+        &[
+            "code",
+            "write a note",
+            "--yes",
+            "--no-memory",
+            "--dir",
+            &dir_arg(ws.path()),
+            "--model-script",
+            script,
+        ],
+        home.path(),
+        ws.path(),
+    );
+    let shown = text(&output);
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(shown.contains("\nthe run failed: "), "{shown}");
+    assert!(
+        shown.contains("the model declined the request: I can't help with that request."),
+        "{shown}"
+    );
+}
+
+/// A goal whose turn the model declines stops at that iteration with the refusal instead of
+/// running the check as though the turn had worked.
+#[test]
+fn a_refused_goal_iteration_fails_the_goal() {
+    let home = tempfile::tempdir().unwrap();
+    let ws = workspace();
+    let output = run(
+        &[
+            "goal",
+            "create done.txt",
+            "--until",
+            "test -f done.txt",
+            "--dir",
+            &dir_arg(ws.path()),
+            "--max-iters",
+            "3",
+            "--yes",
+            "--model-script",
+            r#"[{"refusal": "I can't help with that request."}]"#,
+        ],
+        home.path(),
+        ws.path(),
+    );
+    let shown = text(&output);
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(shown.contains("the model declined the request"), "{shown}");
+    assert!(!shown.contains("goal met"), "{shown}");
+    assert!(!ws.path().join("done.txt").exists(), "{shown}");
+}
+
 #[test]
 fn the_read_only_alias_is_read_only_mode() {
     let home = tempfile::tempdir().unwrap();
@@ -1131,4 +1216,65 @@ fn a_calls_ledger_record_outlives_the_process() {
         recorded[0].1.as_deref().is_some_and(|outcome| outcome.contains("succeeded")),
         "{recorded:?}"
     );
+}
+
+/// A finished session is archived, left out of `sessions list`, refused a turn, exported as a
+/// bundle, and unarchived to continue (spec 3.0 parity item 23).
+#[test]
+fn an_archived_session_is_listed_apart_refused_exported_and_unarchived() {
+    let home = tempfile::tempdir().unwrap();
+    let ws = workspace();
+    let dir = dir_arg(ws.path());
+    let turn = |reply: &str| {
+        let script = format!(r#"[{{"text": "{reply}"}}]"#);
+        run(
+            &[
+                "code",
+                "book the train",
+                "--dir",
+                &dir,
+                "--session",
+                "trip",
+                "--model-script",
+                &script,
+            ],
+            home.path(),
+            ws.path(),
+        )
+    };
+    let first = turn("Booked the 09:12.");
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first));
+
+    let archived =
+        run(&["sessions", "archive", "trip", "--reason", "booked"], home.path(), ws.path());
+    assert!(text(&archived).contains("archived session trip"), "{}", text(&archived));
+    let listed = text(&run(&["sessions", "list"], home.path(), ws.path()));
+    assert!(!listed.contains("trip"), "{listed}");
+    let shelf = text(&run(&["sessions", "list", "--archived"], home.path(), ws.path()));
+    assert!(shelf.contains("trip"), "{shelf}");
+
+    let refused = turn("Never sent.");
+    assert_ne!(refused.status.code(), Some(0), "{}", text(&refused));
+    assert!(text(&refused).contains("is read-only"), "{}", text(&refused));
+
+    let export = ws.path().join("trip.json");
+    let exported = run(
+        &["sessions", "export", "trip", "--out", &export.display().to_string()],
+        home.path(),
+        ws.path(),
+    );
+    assert!(exported.status.success(), "{}", text(&exported));
+    let bundle: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&export).unwrap()).unwrap();
+    assert_eq!(bundle["format"], "adk.session.bundle/v1");
+    assert_eq!(bundle["archived"]["reason"], "booked");
+    assert!(bundle.to_string().contains("Booked the 09:12."), "{bundle}");
+    assert!(!bundle.to_string().contains("Never sent."), "{bundle}");
+
+    let back = run(&["sessions", "unarchive", "trip"], home.path(), ws.path());
+    assert!(back.status.success(), "{}", text(&back));
+    let listed = text(&run(&["sessions", "list"], home.path(), ws.path()));
+    assert!(listed.contains("trip"), "{listed}");
+    let again = turn("Return booked.");
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again));
 }

@@ -212,6 +212,8 @@ export interface AgentRow {
   mode?: ModeView | null;
   /** The session of its latest work, to open its thread. */
   sessionId?: string | null;
+  /** Where its commands run, when it has a shell and its source says (spec 3.3 §5.7). */
+  shell?: ShellView | null;
   /** What it is doing. */
   status: AgentStatus;
   /** The status word: "Working", "Waiting for you", "Asleep until 07:00", "Done", "Failed". */
@@ -222,6 +224,14 @@ export interface AgentRow {
 
 /** What an agent is doing (spec 3.3 §8.1). */
 export type AgentStatus = "working" | "waitingForYou" | "asleep" | "done" | "failed" | "ready" | "paused" | "cantStart";
+
+/** An agent's threads, newest first: `GET /surface/agents/{id}/threads`. */
+export interface AgentThreads {
+  /** The agent, by its roster name. */
+  agent: string;
+  /** Its threads, newest first. */
+  threads: ThreadSummary[];
+}
 
 /** `GET /surface/agents` answer. */
 export interface AgentsResponse {
@@ -244,6 +254,9 @@ export interface AgentsResponse {
   removed?: RemovedAgent[];
 }
 
+/** How a region of one answer stands against the other (board choice V11). */
+export type Agreement = "agree" | "differ" | "onlyHere";
+
 /** The answers a surface may give one decision (spec 3.3 §7.2). */
 export interface Allowed {
   /** A spoken "allow once" takes effect after this many seconds unless cancelled. */
@@ -258,6 +271,18 @@ export interface Allowed {
 
 /** An answer to a decision (spec 3.3 §8.2). */
 export type Answer = "allowOnce" | "alwaysAllow" | "edit" | "deny";
+
+/** One answer for the picture, as the "Answer from" picker lists it. */
+export interface AnswerChoice {
+  /** The call's identifier. */
+  id: string;
+  /** "PP-OCRv6 small". */
+  name: string;
+  /** "on this computer", "Meta, in the cloud". */
+  place: string;
+  /** The tool. */
+  tool: string;
+}
 
 /** One answer a surface may offer, with its label (spec 3.3 §8.2). */
 export interface AnswerOption {
@@ -280,12 +305,68 @@ export interface AnswerRequest {
   answer: Answer;
   /** The changed arguments of an `edit`. */
   editedArgs?: unknown;
+  /** The digests of the images the device showed, for a call with images (spec 3.7 §8.2). */
+  evidence?: string[];
   /** The device showed the call in full (§7.1). */
   expanded?: boolean;
   /** Why, for a `deny`; reported to the agent. */
   reason?: string | null;
   /** The card's `version`. */
   version: number;
+}
+
+/**
+ * How a person answered since a time (spec 3.3 §5.1 "How you answered"): how many of each
+ * answer, and on which surfaces. `GET /surface/answers`.
+ */
+export interface AnswerSummary {
+  /** "Allow once". */
+  allowedOnce: number;
+  /** "Always allow". */
+  alwaysAllowed: number;
+  /** "Deny". */
+  denied: number;
+  /** Edited, then allowed. */
+  edited: number;
+  /** Counted from. */
+  since: string;
+  /** How many were given on each surface, most first. */
+  surfaces: SurfaceCount[];
+  /** "12 answers: 9 allowed once, 2 always allowed, 1 denied". */
+  text: string;
+  /** Every answer. */
+  total: number;
+}
+
+/** One answer, in full. */
+export interface AnswerView {
+  /** When the answer holds nothing. */
+  empty?: EmptyView | null;
+  /** The call's identifier. */
+  id: string;
+  /** Labels with counts, in first-seen order. */
+  labels: LabelCount[];
+  /** Measurements. */
+  measurements?: MeasurementsView | null;
+  /** "PP-OCRv6 small". */
+  name: string;
+  /** "on this computer". */
+  place: string;
+  /** The regions, in the `RegionSet`'s order; a page's in reading order. */
+  regions: RegionView[];
+  /** The run and the call. */
+  run: RunView;
+  /**
+   * The region selected first: the escalated or lowest-scored one on a page, the measured
+   * one in a photo, the first otherwise.
+   */
+  selected?: number | null;
+  /** "11 regions", "1.1 s", "$0". */
+  stats: string[];
+  /** The tool. */
+  tool: string;
+  /** The video and its tracks, for a frame. */
+  video?: VideoView | null;
 }
 
 /**
@@ -388,6 +469,22 @@ export type AppPrompt = {
   text: string;
   /** The link, an `https` or `http` URL. */
   url: string;
+} | {
+  /** Its contents in base64, when the app sent bytes. */
+  blob?: string | null;
+  /** "Cancel". */
+  dismissLabel: string;
+  kind: "download";
+  /** Its media type; never one a browser opens as a page. */
+  mimeType: string;
+  /** The file's name, sanitized. */
+  name: string;
+  /** "Save". */
+  saveLabel: string;
+  /** "The Weather app wants to save forecast.csv (2 KB)" */
+  text: string;
+  /** Its contents as text, when the app sent text. */
+  textContent?: string | null;
 };
 
 /**
@@ -453,6 +550,17 @@ export interface Avatar {
   monogram: string;
 }
 
+/** An axis. */
+export type Axis = "x" | "y" | "z";
+
+/** A badge on the picture. */
+export interface BadgeView {
+  /** "Live · 10:41:09". */
+  text: string;
+  /** The dot's colour. */
+  tone: Tone;
+}
+
 /** "While you were away" (spec 3.3 §5.1, §8.1). */
 export interface Briefing {
   /** One line per event, oldest first. */
@@ -492,6 +600,32 @@ export interface BriefingLine {
   text: string;
 }
 
+/** One of the phone's budget rows. */
+export interface BudgetRow {
+  /** "Looking". */
+  label: string;
+  /** Its colour; `muted` for plain words. */
+  tone: Tone;
+  /** "2 a second (was 5)". */
+  value: string;
+}
+
+/** "Frame budget" (board choice C3). */
+export interface BudgetView {
+  /** "Change the daily frame limit", once the camera paused. */
+  limit?: string | null;
+  /** Looking, Asking, Frames today. */
+  meters: MeterView[];
+  /** "Steps down in this order: …", while nothing has stepped down. */
+  order?: string | null;
+  /** The phone's rows. */
+  rows: BudgetRow[];
+  /** "for line 2". */
+  scope: string;
+  /** "What the budget did": each step with its time, then the next. */
+  steps: StepView[];
+}
+
 /** The exact call a decision is about (spec 3.3 §7.1). */
 export interface CallView {
   /** Its arguments in full, as the inbox shows them to approvers (secrets removed). */
@@ -502,6 +636,168 @@ export interface CallView {
   tool: string;
   /** `text` is cut short: the call must be expanded before it can be approved. */
   truncated: boolean;
+}
+
+/** What a person may do with a camera now. */
+export interface CameraActions {
+  /** "Raise a card from this frame". */
+  raiseCard: boolean;
+  /** "Try again now". */
+  retry: boolean;
+  /**
+   * "Use this browser's camera": the camera takes the frames this screen captures
+   * (`POST /surface/cameras/{camera}/frames`), as the web home's own camera does.
+   */
+  sendFrames?: boolean;
+  /** "Stop the stream". */
+  stop: boolean;
+  /** "Camera on / Off". */
+  switch: boolean;
+  /** "Draw a zone", "Edit the zone". */
+  zone: boolean;
+}
+
+/** The agent that watches a camera. */
+export interface CameraAgent {
+  /** The agent. */
+  agent: AgentRef;
+  /** "Asleep until a defect", "Paused by the frame budget", "Not watching: no frames". */
+  line: string;
+  /** The session its thread follows: "Open the thread". */
+  sessionId: string;
+  /** The line's colour. */
+  tone: Tone;
+}
+
+/** A camera view. */
+export type CameraPreset = "fit" | "front" | "top" | "side" | "iso";
+
+/** Something found on the frame, in the camera's pixels. */
+export interface CameraRegion {
+  /** `[x0, y0, x1, y1]`; absent for a mask drawn alone. */
+  bbox?: number[] | null;
+  /** What a watch looks for: drawn selected. */
+  finding: boolean;
+  /** "part", "seal tear", "fiducial", "person": the overlay's colour (board choice S1). */
+  label: string;
+  /** A measured length. */
+  measurement?: MeasurementView | null;
+  /** A mask's outline (the Masks layer). */
+  outline?: number[][];
+  /** The phone's and a tile's tag: "T45", "14.3 mm". */
+  shortTag: string;
+  /** "part · T45", "seal tear · 0.91 · 5 frames · 14.3 mm", "person · blurred". */
+  tag: string;
+  /** Where the tag sits. */
+  tagAt: TagAt;
+  /** The anonymous track. */
+  track?: number | null;
+}
+
+/** A camera's state, as its pill and its picture show it. */
+export type CameraState = "live" | "savingFrames" | "paused" | "lost" | "off" | "stopped" | "frozen";
+
+/** One camera of the grid. */
+export interface CameraTile {
+  /** The switch may be changed here. */
+  canSwitch: boolean;
+  /** "watching for seal tears", "shown only, nothing watched", "from the voice screen". */
+  caption: string;
+  /** The camera's id. */
+  id: string;
+  /** The switch list's line: "5 a second · 20% of today's frames". */
+  line: string;
+  /** "Line 2 camera". */
+  name: string;
+  /** The switch. */
+  on: boolean;
+  /** The phone's line: "watching", "2 a second", "shown only". */
+  shortLine: string;
+  /** The picture, with its overlays. */
+  stage: StageView;
+  /** The state. */
+  state: CameraState;
+  /** "Live", "Saving frames", "Off". */
+  stateText: string;
+  /** Its colour. */
+  tone: Tone;
+}
+
+/** `GET /surface/cameras/{camera}` answer: one camera, watched large (board choice C1). */
+export interface CameraView {
+  /** What the person may do here now. */
+  actions: CameraActions;
+  /** The agent that watches it. */
+  agent: CameraAgent;
+  /** "Frame budget". */
+  budget: BudgetView;
+  /** The agent's open decisions on this session, such as the held line stop (board choice C13). */
+  decisions: DecisionCard[];
+  /** The camera's id. */
+  id: string;
+  /** "RTSP · 1920 × 1080 · on the line 2 server". */
+  ingest: string;
+  /** "Line 2 camera". */
+  name: string;
+  /** "Nothing is waiting for you." */
+  nothingWaiting: string;
+  /** The banner over the picture, when there is something to warn about. */
+  notice?: NoticeView | null;
+  /** The switch: on, or off (board choice C2). */
+  on: boolean;
+  /** "Sources": every camera, this one's tile following its state (board choice C15). */
+  sources: SourceTile[];
+  /** The picture. */
+  stage: StageView;
+  /** The state. */
+  state: CameraState;
+  /** "Live", "Saving frames", "Paused until midnight", "Can't reach the camera", "Camera off". */
+  stateText: string;
+  /** The pill's colour. */
+  tone: Tone;
+  /** "Tracks now". */
+  tracks: TrackRow[];
+  /** The words under the tracks: "Tracks are anonymous and start again when the camera does." */
+  tracksNote: string;
+  /**
+   * The phone's words under the budget while the camera is off: "Tracks start again when the
+   * camera is back on."
+   */
+  tracksShortNote?: string | null;
+  /** "Watching for". */
+  watches: WatchView[];
+  /** The zones a person may edit, in the camera's pixels. */
+  zones: ZoneView[];
+}
+
+/** `GET /surface/cameras` answer: every camera, a grid of them (board choice C8). */
+export interface CamerasView {
+  /** The agent that watches them. */
+  agent?: CameraAgent | null;
+  /** Each camera's frames today. */
+  budget: MeterView[];
+  /** The phone's: "4 · 3 on". */
+  countShort: string;
+  /** "4 sources · 3 on". */
+  countText: string;
+  /** The agents' open decisions on these cameras' sessions. */
+  decisions: DecisionCard[];
+  /** "Select a camera to watch it large. People are blurred before any frame is shown or kept." */
+  footer: string;
+  /** "Each source has its own frame budget. Stop all pauses every one of them." */
+  note: string;
+  /** "Nothing is waiting for you." */
+  nothingWaiting: string;
+  /** The camera shown first, by its id. */
+  selected?: string | null;
+  /** The phone's line under the large picture: "Line 2 camera · Live · 5 a second". */
+  selectedLine?: string | null;
+  /** "Each camera has its own frame budget. People are blurred before any frame is shown or kept." */
+  shortNote: string;
+  /** Every camera. */
+  tiles: CameraTile[];
+  /** "Cameras". */
+  title: string;
 }
 
 /**
@@ -532,8 +828,91 @@ export interface CardLine {
   value: string;
 }
 
+/**
+ * A held call's images on its card (spec 3.7 §8.2, X11): what would leave, after redaction,
+ * with what was covered, where it goes, what it costs, how long it is kept and why nothing
+ * can be sent when that is so.
+ */
+export interface CardMedia {
+  /**
+   * This surface may tighten the crop or add a redaction, which holds the call again with
+   * the new image (board choices A7, A8).
+   */
+  canChange: boolean;
+  /** What the cost counts: "851 image tokens". */
+  costDetail?: string | null;
+  /** "Up to $0.0044" while waiting; "$0.0024" once it ran. */
+  costText?: string | null;
+  /** What was covered before they leave, by class. */
+  covered: CoveredLine[];
+  /** Every pixel of every image is covered. */
+  coveredAll: boolean;
+  /** "100% of the image", when so. */
+  coveredAllText?: string | null;
+  /** What they were cut from: "Page 2 of claim-0412.pdf". */
+  cutFrom?: string | null;
+  /** How: "nothing resized". */
+  cutNote?: string | null;
+  /** The fixed line under the card (board choice A21). */
+  fixedLine: string;
+  /** Where they go. */
+  goesTo?: GoesTo | null;
+  /** The images, in the order of the call's evidence. */
+  images: EvidenceImage[];
+  /** "Kept as evidence until 18 Dec". */
+  keptText?: string | null;
+  /** Why nothing can be sent, when that is so. */
+  notice?: MediaNotice | null;
+  /**
+   * The digest of the image a changed image replaced, when this call was held again with
+   * a changed image.
+   */
+  replaces?: string | null;
+  /** Where an authorised viewer opens the source image (board choice A9). */
+  sourceHref?: string | null;
+  /**
+   * "The exact image that would leave", "The 3 images that would leave", "The image that
+   * left".
+   */
+  title: string;
+  /** What they are: "Document crop", "3 document crops". */
+  what?: string | null;
+  /** What qualifies `what`: "never the page". */
+  whatNote?: string | null;
+}
+
+/** `POST /surface/cameras/{camera}/cards` answer. */
+export interface CardRaised {
+  /** The kept frame's digest, after blurring: the evidence the card and a held call carry. */
+  digest: string;
+  /** The kept frame in the annotated viewer. */
+  href: string;
+  /** "Kept as evidence until 18 Dec". */
+  keptUntil: string;
+  /** What sending it to the agent did: sent, or queued behind a decision or a turn. */
+  outcome: CommandOutcome;
+  /** The regions that went with it. */
+  regions: number;
+  /** The short form: `sha256:c52ca5…ce7550`. */
+  shortDigest: string;
+  /** "Raised to the Inspector. This one frame is kept as evidence until 18 Dec." */
+  text: string;
+}
+
 /** Where a decision is in its life. */
 export type CardStatus = "waiting" | "decided";
+
+/**
+ * `GET /surface/genui/catalogs` answer (spec 3.3 §6.1 `genui`): the catalogs this home
+ * renders, `forms` first, as documents of one A2UI version. In 1.0 an extension catalog's
+ * document holds only the components it adds, which a surface mixes with `forms`.
+ */
+export interface CatalogDocuments {
+  /** Each catalog's document, by the A2UI catalog meta-schema of that version. */
+  catalogs: unknown[];
+  /** The A2UI version of the documents: `1.0` or `v0.9.1`. */
+  version: string;
+}
 
 /** A catalog this home renders. */
 export interface CatalogView {
@@ -548,6 +927,38 @@ export interface CatalogView {
    * the home.
    */
   leftOut: string[];
+}
+
+/** What a chart's horizontal axis holds. */
+export type ChartAxis = {
+  /** The categories' names, in order. */
+  labels: string[];
+  type: "category";
+} | {
+  type: "number";
+} | {
+  type: "time";
+};
+
+/** How a chart is drawn. */
+export type ChartKind = "line" | "area" | "bar" | "scatter" | "pie" | "sparkline";
+
+/** One series of a chart. */
+export interface ChartSeries {
+  /** Its name, in the legend. */
+  name: string;
+  /** Its horizontal values on a number or time axis; empty on a category axis. */
+  x?: number[];
+  /** Its values. */
+  y: number[];
+}
+
+/** A labelled point on a number or time axis. */
+export interface ChartTick {
+  /** Where, in the axis's values. */
+  at: number;
+  /** What it reads. */
+  text: string;
 }
 
 /** One claim of a protocol. */
@@ -584,10 +995,16 @@ export interface ColorChoice {
  * A command from a surface (spec 3.3 §6). Every command runs as an authenticated
  * `Caller`, whose subject, surface and `Origin` reach its audit record.
  * 
- * §6 also names "steer", a message that reaches a turn while it runs. The runtime takes one
- * through `Runner::steer`, but the engine has no steer command yet: a message sent during a
- * turn is the session's next message (`Send`), and
- * `StopAll` stops a turn that has gone wrong.
+ * A message sent while a turn of its session runs reaches that turn (§6 "steer"): the
+ * engine offers it through `Source::steer`, the runtime screens it as it screens a turn's
+ * own message, and the agent takes it at its next safe point. A turn that ends first hands
+ * the message back, and it goes as the session's next message, once.
+ * 
+ * | Command | A turn of the session runs | Answers |
+ * |---|---|---|
+ * | `Send` | Offered to the turn; it waits in the session's queue until the turn takes it or hands it back | At once: `Queued` |
+ * | `Steer` | The same | Once the message has a fate: `Steered`, or `Queued` when handed back |
+ * | `Queue` | Never offered: the session's next message | At once: `Queued` |
  */
 export type Command = {
   /** The answer. */
@@ -596,6 +1013,12 @@ export type Command = {
   decisionId: string;
   /** The changed arguments of an `edit`. */
   editedArgs?: unknown;
+  /**
+   * The digests of the images the surface showed, in the order of the card's media
+   * (spec 3.7 §8.2): an answer that lets a call with images run names the images it
+   * lets leave, and is refused when they are not the call's.
+   */
+  evidence?: string[];
   /** The surface showed the call in full (§7.1). */
   expanded?: boolean;
   /** Why, for a `deny`; reported to the agent. */
@@ -604,16 +1027,53 @@ export type Command = {
   /** The card's `version`. */
   version: number;
 } | {
+  /** The change. */
+  change: ImageChange;
+  /** The card's `id`. */
+  decisionId: string;
+  /** The digest of the image the person changed, as the card showed it. */
+  from: string;
+  /**
+   * Only make the new image and say its digest and size, holding nothing again: what
+   * the editor shows before **Use this image** (board choice A8).
+   */
+  preview?: boolean;
+  type: "changeImage";
+  /** The card's `version`. */
+  version: number;
+} | {
   /** The decision. */
   decisionId: string;
   type: "cancelAnswer";
 } | {
+  /**
+   * The images the person sent with it (spec 3.3 §5.1): at most
+   * `MAX_IMAGES`. A message with images is never offered to a
+   * running turn; it goes as the session's next.
+   */
+  images?: ImageData[];
   /** The session. */
   sessionId: string;
   /** The message. */
   text: string;
   type: "send";
 } | {
+  /** The session. */
+  sessionId: string;
+  /** The message. */
+  text: string;
+  type: "steer";
+} | {
+  /** The session. */
+  sessionId: string;
+  type: "stopTurn";
+} | {
+  /**
+   * The images the person sent with it (spec 3.3 §5.1): at most
+   * `MAX_IMAGES`. A message with images is never offered to a
+   * running turn; it goes as the session's next.
+   */
+  images?: ImageData[];
   /** The session. */
   sessionId: string;
   /** The message. */
@@ -634,6 +1094,12 @@ export type Command = {
 } | {
   /** The agent: a roster row's name. */
   agent: string;
+  /**
+   * The images the person sent with it (spec 3.3 §5.1): at most
+   * `MAX_IMAGES`. A message with images is never offered to a
+   * running turn; it goes as the session's next.
+   */
+  images?: ImageData[];
   /** The new session. */
   sessionId: string;
   /** The first message. */
@@ -709,6 +1175,16 @@ export type CommandOutcome = {
   card: DecisionCard;
   type: "changed";
 } | {
+  /** The image the change would make: its digest and size, and the one it replaces. */
+  changed: ImageChanged;
+  type: "imagePreview";
+} | {
+  /** The old decision. */
+  card: DecisionCard;
+  /** The image change, when an image changed. */
+  changed?: ImageChanged | null;
+  type: "heldAgain";
+} | {
   /** When it takes effect. */
   cancelUntil: string;
   /** The decision. */
@@ -724,6 +1200,20 @@ export type CommandOutcome = {
   /** The session. */
   sessionId: string;
   type: "sent";
+} | {
+  /** The session. */
+  sessionId: string;
+  /** A turn was running and stopped. */
+  stopped: boolean;
+  /** "Stopped. Your agent waits for your next message." */
+  text: string;
+  type: "turnStopped";
+} | {
+  /** The id of the session event that carries the message. */
+  eventId: string;
+  /** The session. */
+  sessionId: string;
+  type: "steered";
 } | {
   /** Its place in the queue, from 1. */
   position: number;
@@ -796,6 +1286,70 @@ export interface CommandRequest {
   surface?: SurfaceKind;
 }
 
+/**
+ * A command or code an agent ran (spec 3.3 §5.1), from its tool's result: the last lines it
+ * wrote, how it exited and for how long. Every string is data.
+ */
+export interface CommandRun {
+  /**
+   * The command line, when the tool's result repeats it; otherwise the call's own
+   * activity line says what ran.
+   */
+  command?: string | null;
+  /** How long it ran, when the tool says. */
+  durationMs?: number | null;
+  /** How it exited, when it did. */
+  exitCode?: number | null;
+  /** The language of code the sandbox ran: `python`, `javascript`, `command`, …. */
+  language?: string | null;
+  /** How many lines the result holds in all. */
+  lines: number;
+  /** The last lines it wrote, at most `RUN_LINES`. */
+  output: OutputLine[];
+  /** Why it stopped short, when it did. */
+  stopped?: RunStop | null;
+  /** The tool cut what it wrote; the agent can read the whole of it. */
+  truncated?: boolean;
+}
+
+/** A region's standing in a comparison. */
+export interface CompareMark {
+  /** How it stands. */
+  agreement: Agreement;
+  /** The region's index in its answer. */
+  index: number;
+  /** The tag over it: its reading where they differ, "only here". */
+  tag?: string | null;
+}
+
+/** One side of a comparison. */
+export interface ComparePane {
+  /** The answer. */
+  answer: AnswerView;
+  /** Each region's standing. */
+  marks: CompareMark[];
+  /** "PP-OCRv6" — the short name the differences use. */
+  shortName: string;
+}
+
+/** Two answers for one image, side by side (board choice V11). */
+export interface CompareView {
+  /** A. */
+  a: ComparePane;
+  /** Regions both found and read alike. */
+  agree: number;
+  /** B. */
+  b: ComparePane;
+  /** Regions both found and read differently. */
+  differ: number;
+  /** The differences, A's order first. */
+  differences: Difference[];
+  /** Regions only one found. */
+  onlyOne: number;
+  /** "Where both found a region, the boxes overlap closely (mean IoU 0.94)." */
+  overlapText: string;
+}
+
 /** A passkey the person set up on a computer for the web home. */
 export interface ComputerPasskey {
   /** When it was set up. */
@@ -841,6 +1395,36 @@ export interface ConfirmRequest {
   credential: unknown;
   /** The changed arguments, when the page sends them again: they must be the bound ones. */
   editedArgs?: unknown;
+}
+
+/**
+ * What a region on an evidence image covers, by the class the egress gate redacted it as
+ * (spec 3.7 §7.8 step 3).
+ */
+export type CoverClass = "face" | "personalText" | "schemaField" | "marked" | "other";
+
+/** The words over a picture that is not live. */
+export interface CoverView {
+  /** The camera-off icon. */
+  off: boolean;
+  /** A spinner: the source is being tried again. */
+  retrying: boolean;
+  /** "Nothing is captured or sent. You switched line 2 off at 11:05." */
+  text: string;
+  /** "Paused until midnight", "Can't reach the line 2 camera", "Camera off". */
+  title: string;
+}
+
+/** What was covered of one class, as a line of "Covered before it leaves". */
+export interface CoveredLine {
+  /** The class. */
+  class: CoverClass;
+  /** How many regions. */
+  count: number;
+  /** Which images, when the call sends several and not all of them: "in image 3". */
+  note?: string | null;
+  /** "1 face", "3 personal text", "2 fields your schema marks personal". */
+  text: string;
 }
 
 /**
@@ -896,12 +1480,28 @@ export interface DecisionCard {
    * (S-I5).
    */
   detail?: CardDetail | null;
+  /**
+   * What an MCP server asks the person, drawn in the home's own controls in place of the
+   * call's arguments (MCP elicitation; spec 3.3 §7.2). Never on a chat card (S-I5).
+   */
+  elicitation?: ElicitationView | null;
   /** What will happen, in plain words. */
   heading: string;
   /** The inbox entry: what a command answers. Never shown. */
   id: string;
+  /**
+   * The images the call would send, keep or act on, after redaction, with what was
+   * covered, where they go and what they cost (spec 3.7 §8.2, X11). Never on a chat card,
+   * which carries the image itself or a link (S-I5).
+   */
+  media?: CardMedia | null;
   /** The call spends money. */
   money: boolean;
+  /**
+   * The run that waited on this decision ended while it still waits: the answer is kept
+   * and used when the agent picks the thread up again (spec 3.7 §8.2, board choice A12).
+   */
+  parked?: ParkedView | null;
   /** Whether it can be taken back. */
   reversibility: Reversibility;
   /** "Can't be unsent". */
@@ -957,6 +1557,43 @@ export interface Delivery {
   sentAt: string;
 }
 
+/** A depth effect. */
+export type DepthEffect = "tilt" | "flip" | "layers" | "carousel" | "wall" | "stage";
+
+/** One difference between two answers. */
+export interface Difference {
+  /** What A answered: "PO-7781S · 0.58", or "—". */
+  a: string;
+  /** The region in A. */
+  aRegion?: number | null;
+  /** What B answered. */
+  b: string;
+  /** The region in B. */
+  bRegion?: number | null;
+  /** Its label. */
+  label: string;
+  /** The region's number: its reading order, or its place. */
+  number: number;
+  /** "handwriting · read differently", "text · only B found it". */
+  title: string;
+}
+
+/**
+ * What assistive technology reads for a drawn node (A2UI 1.0 `AccessibilityAttributes`): its
+ * label and description resolved and checked like any shown text, how its changes are
+ * announced, and whether it is hidden from screen readers (never a field or a button).
+ */
+export interface DrawnAccessibility {
+  /** More it reads after the name: instructions, a format, a result. */
+  description?: string | null;
+  /** Hidden from screen readers. */
+  hidden?: boolean;
+  /** A short name, read instead of its visible text. */
+  label?: string | null;
+  /** How its changes are announced: `polite` or `assertive`; absent is `off`. */
+  live?: string | null;
+}
+
 /** A declared action of a drawing, as its button shows it. */
 export interface DrawnActionView {
   /** The call's arguments: a field's value, or a constant the drawing fixed. */
@@ -982,6 +1619,31 @@ export interface DrawnArg {
 }
 
 /**
+ * A chart a component of an extension catalog shows in the home (spec 3.3 §6.1 `genui`,
+ * extension catalogs): numbers and words the server already checked by rule 5, never
+ * colours, links or markup. The home draws it in its own chart colours.
+ */
+export interface DrawnChart {
+  /** How it is drawn. */
+  kind: ChartKind;
+  /** The series, at most eight: one per chart colour. */
+  series: ChartSeries[];
+  /**
+   * One sentence that says what the chart shows, for screen readers and the terminal,
+   * written by the server: "Line chart of Revenue, 12 points, from 3100 to 9800".
+   */
+  summary: string;
+  /** Labelled points on a number or time axis, such as "10:00" at its epoch milliseconds. */
+  ticks?: ChartTick[];
+  /** What the horizontal axis holds. */
+  x: ChartAxis;
+  /** The horizontal axis's name. */
+  xLabel?: string | null;
+  /** The vertical axis's name. */
+  yLabel?: string | null;
+}
+
+/**
  * A check a drawn field makes: the catalog's `required`, `regex`, `length`, `numeric`,
  * `email`, `and`, `or` and `not` functions, and the message shown when it fails.
  */
@@ -990,6 +1652,34 @@ export interface DrawnCheck {
   condition: unknown;
   /** "Enter an email address". */
   message: string;
+}
+
+/** Components a home view holds, presented with CSS 3D, as `HomeNode::Depth`. */
+export interface DrawnDepth {
+  /** How the children are presented. */
+  effect: DepthEffect;
+  /** A title for each child, for a carousel, wall or stage's controls and the terminal. */
+  titles?: string[];
+}
+
+/**
+ * A component of an extension catalog as a host renderer reads it (spec 3.3 §6.1 `genui`,
+ * extension catalogs): its properties with every binding and text function resolved and
+ * every string already checked by rule 5. A renderer draws it from these and nothing else,
+ * and draws no control: the component only shows.
+ */
+export interface DrawnExtension {
+  /** The catalog's id. */
+  catalog: string;
+  /**
+   * The keys of the nodes its slots hold, in slot order: each is in the subtree of the
+   * node's child.
+   */
+  children?: string[];
+  /** The component's type, such as `Metric`. */
+  component: string;
+  /** Its properties, resolved and checked. */
+  props: unknown;
 }
 
 /** A field of a drawing: where its value goes, what it takes and what it checks. */
@@ -1035,14 +1725,35 @@ export type DrawnKind = "form" | "card" | "table" | "screen";
  * | `Divider` | — | `axis` | — |
  * | `Button` | Its label | `primary`, `default`, `borderless` | `action` |
  * | `TextField`, `DateTimeInput`, `CheckBox`, `ChoicePicker`, `Slider` | The label | the catalog's variant | `field` |
+ * | `Chart` | — | — | `chart`: a chart an extension component's home view draws |
+ * | `Scene` | — | — | `scene`: a 3D scene an extension component's home view draws; its children are its panels, then its text view |
+ * | `Depth` | — | — | `depth`: the children an extension component's home view holds, presented with CSS 3D |
+ * | An extension component, such as `Metric` | — | — | `extension`, and one child: what the home shows for it |
  */
 export interface DrawnNode {
+  /**
+   * What assistive technology reads for it (A2UI 1.0 `@accessibility`), resolved and
+   * checked by rule 5.
+   */
+  accessibility?: DrawnAccessibility | null;
   /** The declared action a button asks for. */
   action?: string | null;
+  /** A chart the home draws natively, from an extension component's home view. */
+  chart?: DrawnChart | null;
   /** Its children, in order. */
   children?: DrawnNode[];
   /** The catalog component. */
   component: string;
+  /**
+   * How the home presents this node's children in depth, from an extension component's
+   * home view.
+   */
+  depth?: DrawnDepth | null;
+  /**
+   * The extension component this node draws, for a host that draws it with its own
+   * renderer; every other surface draws its one child, what the home shows for it.
+   */
+  extension?: DrawnExtension | null;
   /** A field the person fills in. */
   field?: DrawnField | null;
   /**
@@ -1050,6 +1761,8 @@ export interface DrawnNode {
    * item it was drawn for, `cell-0@/rows/3`.
    */
   key: string;
+  /** A 3D scene the home draws natively, from an extension component's home view. */
+  scene?: DrawnScene | null;
   /** A long list's "Show all 42", when a renderer cuts it. */
   showAllText?: string | null;
   /** The titles of a `Tabs`' tabs, one per child. */
@@ -1066,6 +1779,48 @@ export interface DrawnOption {
   label: string;
   /** The value sent. */
   value: string;
+}
+
+/** A 3D scene a home view draws, as `HomeNode::Scene`. */
+export interface DrawnScene {
+  /** Named axes, ticks and a floor grid. */
+  axes?: SceneAxes | null;
+  /** Where it is seen from. */
+  camera: SceneCamera;
+  /** Its height in CSS pixels, 200 to 960; the home picks one when it is not given. */
+  height?: number | null;
+  /** What the scene is, for its summary and default camera. */
+  kind: SceneKind;
+  /** How it is lit: a preset whose soft light always stays, so nothing goes dark. */
+  lighting: SceneLighting;
+  /** Up to three more lights. */
+  lights?: SceneLight[];
+  /** Objects that move. */
+  motion?: SceneMotion[];
+  /** Its objects, parents before children. */
+  objects: SceneObject[];
+  /**
+   * The held components shown beside objects: written by the server, each the key of one
+   * of the node's children.
+   */
+  panels?: ScenePanel[];
+  /** Picking an object fills this field. */
+  select?: SceneSelect | null;
+  /**
+   * One sentence that says what the scene shows, for screen readers and the terminal,
+   * written by the server: "3D bar chart of Revenue, 24 bars, from 3 to 98".
+   */
+  summary: string;
+  /**
+   * The key of the node's child that says in words what the scene shows, written by the
+   * server: shown by "Show as text", where WebGL is missing, and in the terminal.
+   */
+  textView?: string | null;
+  /**
+   * What bar and grid heights stand for in the data's own numbers, for the summary and the
+   * home's readouts; heights are the data's numbers when not given.
+   */
+  values?: SceneValues | null;
 }
 
 /**
@@ -1138,6 +1893,88 @@ export interface DrawnSurface {
   version: number;
 }
 
+/**
+ * What an MCP server asks the person while the agent's call waits (MCP elicitation), drawn
+ * by the home in its own controls, never by the server: a form whose answer is sent as the
+ * decision's edit and checked against the server's schema, or a page the person opens
+ * themselves, shown in full and never opened by the home (spec 3.3 §7.2).
+ */
+export type ElicitationView = {
+  /** The fields, in the schema's order. */
+  fields: ElicitedField[];
+  /** What it asks, in its words. */
+  message: string;
+  mode: "form";
+  /** The server that asks. */
+  server: string;
+} | {
+  /** Its host, shown on its own so a look-alike stands out. */
+  host: string;
+  /** Why, in its words. */
+  message: string;
+  mode: "url";
+  /** The server that asks. */
+  server: string;
+  /** The whole address, as sent. */
+  url: string;
+  /**
+   * Why to look twice, when there is a reason: look-alike characters, a name hidden
+   * before an `@`, no encryption.
+   */
+  warning?: string | null;
+};
+
+/** One field of an elicitation form. */
+export interface ElicitedField {
+  /** The value it starts with. */
+  default?: unknown;
+  /** The schema's description. */
+  description?: string | null;
+  /** What it takes. */
+  kind: ElicitedKind;
+  /** What the field is called: the schema's `title`, else its key. */
+  label: string;
+  /** A text's length bounds, in characters. */
+  maxLength?: number | null;
+  /** A number's bounds. */
+  maximum?: number | null;
+  /** A text's length bounds, in characters. */
+  minLength?: number | null;
+  /** A number's bounds. */
+  minimum?: number | null;
+  /** Its key in the answer. */
+  name: string;
+  /** A choice's options. */
+  options?: ElicitedOption[];
+  /** The answer is refused without it. */
+  required: boolean;
+}
+
+/** What an elicitation field takes. */
+export type ElicitedKind = "text" | "email" | "url" | "date" | "dateTime" | "number" | "integer" | "boolean" | "choice";
+
+/** One option of a choice. */
+export interface ElicitedOption {
+  /** What the person reads. */
+  label: string;
+  /** What the answer carries. */
+  value: string;
+}
+
+/** An answer with nothing in it (board choice V12): an answer, not an error. */
+export interface EmptyView {
+  /** Asked, Sent, Cost, Run. */
+  facts: Fact[];
+  /** "The call failed." and its line. */
+  failed: FactPart[];
+  /** "Hidden by your filters." and its line. */
+  hidden: FactPart[];
+  /** The sentence, in parts. */
+  text: FactPart[];
+  /** "Nothing found". */
+  title: string;
+}
+
 /** What removing an agent ends, counted (spec 3.3 §5.7 "Pausing and removing"). */
 export interface EndedWork {
   /** Decisions waiting for you that end without an answer. */
@@ -1156,6 +1993,119 @@ export interface EndedWork {
   /** Pieces of work stopped. */
   work: number;
 }
+
+/**
+ * A value replaced by an escalation (board choice V6): what the local backend read, what
+ * the escalation reads now, and the released crop's digest.
+ */
+export interface EscalationView {
+  /** Who escalated: "Gemini". */
+  by: string;
+  /** The released crop's digest, short. */
+  cropDigest?: string | null;
+  /** What the first backend read: `PO-7781S`. */
+  readAs?: string | null;
+  /** Its score. */
+  readAsScore?: number | null;
+}
+
+/** One image a held call would send, as its card shows it. */
+export interface EvidenceImage {
+  /** The feature's one-line description of it. */
+  caption?: string | null;
+  /** Every pixel of it is covered. */
+  coveredAll: boolean;
+  /**
+   * What was covered of it, in one line: "1 field your schema marks personal", "nothing
+   * covered".
+   */
+  coveredText: string;
+  /** `sha256:<hex>` of the image's bytes, in full: the exact call and the terminal show it. */
+  digest: string;
+  /** The digest in short, `sha256:c52ca5…ce7550` (board choice S4). */
+  digestShort: string;
+  /** The field it shows: "PO number". */
+  field?: string | null;
+  /** Height in pixels. */
+  height: number;
+  /**
+   * Where the surface loads the image with the viewer's own authorisation; absent when it
+   * is deleted.
+   */
+  href?: string | null;
+  /** Its place in the call's evidence: what the image route takes. */
+  index: number;
+  /** `image/png`. */
+  mimeType: string;
+  /** It is no longer kept. */
+  purged?: PurgedView | null;
+  /** The regions over it, covered before it leaves. */
+  regions: EvidenceRegion[];
+  /** "1012 × 638 PNG". */
+  sizeText: string;
+  /** Why it is sent rather than read here: "Handwriting". */
+  why?: string | null;
+  /** Width in pixels. */
+  width: number;
+}
+
+/** A region drawn over an evidence image, in the image's own pixels. */
+export interface EvidenceRegion {
+  /** The class. */
+  class: CoverClass;
+  /** The tag on a small picture: "face". */
+  shortTag: string;
+  /**
+   * The region's tag on a large picture: "face", or "face · whole person" for a person
+   * covered whole.
+   */
+  tag: string;
+  /** Left edge, pixels. */
+  x0: number;
+  /** Right edge, pixels, exclusive. */
+  x1: number;
+  /** Top edge, pixels. */
+  y0: number;
+  /** Bottom edge, pixels, exclusive. */
+  y1: number;
+}
+
+/** What an example holds (board choice V13). */
+export type ExampleScope = "region" | "page" | "nothing";
+
+/** Where a labelled example may be saved (board choice V13). */
+export interface ExamplesView {
+  /** The source saves examples. */
+  canSave: boolean;
+  /** The case name offered first, for the selected region. */
+  caseName: string;
+  /** The file picked first. */
+  file: string;
+  /** The eval fixture files there are, relative to the fixtures' root. */
+  files: string[];
+}
+
+/**
+ * A labelled line of a region's details: "Answered in · Model-input pixels, 960 × 960,
+ * letterboxed".
+ */
+export interface Fact {
+  /** "Answered in". */
+  label: string;
+  /** The value, in parts. */
+  parts: FactPart[];
+}
+
+/** One part of a fact's value. */
+export interface FactPart {
+  /** How they read. */
+  style: FactStyle;
+  /** The words. */
+  text: string;
+}
+
+/** How part of a fact reads. */
+export type FactStyle = "plain" | "mono" | "muted" | "strong";
 
 /** One event of a session's store, numbered by its position there (spec 3.3 §6). */
 export interface FeedEntry {
@@ -1220,6 +2170,41 @@ export interface FormsResponse {
   sessionId: string;
 }
 
+/** Why the server dropped a frame a screen sent. */
+export type FrameDropped = "off" | "stopped" | "frozen" | "notReading";
+
+/**
+ * `POST /surface/cameras/{camera}/frames` answer: what became of one frame this screen
+ * captured.
+ */
+export interface FrameTaken {
+  /**
+   * Why it did not. While the camera is off, stopped or paused by Stop all, the screen stops
+   * capturing: a camera switched off sends nothing.
+   */
+  dropped?: FrameDropped | null;
+  /** The frame went on to the camera's pipeline. */
+  taken: boolean;
+}
+
+/** A frame the hub holds, served by its digest. */
+export interface FrameView {
+  /** When it was captured. */
+  at: string;
+  /** "10:41:09". */
+  atText: string;
+  /** `sha256:` of its bytes. */
+  digest: string;
+  /** `/api/surface/cameras/{camera}/frames/{digest}`: the bytes, while the hub holds them. */
+  href: string;
+}
+
+/** `POST /surface/cameras/{camera}/freeze` body: the frame on screen, by its digest. */
+export interface FreezeFrame {
+  /** The frame's `sha256:` digest; the hub must still hold it. */
+  frame: string;
+}
+
 /**
  * What `GET /api/surface/genui/capabilities` answers: a table of claims per protocol, and
  * the catalogs this home renders.
@@ -1229,6 +2214,16 @@ export interface GenuiCapabilities {
   catalogs: CatalogView[];
   /** A2UI, AG-UI and MCP Apps, in that order. */
   protocols: ProtocolClaims[];
+}
+
+/** Where the images go, in words. */
+export interface GoesTo {
+  /** The hosts, joined: `api.anthropic.com`. */
+  host: string;
+  /** The model: `claude-sonnet-5-5`. */
+  model?: string | null;
+  /** Who receives them: "Claude". */
+  provider?: string | null;
 }
 
 /**
@@ -1252,8 +2247,154 @@ export interface GrantedUse {
   text: string;
 }
 
+/**
+ * A change to an evidence image before it leaves (board choices A7, A8): the crop can only
+ * shrink and covering can only grow, so a change never shows more than the image it changes.
+ */
+export interface ImageChange {
+  /** Boxes `[x0, y0, x1, y1]` in the image's pixels to fill solid black. */
+  cover?: number[][];
+  /** The new edges `[x0, y0, x1, y1]` in the image's pixels, inside the image. */
+  crop?: number[] | null;
+  /** The image's place in the call's evidence. */
+  image: number;
+}
+
+/** What a change made: the image it replaces and the new one. */
+export interface ImageChanged {
+  /** The digest of the image the change replaces. */
+  from: string;
+  /** The new image's height. */
+  height: number;
+  /** The digest of the new image, held again for the person's decision. */
+  to: string;
+  /** The new image's width. */
+  width: number;
+}
+
+/**
+ * An image of a person's message (spec 3.3 §5.1): PNG, JPEG, WebP or GIF, base64. A
+ * command carries at most `MAX_IMAGES`, each at most
+ * `MAX_IMAGE_BYTES` once decoded; the engine checks each image's
+ * bytes, not only its declared type.
+ */
+export interface ImageData {
+  /** The image, base64 (standard alphabet, padded). */
+  data: string;
+  /** `image/png`, `image/jpeg`, `image/webp` or `image/gif`. */
+  mimeType: string;
+}
+
 /** One of the three switches of "What it can see" (spec 3.3 §5.6). */
 export type InputSource = "mic" | "camera" | "screen";
+
+/** A label and how many regions carry it: a filter chip. */
+export interface LabelCount {
+  /** How many. */
+  count: number;
+  /** The label. */
+  label: string;
+}
+
+/** How large a label is. */
+export type LabelSize = "small" | "medium" | "large";
+
+/**
+ * `POST /api/surface/vision/{session}/examples`: save a labelled example (board choices V11,
+ * V12, V13).
+ */
+export interface LabelledExample {
+  /** The answer the example starts from. */
+  answer: string;
+  /** The case's name: `inv-2291-p1-po-number`. */
+  caseName: string;
+  /** The eval fixtures file, relative to the fixtures' root: `evals/vision/invoices.test.json`. */
+  file: string;
+  /** The region, corrected, kept or drawn; absent for an example with nothing in it. */
+  region?: RegionCorrection | null;
+  /** What the example holds. */
+  scope: ExampleScope;
+}
+
+/** A kind of light. */
+export type LightKind = "point" | "spot" | "directional";
+
+/** A line's arrowheads. */
+export type LineEnds = "none" | "end" | "both";
+
+/** A mask to draw: COCO run-length encoding, column-major, unset run first. */
+export interface MaskView {
+  /** Pixels set. */
+  area: number;
+  /** The runs. */
+  counts: number[];
+  /** Height of the mask's raster. */
+  height: number;
+  /** Width of the mask's raster. */
+  width: number;
+}
+
+/** A measurement tile (board choice V9). */
+export interface MeasureTile {
+  /** "Longest". */
+  label: string;
+  /** "± 0.3 mm". */
+  uncertainty: string;
+  /** "14.3 mm". */
+  value: string;
+}
+
+/** A measured length, drawn as a line with its ends. */
+export interface MeasurementView {
+  /** One end, in the camera's pixels. */
+  from: number[];
+  /** "14.3 mm". */
+  text: string;
+  /** The other end. */
+  to: number[];
+}
+
+/** An answer's measurements (board choice V9). */
+export interface MeasurementsView {
+  /**
+   * "In the belt's plane, from the fiducial: 40.0 mm is 245 px, so 6.12 px per mm. Valid
+   * only in that plane."
+   */
+  calibration: string;
+  /** The longest length's ends, in source pixels. */
+  line?: number[][] | null;
+  /** The region measured. */
+  region: number;
+  /** The tiles. */
+  tiles: MeasureTile[];
+}
+
+/** A notice on the card about its images: why nothing can be sent. */
+export interface MediaNotice {
+  /** Why it says so. */
+  kind: MediaNoticeKind;
+  /** The rest. */
+  text: string;
+  /** The lead words, in bold: "Nothing to send." */
+  title: string;
+}
+
+/** Why a card's images cannot be sent. */
+export type MediaNoticeKind = "purged" | "allCovered";
+
+/** One meter. */
+export interface MeterView {
+  /** "Looking", "Asking sam-3.1 about unclear tracks", "Frames today". */
+  label: string;
+  /** "As set", "At most 6 a minute · 14 today · $0.14", "Renews at midnight". */
+  note?: string | null;
+  /** How full the bar is, in hundredths. */
+  percent: number;
+  /** The bar's colour. */
+  tone: Tone;
+  /** "5 a second", "2 in the last minute", "61,240 of 300,000". */
+  value: string;
+}
 
 /** How much agents act on their own (spec 3.3 §8.1). */
 export type Mode = "justLook" | "suggest" | "askFirst" | "goAhead";
@@ -1274,6 +2415,44 @@ export interface ModelView {
   model: string;
   /** The provider: `anthropic`, `openai`, `gemini`. */
   provider: string;
+}
+
+/** How an object moves. */
+export type MotionKind = "spin" | "bob" | "pulse" | "orbit" | "path";
+
+/** What a banner offers. */
+export type NoticeAction = {
+  kind: "retry";
+  /** The phone's words. */
+  shortText: string;
+  /** The words. */
+  text: string;
+} | {
+  /** Where it opens. */
+  href: string;
+  kind: "limit";
+  /** The phone's words. */
+  shortText: string;
+  /** The words. */
+  text: string;
+};
+
+/** The banner over the picture. */
+export interface NoticeView {
+  /** What the banner offers. */
+  action?: NoticeAction | null;
+  /** The error, credentials hidden: "connection refused · rtsp://[credentials hidden]@…". */
+  detail?: string | null;
+  /** The phone's shorter text. */
+  shortText: string;
+  /** The phone's shorter title. */
+  shortTitle: string;
+  /** What follows the title. */
+  text: string;
+  /** "Saving frames.", "Parts on line 2 are passing without inspection." */
+  title: string;
+  /** Its colour. */
+  tone: Tone;
 }
 
 /**
@@ -1297,6 +2476,24 @@ export type Origin = {
   agent: string;
   kind: "agent";
 };
+
+/** A line a run wrote. */
+export interface OutputLine {
+  /** It went to standard error. Absent when false. */
+  stderr?: boolean;
+  /** The line, as data. */
+  text: string;
+}
+
+/** A decision whose run stopped waiting for it (spec 3.7 §8.2, board choice A12). */
+export interface ParkedView {
+  /** When the run ended. */
+  at: string;
+  /** Local `HH:MM`. */
+  atText: string;
+  /** "Document desk stopped waiting at 10:24 and finished its run without this. …". */
+  text: string;
+}
 
 /**
  * `POST /surface/phone/passkey/options` answer: the options for
@@ -1358,6 +2555,9 @@ export interface PhoneInfo {
   rpId: string;
 }
 
+/** What kind of picture an answer is about, which decides its layers and words. */
+export type PictureKind = "photo" | "document" | "videoFrame";
+
 /** A pill on a briefing line (spec 3.3 §5.1 Today). */
 export type Pill = "done" | "failed" | "waitingForYou" | "youDecided" | "suggestion" | "question";
 
@@ -1369,6 +2569,18 @@ export interface ProtocolClaims {
   id: string;
   /** Its name: `A2UI`, `AG-UI`, `MCP Apps`. */
   name: string;
+}
+
+/** An evidence image that is no longer kept (board choice A13). */
+export interface PurgedView {
+  /** The day it went, "18 Dec", when its retention ran out. */
+  day?: string | null;
+  /** The shorter line a small picture shows: "Image deleted 18 Dec". */
+  short: string;
+  /** "Evidence is kept for 30 days. What it was, …". */
+  text: string;
+  /** "This image was deleted on 18 Dec". */
+  title: string;
 }
 
 /** The keys a browser gives with its push subscription. */
@@ -1405,8 +2617,9 @@ export interface QrRequest {
 /** `GET /surface/sessions/{session}/queued` answer (spec 3.3 §7.4 rule 2, S-I4). */
 export interface QueuedResponse {
   /**
-   * What the caller typed while a decision of the session was open, oldest first; each is
-   * sent once the session's decisions are answered.
+   * What the caller typed while a decision of the session was open or a turn ran, oldest
+   * first; each is sent once the session is free, or leaves the list when the running turn
+   * takes it.
    */
   queued: string[];
   /** The session. */
@@ -1423,6 +2636,14 @@ export interface QuietView {
   start: string;
   /** "Quiet from 22:00", or "Quiet until 07:00" while it holds. */
   text: string;
+}
+
+/** `POST /surface/cameras/{camera}/cards` body: a card from a frozen frame (board choice C11). */
+export interface RaiseCard {
+  /** The frozen frame, by its digest; the hub must still hold it. */
+  frame: string;
+  /** "What should it look at?" */
+  note: string;
 }
 
 /** Why a drawing was refused, in a person's terms (spec 3.3 §7.4 rule 5). */
@@ -1456,6 +2677,75 @@ export interface RefusedDrawing {
   tool: string;
 }
 
+/** A region as a person corrected or drew it. */
+export interface RegionCorrection {
+  /** The box `[x0, y0, x1, y1]` in the image's pixels. */
+  box: number[];
+  /**
+   * The region it corrects, by its index in the answer; absent for a region the person
+   * drew.
+   */
+  index?: number | null;
+  /** The label. */
+  label: string;
+  /** The text, for a page's block. */
+  text?: string | null;
+}
+
+/** One region of an answer, as the viewer draws and lists it. */
+export interface RegionView {
+  /** It touches the picture's edge. */
+  atEdge: boolean;
+  /** Its pixels are blurred in the picture: a person. */
+  blurred: boolean;
+  /** The box as the details show it: `1250, 466 → 1532, 540`, in source pixels. */
+  boxText: string;
+  /** The transform chain as steps (board choice V4). */
+  chain: string[];
+  /** The list's quieter words: the text, "mask · 14.3 mm", "box · at the edge". */
+  detail: string;
+  /** A value an escalation replaced. */
+  escalation?: EscalationView | null;
+  /** The details, in order (board choices V4, V5, V6). */
+  facts: Fact[];
+  /** The details' heading: "5 · handwriting", "Seal tear", "T4 · forklift". */
+  heading: string;
+  /** Its place in the answer's `RegionSet`: what an example and the export name. */
+  index: number;
+  /** The label or block kind: "handwriting", "seal tear". */
+  label: string;
+  /** The mask, when the shape is one. */
+  mask?: MaskView | null;
+  /** Its measurement in one line: "14.3 mm". */
+  measurement?: string | null;
+  /** Its place in reading order, from 1, for a page. */
+  order?: number | null;
+  /** The polygon's points, when the shape is one. */
+  polygon?: number[][];
+  /** The score. */
+  score?: number | null;
+  /** The score as the list shows it: "0.58". */
+  scoreText: string;
+  /** The shape's kind. */
+  shape: ShapeKind;
+  /** The tag over the picture: "part · 0.96", "seal tear · 0.91 · 14.3 mm". */
+  tag: string;
+  /** The text it reads, for a page's block. */
+  text?: string | null;
+  /** The track, for a video frame. */
+  track?: number | null;
+  /** "T4". */
+  trackName?: string | null;
+  /** Left edge in source pixels. */
+  x0: number;
+  /** Right edge in source pixels, exclusive. */
+  x1: number;
+  /** Top edge in source pixels. */
+  y0: number;
+  /** Bottom edge in source pixels, exclusive. */
+  y1: number;
+}
+
 /**
  * An agent the person removed, whose threads stay readable (spec 3.3 §5.7, §13 decision 18;
  * owner, at the wave 3 gate: "Removed agents" at the roster's foot).
@@ -1485,11 +2775,341 @@ export type Reversibility = "cantBeUnsent" | "cantBeUndone" | "canBeRemoved" | "
 /** How much harm a call can do, as approvers see it (spec 3.3 §7.1). */
 export type Risk = "low" | "medium" | "high";
 
+/** Why a run stopped short. */
+export type RunStop = "timeout" | "memoryExceeded" | "policyViolation" | "error";
+
+/** The run and the call that produced an answer. */
+export interface RunView {
+  /** The agent, by its name in the runtime. */
+  agent: string;
+  /** The tool and the call: "vision_read · c-31", in parts. */
+  call: FactPart[];
+  /** "Document desk · 10:31". */
+  text: string;
+}
+
+/** What saving an example did. */
+export interface SavedExample {
+  /** The case's name. */
+  caseName: string;
+  /** The file, relative to the fixtures' root. */
+  file: string;
+  /** The image file the case points at, relative to the eval file. */
+  image: string;
+  /**
+   * "Saved to evals/vision/invoices.test.json as inv-2291-p1-po-number. The run's answer
+   * stays as it was."
+   */
+  text: string;
+}
+
+/** A scene's axes. */
+export interface SceneAxes {
+  /** A grid on the ground. */
+  floor?: boolean;
+  /** Labelled points along them. */
+  ticks?: SceneTick[];
+  /** The x axis's name. */
+  x?: string | null;
+  /** The y axis's name: up. */
+  y?: string | null;
+  /** The z axis's name. */
+  z?: string | null;
+}
+
+/** Where a scene is seen from. */
+export interface SceneCamera {
+  /** Where the camera is, in place of the preset's. */
+  at?: number[] | null;
+  /** The person can't turn or zoom it. */
+  fixed?: boolean;
+  /** Its vertical field of view, 15 to 90 degrees. */
+  fov?: number | null;
+  /** A view the home frames to fit the scene. */
+  preset: CameraPreset;
+  /** It turns slowly about the scene, until the person turns it. */
+  spin?: boolean;
+  /** What it looks at, in place of the scene's centre. */
+  target?: number[] | null;
+}
+
+/** A colour of the home's palette. */
+export type SceneColor = "chart1" | "chart2" | "chart3" | "chart4" | "chart5" | "chart6" | "chart7" | "chart8" | "ink" | "neutral" | "muted" | "ramp";
+
+/** An object's surface. */
+export type SceneFinish = "matte" | "glossy" | "flat";
+
+/** What a scene is. */
+export type SceneKind = "space" | "bars" | "points" | "surface" | "network" | "globe";
+
+/** A light added to the preset. */
+export interface SceneLight {
+  /** Where it is; a directional light shines from there towards the centre. */
+  at: number[];
+  /** Its colour; white when not given. */
+  color?: SceneColor | null;
+  /** How bright, 0 to 2. */
+  intensity: number;
+  /** What kind. */
+  kind: LightKind;
+}
+
+/** A lighting preset. */
+export type SceneLighting = "studio" | "soft" | "flat";
+
+/** How an object looks: the home's colours, never one the agent picks. */
+export interface SceneLook {
+  /** Its colour. */
+  color: SceneColor;
+  /** Its surface. */
+  finish: SceneFinish;
+  /** How opaque, 0.15 to 1; 1 when not given. */
+  opacity?: number | null;
+  /** Drawn as edges only. */
+  wireframe?: boolean;
+}
+
+/** An object that moves. Under reduced motion nothing moves; the person can pause any motion. */
+export interface SceneMotion {
+  /** How far it swings or how much it grows: 0 to 100 for `bob`, 0 to 1 for `pulse`. */
+  amount?: number | null;
+  /** The axis it turns or moves along. */
+  axis: Axis;
+  /** Seconds before it starts, 0 to 30. */
+  delay?: number | null;
+  /** How it moves. */
+  kind: MotionKind;
+  /** The points a `path` motion follows, `x, y, z` flat, in its parent's space. */
+  path?: number[];
+  /** How many times, 1 to 100; it goes on when not given. */
+  repeat?: number | null;
+  /** How long one turn, swing or trip takes, 0.2 to 120. */
+  seconds: number;
+  /** The object. */
+  target: string;
+}
+
+/** One object of a scene. */
+export interface SceneObject {
+  /** Where it is, in its parent's space. */
+  at: number[];
+  /** Unique within the scene: what parents, panels, motion and picking name it by. */
+  id: string;
+  /** What it is called, shown beside it as page text. */
+  label?: string | null;
+  /** How it looks. */
+  look: SceneLook;
+  /** The group it belongs to: it moves, turns and scales with it. */
+  parent?: string | null;
+  /** How it is scaled along each axis. */
+  scale?: number[] | null;
+  /** Its shape. */
+  shape: SceneShape;
+  /**
+   * A state it is in, drawn in the state's colour beside its label's word; an object with
+   * a state has a label, so colour is never the only sign.
+   */
+  state?: SceneState | null;
+  /** How it is turned about each axis, in degrees. */
+  turn?: number[] | null;
+  /**
+   * The option value picking it chooses (see `SceneSelect`); an object with one has a
+   * label, so the person sees what they pick.
+   */
+  value?: string | null;
+}
+
+/** A held component shown beside an object. */
+export interface ScenePanel {
+  /** The object it is shown beside. */
+  anchor: string;
+  /** The key of the node's child it shows. */
+  key: string;
+}
+
+/**
+ * Picking an object fills a choice field the drawing shows, with the object's `value`
+ * (spec 3.3 §7.4 rule 5: a scene's pick fills a shown choice field; it never sends). The
+ * field stays the way to choose by keyboard and screen reader, and a form's Send still asks.
+ */
+export interface SceneSelect {
+  /**
+   * What picking does, in words, written by the server: "Picking one fills Dock. Nothing
+   * is sent."
+   */
+  note: string;
+  /** The data model path of the choice field it fills, absolute. */
+  path: string;
+}
+
+/** A scene object's shape. Flat number lists hold one point after another. */
+export type SceneShape = {
+  type: "group";
+} | {
+  /** Width, height and depth. */
+  size: number[];
+  type: "box";
+} | {
+  /** Its radius. */
+  radius: number;
+  type: "sphere";
+} | {
+  /** Its height. */
+  height: number;
+  /** The bottom's radius. */
+  radiusBottom: number;
+  /** The top's radius. */
+  radiusTop: number;
+  type: "cylinder";
+} | {
+  /** From the centre to the middle of the tube. */
+  radius: number;
+  /** The tube's radius. */
+  tube: number;
+  type: "torus";
+} | {
+  /** Along z. */
+  depth: number;
+  type: "plane";
+  /** Along x. */
+  width: number;
+} | {
+  /** Arrowheads. */
+  arrow: LineEnds;
+  /** Dashed. */
+  dashed: boolean;
+  /** The points, flat. */
+  points: number[];
+  /** Separate segments, each a pair of points, rather than one line through them all. */
+  segments: boolean;
+  /** A smooth curve through the points. */
+  smooth: boolean;
+  type: "line";
+} | {
+  /** Where each bar stands, `x, z` flat. */
+  at: number[];
+  /** Each bar's height. */
+  heights: number[];
+  /** Each bar's series, 0 to 7, drawn in that chart colour; empty for the object's own. */
+  series?: number[];
+  type: "bars";
+  /** Each bar's width and depth. */
+  width: number;
+} | {
+  /** Where each point is, flat. */
+  at: number[];
+  /** Each point's series, 0 to 7, drawn in that chart colour; empty for the object's own. */
+  series?: number[];
+  /** Each point's radius. */
+  size: number;
+  type: "points";
+} | {
+  /** Points along x. */
+  columns: number;
+  /** Along z. */
+  depth: number;
+  /** One height per point, row after row. */
+  heights: number[];
+  /** Points along z. */
+  rows: number;
+  type: "grid";
+  /** Along x. */
+  width: number;
+} | {
+  /** Its radius. */
+  radius: number;
+  type: "globe";
+} | {
+  /** How large. */
+  size: LabelSize;
+  /** What it reads. */
+  text: string;
+  type: "label";
+};
+
+/** A state an object is in. */
+export type SceneState = "ok" | "warning" | "critical" | "info";
+
+/** A labelled point on an axis. */
+export interface SceneTick {
+  /** Where along it. */
+  at: number;
+  /** Which axis. */
+  axis: Axis;
+  /** What it reads. */
+  text: string;
+}
+
+/**
+ * How a scene's heights map to the data's numbers: a height `h` stands for
+ * `h * scale + offset`.
+ */
+export interface SceneValues {
+  /** What a height of 0 stands for. */
+  offset: number;
+  /** What one unit of height stands for; above 0. */
+  scale: number;
+}
+
 /** What asked for a `DrawnSent` call (spec 3.3 §6.1 `genui`, `genui-apps`). */
 export type SentVia = "form" | "app";
 
+/** The kind of a region's shape. */
+export type ShapeKind = "point" | "box" | "polygon" | "mask" | "keypoints";
+
+/** Where an agent's commands run (spec 3.3 §5.7), as its harness reports it. */
+export type ShellPlace = {
+  kind: "host";
+} | {
+  /** The enforcer: `seatbelt`, `bubblewrap`; absent when the source does not say. */
+  enforcer?: string | null;
+  kind: "sandbox";
+} | {
+  /** The image. */
+  image: string;
+  kind: "container";
+} | {
+  kind: "remote";
+  /** It runs off this computer, so commands cannot reach its files. */
+  offHost: boolean;
+  /** The provider: `e2b`, `daytona`, `modal`, …. */
+  provider: string;
+} | {
+  kind: "degraded";
+  /** Why it is unavailable. */
+  reason: string;
+  /** The sandbox asked for. */
+  requested: string;
+};
+
 /** Where an agent's commands run: nowhere, in the sandbox, or on this computer. */
 export type ShellUse = "none" | "sandboxed" | "host";
+
+/** Where an agent's commands run, and the words that say so. */
+export interface ShellView {
+  /** Where. */
+  place: ShellPlace;
+  /** "Commands run in the sandbox (Seatbelt)". */
+  text: string;
+}
+
+/** One camera in "Sources", the strip under a single camera (board choice C15). */
+export interface SourceTile {
+  /** The camera's id. */
+  id: string;
+  /** "Line 3 camera". */
+  name: string;
+  /** The camera shown large. */
+  selected: boolean;
+  /** The small picture. */
+  stage: StageView;
+  /** The state. */
+  state: CameraState;
+  /** "Live", "Saving frames", "Paused", "Lost", "Off". */
+  stateText: string;
+  /** Its colour. */
+  tone: Tone;
+}
 
 /** Who wrote a message in a thread. */
 export type Speaker = "you" | "agent";
@@ -1502,6 +3122,33 @@ export interface SpendView {
   spentMicroUsd: number;
   /** "$1.84 of $5.00 today", or "$1.84 today" with no limit. */
   text: string;
+}
+
+/** How the picture is drawn. */
+export type StageLook = "live" | "dimmed" | "grey" | "dark";
+
+/** The picture and what is drawn over it. */
+export interface StageView {
+  /** "Live · 10:41:09", "Last frame · 15:12:03". */
+  badge?: BadgeView | null;
+  /** The words over the picture when it is not live. */
+  cover?: CoverView | null;
+  /** The frame shown, when one is held. */
+  frame?: FrameView | null;
+  /** The camera's height in pixels. */
+  height: number;
+  /** How the picture is drawn. */
+  look: StageLook;
+  /** "Looking 5 a second · overlays 0.1 s behind" (board choice C10). */
+  rate?: string | null;
+  /** What was found on the frame. */
+  regions: CameraRegion[];
+  /** Where each track was over the frames held. */
+  trails: TrailView[];
+  /** The camera's width in pixels; every region is in these pixels. */
+  width: number;
+  /** The zones. */
+  zones: ZoneView[];
 }
 
 /**
@@ -1529,10 +3176,28 @@ export interface StatusLine {
   stoppedText?: string | null;
 }
 
+/** One step the governor took, or the next. */
+export interface StepView {
+  /** "14:02", or "next". */
+  at: string;
+  /** The next step, not taken yet. */
+  next: boolean;
+  /** "Looked less often: 5 → 2 a second (90% used)". */
+  text: string;
+}
+
 /** `POST /surface/stop` body: **Stop all** from a paired device (spec 3.3 §11 S-I10). */
 export interface StopRequest {
   /** Why. */
   reason?: string | null;
+}
+
+/** How many answers were given on one surface. */
+export interface SurfaceCount {
+  /** How many. */
+  count: number;
+  /** The surface. */
+  surface: SurfaceKind;
 }
 
 /**
@@ -1558,11 +3223,14 @@ export interface SurfaceQuery {
    * that session's decisions.
    */
   session?: string | null;
-  /** `GET /surface/briefing`: since when. */
+  /** `GET /surface/briefing` and `GET /surface/answers`: since when. */
   since?: string | null;
   /** The surface; defaults to the web home. */
   surface?: SurfaceKind | null;
 }
+
+/** Where a region's tag sits: above its box, below it, or inside it at the frame's edge. */
+export type TagAt = "above" | "below" | "in";
 
 /**
  * `POST /surface/decisions/{id}/take-over` body: the secret typed on a surface, for the card
@@ -1586,6 +3254,8 @@ export type ThreadItem = {
   author: string;
   /** The person or an agent. */
   from: Speaker;
+  /** The images the person sent with it (spec 3.3 §5.1). Absent when none. */
+  images?: ImageData[];
   kind: "message";
   /** The text, as data. */
   text: string;
@@ -1600,6 +3270,11 @@ export type ThreadItem = {
 } | {
   /** The call it answers. */
   callId?: string | null;
+  /**
+   * The image a vision tool answered about, by digest: the thread links the call to
+   * the annotated viewer (spec 3.7 §8.2, board choice V1).
+   */
+  image?: string | null;
   kind: "result";
   /** It succeeded. */
   ok: boolean;
@@ -1607,6 +3282,24 @@ export type ThreadItem = {
   text: string;
   /** The tool. */
   tool: string;
+} | {
+  /** The call it answers. */
+  callId?: string | null;
+  kind: "run";
+  /** It succeeded: it exited with 0. */
+  ok: boolean;
+  /** The run. */
+  run: CommandRun;
+  /** "Done" or "Failed". */
+  text: string;
+  /** The tool. */
+  tool: string;
+} | {
+  /** The call that offered them. */
+  callId?: string | null;
+  kind: "suggestions";
+  /** The replies, checked: one to four short lines, as data. */
+  replies: string[];
 } | {
   /** The inbox entry, when the call reached the inbox. */
   decisionId?: string | null;
@@ -1641,12 +3334,70 @@ export interface ThreadResponse {
   sessionId: string;
 }
 
+/**
+ * One of an agent's threads (spec 3.3 §5.1 "Thread history"): its session and when it last
+ * changed.
+ */
+export interface ThreadSummary {
+  /** When it last changed. */
+  at: string;
+  /** The session to open. */
+  sessionId: string;
+  /** "25 Oct 10:02". */
+  when: string;
+}
+
 /** One step of how a decision got here (spec 3.3 §7.1). */
 export interface TimelineStep {
   /** The step the decision is at now. */
   current: boolean;
   /** "Asked at 18:00", "Waited through quiet time", "Waiting for you". */
   text: string;
+}
+
+/** The colour a line of words takes. */
+export type Tone = "ok" | "warn" | "fail" | "muted" | "plain";
+
+/** One track now. */
+export interface TrackRow {
+  /** A watch looks for what was found on it: the row is marked. */
+  finding: boolean;
+  /** "T43". */
+  id: string;
+  /** "part". */
+  label: string;
+  /** "seal tear 0.91 · in the zone · 5 frames". */
+  note: string;
+  /** The phone's note: "seal tear 0.91 · in the zone". */
+  shortNote: string;
+  /** The swatch: the finding's label, else the track's. */
+  swatch: string;
+}
+
+/** One track of a video (board choice V10). */
+export interface TrackView {
+  /** People are blurred. */
+  blurred: boolean;
+  /** "139", "1.2k": frames seen. */
+  framesText: string;
+  /** The track's identifier. */
+  id: number;
+  /** "forklift". */
+  label: string;
+  /** "T4". */
+  name: string;
+  /** When it is seen, in seconds. */
+  spans: number[][];
+  /** Where it was, oldest first. */
+  trail: number[][];
+}
+
+/** Where a track was over the frames held: its trail. */
+export interface TrailView {
+  /** Its centres, newest first, in the camera's pixels. */
+  points: number[][];
+  /** The track. */
+  track: number;
 }
 
 /** What an agent can use (spec 3.3 §5.7 "What it can use"). */
@@ -1674,6 +3425,70 @@ export interface Via {
   origin: Origin;
   /** The surface. */
   surface: SurfaceKind;
+}
+
+/** The video a frame comes from (board choice V10). */
+export interface VideoView {
+  /** Where the frame is, in seconds. */
+  atS: number;
+  /** "10:34.1". */
+  atText: string;
+  /** "frame 19,023 · sampled 5 a second". */
+  frameText: string;
+  /** How long the video is, in seconds. */
+  lengthS: number;
+  /** "20:00". */
+  lengthText: string;
+  /** "Tracks are anonymous …". */
+  note: string;
+  /** The tracks. */
+  tracks: TrackView[];
+}
+
+/** The picture. */
+export interface ViewerImage {
+  /** `sha256:<hex>` in full. */
+  digest: string;
+  /** `sha256:556b49…a22654` (board choice S4). */
+  digestShort: string;
+  /** Height in pixels. */
+  height: number;
+  /** Where the surface loads it with the viewer's own authorisation. */
+  href: string;
+  /** `image/png`. */
+  mimeType: string;
+  /** Width in pixels. */
+  width: number;
+}
+
+/** What the annotated viewer shows of one image in one session (spec 3.7 §8.2, X12). */
+export interface ViewerView {
+  /** The agent the back link returns to. */
+  agent: string;
+  /** Its display name: "Document desk". */
+  agentName: string;
+  /** The answer shown, when there is one. */
+  answer?: AnswerView | null;
+  /** Every answer for this image in the session, newest first. */
+  answers: AnswerChoice[];
+  /** A feature's line under the picture. */
+  caption?: string | null;
+  /** Two answers side by side, when asked. */
+  compare?: CompareView | null;
+  /** Saving labelled examples. */
+  examples: ExamplesView;
+  /** The picture. */
+  image: ViewerImage;
+  /** What kind of picture it is. */
+  kind: PictureKind;
+  /** "1654 × 2339 · INV-2291.pdf, page 1 at 200 dpi". */
+  meta: string;
+  /** The score a region needs to be shown at first. */
+  minScore: number;
+  /** The session. */
+  sessionId: string;
+  /** "INV-2291 · page 1". */
+  title: string;
 }
 
 /** A text frame the view sends up the voice socket (spec 3.3 §5.6). */
@@ -1833,6 +3648,32 @@ export type VoiceUpdate = {
   type: "error";
 };
 
+/** One watch condition (board choice C1 "Watching for"). */
+export interface WatchView {
+  /** It looks at frames now. */
+  active: boolean;
+  /** ". Then wait 30 s before waking again for the same track." */
+  after: string;
+  /** "Score 0.80 or more, 3 frames in a row, inside". */
+  before: string;
+  /** Its id. */
+  id: string;
+  /** The label it looks for: its colour. */
+  label: string;
+  /** "Seal tear". */
+  name: string;
+  /** "Watching", "Paused", "No frames", "Camera off". */
+  pill: string;
+  /** What follows the zone on the phone: " · not watching" when it does not look. */
+  shortAfter: string;
+  /** The phone's line: "Seal tear, 0.80+, 3 frames in". */
+  shortBefore: string;
+  /** "Woke the Inspector 3 times today". */
+  woke: string;
+  /** The zone it looks inside: "Inspection window". */
+  zone?: string | null;
+}
+
 /** What of the web an agent reaches. */
 export type WebUse = {
   access: "none";
@@ -1843,3 +3684,38 @@ export type WebUse = {
 } | {
   access: "any";
 };
+
+/**
+ * `PUT /surface/cameras/{camera}/zones/{zone}` body: the zone's new name and corners, and the
+ * corners the person saw before changing them.
+ */
+export interface ZoneChange {
+  /** `[x0, y0, x1, y1]` in the camera's pixels. */
+  corners: number[];
+  /** The zone's name. */
+  name: string;
+  /** The corners the person started from: a zone changed since is refused, not overwritten. */
+  was: number[];
+}
+
+/** `PUT /surface/cameras/{camera}/zones/{zone}` answer. */
+export interface ZoneSaved {
+  /** "Saved. The seal tear watch uses it from the next frame." */
+  text: string;
+  /** The zone now. */
+  zone: ZoneView;
+}
+
+/** A zone, in the camera's pixels (board choice C12). */
+export interface ZoneView {
+  /** `[x0, y0, x1, y1]` in the camera's pixels. */
+  corners: number[];
+  /** "700, 200 → 1600, 880". */
+  cornersText: string;
+  /** Its id. */
+  id: string;
+  /** "Inspection window". */
+  name: string;
+  /** The watches that use it: "Seal tear watch". */
+  usedBy: string[];
+}

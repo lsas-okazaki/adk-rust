@@ -343,6 +343,10 @@ pub enum ProcessKind {
     Proposed,
     /// The kernel's own work.
     Maintenance,
+    /// A background sub-agent's run, started by the process its
+    /// [`parent`](ProcessMeta::parent) names; its labels `subagent` and `subagent.name` carry
+    /// the sub-agent's id and name.
+    Subagent,
 }
 
 impl fmt::Display for ProcessKind {
@@ -354,6 +358,7 @@ impl fmt::Display for ProcessKind {
             Self::Triggered { source } => write!(f, "triggered:{source}"),
             Self::Proposed => f.write_str("proposed"),
             Self::Maintenance => f.write_str("maintenance"),
+            Self::Subagent => f.write_str("subagent"),
         }
     }
 }
@@ -604,6 +609,8 @@ pub trait ProgressSource: Send + Sync {
     /// The [`RunUsage`] counter of the session `run` continues, or `None` when the agent
     /// keeps none. The kernel reads it when a claim starts and on every scheduler tick, and
     /// attributes the cost between readings to the process ([`ProcessStore::add_spend`]).
+    /// For a claim this returns `None` for, the kernel counts the usage the agent turn's
+    /// events carry instead, so a plain `Runner` is accounted without a source.
     ///
     /// # Errors
     ///
@@ -1287,6 +1294,9 @@ impl ProcessTable {
             let base = local.baseline.clone().unwrap_or_default();
             view.model_calls = last.model_calls.saturating_sub(base.model_calls);
             view.tool_calls = last.tool_calls.saturating_sub(base.tool_calls);
+        } else if let Some(local) = &local {
+            view.model_calls = local.turn.model_calls;
+            view.tool_calls = local.turn.tool_calls;
         }
         // A partition's own source answers for its processes (spec 3.2 §7.8).
         let progress = self

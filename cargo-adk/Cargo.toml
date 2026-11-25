@@ -12,17 +12,34 @@ documentation = "https://docs.rs/cargo-adk"
 keywords = ["adk", "agent", "scaffold", "cli", "ai"]
 categories = ["development-tools::cargo-plugins", "command-line-utilities"]
 readme = "README.md"
+exclude = ["tests/"]
 
 [[bin]]
 name = "cargo-adk"
 path = "src/main.rs"
+
+[features]
+default = []
+# `cargo adk bench`: performance benchmarks against real LLM APIs through `adk-bench`. Off by
+# default because adk-bench links an agent runtime the other subcommands do not use.
+bench = ["dep:adk-bench", "dep:tracing-subscriber"]
+# `cargo adk deploy --target agent-engine`: Agent Engine on Google Cloud through Application
+# Default Credentials. Off by default because it links the Google Cloud auth stack.
+gcp = ["adk-deploy/gcp"]
+# `cargo adk deploy --target ecs-express`: Amazon ECS Express Mode through the AWS credential
+# chain. Off by default because it links the AWS config and signing stack.
+aws = ["adk-deploy/aws"]
+# `cargo adk deploy --target azure-container-apps`: Azure Container Apps through
+# DefaultAzureCredential. Off by default because it links the Azure identity stack.
+azure = ["adk-deploy/azure"]
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 adk-deploy = { workspace = true }
 adk-core = { workspace = true }
 adk-eval = { workspace = true, features = ["ci-helpers"] }
-adk-bench = { workspace = true }
+# `cargo adk bench` (feature `bench`).
+adk-bench = { workspace = true, optional = true }
 adk-model = { workspace = true, features = ["gemini", "openai", "anthropic"] }
 async-trait = { workspace = true }
 futures = { workspace = true }
@@ -36,8 +53,8 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 hex = { workspace = true }
 syn = { version = "2", features = ["full", "parsing"] }
-serde_yaml_ng = "0.10"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde-saphyr.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [dev-dependencies]
 proptest = "1.4"

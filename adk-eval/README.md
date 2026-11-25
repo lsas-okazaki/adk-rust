@@ -8,7 +8,7 @@ Agent evaluation framework for Rust Agent Development Kit (ADK-Rust).
 
 ## Overview
 
-`adk-eval` provides comprehensive tools for testing and validating agent behavior, enabling developers to ensure their agents perform correctly and consistently. Unlike traditional software testing, agent evaluation must account for the probabilistic nature of LLMs while still providing meaningful quality signals.
+`adk-eval` provides tools for testing and validating agent behavior. Unlike traditional software testing, agent evaluation must account for the probabilistic nature of LLMs while still providing meaningful quality signals.
 
 ## Features
 
@@ -17,12 +17,17 @@ Agent evaluation framework for Rust Agent Development Kit (ADK-Rust).
 - **Response Quality**: Assess final output quality using multiple algorithms
 - **LLM-Judged Evaluation**: Semantic matching, rubric-based scoring, and safety checks
 - **Multiple Criteria**: Ground truth, similarity-based, and configurable thresholds
-- **Detailed Reporting**: Comprehensive results with failure analysis
+- **Detailed Reporting**: Per-case results, scores, and failure details
 - **Structured LLM Judge**: Typed verdicts (pass/fail/partial) with scores and reasoning
+- **Rubric-Graded Outcomes**: `OutcomeGrader` grades a deliverable per criterion in a context of its own; `RubricCheckAgent` loops an agent until the rubric passes (default 3 attempts, at most 20), metered against the run budget
 - **Embedding Similarity**: Cosine similarity between embedding vectors (feature: `embedding`)
 - **Cost & Latency Tracking**: Token usage extraction, dollar cost estimation, latency recording
 - **Trace Analysis**: Detect redundant tool calls, execution loops, compute efficiency scores
 - **Regression Baselines**: Save/load metric snapshots, detect quality degradation
+- **Vision**: image fixtures pinned by SHA-256 and verified on load (`ImageFixture`), and `EvaluationCriteria::vision` scoring regions, masks, OCR text, document fields, detections and click targets in source pixels against each turn's `expected_vision` (`vision` module)
+- **Repeated Runs**: `Evaluator::evaluate_test_file_runs` runs an eval set `num_runs` times and reports each case's pass rate, score mean and sample variance, and flakiness (`MultiRunReport`); baselines from it carry a `pass_rate` metric
+- **Metered Judging**: `Evaluator::set_run_config` puts every eval run and LLM-judge call under one budget, spend ledger and kill switch; a refusal stops the evaluation (`EvalError::Refused`) instead of failing cases
+- **Online Evaluation**: `online::OnlineEvaluator` judges a seeded sample of finished production runs (filters by agent, request metadata and outcome) on a background worker with rubric, safety, hallucination, trajectory-efficiency and thread-level criteria, under its own budget and the kill switch; verdicts go to an `OnlineEvalStore` (in-memory or JSONL) and to `gen_ai.evaluation.result` telemetry
 - **Ledger Statistics**: Median/MAD baselines per dimension and day class, warm-up, windowed deviation test, and drift runs with cooldowns over a content-free activity ledger (`ledger`), also run as `cargo adk eval --ledger`
 - **JUnit XML Output**: CI-friendly report generation (feature: `ci-helpers`)
 - **Human Annotation**: JSONL export/import workflow for human review
@@ -54,7 +59,7 @@ use adk_model::GeminiModel;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let model = GeminiModel::new(std::env::var("GOOGLE_API_KEY")?, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(std::env::var("GOOGLE_API_KEY")?, "gemini-3.8-flash")?;
     let agent = LlmAgentBuilder::new("geography_agent")
         .instruction("Answer with the name of the city only.")
         .model(Arc::new(model))
@@ -199,7 +204,7 @@ use adk_eval::{EvaluationConfig, EvaluationCriteria, Evaluator};
 use adk_model::GeminiModel;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let judge_model = Arc::new(GeminiModel::new(std::env::var("GOOGLE_API_KEY")?, "gemini-3.7-flash")?);
+    let judge_model = Arc::new(GeminiModel::new(std::env::var("GOOGLE_API_KEY")?, "gemini-3.8-flash")?);
     let config = EvaluationConfig::with_criteria(
         EvaluationCriteria::semantic_match(0.85), // 85% semantic similarity required
     );
@@ -311,6 +316,57 @@ async fn run_cases(evaluator: &Evaluator, agent: Arc<dyn Agent>, cases: &[EvalCa
 
 A case passes only when at least one criterion was evaluated and none failed: an empty test file, a case without turns, an evaluator without criteria, or a directory without `*.test.json` files returns `EvalError::ConfigError`, and a case no criterion applies to fails as `not_evaluated`. `EvaluationReport::all_passed()` is `false` for a report without results.
 
+### Repeated Runs
+
+Run an eval set several times to separate reliable cases from lucky ones. Each case gets a fresh session every run; a case passes when it passes in at least `min_pass_rate` of the runs (every run by default):
+
+```rust
+use std::sync::Arc;
+
+use adk_core::{Agent, RunBudget, RunConfig};
+use adk_eval::{Evaluator, MultiRunConfig, TestFile};
+
+async fn three_runs(mut evaluator: Evaluator, agent: Arc<dyn Agent>) -> adk_eval::Result<()> {
+    // The agent's and the judges' model calls share one budget for the whole evaluation.
+    evaluator.set_run_config(RunConfig::builder().budget(RunBudget::new().max_model_calls(100)).build());
+    let file = TestFile::load("tests/weather.test.json")?;
+    let report = evaluator.evaluate_test_file_runs(agent, &file, &MultiRunConfig::new(3)?).await?;
+    for case in &report.cases {
+        println!("{}: {}/{} runs, flaky={}", case.eval_id, case.passed_runs, case.runs, case.flaky);
+    }
+    assert!(report.all_passed(), "{}", report.format_summary());
+    Ok(())
+}
+```
+
+When the budget, the spend ledger or a frozen kill switch refuses a run or a judge call, the runs stop: the report keeps the completed runs and says why in `stopped`. `cargo adk eval --num-runs 3 --min-pass-rate 0.67 --judge-max-calls 50` does the same for an agent binary.
+
+### Online Evaluation
+
+Judge a sample of production runs after they finish, without slowing them down. The evaluator's plugin samples runs on a `Runner`; a background worker judges them under the evaluator's own budget:
+
+```rust
+use std::sync::Arc;
+
+use adk_core::{Llm, RunBudget};
+use adk_eval::EvaluationCriteria;
+use adk_eval::online::{OnlineEvalConfig, OnlineEvaluator, RunOutcome, SamplingPolicy};
+use adk_plugin::PluginManager;
+
+fn online(judge: Arc<dyn Llm>) -> adk_eval::Result<(OnlineEvaluator, Arc<PluginManager>)> {
+    let sampling = SamplingPolicy::rate(0.05)?.with_seed(1).outcome(RunOutcome::Completed);
+    let config = OnlineEvalConfig::new(sampling)
+        .with_criteria(EvaluationCriteria { safety_score: Some(0.9), ..Default::default() })
+        .with_min_trajectory_efficiency(0.5)
+        .with_budget(RunBudget::new().max_model_calls(500));
+    let evaluator = OnlineEvaluator::builder(config).judge(judge).start()?;
+    let plugins = Arc::new(PluginManager::new(vec![evaluator.plugin()]));
+    Ok((evaluator, plugins)) // Runner::builder().plugin_manager(plugins)
+}
+```
+
+`evaluator.store().list(&OnlineEvalQuery::default().failed_only())` returns the failed runs newest first. See the [online evaluation guide](../docs/official_docs/evaluation/online-evaluation.md).
+
 ## Integration with cargo test
 
 ```rust
@@ -323,7 +379,7 @@ use adk_model::GeminiModel;
 #[tokio::test]
 #[ignore = "calls the Gemini API"]
 async fn geography_agent_passes_its_eval_set() {
-    let model = GeminiModel::new(std::env::var("GOOGLE_API_KEY").unwrap(), "gemini-3.7-flash").unwrap();
+    let model = GeminiModel::new(std::env::var("GOOGLE_API_KEY").unwrap(), "gemini-3.8-flash").unwrap();
     let agent = LlmAgentBuilder::new("geography_agent")
         .instruction("Answer with the name of the city only.")
         .model(Arc::new(model))
@@ -351,12 +407,17 @@ adk-eval = { version = "3.0.0", features = ["embedding", "ci-helpers", "statisti
 |---------|-----------|------------|
 | `embedding` | `adk-memory` | Embedding-based semantic similarity |
 | `ci-helpers` | `quick-xml` | JUnit XML report generation |
-| `statistics` | `statrs` | Wilcoxon signed-rank for A/B comparison |
-| `vertex-eval` | `adk-gcp` | Vertex AI Gen AI Evaluation Service bridge (`VertexEvalClient`, `VertexEvalJudge`) |
+| `statistics` | `libm` | Wilcoxon signed-rank for A/B comparison |
+| `vertex-eval` | `adk-gcp`, `google-cloud-auth`, `reqwest` | Vertex AI Gen AI Evaluation Service bridge (`VertexEvalClient`, `VertexEvalJudge`) |
 | `personas` | none | The `personas` module: simulated users for multi-turn evaluation |
 | `experiments` | `libm` | `ExperimentAnalyzer`: sequential analysis of web experiments with guardrails |
 
 All other features (structured judge, cost tracker, trace analyzer, baselines, annotations, test generator, conversation scorer) work without extra feature flags.
+
+The optional dependencies are not features of their own: enable `vertex-eval`, not `adk-gcp`,
+`google-cloud-auth`, or `reqwest`. Through the `adk-rust` umbrella, its `eval` feature enables this
+crate's `personas`, and its `vertex-eval` feature enables `vertex-eval`; `adk-rust` has no
+`personas` feature.
 
 ### Structured LLM Judge
 
@@ -375,6 +436,35 @@ async fn judge(model: Arc<dyn Llm>) -> adk_eval::Result<()> {
 }
 ```
 
+### Rubric-Graded Outcomes
+
+A grader in a context of its own checks a deliverable against independently gradeable
+criteria; `RubricCheckAgent` makes it the exit condition of a `LoopAgent`:
+
+```rust
+use std::sync::Arc;
+
+use adk_agent::{LlmAgentBuilder, LoopAgent};
+use adk_eval::{RubricCheckAgent, RubricConfig};
+
+fn blurb_loop(model: Arc<dyn adk_core::Llm>) -> adk_core::Result<LoopAgent> {
+    let writer = LlmAgentBuilder::new("writer")
+        .instruction("Write the product blurb the user asks for.")
+        .model(model.clone())
+        .output_key("draft")
+        .build()?;
+    let rubric = RubricConfig::from_markdown("- Names the product\n- States the monthly price");
+    let check = RubricCheckAgent::new("rubric_check", model, rubric)
+        .with_deliverable_key("draft")
+        .with_max_iterations(3);
+    Ok(LoopAgent::new("blurb", vec![Arc::new(writer), Arc::new(check)]))
+}
+```
+
+Each attempt's failed criteria and the grader's feedback reach the next attempt; the loop stops
+once every criterion passes or after `with_max_iterations` graded attempts (3 by default, at most
+20). The grading call counts against the run budget. `OutcomeGrader` grades once, outside a loop.
+
 ### Cost and Latency Tracking
 
 ```rust
@@ -382,8 +472,8 @@ use adk_eval::CostTracker;
 
 fn main() {
     let tracker = CostTracker::new();
-    // gemini-3.7-flash: $0.00075 per 1K input tokens, $0.00375 per 1K output tokens.
-    let cost = tracker.compute_cost("gemini-3.7-flash", 2000, 800).unwrap();
+    // gemini-3.8-flash: $0.00075 per 1K input tokens, $0.00375 per 1K output tokens.
+    let cost = tracker.compute_cost("gemini-3.8-flash", 2000, 800).unwrap();
     assert!((cost - 0.0045).abs() < 1e-9);
 }
 ```
@@ -429,6 +519,36 @@ fn main() -> adk_eval::Result<()> {
 ```
 
 A baseline metric or case with no score in the new run, such as a case that errored, is a regression with `current_value: None`. A missing baseline file is an error rather than an empty result.
+
+### Vision
+
+A turn shows the agent an image fixture by path and digest, and states what it must perceive
+in `expected_vision`; the scores come from the agent's `vision_detect`, `vision_segment`,
+`vision_read` and `vision_describe` responses.
+
+```json
+{
+  "invocation_id": "t0",
+  "user_content": {"role": "user", "parts": [
+    {"image": {"path": "scene-1024x640.png", "digest": "sha256:c0e126b352e65420f0072d06ee1f15b73d3fc90e930adcd44a525954999048a9"}},
+    {"text": "stop sign, clock"}
+  ]},
+  "expected_vision": {
+    "regions": [{"label": "stop sign", "box": [121.4, 111.4, 398.6, 388.6]}],
+    "count": 2
+  }
+}
+```
+
+| Scores | From |
+|--------|------|
+| `region_iou`, `box_hit_rate`, `mask_iou` | Expected regions and masks |
+| `detection_precision`, `detection_recall`, `detection_ap`, `detection_map` | COCO matching at `iou_threshold` |
+| `ocr_char_accuracy`, `ocr_word_accuracy` | Expected page text |
+| `field_exact_match`, `field_normalized_match` | Expected fields |
+| `grounding_hit_rate`, `count_accuracy` | Click targets and the region count |
+
+See [Vision Evals](../docs/official_docs/vision/evals.md).
 
 ### Ledger Statistics
 

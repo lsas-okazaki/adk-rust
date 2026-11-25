@@ -169,7 +169,7 @@ cp .env.example .env
 The repo ships a `lefthook.yml` that wires the [Quality Gates](#quality-gates) into git hooks, so they run automatically:
 
 - **pre-commit** — format check (`cargo fmt --all -- --check`), lint (`cargo clippy --workspace --all-targets -- -D warnings`), the feature-surface gate (`scripts/check-feature-growth.sh`: a new `adk-rust` feature must change what links or carry a recorded decision — see [docs/feature-surface.md](docs/feature-surface.md)), shell-script lint (`shellcheck --severity=warning` on staged `*.sh`, mirroring the shellcheck hook in `devenv.nix`), and PSScriptAnalyzer on staged `*.ps1` (`scripts/lint-powershell.ps1`, skipped when the module is not installed)
-- **pre-push** — a fast compilation check (`cargo check --workspace`), not the full test suite, plus `scripts/check-examples-compile.sh` over the four example shards when an example or a crate it depends on changed. CI is the full-suite safety net, so the local push gate stays quick (see [Quality Gates](#quality-gates) for the CI tier design)
+- **pre-push** — a fast compilation check (`cargo check --workspace`), not the full test suite, plus `scripts/check-examples-compile.sh` over the two example shards when an example or a crate it depends on changed. CI is the full-suite safety net, so the local push gate stays quick (see [Quality Gates](#quality-gates) for the CI tier design)
 
 Each gate runs only when a file it checks is staged, so a Markdown-only commit runs none of them. The shellcheck gate runs at `--severity=warning` so informational notes (e.g. SC1091 about sourced files that can't be followed) don't block commits. Install shellcheck with `brew install shellcheck` (macOS) or `apt install shellcheck` (Debian/Ubuntu); `scripts/setup-dev.sh` installs it for you.
 
@@ -205,8 +205,8 @@ ADK-Rust is a Cargo workspace of publishable crates organized by responsibility.
 adk-studio/        Retired in favour of adk-surface's workflow observer
                    (docs/official_docs/surfaces/workflow.md).
                    Repo: https://github.com/zavora-ai/adk-studio
-adk-ui/            Retired, for ADK-Rust 2 only: agent-drawn UI is adk-surface's
-                   `genui` feature (docs/official_docs/surfaces/genui.md).
+adk-ui/            Extension catalogs for adk-surface's `genui` (3.x); 2.x is for
+                   ADK-Rust 2 only (docs/official_docs/surfaces/genui.md).
                    Repo: https://github.com/zavora-ai/adk-ui
 ```
 
@@ -275,7 +275,7 @@ expensive axes just move to a later tier.
 
 | Tier | Trigger | Checks | Blocks merge? |
 |------|---------|--------|---------------|
-| **PR** | pull request (`ci.yml` + `semver.yml`) | `fmt`, `web` (the web home's build and generated assets), `clippy --workspace -D warnings`, `nextest --workspace` on Linux, `feature-coverage` (feature-gated modules like `adk-agent --features codeact`: each pair linted on its own, each crate's tests once with its pairs' features combined, and only for the crates the change can affect), `postgres` (the `#[ignore]`d PostgreSQL suites against a pgvector server, including TLS), docs and doctests, standalone examples (4 shards; `examples/harness_kernel` under `clippy -D warnings`), the scripted scenarios of `examples/harness_kernel` on Linux and of `examples/website`, `templates`, a compile-only macOS build, a Windows build with the code only Windows has (restricted-token enforcer, process trees, owner-only files, the kernel's named pipe and service), and `semver` (stable strict against `SEMVER_RELEASE_TYPE` in `semver.yml`: `minor` fails breakage; `major`, during a major release candidate, accepts every change, so the job reports without building, and `breaking` changelog fragments record the changes; beta warn-only) | Yes — aggregated by `pr-gate`, plus `semver` |
+| **PR** | pull request (`ci.yml` + `semver.yml`) | `fmt`, `web` (the web home's build and generated assets), `clippy --workspace -D warnings`, `nextest --workspace` on Linux, `feature-coverage` (feature-gated modules like `adk-agent --features codeact`: each pair linted on its own, each crate's tests once with its pairs' features combined, and only for the crates the change can affect), `surface-e2e` (adk-surface's generated API and the web home end to end), `postgres` (the `#[ignore]`d PostgreSQL suites against a pgvector server, including TLS), docs and doctests, standalone examples (2 shards; `examples/harness_kernel` under `clippy -D warnings`), the scripted scenarios of `examples/harness_kernel` on Linux and of `examples/website`, `doc-gates` (documentation, release and script checks), `templates` (the cargo-adk scaffolds), a compile-only macOS build, a Windows build with the code only Windows has (restricted-token enforcer, process trees, owner-only files, the kernel's named pipe and service), and `semver` (stable strict against `SEMVER_RELEASE_TYPE` in `semver.yml`: `minor` fails breakage; `major`, during a major release candidate, accepts every change, so the job reports without building, and `breaking` changelog fragments record the changes; beta warn-only) | Yes — aggregated by `pr-gate`, plus `semver` |
 | **Merge** | `push: main` (`ci-merge.yml`, `ci.yml`'s `clippy` and `test`, `sandbox-linux.yml`), and on demand (`gh workflow run ci-merge.yml --ref <branch>`) | cross-platform `nextest --workspace` on macOS/Windows (the Windows kernel scenarios included), the scripted scenarios of `examples/harness_kernel` on macOS, the documented-example check, the computer-use receipt, Linux clippy and tests (which save the build caches pull requests restore); bubblewrap enforcement proven on `ubuntu-24.04` (`sandbox-linux.yml`, also on a pull request that touches the sandbox or the harness shell, and on demand) | No — runs post-merge |
 | **Nightly** | `schedule` (`ci-nightly.yml`) | feature-combination matrix, every feature-coverage pair on its own build (`feature-coverage-isolated`), `cargo-audit`/`cargo-deny` supply-chain, `#[ignore]` integration tests gated on secrets | No — runs on a schedule |
 
@@ -337,9 +337,9 @@ Require exactly these stable contexts in the `main` ruleset:
 
 `pr-gate` covers `fmt`, `web`, `clippy`, Linux workspace tests, the
 `feature-coverage` shards driven by `scripts/feature-coverage-pairs.txt` (those the
-change can affect), the
-`postgres` job driven by `scripts/test-postgres.sh`, docs and doctests, the four
-standalone-example shards, `kernel-scenarios`, `website-scenarios`, `templates`, the macOS build, and the Windows build with
+change can affect), `surface-e2e`, the
+`postgres` job driven by `scripts/test-postgres.sh`, docs and doctests, the two
+standalone-example shards, `kernel-scenarios`, `website-scenarios`, `doc-gates`, `templates`, the macOS build, and the Windows build with
 the code only Windows has. `semver` stays separate because its
 workflow has an independent trigger and keeps stable crates strict while
 beta/experimental crates remain advisory.
@@ -349,9 +349,27 @@ skipped job only when the scope or the event skipped it:
 
 | Run | Jobs that run |
 |-----|---------------|
-| Pull request that touches code | every job |
-| Pull request that touches only `docs/`, Markdown, or `LICENSE*` | `fmt`, `web`, `templates` (the documentation gates) |
+| Pull request that touches code | every job, less the scoped jobs below whose crates the change cannot affect |
+| Pull request that touches only `docs/`, Markdown, or `LICENSE*` | `fmt`, `web`, `doc-gates` |
 | Merge-queue build | every job except `docs`, the standalone-example shards, `kernel-scenarios`, `website-scenarios` and the macOS and Windows builds, which the pull request already passed and a merge cannot break on its own |
+
+`scripts/ci-scope.py` maps the changed files to the crates they can affect — a changed
+crate and every workspace crate that depends on it — and selects the scoped jobs from
+`scripts/ci-job-crates.txt`, which states what each one builds. A file outside the
+crates, `docs/` and Markdown (the lockfile, a manifest, CI, a script) runs every job.
+
+| Scoped job | Runs when the change can affect |
+|------------|---------------------------------|
+| `feature-coverage` shard | a crate with a pair in the shard (`scripts/feature-coverage-pairs.txt`) |
+| `postgres` | a crate `scripts/test-postgres.sh` or the job's Redis and Qdrant steps test |
+| `templates` | `cargo-adk` or a crate the scaffolds build from the checkout |
+| `kernel-scenarios`, `website-scenarios` | the example's own files or a crate its manifest names by path |
+| `windows` | a crate whose Windows-only code the job tests; the merge tier's Windows run builds the workspace for every other change |
+| `surface-e2e` | `adk-surface` or `adk-cli` |
+
+`feature-coverage`, `surface-e2e`, `postgres`, `docs`, the standalone-example shards,
+`templates`, and the macOS and Windows builds start after `fmt` and `clippy` pass. When
+either fails they are skipped, and `pr-gate` fails on the failed job.
 
 ### NOT required (informational tiers)
 
@@ -608,8 +626,15 @@ step.
    bash scripts/changelog-assemble.sh --into <version>
    ```
 
+   The dated `## [<version>] - YYYY-MM-DD` heading exists from the start of the cycle,
+   because `check-release-consistency.sh` requires the newest release heading to match the
+   workspace version. Set its date to the release day.
+
 3. In the same pull request, set the README banner to `v<version> Released!` with
    the crates.io link for the new version, and mark the roadmap version `(current)`.
+   Update `SECURITY.md`'s supported versions and the release's milestone text in
+   `STABILITY.md`. For a major release, set `SEMVER_RELEASE_TYPE` in
+   `.github/workflows/semver.yml` back to `minor` in the first pull request after the tag.
    Run the normal quality gates plus:
 
    ```bash
@@ -637,7 +662,8 @@ step.
    entry as the release notes.
 7. Publish with `cargo xtask publish`. If crates.io indexing interrupts the
    workspace publish, resume safely with `cargo xtask publish --resume`; it uses
-   the computed dependency order and skips versions that already exist. Then
+   the computed dependency order, skips versions that already exist, and stops at
+   the first crate that fails, so a rerun continues from that crate. Then
    confirm every crate's new version on crates.io and its docs.rs build.
 
 ## Getting Help

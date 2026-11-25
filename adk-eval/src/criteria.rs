@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::vision::VisionCriteria;
+
 /// Collection of evaluation criteria
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EvaluationCriteria {
@@ -52,6 +54,12 @@ pub struct EvaluationCriteria {
     /// Detects factual inaccuracies or made-up information
     #[serde(default)]
     pub hallucination_score: Option<f64>,
+
+    /// Vision scores — regions, masks, OCR text, fields, detections and click targets —
+    /// checked against each turn's [`expected_vision`](crate::Turn::expected_vision); see
+    /// [`vision`](crate::vision).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<VisionCriteria>,
 
     /// Criteria your own code scores; carried with the configuration for it.
     ///
@@ -110,6 +118,26 @@ impl EvaluationCriteria {
         self
     }
 
+    /// Add vision thresholds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_eval::EvaluationCriteria;
+    /// use adk_eval::vision::VisionCriteria;
+    ///
+    /// let criteria = EvaluationCriteria::default().with_vision(VisionCriteria {
+    ///     region_iou: Some(0.75),
+    ///     ocr_char_accuracy: Some(0.98),
+    ///     ..Default::default()
+    /// });
+    /// assert!(criteria.has_criteria());
+    /// ```
+    pub fn with_vision(mut self, vision: VisionCriteria) -> Self {
+        self.vision = Some(vision);
+        self
+    }
+
     /// Whether any criterion [`Evaluator`](crate::Evaluator) scores has a threshold.
     ///
     /// [`custom`](Self::custom) criteria are not counted, since the evaluator does not score
@@ -140,6 +168,7 @@ impl EvaluationCriteria {
             || self.rubric_quality_score.is_some()
             || self.safety_score.is_some()
             || self.hallucination_score.is_some()
+            || self.vision.as_ref().is_some_and(VisionCriteria::has_thresholds)
     }
 }
 
@@ -240,7 +269,7 @@ impl Default for SemanticMatchConfig {
 }
 
 fn default_judge_model() -> String {
-    "gemini-3.7-flash".to_string()
+    "gemini-3.8-flash".to_string()
 }
 
 /// Configuration for rubric-based evaluation
@@ -248,6 +277,117 @@ fn default_judge_model() -> String {
 pub struct RubricConfig {
     /// List of rubrics to evaluate against
     pub rubrics: Vec<Rubric>,
+}
+
+impl RubricConfig {
+    /// A rubric with one criterion per item, each named by its own text, as the
+    /// [`OutcomeGrader`](crate::OutcomeGrader) grades them. Blank items are skipped.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let rubric = adk_eval::RubricConfig::from_criteria(["poem.md has three lines", "it rhymes"]);
+    /// assert_eq!(rubric.rubrics.len(), 2);
+    /// assert_eq!(rubric.rubrics[1].description, "it rhymes");
+    /// ```
+    pub fn from_criteria<I, S>(criteria: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let rubrics = criteria
+            .into_iter()
+            .map(|criterion| criterion.as_ref().trim().to_string())
+            .filter(|criterion| !criterion.is_empty())
+            .map(|criterion| Rubric::new(&criterion, &criterion))
+            .collect();
+        Self { rubrics }
+    }
+
+    /// Reads criteria from Markdown: each list item (`-`, `*`, `+`, `1.`, `1)`, with or
+    /// without a `[ ]` checkbox) is one criterion, and indented lines below an item continue
+    /// it. Without list items, each paragraph is one criterion. Headings are ignored.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let rubric = adk_eval::RubricConfig::from_markdown(
+    ///     "# Rubric\n\n- `poem.md` has exactly three lines\n- The poem mentions ownership,\n  borrowing or lifetimes\n1. [ ] It has a title line\n",
+    /// );
+    /// let criteria: Vec<&str> = rubric.rubrics.iter().map(|r| r.description.as_str()).collect();
+    /// assert_eq!(
+    ///     criteria,
+    ///     [
+    ///         "`poem.md` has exactly three lines",
+    ///         "The poem mentions ownership, borrowing or lifetimes",
+    ///         "It has a title line",
+    ///     ]
+    /// );
+    /// ```
+    pub fn from_markdown(text: &str) -> Self {
+        let mut items: Vec<String> = Vec::new();
+        let mut in_item = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                in_item = false;
+                continue;
+            }
+            let indented = line.starts_with([' ', '\t']);
+            if let Some(item) = list_item(trimmed).filter(|_| !(indented && in_item)) {
+                items.push(item.to_string());
+                in_item = true;
+            } else if indented
+                && in_item
+                && let Some(current) = items.last_mut()
+            {
+                current.push(' ');
+                current.push_str(list_item(trimmed).unwrap_or(trimmed));
+            } else {
+                in_item = false;
+            }
+        }
+        if items.is_empty() {
+            let mut paragraph = String::new();
+            for line in text.lines().map(str::trim) {
+                if line.is_empty() || line.starts_with('#') {
+                    items.extend((!paragraph.is_empty()).then(|| std::mem::take(&mut paragraph)));
+                } else {
+                    if !paragraph.is_empty() {
+                        paragraph.push(' ');
+                    }
+                    paragraph.push_str(line);
+                }
+            }
+            items.extend((!paragraph.is_empty()).then_some(paragraph));
+        }
+        Self::from_criteria(items)
+    }
+}
+
+/// The text of a Markdown list item, without its marker and checkbox.
+fn list_item(line: &str) -> Option<&str> {
+    let rest = if let Some(rest) = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+    {
+        rest
+    } else {
+        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+        let marker =
+            line[digits..].strip_prefix(". ").or_else(|| line[digits..].strip_prefix(") "));
+        match marker {
+            Some(rest) if digits > 0 => rest,
+            _ => return None,
+        }
+    };
+    let rest = rest.trim_start();
+    let rest = ["[ ] ", "[x] ", "[X] "]
+        .iter()
+        .find_map(|checkbox| rest.strip_prefix(checkbox))
+        .unwrap_or(rest);
+    Some(rest.trim())
 }
 
 /// A single rubric for quality assessment

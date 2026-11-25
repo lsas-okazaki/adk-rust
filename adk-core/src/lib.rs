@@ -34,6 +34,7 @@
 //! | `egress-dns` | `egress::SystemResolver`: the operating system resolver for egress checks |
 //! | `egress-client` | `egress::GuardedClient`: an HTTP client that enforces an `EgressPolicy` |
 //! | `webhook-delivery` | The `webhook_delivery` module: signed outbound delivery |
+//! | `auth-bridge` | The `request_context` module: `RequestContextExtractor`, the trait an HTTP server authenticates requests through |
 //!
 //! ## Quick Start
 //!
@@ -141,6 +142,8 @@ pub mod budget;
 pub mod callbacks;
 /// Time sources for stores whose behaviour depends on the current time.
 pub mod clock;
+/// Provider-neutral computer actuation: actions, screenshots, and the actuator trait.
+pub mod computer;
 /// Conformance suites that every durable store backend runs against its implementation.
 #[cfg(feature = "conformance")]
 pub mod conformance;
@@ -148,13 +151,19 @@ pub mod conformance;
 pub mod context;
 /// Agent credentials, identity sources, and resource-scoped token brokers.
 pub mod credential;
-/// Network egress policy, the shared address classifier, and the egress-guarded HTTP client.
+/// Typed decisions: a model picks one of a fixed set of options, with a rationale and a
+/// confidence.
+pub mod decision;
 pub mod egress;
 /// Unified structured error type and result alias.
 pub mod error;
 /// Event types representing agent interactions in a conversation.
 pub mod event;
 mod event_stream;
+/// The LLM summarizer that session and in-run compaction share.
+pub mod event_summarizer;
+/// Evidence an approver sees with a held call: images by digest and artifact.
+pub mod evidence;
 /// Governed tool execution: kill switch, durable approvals, and the authorization path.
 pub mod governance;
 /// Durable freeze state for the kill switch, shared by every replica.
@@ -168,7 +177,7 @@ pub mod history;
 pub mod identity;
 /// Template-based instruction injection with session state interpolation.
 pub mod instruction_template;
-/// Intra-turn context compaction configuration.
+/// Auto-compaction during a run: its threshold, the token estimate, and the agents' hook.
 pub mod intra_compaction;
 /// Leases with fencing epochs: one owner of a named resource at a time.
 pub mod lease;
@@ -176,6 +185,9 @@ pub mod lease;
 pub mod metering;
 /// LLM trait, request/response types, and caching configuration.
 pub mod model;
+/// The process's one ONNX Runtime environment, shared by every crate that runs ONNX models.
+#[cfg(feature = "ort")]
+pub mod onnx;
 /// Tool execution policy: allow, deny, or require approval per call.
 pub mod policy;
 /// Agent identity: agent identifiers, principals, and acting contexts.
@@ -183,6 +195,8 @@ pub mod principal;
 pub mod queue_source;
 /// HTTP request context extracted by auth middleware.
 pub mod request_context;
+/// Model-evaluated tool approval: a reviewer that decides held calls before a person.
+pub mod review;
 /// Durable runs: a queue of runs that workers claim under fenced leases.
 pub mod run_store;
 /// Schedules that enqueue durable runs, and the firing rule.
@@ -200,7 +214,9 @@ pub mod spend;
 /// User messages that reach a run while it runs: the run's inbox, the receipt and the
 /// event marker.
 pub mod steering;
-/// Data subjects: visitor ids, consent, and export, erasure, and linking across stores.
+/// Background sub-agents: the host contract, their status, the budget slice and tool
+/// ceiling they run under, and the notice a parent receives.
+pub mod subagent;
 pub mod subject;
 /// Tool trait, toolset, execution strategy, and registry.
 pub mod tool;
@@ -222,14 +238,15 @@ pub use acting::{
     SubjectDelegationPolicy, SubjectDelegationRequest, subject_mismatch_error,
 };
 pub use action_ledger::{
-    ActionLedger, ActionOutcome, ActionRecord, InMemoryActionLedger, NOT_RUN_PREFIX,
-    OUTCOME_UNKNOWN_STATUS, is_not_run, is_outcome_unknown, json_digest, not_run_text,
-    outcome_unknown_response,
+    ActionLedger, ActionOutcome, ActionRecord, InMemoryActionLedger, LedgerAnswer, LedgeredCall,
+    NOT_RUN_PREFIX, OUTCOME_UNKNOWN_STATUS, begin_ledgered_call, held_call_ledger_key,
+    interrupted_call_response, is_not_run, is_outcome_unknown, json_digest, not_run_text,
+    outcome_unknown_response, record_outcome_unknown,
 };
 pub use agent::{
-    Agent, AgentCapabilities, AgentInteractionMode, AgentRelationshipKind, AgentTopology,
-    AgentTopologyMember, AgentTopologyRelationship, AgentTransferDecision, AgentTransferRequest,
-    EventStream, ResolvedContext, screen_user_input_with,
+    Agent, AgentCapabilities, AgentInteractionMode, AgentKind, AgentProfile, AgentRelationshipKind,
+    AgentTopology, AgentTopologyMember, AgentTopologyRelationship, AgentTransferDecision,
+    AgentTransferRequest, EventStream, ResolvedContext, ToolProfile, screen_user_input_with,
 };
 pub use agent_invoker::AgentInvoker;
 pub use agent_loader::{AgentLoader, MultiAgentLoader, SingleAgentLoader};
@@ -248,10 +265,14 @@ pub use budget::{
 pub use callbacks::{
     AfterAgentCallback, AfterModelCallback, AfterToolCallback, AfterToolCallbackFull,
     BaseEventsSummarizer, BeforeAgentCallback, BeforeModelCallback, BeforeModelResult,
-    BeforeToolCallback, EventsCompactionConfig, GlobalInstructionProvider, HistoryProcessor,
-    InstructionProvider, InvocationHooks, OnToolErrorCallback,
+    BeforeToolCallback, CALLBACK_PANICKED_CODE, EventsCompactionConfig, GlobalInstructionProvider,
+    HistoryProcessor, InstructionProvider, InvocationHooks, OnToolErrorCallback, guard_callback,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use computer::{
+    ActuationOutput, ComputerAction, ComputerActionKind, ComputerActuator, MouseButton,
+    ScreenPoint, Screenshot, ScrollDirection,
+};
 pub use context::{
     Artifacts, BUILTIN_TOOL_ORIGIN, BackpressurePolicy, BatchCall, CallbackContext,
     IncludeContents, InvocationContext, MAX_STATE_KEY_LEN, Memory, MemoryEntry, ReadonlyContext,
@@ -264,6 +285,7 @@ pub use credential::{
     AgentCredential, CredentialBroker, CredentialKind, CredentialSecret, IdentitySource,
     RevocationScope, ScopedToken, StaticIdentitySource, resource_indicator,
 };
+pub use decision::{Choice, ChoiceOption, Decider, Decision, decide};
 pub use error::{
     AdkError, ErrorCategory, ErrorComponent, ErrorDetails, ErrorDiagnostics, Result, RetryHint,
     UPSTREAM_EXCERPT_BYTES, json_error_summary, upstream_excerpt,
@@ -274,17 +296,19 @@ pub use event::{
     WorkflowPosition, event_belongs_to_branch,
 };
 pub use event_stream::EventTextDeltas;
+pub use event_summarizer::LlmEventSummarizer;
+pub use evidence::{ArtifactLocator, Evidence, ImageEvidence};
 pub use governance::{
     ApprovalScope, ApprovalStore, BUILTIN_TOOLS_WITHHELD_KEY, BuiltinToolGovernor,
     BuiltinToolWithholding, CONFIRMATION_PENDING_STATUS, DEFAULT_TOOL_CONFIRMATION_TIMEOUT,
     DRAW_TOOL_NAMES, GOVERNANCE_FROZEN_CODE, GOVERNANCE_STALE_CODE, GovernanceControl,
     GovernanceMirrorConfig, GovernanceWatch, GovernedCall, HeldToolCall, InMemoryApprovalStore,
     PendingApproval, REQUESTED_CALL_ID_PREFIX, REQUESTED_CALL_METADATA_KEY, RequestedCall,
-    RequestedVia, RequestedViaKind, ToolApproval, ToolAuthorization, ToolCallScreen, ToolGate,
-    WithheldBuiltinTool, authorize_tool_call, builtin_tool_configuration, confirm_tool_call,
-    confirmation_decision_available, confirmation_pending_response, held_call_compaction_limit,
-    held_tool_calls, is_confirmation_pending, supersede_pending_responses, untrusted_block,
-    withdraw_held_call, workflow_resume_positions,
+    RequestedCallSeal, RequestedVia, RequestedViaKind, SealedCall, ToolApproval, ToolAuthorization,
+    ToolCallScreen, ToolGate, WithheldBuiltinTool, authorize_tool_call, builtin_tool_configuration,
+    confirm_tool_call, confirmation_decision_available, confirmation_pending_response,
+    held_call_compaction_limit, held_tool_calls, is_confirmation_pending,
+    supersede_pending_responses, untrusted_block, withdraw_held_call, workflow_resume_positions,
 };
 pub use governance_state::{
     GovernanceScope, GovernanceState, GovernanceStateStore, InMemoryGovernanceStateStore,
@@ -294,7 +318,10 @@ pub use identity::{
     AdkIdentity, AppName, ExecutionIdentity, IdentityError, InvocationId, SessionId, UserId,
 };
 pub use instruction_template::inject_session_state;
-pub use intra_compaction::IntraCompactionConfig;
+pub use intra_compaction::{
+    CompactedHistory, CompactionTrigger, HistoryCompactionRequest, HistoryCompactor,
+    IntraCompactionConfig, NativeCompactionRequest,
+};
 pub use lease::{InMemoryLeaseStore, Lease, LeaseStore};
 pub use metering::{
     LlmSpendEstimate, MeteredLlm, MeteredUsage, ModelCallScope, ModelSpendHold,
@@ -304,9 +331,10 @@ pub use metering::{
 pub use model::{
     BuiltinToolUse, CacheCapable, CitationMetadata, CitationSource, ContextCacheConfig, Effort,
     FinishReason, GenerateContentConfig, Llm, LlmRequest, LlmResponse, LlmResponseStream,
+    ToolDeclarations, ToolDeclarationsIter, ToolDeclarationsKeys, ToolDeclarationsValues,
     UsageMetadata, nullable_count,
 };
-pub use model::{NativeWebSearch, NativeWebSearchTool};
+pub use model::{DataLocality, NativeCompaction, NativeWebSearch, NativeWebSearchTool};
 pub use policy::{
     ArgPredicate, DeclarativePolicy, DeclarativePolicyBuilder, PolicyCall, PolicyDecision,
     PolicyRule, StrictestPolicy, ToolPolicy, ToolPolicyRequest,
@@ -318,13 +346,17 @@ pub use queue_source::{
     InMemoryQueueSource, IngressReport, QueueIngress, QueueMessage, QueueSource,
 };
 pub use request_context::RequestContext;
+pub use review::{
+    DEFAULT_REVIEW_TIMEOUT, MODEL_REVIEWER_PREFIX, ModelApprover, REVIEW_SOURCE, ReviewScope,
+    ReviewVerdict, ToolReview, ToolReviewer,
+};
 pub use run_store::{
-    ClaimedRun, DurableRunStore, Enqueued, InMemoryRunStore, NewRun, OnConflict, RunCheckpointRef,
-    RunFilter, RunOutcome, RunRecord, RunState,
+    ClaimedRun, DurableRunStore, Enqueued, InMemoryRunStore, NewRun, OnConflict, RetryBackoff,
+    RunCheckpointRef, RunFilter, RunOutcome, RunRecord, RunState,
 };
 pub use schedule::{
-    FirePlan, InMemoryScheduleStore, MissedFirePolicy, Schedule, ScheduleSpec, ScheduleStore,
-    firing_idempotency_key, plan_fires,
+    FirePlan, InMemoryScheduleStore, Jitter, MissedFirePolicy, Schedule, ScheduleSpec,
+    ScheduleStore, firing_idempotency_key, manual_idempotency_key, plan_fires,
 };
 pub use schema_adapter::{GenericSchemaAdapter, SchemaAdapter};
 pub use schema_cache::SchemaCache;
@@ -337,9 +369,15 @@ pub use steering::{
     STEER_INVALID_MESSAGE_CODE, STEER_NO_ACTIVE_RUN_CODE, SteerOutcome, SteerReceipt,
     SteeringInbox, SteeringMarker, SteeringMessage, validate_steering_message,
 };
+pub use subagent::{
+    FollowUp, RunLimits, SubagentHost, SubagentLaunch, SubagentMode, SubagentParent,
+    SubagentRecord, SubagentRequest, SubagentScope, SubagentStart, SubagentStatus, SubagentTarget,
+    ToolCeiling,
+};
 pub use tool::{
-    DUPLICATE_TOOL_NAME_CODE, RetryBudget, Tool, ToolContext, ToolEffect, ToolExecutionStrategy,
-    ToolPredicate, ToolRegistry, Toolset, ValidationMode, ensure_unique_tool_names,
+    BatchGroup, DUPLICATE_TOOL_NAME_CODE, RetryBudget, Tool, ToolContext, ToolEffect,
+    ToolExecutionStrategy, ToolPredicate, ToolRegistry, Toolset, ValidationMode,
+    ensure_unique_tool_names,
 };
 pub use tool_concurrency::{ConcurrencyPermit, ToolConcurrencyManager};
 pub use tool_response::{

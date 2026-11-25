@@ -135,6 +135,10 @@ pub struct HarnessRuntime {
     pub(crate) ledger: Arc<dyn ShellLedger>,
     pub(crate) approval_store: Arc<dyn ApprovalStore>,
     pub(crate) approval_service: Option<Arc<dyn ApprovalService>>,
+    /// The reviewer of calls Auto mode holds, when auto review is on.
+    pub(crate) auto_review: Option<Arc<dyn adk_core::ToolReviewer>>,
+    /// Checks requested calls against their approval seals, when set.
+    pub(crate) requested_call_seal: Option<Arc<dyn adk_core::RequestedCallSeal>>,
     pub(crate) ledgers: crate::ledger::HarnessLedgers,
     pub(crate) handler: Option<Arc<dyn ToolConfirmationHandler>>,
     pub(crate) confirmation_timeout: Duration,
@@ -142,6 +146,9 @@ pub struct HarnessRuntime {
     pub(crate) spend_ledger: Option<Arc<dyn SpendLedger>>,
     pub(crate) history_max_events: Option<usize>,
     pub(crate) compaction: Option<EventsCompactionConfig>,
+    /// When the harness's runs compact their history before a model call; `None` keeps the
+    /// runner's default, which is on.
+    pub(crate) intra_compaction: Option<adk_core::IntraCompactionConfig>,
     pub(crate) toolset: Arc<HarnessToolset>,
     pub(crate) instructions: Arc<InstructionState>,
     pub(crate) non_waivable_tools: BTreeSet<String>,
@@ -267,6 +274,12 @@ impl HarnessRuntime {
         self.approval_service.as_ref()
     }
 
+    /// The reviewer of calls Auto mode holds, when auto review is on
+    /// ([`HarnessAgentBuilder::auto_review`](crate::HarnessAgentBuilder::auto_review)).
+    pub fn auto_review(&self) -> Option<&Arc<dyn adk_core::ToolReviewer>> {
+        self.auto_review.as_ref()
+    }
+
     /// Take over (spec 3.3 §8.2, §10 H2), when the harness was built with it: surfaces answer
     /// a take-over entry through it.
     pub fn take_over(&self) -> Option<&crate::take_over::TakeOver> {
@@ -313,6 +326,12 @@ impl HarnessRuntime {
     /// The events compaction the harness asks its runner for.
     pub fn compaction(&self) -> Option<&EventsCompactionConfig> {
         self.compaction.as_ref()
+    }
+
+    /// When the harness's runs compact their history before a model call, when set on the
+    /// builder; `None` keeps the runner's auto-compaction, which is on.
+    pub fn intra_compaction(&self) -> Option<&adk_core::IntraCompactionConfig> {
+        self.intra_compaction.as_ref()
     }
 
     /// The spend of `subject`, or of every subject, since the harness was built: per
@@ -407,6 +426,7 @@ impl HarnessRuntime {
 /// | Approvals | the approval service and store are filled only when empty or identical; otherwise the run's own are kept with a warning |
 /// | Action ledger | the harness's ledger when the run carries none; a run's own keeps the records, with resumed held calls keyed alike (spec 3.1 §7.12) |
 /// | Non-waivable | `tool_approvals` entries naming non-waivable calls are removed |
+/// | Auto review | the harness's reviewer, limited to what Auto mode holds, when the run carries none |
 /// | Run-owned fields | `durable_run_id`, the confirmation handler and call-ID decisions are never touched |
 ///
 /// # Example
@@ -514,6 +534,21 @@ impl HarnessLayer<'_> {
             config.tool_policy = Some(composed);
         }
 
+        // Auto review: the reviewer sees only what Auto mode holds and a rule could answer.
+        if config.tool_reviewer.is_none()
+            && let Some(reviewer) = &runtime.auto_review
+        {
+            config.tool_reviewer = Some(Arc::new(crate::policy::AutoReview::new(
+                reviewer.clone(),
+                runtime.policy.clone(),
+                runtime.non_waivable_tools.clone(),
+                runtime.non_waivable_prefixes.clone(),
+                runtime.workspace.root().to_path_buf(),
+            )));
+        }
+        if config.requested_call_seal.is_none() {
+            config.requested_call_seal = runtime.requested_call_seal.clone();
+        }
         match (&config.approval_service, &runtime.approval_service) {
             (None, Some(service)) => config.approval_service = Some(service.clone()),
             (Some(own), Some(service)) if !Arc::ptr_eq(own, service) => tracing::warn!(
@@ -585,6 +620,9 @@ impl HarnessLayer<'_> {
         }
         if config.history_max_events.is_none() {
             config.history_max_events = runtime.history_max_events;
+        }
+        if config.intra_compaction.is_none() {
+            config.intra_compaction = runtime.intra_compaction.clone();
         }
     }
 }
@@ -851,6 +889,16 @@ impl Agent for HarnessAgent {
 
     async fn close(&self) {
         self.root.close().await;
+    }
+
+    /// Starts the MCP servers the first run would start, under the same trust rule, then
+    /// prewarms the root's model.
+    async fn prewarm(&self) -> Result<()> {
+        #[cfg(feature = "mcp")]
+        if let Some(mcp) = &self.runtime.mcp {
+            mcp.ensure_started(self.runtime.workspace_trusted()).await;
+        }
+        self.root.prewarm().await
     }
 
     async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
@@ -1161,6 +1209,10 @@ impl Agent for GovernedRoot {
 
     async fn close(&self) {
         self.root.close().await;
+    }
+
+    async fn prewarm(&self) -> Result<()> {
+        self.root.prewarm().await
     }
 
     async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {

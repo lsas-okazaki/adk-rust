@@ -7,15 +7,16 @@ license.workspace = true
 authors.workspace = true
 description = "Developer tools (read/write/edit/grep/glob/bash) for ADK-Rust coding agents, scoped to a sandboxed workspace"
 repository.workspace = true
+homepage.workspace = true
 documentation = "https://docs.rs/adk-devtools"
 readme = "README.md"
+exclude = ["tests/"]
 keywords = ["adk", "agent", "coding", "tools", "filesystem"]
 categories = ["development-tools", "asynchronous"]
 
 [dependencies]
 adk-core.workspace = true
 async-trait.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

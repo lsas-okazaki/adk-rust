@@ -92,7 +92,7 @@ fails with `run_store.stale_epoch` once the run is no longer `Running` at that e
 | `Running` | `wait(until)` | `Waiting`, lease released | — | — |
 | `Waiting` | `claim` once `until` passed or `wake` was called | `Running` | — | + 1 |
 | `Running` | `finish(Completed)` | `Completed` | — | — |
-| `Running` | `finish(Failed { retryable: true })` with attempts left and no cancel request | `Queued` | — | — |
+| `Running` | `finish(Failed { retryable: true, backoff })` with attempts left and no cancel request | `Queued`, claimable once `backoff` has passed | — | — |
 | `Running` | `finish(Failed)` otherwise | `Failed` | — | — |
 | `Running` | `finish(Cancelled)` | `Cancelled` | — | — |
 | `Queued`, `Waiting` | `request_cancel` | `Cancelled` | — | — |
@@ -212,6 +212,7 @@ more than `retain_finished` loses runs that just finished.
 | `retain_finished` | 24 h | Finished runs older than this on the worker's clock are pruned by the claim loop |
 | `approval_timeout` | `None` | How long a run parked on a held tool call waits for a decision; `None` waits until woken |
 | `allowed_principals` | Empty | Agent ids beyond the worker's own and the target's derived id that a run's stored principal may name (`with_allowed_principal`); any other fails the run with `identity.principal_not_allowed` |
+| `retry_backoff` | `RetryBackoff::default()` | How long a retryable failure of a model call (a provider's `429`, `503` or timeout), or one whose error names a wait (`Retry-After`), waits before the next attempt: about 5, 10 and 20 s after attempts 1, 2 and 3 (exponential, jittered down by up to half), at least the error's retry hint, at most 10 minutes. Other retryable failures, such as a busy store or a workflow's, retry at once. `RetryBackoff::none()` retries every one at once |
 | `on_governance_refusal` | `GovernanceRefusal::Park` | What a kill-switch refusal does to a run that already made a model or tool call, on a worker with a governance control: `Park` parks it at its next model-call boundary and wakes it on unfreeze, as **Kill switch** below describes; `Fail` ends the attempt with the control's error (spec 3.2 §10 S3) |
 
 One attempt of a claimed run:
@@ -225,8 +226,11 @@ One attempt of a claimed run:
    request stops the run cooperatively; one refused with `run_store.stale_epoch` drops the
    execution at once, and the worker writes nothing more.
 4. `finish` writes the outcome, fenced by the epoch: `Completed`, `Failed { retryable }`
-   (retryable failures requeue while attempts remain), or `Cancelled` when cancellation was
-   requested.
+   (retryable failures requeue while attempts remain; a provider's or a hinted failure is
+   claimable once `retry_backoff` has passed), or `Cancelled` when cancellation was
+   requested. A retryable failure of the last
+   attempt fails the run with `; attempts exhausted (N of N)` after the error, so the run stays
+   listed as failed with what stopped it.
 
 **Lease fence.** For agent runs the worker installs invocation hooks around every model call,
 model response, tool call, and tool result. Each checks that the lease is still provably held —
@@ -352,7 +356,7 @@ A run claimed again past `expires_at` with the same calls still held fails with
 `DurableWorker::with_hooks` registers a `WorkerHooks` implementation; each call adds one, and
 hooks run in the order they were added. Every method has an empty default. A hook runs after the
 store write it reports, so the store already shows the state the hook receives, and it only
-observes: it cannot change what the worker does. The worker awaits each hook, so a hook hands
+observes, `wake_input` aside: it cannot change what the worker does. The worker awaits each hook, so a hook hands
 slow work, such as delivery to a remote sink, to another task.
 
 | Hook | Called | The run it receives |
@@ -360,6 +364,14 @@ slow work, such as delivery to a remote sink, to another task.
 | `on_claim(run)` | Once the worker starts the claimed run's target, before any model call or workflow step | `Running`, at the claim's epoch |
 | `on_park(run, reason)` | After `wait` parked the run | `Waiting`, holding no lease |
 | `on_finish(run)` | After `finish` wrote the attempt's outcome | `Completed`, `Failed`, or `Cancelled`; `Queued` when a retryable failure requeued it |
+| `on_event(run, event)` | For each event an agent turn yields, partial chunks included; the events carry each model response's usage and cost | `Running`, as claimed |
+| `wake_input(run)` | After `on_claim`, for an agent run; returns why the run was woken, or `None` | `Running`, at the claim's epoch |
+
+`wake_input` is the one hook that returns something. The worker adds its text to the user
+content of the turn the claim starts — after the run's input, or in place of the blank turn of
+a parked run — so the agent tree screens it as a user message. The first hook that returns text
+wins. A session that already holds a user message starting with the text's first line is not
+given it again, and a run parked on a held call is given none.
 
 | `ParkReason` | Parked by | Claimable |
 |--------------|-----------|-----------|
@@ -514,9 +526,22 @@ While the governance control refuses work, nothing fires and nothing advances. O
 lifts, the missed-fire policy decides which fire times that fell due during it run.
 `start_cron_scheduler` runs the tick loop every second; start it on every replica.
 
+`DurableScheduler::with_jitter(Jitter)` spreads schedules that share a cadence. Each run is
+still enqueued at its fire time and keyed by it, and the schedule advances as planned; the
+run's `not_before` is the fire time plus the schedule's offset, a fixed share of up to
+`percent` of the gap to the next fire time, at most `max`, and always under half the gap.
+`Jitter::default()` is 15 percent, at most nine minutes. A run waiting out its offset is a
+queued run: a worker under a frozen kill switch claims nothing, so it starts once the freeze
+lifts.
+
+`Schedule::run_now(request_id)` is the run a manual "run now" enqueues: the template, its
+concurrency key and the service subject of a fire, keyed
+`schedule:{id}:manual:{request id}`. The schedule is not changed.
+
 ```rust
 use std::sync::Arc;
 
+use adk_core::schedule::Jitter;
 use adk_core::{DurableRunStore, GovernanceControl, ScheduleStore};
 use adk_server::background::DurableScheduler;
 
@@ -525,7 +550,10 @@ fn start(
     run_store: Arc<dyn DurableRunStore>,
     governance: GovernanceControl,
 ) -> tokio::task::JoinHandle<()> {
-    DurableScheduler::new(schedule_store, run_store).with_governance(governance).spawn()
+    DurableScheduler::new(schedule_store, run_store)
+        .with_governance(governance)
+        .with_jitter(Jitter::default())
+        .spawn()
 }
 ```
 
@@ -769,7 +797,7 @@ and every run is claimed exactly once. The nightly
 
 ## End-to-end example
 
-[`examples/durable_company`](https://github.com/zavora-ai/adk-rust/tree/main/examples/durable_company)
+The `durable_company` example in [adk-playground](https://github.com/zavora-ai/adk-playground)
 runs one accounts-payable day against a real model, with every piece of this page and the
 governance features working together. Replicas are separate OS processes on SQLite and
 PostgreSQL, and tasks in one process on the in-memory stores.
@@ -786,9 +814,7 @@ PostgreSQL, and tasks in one process on the in-memory stores.
 | Freeze | `GovernanceControl::mirrored`, `freeze_recorded` | No run is claimed and no schedule fires on any replica |
 | Audit | Signed audit log per process, `adk-rust audit export` / `verify` | Every log verifies; an edited record does not |
 
-```bash
-cargo run --manifest-path examples/durable_company/Cargo.toml -- --provider openai --store sqlite
-```
+The example takes `--provider` (for instance `openai`) and `--store` (for instance `sqlite`).
 
 ## Verified guarantees
 

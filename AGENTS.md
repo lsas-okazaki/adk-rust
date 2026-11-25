@@ -49,7 +49,7 @@ feature-gated builds and the `full` tier require.
 | Tool | Needed for | Linux | macOS | Windows |
 |------|-----------|-------|-------|---------|
 | `protoc` | `adk-rag --features lancedb` (lance build script) | `apt install protobuf-compiler` | `brew install protobuf` | [prebuilt release](https://github.com/protocolbuffers/protobuf/releases), then set `PROTOC` |
-| NASM | `aws-lc-sys` on MSVC — any rustls path, e.g. `adk-auth --features sso` | not needed | not needed | [nasm.us](https://www.nasm.us/), add to `PATH` |
+| NASM | `aws-lc-sys` on MSVC — every TLS path, the default build included (`AWS_LC_SYS_PREBUILT_NASM=1` uses its prebuilt objects instead) | not needed | not needed | [nasm.us](https://www.nasm.us/), add to `PATH` |
 | `cmake` | `openai-webrtc` (audiopus builds Opus from source) | `apt install cmake` | `brew install cmake` | [get-cmake](https://github.com/lukka/get-cmake) or the official installer |
 | ALSA (`libasound2-dev`) | `examples/desktop_audio` (cpal links `alsa-sys`); pre-push examples gate | `apt install libasound2-dev` | not needed (CoreAudio) | not needed |
 | `bash` / `sh` | Shell-tool and external-runner tests across `adk-bench`, `adk-devtools`, `adk-managed`, `adk-sandbox`, `adk-tool` | preinstalled | preinstalled | [Git for Windows](https://git-scm.com/download/win) ships them in `Git\bin`, which the installer leaves off `PATH` — add it |
@@ -167,20 +167,28 @@ expensive axes move to a later tier.
   driven by `scripts/feature-coverage-pairs.txt`: every pair linted on its own, each
   crate's tests run once with its pairs' features combined (a `solo` pair keeps its own
   build), and only the shards and crates the change can affect (`scripts/ci-scope.py`);
-  the nightly `feature-coverage-isolated` job tests every pair on its own build, `postgres` (the
+  the nightly `feature-coverage-isolated` job tests every pair on its own build,
+  `surface-e2e` (adk-surface's generated API and the web home end to end), `postgres` (the
   `#[ignore]`d PostgreSQL suites, pgvector and TLS included, against a
   `pgvector/pgvector:pg17` service, driven by `scripts/test-postgres.sh`),
   `docs` (`cargo doc --workspace --no-deps` plus doctests), standalone examples
-  (4 shards), `kernel-scenarios` (the scripted scenarios of `examples/harness_kernel`, on Linux),
+  (2 shards), `kernel-scenarios` (the scripted scenarios of `examples/harness_kernel`, on Linux),
   `website-scenarios` (spec 3.5's scripted scenarios of `examples/website`),
-  `templates`, a compile-only macOS build, a Windows build with the code only
+  `doc-gates` (the documentation, release and script checks), `templates` (the cargo-adk
+  scaffolds), a compile-only macOS build, a Windows build with the code only
   Windows has (the restricted-token enforcer, process trees, owner-only files, the
   kernel's named pipe and service, the external generators' path), and `semver`
   (stable strict against the release type in `semver.yml`'s `SEMVER_RELEASE_TYPE`:
   `minor` fails breakage; `major`, during a major release candidate, accepts every
   change, so the job reports without building; everything else warn-only). A `scope`
-  job skips the Rust jobs when a change touches only `docs/` or Markdown, and
-  merge-queue builds skip `docs`, the standalone examples, the kernel scenarios and
+  job skips the Rust jobs when a change touches only `docs/` or Markdown, and runs
+  `postgres`, `templates`, `kernel-scenarios`, `website-scenarios`, `windows` and
+  `surface-e2e` only when the change can affect a crate they build
+  (`scripts/ci-job-crates.txt`; the merge tier's Windows run builds the workspace for
+  every other change). The jobs that compile from nothing or run long —
+  `feature-coverage`, `surface-e2e`, `postgres`, `docs`, the standalone examples,
+  `templates`, macOS and Windows — start after `fmt` and `clippy` pass. Merge-queue
+  builds skip `docs`, the standalone examples, the kernel scenarios and
   the macOS/Windows builds the pull request already passed. CI builds carry no debug
   info (`CARGO_PROFILE_DEV_DEBUG=0`). Only `main` saves build caches: a push to `main`
   runs `ci.yml`'s `clippy` and `test`, whose caches every pull request restores.
@@ -215,7 +223,7 @@ every `ci.yml` dependency succeeds or was skipped by the change scope. See CONTR
   shell scripts, and PSScriptAnalyzer on staged `*.ps1` via
   `scripts/lint-powershell.ps1` (skips itself when the module is not installed).
 - **pre-push** — `cargo check --workspace` (a fast compilation check, not the full
-  test suite), plus `scripts/check-examples-compile.sh` over all four shards when
+  test suite), plus `scripts/check-examples-compile.sh` over both shards when
   an example or a workspace crate it depends on has changed. The standalone
   examples are outside the workspace, so nothing else compiles them. CI is the
   full-suite safety net, so the local gate stays quick.
@@ -252,7 +260,7 @@ adk-gcp/           Google Cloud REST plumbing: ADC credentials, bounded HTTP tra
 adk-anthropic/     Anthropic client: streaming, thinking, prompt caching, Managed Agents and Files APIs
 adk-tool/          FunctionTool, MCP client and server, built-in tool wrappers, Slack/BigQuery/Spanner
 adk-runner/        Execution runtime: event streaming, budgets, ledgers, cancellation and recovery
-adk-server/        Axum server, A2A v1.0.0, background runs and cron (`background`), AWP edge (`awp`)
+adk-server/        Axum server, A2A v1.0.0, background runs and cron (`background`), AWP edge (`awp`), agents over MCP (`mcp`)
 adk-session/       Sessions on SQLite, PostgreSQL, Redis, MongoDB, Firestore, Neo4j, Vertex; durable stores
 adk-artifact/      Versioned binary artifacts: in-memory, file, GCS (`gcs`)
 adk-memory/        Semantic memory and search on seven backends, SQLite knowledge graph (`graph-memory`)
@@ -282,10 +290,12 @@ adk-bench/         Runtime benchmarks with real LLM APIs and a Python ADK compar
 adk-sandbox/       Process/WASM sandboxes; Seatbelt, bubblewrap and Windows restricted-token enforcers
 adk-audio/         STT/TTS providers, desktop audio, ONNX models (Whisper, Kokoro, ...)
 adk-rag/           Retrieval-augmented generation pipelines and vector store backends
+adk-vision/        Perception: regions in source pixels, manifests, traits, runtime, egress gate, governed tools, image privacy guardrail (`guardrail`)
+adk-vision-sam-codec/ Meta sam-3.1 mask codec ported from `@meta-sam/parser`; SAM License, not Apache-2.0 (`adk-vision/sam-codec`)
 adk-action/        Action node types and variable interpolation for adk-graph
 adk-enterprise/    HTTP/SSE client for the ADK-Rust Enterprise Managed Agent Service
 adk-managed/       Provider-neutral managed agent runtime with durable, parked turns
-adk-deploy/        Deployment manifests, bundling, and the Agent Engine client (`gcp`)
+adk-deploy/        Deploy manifests, bundling, targets: container, Agent Engine, ECS, Container Apps
 adk-payments/      Agentic commerce (ACP, AP2) and the owner-funded wallet (`wallet`)
 cargo-adk/         `cargo adk`: project templates, builds, eval runs, deployment
 adk-mistralrs/     In-process local inference via mistral.rs 0.8; GPU features opt-in
@@ -307,9 +317,10 @@ adk-studio/      Retired in favour of adk-surface's workflow observer
                  (docs/official_docs/surfaces/workflow.md).
                  Repo: https://github.com/zavora-ai/adk-studio
 
-adk-ui/          Retired, for ADK-Rust 2 only (spec 3.3 decision 11): agent-drawn UI is
-                 adk-surface's `genui` feature. Do not add code to it or depend on it.
-                 Repo: https://github.com/zavora-ai/adk-ui
+adk-ui/          Extension catalogs for genui (spec 3.3 decision 11, amended): charts,
+                 metrics, pages and scenes on `Catalog::extend`. It owns no render tool,
+                 protocol, provenance or approval path; no crate here depends on it.
+                 2.x is for ADK-Rust 2 only. Repo: https://github.com/zavora-ai/adk-ui
                  UI protocol constants stay in adk-server/src/ui_protocol.rs for the
                  deprecated `adk_ui` profile and the /api/ui bridge.
 ```
@@ -317,8 +328,9 @@ adk-ui/          Retired, for ADK-Rust 2 only (spec 3.3 decision 11): agent-draw
 ### Examples and docs
 
 ```
-examples/              Standalone example crates, each with its own Cargo.toml and outside the
-                       workspace. More examples live in the adk-playground repo.
+examples/              Standalone crates outside the workspace, each with its own Cargo.toml:
+                       the scenarios CI runs, spec scenarios, and release-validation crates.
+                       Teaching examples live in the adk-playground repo.
 docs/official_docs/    Comprehensive documentation site content
 ```
 
@@ -338,7 +350,7 @@ docs/official_docs/    Comprehensive documentation site content
 - `bedrock` — Amazon Bedrock via AWS SDK Converse API
 - `azure-ai` — Azure AI Inference endpoints
 - `all-providers` — enables all real feature flags
-- `fireworks`, `together`, `mistral`, `perplexity`, `cerebras`, `sambanova`, `xai` — backward-compat aliases for `openai`. Use `OpenAICompatibleConfig` presets instead of separate client types.
+- Fireworks, Together, Mistral, Perplexity, Cerebras, SambaNova and xAI have no feature of their own: enable `openai` and use the `OpenAICompatibleConfig` presets.
 
 ### Gemini model selection
 
@@ -346,14 +358,22 @@ Use current-generation models. Gemini 2.0 models were shut down on June 1, 2026.
 
 | Use case | Model ID | Notes |
 |----------|----------|-------|
-| Default / general | `gemini-3.7-flash` | Default in `adk-gemini` and `adk-model` |
+| Default / general | `gemini-3.8-flash` | Default in `adk-gemini` and `adk-model` |
 | Cost-efficient / high-volume | `gemini-3.5-flash-lite` | Fast routing and high-volume work |
-| Advanced reasoning | `gemini-3.1-pro-preview` | Preview reasoning model |
-| Image generation | `gemini-3.1-flash-image` | Native image output |
-| Live voice | `gemini-3.1-flash-live-preview` | Realtime audio and video |
+| Advanced reasoning | `gemini-4-carbon` | Strongest reasoning model; `gemini-4-argon` is the efficient one |
+| Image generation | `gemini-nano-banana-2.1` | Native image output |
+| Live voice | `gemini-3.1-flash-live-preview` | Realtime audio and video; default in `adk-realtime` and `adk-model` |
+| Live voice, newer model | `gemini-3.8-live` | Built-in reasoning, no thinking level; tools declared `BLOCKING` |
+| Live voice with configurable reasoning | `gemini-3.8-live-extended-thinking` | `RealtimeConfig::with_thinking_level` (low, medium, high; ADK sends medium unless set); tools run non-blocking |
 
 **Avoid retired models:** `gemini-2.0-flash`, `gemini-2.0-flash-lite`,
-`gemini-3.1-flash-lite-preview`, and `gemini-3-pro-preview`.
+`gemini-3.1-flash-lite-preview`, `gemini-3-pro-preview`, and
+`gemini-2.5-computer-use-preview-10-2025`.
+
+**Avoid deprecated models:** `gemini-3.7-flash` (routed to `gemini-3.8-flash`),
+`gemini-3.5-flash`, `gemini-3.1-flash-image`, and `gemini-2.5-pro` / `gemini-2.5-flash`
+(shut down on December 1, 2026). `adk-model/src/catalog.rs` lists every provider's
+deprecated and retired IDs.
 
 ### adk-realtime
 
@@ -374,8 +394,8 @@ Four tiered presets control which crates are compiled:
 
 - `minimal` **(default)** — agents, models, gemini, runner, sessions.
 - `standard` — minimal + openai, anthropic, anthropic-client, tools, memory, telemetry, skills, graph, auth, server, eval, guardrail, plugin, artifacts, computer-use.
-- `enterprise` — standard + realtime, browser, rag, payments, awp.
-- `full` — enterprise + audio, code, sandbox, code-tools, graph-functional, graph-node-cache, graph-delta, graph-time-travel, harness, harness-kernel, website. Everything that needs no external infrastructure.
+- `enterprise` — standard + realtime, browser, rag, payments, awp, autonomy (harness, harness-kernel, background runs, cron, webhook ingress, approvals, SQLite stores, signed audit).
+- `full` — enterprise + audio, code, sandbox, code-tools, graph-functional, graph-node-cache, graph-delta, graph-time-travel, graph-yaml, website, vision. Everything that needs no external infrastructure.
 
 Every other feature composes with any tier (`features = ["minimal", "audio"]`).
 `adk-rust/Cargo.toml` lists each one with what it forwards to; production backends
@@ -576,9 +596,9 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
 
 ### New example
 
-Examples live as standalone crates in `examples/` (each with their own `Cargo.toml` and `[workspace]` key). Additional examples go to the [adk-playground](https://github.com/zavora-ai/adk-playground) repo.
+Teaching examples go to the [adk-playground](https://github.com/zavora-ai/adk-playground) repo. `examples/` holds the standalone crates CI runs, spec scenarios, and release-validation crates (each with their own `Cargo.toml` and `[workspace]` key).
 
-Pattern for a new example crate:
+Pattern for a new crate in `examples/`:
 ```
 examples/my_example/
 ├── Cargo.toml          # [workspace] key, path deps to workspace crates

@@ -1,9 +1,10 @@
 # Sandboxed Code Execution
 
-The `adk-sandbox` crate provides isolated code execution for ADK agents, with two levels of isolation:
+The `adk-sandbox` crate provides isolated code execution for ADK agents, with three levels of isolation:
 
 1. **Process isolation** — child processes with environment isolation and timeout enforcement
 2. **OS-level sandbox profiles** — kernel-level restrictions on filesystem, network, and process spawning
+3. **Remote sandboxes** — E2B microVMs, Daytona containers or VMs, and Modal gVisor containers off this host, behind the same `SandboxClient` interface as the local and Docker clients ([Remote Sandbox Providers](remote-providers.md))
 
 ## Backends
 
@@ -12,6 +13,7 @@ The `adk-sandbox` crate provides isolated code execution for ADK agents, with tw
 | `ProcessBackend` | Environment + timeout | Rust, Python, JS, TS, Command | `process` (default) |
 | `ProcessBackend` + sandbox | Kernel-level | Same as above | `process` + `sandbox-native` |
 | `WasmBackend` | Full (memory, fs, network) | WASM only | `wasm` |
+| `SessionBackend` | That of its `SandboxClient`: none for `LocalUnixClient`, a container for `DockerClient`, a microVM for `E2bClient`, a container or VM for `DaytonaClient`, a gVisor container for `ModalClient` | Python, JS, Command; Rust on request | `workspace` |
 
 ### Which Isolation Are You Getting?
 
@@ -23,7 +25,7 @@ crate name:
 | `IsolationClass::SubprocessOnly` | A child process with a cleared environment, a timeout, and its own process group, which is killed on timeout and again when the process exits. The OS applies no further restriction: the code can read the host filesystem and reach the network. This is what `ProcessBackend::default()` gives you. |
 | `IsolationClass::OsEnforced` | An enforcer **and** a policy are attached, so the OS restricts the child. |
 
-Two things about the process backend worth knowing:
+### Program Lookup and Compilation
 
 - **How the program is found.** Without an enforcer, a bare `python3`, `node`, or
   `rustc` is looked up on the caller's `PATH` and passed to the child as an absolute
@@ -205,6 +207,12 @@ read-only one is writable again, and fixed in place.
 enforcers (under bubblewrap in CI through the `Sandbox Linux` workflow). The read-only entry
 must exist when the command is built, as every allowed path must, so a path that does not
 exist yet cannot be protected from creation this way.
+
+The enforcers grant each path at its resolved location, so a symbolic link in an allowed
+path — `/tmp` and Homebrew's `opt` links on macOS — is routine and logged at `debug`. A
+read-only entry reached through a link inside the read-write entry is the exception: the grant
+keeps the link's target read-only, but a command can replace the link itself, so the enforcer
+logs a `warn` naming the path. Replace such a link with what it points to.
 
 > **Note:** bubblewrap mounts each allowed path at its resolved location. On a merged-`/usr`
 > distribution `/bin` and `/lib` are symbolic links into `/usr`, so a policy that lists them
@@ -418,6 +426,10 @@ server of `adk-tool`'s `McpServerManager`, and so each kernel driver, is held th
 ## Workspace Clients
 
 The `workspace` feature adds a `provision → session → exec → snapshot → resume` lifecycle.
+`LocalUnixClient` and `DockerClient` run it on this host; `E2bClient` (`remote-e2b`),
+`DaytonaClient` (`remote-daytona`) and `ModalClient` (`remote-modal`) run it in a provider's
+microVMs or containers, as [Remote Sandbox Providers](remote-providers.md) describes. `SandboxSession::exec` takes a
+`CommandRequest` with its own timeout, environment and working directory.
 
 | Control | `LocalUnixClient` | `DockerClient` (`workspace-docker`) |
 |---------|-------------------|-------------------------------------|
@@ -474,4 +486,4 @@ crate needs a wildcard arm.
 
 ### Example
 
-See [`examples/sandbox_agent/`](https://github.com/zavora-ai/adk-rust/tree/main/examples/sandbox_agent) for a full LLM-agent-driven example that executes Python code in a sandboxed environment with network access blocked by the OS kernel.
+See the `sandbox_agent` example in [adk-playground](https://github.com/zavora-ai/adk-playground) for a full LLM-agent-driven example that executes Python code in a sandboxed environment with network access blocked by the OS kernel.

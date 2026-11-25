@@ -10,6 +10,7 @@ import { Voice } from "../screens/Voice";
 import { TrayPanel } from "../tray/TrayPanel";
 import { Website } from "../website/Website";
 import { agentsFixture } from "./agents";
+import { DeveloperFixture } from "./developer";
 import { FixtureClient, fixtureSeams, releaseCard, takeOverCard } from "./fixture";
 import { genuiFixture } from "./genui";
 import { phoneFixture } from "./phone";
@@ -18,6 +19,12 @@ import { VerbsFixture, VerbsHomeFixture, snoozeCard, verbsSeams, verbsVoiceDevic
 import { VoiceFixtureClient, fixtureDevices } from "./voice";
 import { WebsiteFixture } from "./website";
 import { workflowFixture } from "./workflow";
+import { VisionHomeFixture, visionPhoneFixture } from "./vision";
+import type { VisionState } from "./vision";
+import { CORRECTING, ViewerHomeFixture, viewerPhoneFixture, viewerPlaceOf } from "./viewer";
+import type { ViewerState } from "./viewer";
+import { CameraActionsBoard, CameraHomeFixture, cameraPhoneFixture, cameraPlaceOf } from "./camera";
+import type { CameraBoardState } from "./camera";
 import "../styles/fonts.css";
 import "../styles/tokens.css";
 import "../styles/app.css";
@@ -59,8 +66,62 @@ const screens: Record<string, () => ReactNode> = {
   workflow: () => (
     <App client={client} seams={fixtureSeams()} initialSection="developer" workflow={workflowFixture(params, client)} />
   ),
+  // The developer view of a run (spec 3.3 §12): three agents, one call held for the person.
+  developer: () => {
+    try {
+      window.localStorage.setItem("adk.home.developer.user", "you");
+    } catch {
+      // Without storage the view reads the trace alone.
+    }
+    return <App client={new DeveloperFixture()} seams={fixtureSeams()} initialSection="developer" />;
+  },
   // Agent-drawn UI (spec 3.3 §6.1 `genui`): `&genui=form|sent|display|refused|states|…`.
   genui: () => genuiFixture(params),
+  // Approve with the image (spec 3.7 §8.2):
+  // `&vision=pending|parked|purged|several|allRedacted|decided|changed`.
+  vision: () => {
+    const state = (params.get("vision") ?? "pending") as VisionState;
+    return <App client={new VisionHomeFixture(state)} seams={fixtureSeams()} initialSection="threads" initialAgent="desk" />;
+  },
+  // The annotated viewer (spec 3.7 §8.2, X12): `&viewer=document|photo|video|compare|empty|correct`.
+  viewer: () => {
+    const state = (params.get("viewer") ?? "document") as ViewerState;
+    const place = viewerPlaceOf(state);
+    return (
+      <App
+        client={new ViewerHomeFixture(state)}
+        seams={fixtureSeams()}
+        initialSection="threads"
+        initialViewer={{ place, correction: state === "correct" ? CORRECTING : undefined }}
+      />
+    );
+  },
+  viewerPhone: () => {
+    const fixture = viewerPhoneFixture();
+    return <PhoneApp client={fixture.client} initial={fixture.initial} />;
+  },
+  // The live camera surface (spec 3.7 §8.2): `&camera=live|stepped-down|quota-exhausted|
+  // source-lost|switched-off|stop-all|several-sources|zone-and-card`.
+  camera: () => {
+    const state = (params.get("camera") ?? "live") as CameraBoardState;
+    if (state === "zone-and-card") return <CameraActionsBoard />;
+    return (
+      <App
+        client={new CameraHomeFixture(state)}
+        seams={fixtureSeams()}
+        initialSection="threads"
+        initialCamera={cameraPlaceOf(state)}
+      />
+    );
+  },
+  cameraPhone: () => {
+    const fixture = cameraPhoneFixture((params.get("camera") ?? "live") as CameraBoardState);
+    return <PhoneApp client={fixture.client} initial={fixture.initial} />;
+  },
+  visionPhone: () => {
+    const fixture = visionPhoneFixture((params.get("vision") ?? "pending") as VisionState);
+    return <PhoneApp client={fixture.client} initial={fixture.initial} />;
+  },
 };
 const screen = screens[params.get("screen") ?? ""];
 const root = document.getElementById("root");

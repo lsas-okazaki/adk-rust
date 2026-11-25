@@ -5,14 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "HTTP server and A2A protocol for Rust Agent Development Kit (ADK-Rust) agents"
+description = "HTTP server for ADK-Rust agents: REST and SSE, A2A v1.0, background runs and cron, approvals, and the AWP agent edge"
 homepage.workspace = true
 repository.workspace = true
 documentation = "https://docs.rs/adk-server"
 keywords = ["ai", "agent", "adk", "server", "a2a"]
 categories = ["api-bindings", "web-programming::http-server"]
 readme = "README.md"
-include = ["src/**/*", "Cargo.toml", "README.md"]
+include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -31,14 +31,12 @@ adk-tool = { workspace = true, optional = true }
 google-cloud-auth = { version = "1.8", optional = true, default-features = false, features = ["default-rustls-provider"] }
 adk-telemetry.workspace = true
 tokio = { workspace = true, features = ["sync", "signal", "macros", "rt", "time"] }
-tokio-stream.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-anyhow.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 axum = { version = "0.8", features = ["macros"] }
@@ -51,9 +49,9 @@ base64 = "0.22"
 mime_guess = "2.0.5"
 reqwest.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
-a2a-protocol-types = { version = "0.12.1", optional = true }
+a2a-protocol-types = { version = "0.15", optional = true }
 # Optional: YAML agent definition parsing
-serde_yaml = { version = "0.9", optional = true }
+serde-saphyr = { workspace = true, optional = true }
 # Optional: filesystem watcher for hot reload
 notify = { version = "8", optional = true }
 # Optional: environment variable interpolation in YAML configs
@@ -66,7 +64,6 @@ hex = { workspace = true, optional = true }
 adk-awp = { workspace = true, optional = true, features = ["signing"] }
 awp-types = { workspace = true, optional = true }
 adk-auth = { workspace = true, optional = true, features = ["web-bot-auth", "sso"] }
-http = { version = "1", optional = true }
 # Optional: the edge's durable stores (`awp-sqlite`, `awp-postgres`, `awp-redis`)
 sqlx = { workspace = true, optional = true, features = ["runtime-tokio"] }
 fred = { version = "10", optional = true, features = ["i-scripts"] }
@@ -75,7 +72,7 @@ fred = { version = "10", optional = true, features = ["i-scripts"] }
 default = []
 a2a-v1 = ["dep:a2a-protocol-types", "adk-core/egress-client"]
 # Enable YAML agent definition loading and hot reload
-yaml-agent = ["dep:serde_yaml", "dep:notify", "dep:regex"]
+yaml-agent = ["dep:serde-saphyr", "dep:notify", "dep:regex"]
 # Enable Agent Registry REST API
 agent-registry = []
 # Enable built-in A2A interceptors (auth, rate-limit, audit)
@@ -86,8 +83,14 @@ openai-webhooks = ["dep:hmac", "dep:sha2", "dep:hex"]
 webhook-ingress = ["adk-core/webhooks", "dep:hmac", "dep:sha2", "dep:hex"]
 # Enable background run endpoints and cron job management
 background = ["adk-core/cron"]
+# Google Pub/Sub push and Eventarc trigger endpoints (`POST /triggers/{pubsub,eventarc}/{name}`)
+# that verify Google-signed OIDC tokens and enqueue durable runs
+google-triggers = ["dep:adk-auth"]
 # Approval inbox endpoints, the approval ticker, and the signed approval webhook notifier
 approvals = ["adk-core/webhook-delivery"]
+# Agents served over MCP: each call a durable run followed as an MCP task, held calls asked as
+# elicitations (stdio and Streamable HTTP)
+mcp = ["background", "dep:adk-tool", "adk-tool/mcp-server"]
 # Enable the Gemini Enterprise Agent Platform (ReasoningEngine) dispatch surface
 # and the turnkey serve_agent_engine entrypoint (tokio/net for the listener)
 agent-engine = ["dep:adk-memory", "tokio/net"]
@@ -103,7 +106,6 @@ awp = [
     "dep:adk-auth",
     "dep:adk-tool",
     "adk-tool/mcp-server",
-    "dep:http",
     "dep:sha2",
     "dep:hex",
     "dep:hmac",
@@ -124,6 +126,8 @@ vertex-remote-engine = [
 ]
 
 [dev-dependencies]
+# The `build_agent_engine_app` doctest.
+anyhow.workspace = true
 # Input guardrails on the agents a recovering durable worker resumes.
 adk-agent = { path = "../adk-agent", features = ["guardrails"] }
 adk-graph = { path = "../adk-graph" }
@@ -136,12 +140,16 @@ tracing-subscriber = "0.3"
 uuid = { version = "1.23", features = ["v4"] }
 async-trait.workspace = true
 chrono = "0.4"
-hyper = "1.8.1"
 http-body-util = "0.1.3"
 proptest = "1.4"
 tempfile = "3"
 tokio-test = "0.4"
 # The edge's chat socket tests (`awp`).
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.29"
+# The RS256 signer the Google push trigger tests mint OIDC tokens with (`google-triggers`).
+adk-auth = { path = "../adk-auth", features = ["agent-federation"] }
+# The MCP client of the agent-over-MCP tests (`mcp`), and the live run's `.env`.
+adk-tool = { path = "../adk-tool", features = ["mcp-server", "http-transport"] }
+dotenvy = "0.15"
 # The edge store conformance suite runs on a multi-threaded runtime.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

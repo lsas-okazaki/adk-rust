@@ -13,7 +13,7 @@ Function tools let you give agents abilities beyond conversation - calling APIs,
 | `#[tool]` macro (recommended) | A tool is one async function with a typed argument struct |
 | `FunctionTool::new()` | The tool is built at runtime, or you prefer an explicit closure |
 | `StatefulTool<S>` | Calls share state, such as a cache or a connection pool |
-| A `Tool` implementation | You need full control over the declaration or execution |
+| A `Tool` implementation | You need full control over the declaration or execution; see [Implementing the Core Traits](../core/traits.md#tool) for every method |
 
 Argument types derive their JSON Schema with `schemars`, and every tool receives an
 `Arc<dyn ToolContext>` with the session, artifacts, and memory of the call.
@@ -278,7 +278,7 @@ struct WeatherParams {
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
 
     // Weather tool with proper schema
     let weather_tool = FunctionTool::new(
@@ -782,7 +782,8 @@ therefore slows the tool briefly but can never stall it indefinitely or exhaust 
 These limits apply only to *progress*. A tool's final result is not affected, so
 truncate large results inside the tool if that matters to you.
 
-> See the `streaming_bash` example for a complete web UI that renders live
+> See the `streaming_bash` example in [adk-playground](https://github.com/zavora-ai/adk-playground)
+> for a complete web UI that renders live
 > `bash` output and one-shot tool results (`read_file`, `grep`, `glob`) from a
 > single event feed. The streaming `bash` tool itself lives in `adk-devtools`.
 
@@ -801,10 +802,10 @@ cargo run
 | Example | What it shows |
 |---------|---------------|
 | `examples/tool_schemas` | Argument validation with `LlmAgent` and `Runner`: unknown and out-of-range arguments rejected and corrected, the schema Gemini receives, duplicate tool names failing the build |
-| `examples/streaming_bash` | Live tool progress in a web UI |
-| `examples/multimodal_function_response` | A tool that returns an image to the model |
+| `streaming_bash` in [adk-playground](https://github.com/zavora-ai/adk-playground) | Live tool progress in a web UI |
+| `multimodal_function_response` in [adk-playground](https://github.com/zavora-ai/adk-playground) | A tool that returns an image to the model |
 
-Each example is a standalone crate:
+An example in this repository is a standalone crate:
 
 ```bash
 cargo run --manifest-path examples/tool_schemas/Cargo.toml
@@ -853,8 +854,8 @@ that tool. The origin is `Tool::origin()` — `"static"` (`adk_core::STATIC_TOOL
 tool compiled into the agent, `mcp:{toolset name}` for an MCP tool — plus a SHA-256 digest of
 the tool's declaration and `annotations()`. A held call that resumes against a tool with
 another origin or a changed declaration is answered as not run. A `Tool` that wraps another
-tool should forward `origin()` and `annotations()`; `adk-auth`'s `ProtectedTool` and
-`ScopeGuard` forward `origin()` only. See
+tool forwards `origin()` and `annotations()` with every other method, as `adk-auth`'s
+`ProtectedTool` and `ScopeGuard` do; see [Wrapping a tool](../core/traits.md#wrapping-a-tool) and
 [Tool Authorization](../security/tool-authorization.md#decisions-authorize-one-exact-call).
 
 ---
@@ -932,6 +933,7 @@ let cache_tool = StatefulTool::new(
 - [Built-in Tools](built-in-tools.md) - Pre-built tools (GoogleSearch, ExitLoop)
 - [MCP Tools](mcp-tools.md) - Model Context Protocol integration
 - [Tool Effects](tool-effects.md) - Retries, idempotency keys, and the action ledger
+- [Implementing the Core Traits](../core/traits.md#tool) - Every `Tool` method and what a wrapper forwards
 - [LlmAgent](../agents/llm-agent.md) - Adding tools to agents
 
 ---
@@ -1046,7 +1048,8 @@ let frd = FunctionResponseData::with_multimodal(
 `with_inline_data` and `with_multimodal` panic when an inline part exceeds
 `adk_core::MAX_INLINE_DATA_SIZE` (10 MB).
 
-See `examples/multimodal_function_response/` for a complete working example.
+See the `multimodal_function_response` example in [adk-playground](https://github.com/zavora-ai/adk-playground) for
+a complete working example.
 
 ---
 

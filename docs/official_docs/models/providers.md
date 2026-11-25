@@ -7,9 +7,9 @@ the `adk_core::Llm` trait, so an agent takes any of them without other changes.
 
 | Provider | Client | `adk-model` feature | Key the samples read | Catalog default |
 |----------|--------|---------------------|----------------------|-----------------|
-| Gemini | `GeminiModel` | `gemini` (default) | `GOOGLE_API_KEY` | `gemini-3.7-flash` |
-| OpenAI | `OpenAIClient`, [`OpenAIResponsesClient`](./openai-responses.md) | `openai` | `OPENAI_API_KEY` | `gpt-5.6-terra` |
-| Anthropic | `AnthropicClient` ([details](./anthropic.md)) | `anthropic` | `ANTHROPIC_API_KEY` | `claude-sonnet-5` |
+| Gemini | `GeminiModel` | `gemini` (default) | `GOOGLE_API_KEY` | `gemini-3.8-flash` |
+| OpenAI | `OpenAIClient`, [`OpenAIResponsesClient`](./openai-responses.md) | `openai` | `OPENAI_API_KEY` | `gpt-6.1-sol` |
+| Anthropic | `AnthropicClient` ([details](./anthropic.md)) | `anthropic` | `ANTHROPIC_API_KEY` | `claude-sonnet-5-5` |
 | DeepSeek | `DeepSeekClient` | `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-flash` |
 | Groq | `GroqClient` | `groq` | `GROQ_API_KEY` | `openai/gpt-oss-120b` |
 | Meta Muse | `MuseClient` | `muse` | `META_API_KEY` | `muse-spark-1.3` |
@@ -31,9 +31,9 @@ and configs use. `adk-rust --provider` takes the same identifiers.
 
 | Identifier | Variant | `feature()` | `env_var()` | `default_model()` |
 |------------|---------|-------------|-------------|-------------------|
-| `gemini` | `Gemini` | `gemini` | `GOOGLE_API_KEY` (`alt_env_var()`: `GEMINI_API_KEY`) | `Some("gemini-3.7-flash")` |
-| `openai` | `Openai` | `openai` | `OPENAI_API_KEY` | `Some("gpt-5.6-terra")` |
-| `anthropic` | `Anthropic` | `anthropic` | `ANTHROPIC_API_KEY` | `Some("claude-sonnet-5")` |
+| `gemini` | `Gemini` | `gemini` | `GOOGLE_API_KEY` (`alt_env_var()`: `GEMINI_API_KEY`) | `Some("gemini-3.8-flash")` |
+| `openai` | `Openai` | `openai` | `OPENAI_API_KEY` | `Some("gpt-6.1-sol")` |
+| `anthropic` | `Anthropic` | `anthropic` | `ANTHROPIC_API_KEY` | `Some("claude-sonnet-5-5")` |
 | `deepseek` | `Deepseek` | `deepseek` | `DEEPSEEK_API_KEY` | `Some("deepseek-flash")` |
 | `groq` | `Groq` | `groq` | `GROQ_API_KEY` | `Some("openai/gpt-oss-120b")` |
 | `ollama` | `Ollama` | `ollama` | empty, no key | `Some("qwen3.5")` |
@@ -118,6 +118,49 @@ fn normalized(model: &dyn Llm) -> Value {
 
 See [Schema Normalization](../tools/schema-normalization.md) for what each adapter changes.
 
+### Structured output by provider
+
+`GenerateContentConfig::response_schema`, which `LlmAgentBuilder::output_schema`, the
+`adk-eval` judges and `adk_core::decide` set, reaches each provider as its own structured-output
+control. No client turns it into a forced tool call.
+
+| Client | Sent as |
+|--------|---------|
+| `GeminiModel` | `responseSchema` with `responseMimeType: application/json`, normalized by `GeminiSchemaAdapter` |
+| `OpenAIClient`, `AzureOpenAIClient`, `OpenAICompatible` | strict `response_format` (`json_schema`) on Chat Completions; `text.format` on the Responses API |
+| `AnthropicClient` | `output_config.format` (`json_schema`): every object closed with `additionalProperties: false`, numeric and length bounds dropped; a schema with an open map is not sent |
+| `GroqClient`, `AzureAIClient` | `response_format` (`json_schema`) |
+| `OpenRouterClient`, `MuseClient` | `response_format` (`json_schema`) |
+| `DeepSeekClient` | `response_format` `json_object`; the schema joins the prompt as a system message unless the prompt already mentions JSON |
+| `OllamaModel` | `format` |
+| `BedrockClient`, `MistralRsModel` | not sent; the prompt asks for the format and the caller validates the reply |
+
+### Data locality
+
+`Llm::data_locality()` says where a call's request data goes, so a guardrail can tell which
+model calls leave the machine — the image privacy guardrail gates every image a remote model
+would receive:
+
+| `DataLocality` | Request data | Clients |
+|----------------|--------------|---------|
+| `InProcess` | Stays in this process | `MistralRsModel`, `MistralRsVisionModel`, `MistralRsMultiModel`, `MistralRsAdapterModel` |
+| `Loopback` | Leaves the process for a server on this machine | `OpenAICompatible`, `OpenAIClient` and `OpenAIResponsesClient` whose base URL is `localhost` or a loopback address; `OllamaModel` at such a host, except cloud models (`…-cloud`), which the server forwards to ollama.com |
+| `Remote` (default) | Leaves the machine | Every hosted provider, and any model that does not say |
+
+Wrappers report the model they wrap: `MeteredLlm`, `OpenCodeClient`, and the harness's model
+wrappers forward it, and `FallbackLlm` reports the least local model of its chain, since a call
+may reach any of them. `DataLocality::of_url` classifies a base URL for a client of your own.
+
+```rust
+use adk_core::{DataLocality, Llm};
+
+fn leaves_the_machine(model: &dyn Llm) -> bool {
+    model.data_locality().leaves_machine()
+}
+
+assert_eq!(DataLocality::of_url("http://127.0.0.1:8000/v1"), DataLocality::Loopback);
+```
+
 ---
 
 ## Gemini
@@ -138,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = GeminiModel::new(&api_key, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(&api_key, "gemini-3.8-flash")?;
 
     let agent = LlmAgentBuilder::new("gemini_assistant")
         .description("Gemini-powered assistant")
@@ -156,11 +199,18 @@ async fn main() -> anyhow::Result<()> {
 
 | Model | Catalog role |
 |-------|--------------|
-| `gemini-3.7-flash` | Default, balanced |
+| `gemini-3.8-flash` | Default, balanced |
+| `gemini-4-hydrogen` | Balanced |
+| `gemini-4-carbon` | Flagship |
+| `gemini-4-argon` | Flagship |
 | `gemini-3.6-flash` | Balanced |
-| `gemini-3.5-flash` | Balanced |
 | `gemini-3.5-flash-lite` | Economy |
 | `gemini-3.1-pro-preview` | Flagship (preview) |
+
+`gemini-3.7-flash` and `gemini-3.5-flash` are deprecated (the Gemini API routes them to
+`gemini-3.8-flash` and `gemini-3.6-flash`), and `gemini-2.5-pro` and `gemini-2.5-flash` shut down
+on 2026-12-01. Gemini 4 Hydrogen does not support explicit caching and rejects the `minimal`
+thinking level.
 
 `GeminiModel::new` logs a warning when the model is deprecated or retired in the catalog, naming
 its replacement.
@@ -175,7 +225,7 @@ use adk_gemini::{ThinkingConfig, ThinkingLevel};
 use adk_model::GeminiModel;
 
 fn build(api_key: &str) -> adk_core::Result<GeminiModel> {
-    Ok(GeminiModel::new(api_key, "gemini-3.7-flash")?.with_thinking_config(
+    Ok(GeminiModel::new(api_key, "gemini-3.8-flash")?.with_thinking_config(
         ThinkingConfig::new().with_thinking_level(ThinkingLevel::High).with_thoughts_included(true),
     ))
 }
@@ -186,7 +236,7 @@ fn build(api_key: &str) -> adk_core::Result<GeminiModel> {
 | Thought summaries | With `with_thoughts_included(true)`, they arrive as `Part::Thinking` |
 | Thought signatures | `thoughtSignature` values are kept on the parts that carry them and sent back on later turns |
 | `thinking_budget` | The token-budget control of earlier models; `ThinkingConfig::validate` rejects a config that sets it together with `thinking_level` |
-| `gemini-3.6-flash`, `gemini-3.7-flash` | A request with `temperature`, `top_p`, or `top_k` fails with `model.gemini.sampling_unsupported`, and a `thinking_budget` with `model.gemini.thinking_budget_unsupported` (`InvalidInput`), before anything is sent |
+| `gemini-3.6-flash`, `gemini-3.7-flash`, `gemini-3.8-flash` | A request with `temperature`, `top_p`, or `top_k` fails with `model.gemini.sampling_unsupported`, and a `thinking_budget` with `model.gemini.thinking_budget_unsupported` (`InvalidInput`), before anything is sent |
 
 ### Failed, Blocked, and Unfinished Responses
 
@@ -200,7 +250,8 @@ fn build(api_key: &str) -> adk_core::Result<GeminiModel> {
 | A prompt blocked through `promptFeedback.blockReason` | A final response with `FinishReason::Safety`, `error_code` set to the block reason (for example `PROHIBITED_CONTENT`), and no content; `LlmAgent` ends the run with `model.provider_error` |
 | `finishReason` `SAFETY`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `IMAGE_SAFETY`, or `MODEL_ARMOR` | `FinishReason::Safety` |
 | `finishReason` `RECITATION` | `FinishReason::Recitation` |
-| `finishReason` `LANGUAGE`, `MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL`, `TOO_MANY_TOOL_CALLS`, or `OTHER` | `FinishReason::Other` |
+| `finishReason` `MALFORMED_FUNCTION_CALL` or `UNEXPECTED_TOOL_CALL` | `FinishReason::MalformedToolCall`; `LlmAgent` ends the run with `model.malformed_tool_call` |
+| `finishReason` `LANGUAGE`, `TOO_MANY_TOOL_CALLS`, `OTHER`, or a value this version does not know | `FinishReason::Other` |
 
 HTTP failures take their category from the status: 500, 502, and the other 5xx statuses are
 `Unavailable` and 504 is `Timeout`, all retried; 403 is `Forbidden`.
@@ -230,7 +281,7 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     let api_key = std::env::var("OPENAI_API_KEY")?;
-    let model = OpenAIClient::new(OpenAIConfig::new(&api_key, "gpt-5.6-terra"))?;
+    let model = OpenAIClient::new(OpenAIConfig::new(&api_key, "gpt-6.1-sol"))?;
 
     let agent = LlmAgentBuilder::new("openai_assistant")
         .description("OpenAI-powered assistant")
@@ -269,7 +320,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 fn build(api_key: &str) -> anyhow::Result<LlmAgent> {
-    let model = OpenAIClient::new(OpenAIConfig::new(api_key, "gpt-5.6-terra"))?;
+    let model = OpenAIClient::new(OpenAIConfig::new(api_key, "gpt-6.1-sol"))?;
 
     Ok(LlmAgentBuilder::new("data_extractor")
         .model(Arc::new(model))
@@ -297,10 +348,11 @@ Strict mode requires `additionalProperties: false` on every object, nested objec
 
 When the model declines a request, Chat Completions sends the refusal in `message.refusal`
 (streamed as `delta.refusal`) with `content: null`. `OpenAIClient`, `OpenAICompatible` and
-its presets, `AzureOpenAIClient`, and OpenCode Chat return the refusal as the response's
-text and finish it with `FinishReason::Safety`. `error_code` stays unset, since a refusal is
-an answer, not a failure; with `output_schema` set, `LlmAgent` validates the refusal text
-like any other answer.
+its presets, `AzureOpenAIClient`, OpenCode Chat, and `OpenRouterClient` return the refusal as
+the response's text and finish it with `FinishReason::Refusal`, without an `error_code`.
+`LlmAgent` emits that event, so the session keeps the refusal, and then ends the run with
+`model.refusal` (`ErrorCategory::Forbidden`), the same outcome as an Anthropic refusal; see
+[finish reasons](../events/events.md).
 
 ### Reasoning Effort
 
@@ -309,7 +361,7 @@ use adk_model::openai::{OpenAIClient, OpenAIConfig, OpenAIReasoningEffort};
 
 fn build(api_key: &str) -> Result<OpenAIClient, adk_core::AdkError> {
     OpenAIClient::new_with_reasoning_effort(
-        OpenAIConfig::new(api_key, "gpt-5.6-terra"),
+        OpenAIConfig::new(api_key, "gpt-6.1-sol"),
         OpenAIReasoningEffort::XHigh,
     )
 }
@@ -338,7 +390,7 @@ fn build() -> Result<OpenAIClient, adk_core::AdkError> {
 
 `OpenAICompatible` with an `OpenAICompatibleConfig` preset (`fireworks`, `together`,
 `mistral`, `perplexity`, `cerebras`, `sambanova`, `xai`, `minimax`, `gemini`,
-`orcarouter`, `cheaper_inference`, `api_route`, and others) sets the base URL and provider name. Structured output needs
+`orcarouter`, `api_route`, and others) sets the base URL and provider name. Structured output needs
 support on the server.
 
 #### Reasoning History
@@ -378,7 +430,7 @@ use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
 
 fn build() -> anyhow::Result<OpenAICompatible> {
     let api_key = std::env::var("GEMINI_API_KEY")?;
-    Ok(OpenAICompatible::new(OpenAICompatibleConfig::gemini(api_key, "gemini-3.7-flash"))?)
+    Ok(OpenAICompatible::new(OpenAICompatibleConfig::gemini(api_key, "gemini-3.8-flash"))?)
 }
 ```
 
@@ -398,7 +450,7 @@ cargo run -p adk-agent --example gemini_openai_compat_agent
 #### OrcaRouter
 
 `OpenAICompatibleConfig::orcarouter` targets `https://api.orcarouter.ai/v1`. Model IDs carry a
-vendor prefix (`openai/gpt-5.6-terra`, `anthropic/claude-sonnet-5`), so changing the model
+vendor prefix (`openai/gpt-5.6-terra`, `anthropic/claude-sonnet-5-5`), so changing the model
 string switches the upstream vendor:
 
 ```rust
@@ -413,26 +465,6 @@ fn build() -> anyhow::Result<OpenAICompatible> {
 ```bash
 # Chat, tool calling, and a second vendor on the same client (requires ORCAROUTER_API_KEY).
 cargo run --manifest-path examples/orcarouter/Cargo.toml
-```
-
-#### Cheaper Inference
-
-`OpenAICompatibleConfig::cheaper_inference` targets `https://api.cheaperinference.com/v1`.
-Model IDs are bare (`gpt-5.4-mini`, `claude-sonnet-5`), so changing the model string switches
-the upstream vendor:
-
-```rust
-use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
-
-fn build() -> anyhow::Result<OpenAICompatible> {
-    let api_key = std::env::var("CHEAPER_INFERENCE_API_KEY")?;
-    Ok(OpenAICompatible::new(OpenAICompatibleConfig::cheaper_inference(api_key, "gpt-5.4-mini"))?)
-}
-```
-
-```bash
-# Chat, tool calling, and a second vendor on the same client (requires CHEAPER_INFERENCE_API_KEY).
-cargo run --manifest-path examples/cheaper_inference/Cargo.toml
 ```
 
 #### API Route
@@ -454,10 +486,19 @@ fn build() -> anyhow::Result<OpenAICompatible> {
 
 | Model | Catalog role |
 |-------|--------------|
-| `gpt-5.6-terra` | Default, balanced |
+| `gpt-6.1-sol` | Default, balanced |
+| `gpt-6-astra` | Flagship |
+| `gpt-6.1-terra` | Balanced |
+| `gpt-6-sol` | Balanced |
+| `gpt-6-luna` | Economy |
+| `gpt-5.6-terra` | Balanced |
 | `gpt-5.6-sol` | Flagship |
 | `gpt-5.6-luna` | Economy |
-| `gpt-5.6` | Flagship |
+
+`gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5-pro` and `o3` shut down on 2026-12-11, and
+`gpt-4.1`, `gpt-4.1-mini`, `gpt-4o` and `gpt-4o-mini` on 2027-01-14; `gpt-4.1-nano`, `o4-mini`,
+`o3-mini` and `o1` were retired on 2026-10-23. `adk_model::catalog` lists the replacement for
+each.
 
 ---
 
@@ -478,7 +519,7 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     let api_key = std::env::var("ANTHROPIC_API_KEY")?;
-    let model = AnthropicClient::new(AnthropicConfig::new(&api_key, "claude-sonnet-5"))?;
+    let model = AnthropicClient::new(AnthropicConfig::new(&api_key, "claude-sonnet-5-5"))?;
 
     let agent = LlmAgentBuilder::new("anthropic_assistant")
         .description("Anthropic-powered assistant")
@@ -518,14 +559,18 @@ fn build() -> Result<AnthropicClient, adk_core::AdkError> {
 
 | Model | Catalog role |
 |-------|--------------|
-| `claude-sonnet-5` | Default, balanced |
-| `claude-fable-5-1` | Flagship |
+| `claude-sonnet-5-5` | Default, balanced |
+| `claude-fable-5-2` | Flagship |
+| `claude-mythos-5-2` | Flagship (verified organizations only) |
 | `claude-opus-5-5` | Flagship |
-| `claude-sonnet-5-5` | Balanced |
 | `claude-haiku-5-5` | Economy |
-| `claude-opus-5` | Flagship |
-| `claude-fable-5` | Flagship |
+| `claude-fable-5-1`, `claude-mythos-5-1`, `claude-fable-5`, `claude-mythos-5` | Flagship |
+| `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6` | Flagship |
+| `claude-sonnet-5`, `claude-sonnet-4-6` | Balanced |
 | `claude-haiku-4-5` | Economy |
+
+`claude-sonnet-4-5` is deprecated and retires on 2026-11-30; Claude Opus 4.1, Opus 4, Sonnet 4
+and the Claude 3 models are retired.
 
 ---
 
@@ -564,8 +609,10 @@ async fn main() -> anyhow::Result<()> {
 | `deepseek-flash` (default) | `DeepSeekClient::chat`, `DeepSeekClient::v4_flash` |
 | `deepseek-v4-pro` | `DeepSeekClient::reasoner` (thinking on), `DeepSeekClient::v4_pro` (thinking on, effort `High`) |
 
-DeepSeek retired `deepseek-chat`, `deepseek-reasoner`, and the `deepseek-v4-flash` alias on
-2026-07-24. With thinking on, the reasoning arrives as `Part::Thinking`.
+DeepSeek retired `deepseek-chat` and `deepseek-reasoner` on 2026-07-24. The
+`deepseek-v4-flash` model was retired on 2026-09-10; its name is still accepted and served by
+`deepseek-flash`, and the catalog marks it deprecated. With thinking on, the reasoning arrives
+as `Part::Thinking`.
 
 ### Web search
 
@@ -706,7 +753,8 @@ committed at the catalog's per-unit price. See
 
 `MuseRealtimeAsrClient` (feature `muse-realtime`) transcribes live PCM16 mono audio over Meta's
 realtime WebSocket; `adk_audio::MuseStt` (feature `muse` of `adk-audio`) wraps it and
-`MuseAsrClient` as an `SttProvider`, with `TranscriptEvent`s.
+`MuseAsrClient` as an `SttProvider`, with `TranscriptEvent`s (see
+[Speech with adk-audio](../audio/speech.md)).
 
 | Behaviour | Detail |
 |-----------|--------|
@@ -862,14 +910,14 @@ returns that verification date (`PRICING_EFFECTIVE_DATE`).
 |------|-----------|
 | Cached tokens | `prompt_token_count` includes cache reads and writes; each prompt token is billed once, at the uncached, cache-read or cache-write rate |
 | Anthropic cache writes | The 1-hour share of `cache_creation_input_tokens` bills at the 1-hour rate, the rest at the 5-minute rate |
-| Long context | Gemini Pro models (over 200K), OpenAI GPT-5.4/5.5 (272K and above) and Claude Haiku 5.5 (over 100K) switch the whole request to the long-context rates; GPT-5.6 long-context rates are not applied |
+| Long context | Gemini Pro models (over 200K), OpenAI GPT-6, GPT-5.6, GPT-5.5 and GPT-5.4 (over 272K), Claude Haiku 5.5 (over 100K) and Muse Ember (over 200K) switch the whole request to the long-context rates |
 | Dated aliases | `gpt-4.1-2025-04-14`, `claude-sonnet-4-5-20250929`, `claude-sonnet-4-5@20250929` and `us.anthropic.claude-sonnet-4-5-20250929-v1:0` resolve to the listed model |
 | Billing provider | A vendor's list price applies only to providers that bill it at that price; an OpenAI model name served by another gateway stays unpriced |
-| Gemini | `gemini-3.7-flash` requests are reported as `gemini-3.8-flash`; both are priced at the Gemini 3.8 Flash rates, which change on 2027-01-01 |
-| DeepSeek | `deepseek-flash` (and the retired `deepseek-v4-flash` alias) and `deepseek-v4-pro` at peak rates during 01:00–04:00 and 06:00–10:00 UTC on weekdays, half price otherwise; Chinese public holidays bill at peak; `deepseek-chat` and `deepseek-reasoner` are unpriced |
+| Gemini | `gemini-3.7-flash` is deprecated and its requests are reported as `gemini-3.8-flash`; both are priced at the Gemini 3.8 Flash rates, which change on 2027-01-01. Gemini 4 Carbon and Argon rates change on 2026-12-01 |
+| DeepSeek | `deepseek-flash` (and the deprecated `deepseek-v4-flash` alias) and `deepseek-v4-pro` at peak rates during 01:00–04:00 and 06:00–10:00 UTC on weekdays, half price otherwise; Chinese public holidays bill at peak; `deepseek-chat` and `deepseek-reasoner` are unpriced |
 | Groq | GPT-OSS and Qwen models at Groq's published rates; models Groq prices only on request (Llama, MiniMax) stay unpriced |
 | xAI | Grok models, with the whole request at the long-context rate once the prompt reaches 200K tokens |
-| Mistral | Current models and their `-latest` aliases; retired dated ids and Mistral Large 4 (sale price) stay unpriced |
+| Mistral | Current models and their `-latest` aliases, with `mistral-large-latest` at the Mistral Large 4 rate; retired dated ids stay unpriced |
 | Ollama | Local models cost zero; `*cloud*` models stay unpriced |
 | OpenCode | Responses are attributed to `opencode` / `opencode-go` and stay unpriced |
 | Unknown models | `cost` stays `None`, which means unknown, never free |
@@ -958,7 +1006,7 @@ use adk_model::pricing::{BuiltinToolFee, ModelPrice, ModelRates, PriceVendor, Pr
 
 fn main() {
     let catalog = PricingCatalog::new("contract-2026")
-        .with_price(ModelPrice::new(PriceVendor::Google, "gemini-3.7-flash", ModelRates::new(0.75, 3.75)))
+        .with_price(ModelPrice::new(PriceVendor::Google, "gemini-3.8-flash", ModelRates::new(0.75, 3.75)))
         .with_builtin_tool_fee(
             BuiltinToolFee::per_use(PriceVendor::Google, "google_search", 0.010)
                 .for_models(["gemini-3*"]),
@@ -967,7 +1015,7 @@ fn main() {
         builtin_tool_uses: vec![BuiltinToolUse::new("google_search", 3)],
         ..Default::default()
     };
-    let cost = catalog.cost_usd(Some("gemini"), "gemini-3.7-flash", &usage).unwrap();
+    let cost = catalog.cost_usd(Some("gemini"), "gemini-3.8-flash", &usage).unwrap();
     assert!((cost - 0.03).abs() < 1e-9);
 }
 ```
@@ -985,6 +1033,7 @@ OpenAI-compatible, Azure OpenAI, Azure AI Inference, Anthropic, DeepSeek, Groq).
 | Behaviour | Rule |
 |-----------|------|
 | Transient upstream errors | HTTP 500, 502, 503, 504, and 529 map to `ErrorCategory::Unavailable` with the upstream status recorded, so `RetryConfig` retries them |
+| Quota and credit | An account out of quota or credit maps to `ErrorCategory::ResourceExhausted`, which is not retried, and the message says to add credit or raise the limit: HTTP 402 from any client, an error `code` or `type` of `insufficient_quota`, `credit_balance_exhausted`, `billing_hard_limit_reached`, `organization_spend_limit_exceeded` or `project_spend_limit_exceeded` (OpenAI sends these with HTTP 429), and Anthropic's `billing_error`. Gemini's `RESOURCE_EXHAUSTED` stays `RateLimited`: its quotas reset, and `retryDelay` says when |
 | `Retry-After` | A delay in seconds or an HTTP-date is attached to the error and used for the next retry. A delay above `RetryConfig::max_server_delay` (default 60 seconds) is not waited: the error is returned with the delay on `AdkError::retry` |
 | Gemini `RetryInfo` | Without a `Retry-After` header, Gemini (AI Studio and Vertex AI) takes the delay from the `retryDelay` of a `google.rpc.RetryInfo` error detail (`"37s"`, `"1.5s"`), which is how the API reports the wait a 429 quota error needs, under the same bound |
 | Mid-stream Anthropic `error` event | Fails the stream with the category of the equivalent HTTP error, so `overloaded_error` and `rate_limit_error` are retryable |
@@ -993,7 +1042,7 @@ OpenAI-compatible, Azure OpenAI, Azure AI Inference, Anthropic, DeepSeek, Groq).
 | Text-encoded tool calls | Recognised only when the request declares the named tool; a ` ```json ` fence also needs an `arguments` or `parameters` object. DeepSeek-V3 native tokens (`<｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME` with a fenced arguments object, and the V3.1 `NAME<｜tool▁sep｜>{...}` form) become calls. The OpenAI-compatible clients and `OllamaModel` recognise them in streamed and complete responses |
 | Several function responses in one content | The Chat Completions clients (OpenAI-compatible and its presets, OpenCode Chat, Azure OpenAI, Groq, DeepSeek, OpenRouter) send one `tool` message per response, in order, and the content's other parts as a user message after them; these clients and Azure AI Inference also send function responses in a user-role content as `tool` messages |
 | Images a tool returns | Anthropic sends them inside the `tool_result` block and Bedrock inside the `toolResult` (Bedrock also carries supported documents); the OpenAI clients, Groq, DeepSeek, Azure AI Inference, and Ollama, whose tool messages carry only text, send them in a user message after the tool messages |
-| Tool order | Anthropic and Bedrock send tool definitions sorted by name, so the prompt-cache prefix is stable |
+| Tool order | Every provider sends tool definitions in the order the agent declares them (`LlmRequest.tools` is an ordered `ToolDeclarations`), as adk-python and adk-go do. The order is the same on every request, so the prompt-cache prefix is stable |
 | API keys | Provider configs redact the key in `Debug` output and omit it when serialized |
 | Error messages | Every client, Gemini, Ollama, and OpenRouter included, quotes an HTTP error body or a provider's error message up to `adk_core::UPSTREAM_EXCERPT_BYTES` (512 bytes), since it can echo the prompt or tool arguments. A response that cannot be decoded is described by its decoder error class and position (`adk_core::json_error_summary`), never quoted |
 | Logs | Clients, the retry loop, and `adk-gemini` log a failure's diagnostics (`AdkError::diagnostics()`: category, code, upstream status, provider, provider code, request ID) and never its message, a response body, or a response; see [Errors in spans and logs](../observability/telemetry.md#errors-in-spans-and-logs) |
@@ -1043,7 +1092,7 @@ returns it; a streamed answer carries every token's entry on its final response.
 
 A model can still reject a field its API accepts: GPT-5 models answer `stop` with HTTP 400,
 so stop sequences on OpenAI need a model such as `gpt-4.1-mini`, and current Gemini models
-(`gemini-3.5-flash-lite`, `gemini-3.7-flash`) answer penalties and log probabilities with
+(`gemini-3.5-flash-lite`, `gemini-3.8-flash`) answer penalties and log probabilities with
 `INVALID_ARGUMENT` ("Penalty is not enabled for this model"), which fails the request with
 `ErrorCategory::InvalidInput`. `top_k` is not covered by this check, and `OllamaModel` does
 not send `max_output_tokens`.
@@ -1136,6 +1185,16 @@ state is not written, and no tool from the turn runs.
 - **SSE framing**: `data:` fields are read with or without the space after the colon, a
   last line without a line ending is read, and a UTF-8 character split across network
   chunks is decoded whole.
+- **OpenRouter refusals and malformed tool calls**: OpenRouter normalizes `finish_reason` and
+  keeps the provider's own value in `native_finish_reason`. A `native_finish_reason` of
+  `refusal` finishes with `FinishReason::Refusal`, and `MALFORMED_FUNCTION_CALL`,
+  `UNEXPECTED_TOOL_CALL`, or `malformed_tool_use` with `FinishReason::MalformedToolCall`. A chat
+  `refusal` or a Responses `refusal` content part is the response's text and finishes with
+  `FinishReason::Refusal`.
+- **Bedrock stop reasons**: `malformed_tool_use` finishes with `FinishReason::MalformedToolCall`,
+  `model_context_window_exceeded` with `FinishReason::MaxTokens`, `content_filtered` and
+  `guardrail_intervened` with `FinishReason::Safety`, and `malformed_model_output` with
+  `FinishReason::Other`.
 - **OpenRouter Responses**: `response.incomplete` for `max_output_tokens` finishes with
   `FinishReason::MaxTokens` and for `content_filter` with `FinishReason::Safety`; any other
   reason fails with `model.openrouter.response_incomplete`, and a `cancelled` status with
@@ -1277,11 +1336,11 @@ use std::sync::Arc;
 
 fn model_for(provider: &str, api_key: &str) -> anyhow::Result<Arc<dyn Llm>> {
     Ok(match provider {
-        "openai" => Arc::new(OpenAIClient::new(OpenAIConfig::new(api_key, "gpt-5.6-terra"))?),
-        "anthropic" => Arc::new(AnthropicClient::new(AnthropicConfig::new(api_key, "claude-sonnet-5"))?),
+        "openai" => Arc::new(OpenAIClient::new(OpenAIConfig::new(api_key, "gpt-6.1-sol"))?),
+        "anthropic" => Arc::new(AnthropicClient::new(AnthropicConfig::new(api_key, "claude-sonnet-5-5"))?),
         "deepseek" => Arc::new(DeepSeekClient::chat(api_key)?),
         "groq" => Arc::new(GroqClient::new(GroqConfig::gpt_oss_120b(api_key))?),
-        _ => Arc::new(GeminiModel::new(api_key, "gemini-3.7-flash")?),
+        _ => Arc::new(GeminiModel::new(api_key, "gemini-3.8-flash")?),
     })
 }
 
@@ -1297,6 +1356,9 @@ fn build(provider: &str, api_key: &str) -> anyhow::Result<LlmAgent> {
 configures: Gemini on Vertex AI when `GOOGLE_GENAI_USE_ENTERPRISE` or
 `GOOGLE_GENAI_USE_VERTEXAI` is `1` or `true` (needs `gemini-vertex`), then
 `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `GOOGLE_API_KEY`.
+
+To move to another provider when one fails at run time, wrap the models in a `FallbackLlm`
+([Model fallback](./fallback.md)).
 
 ---
 
@@ -1380,6 +1442,7 @@ are in the [adk-playground](https://github.com/zavora-ai/adk-playground) reposit
 - [Anthropic](./anthropic.md) - The `adk-anthropic` client
 - [Gemini Interactions API](./gemini-interactions.md) - Stateful Gemini transport
 - [OpenCode Go and Zen](./opencode.md) - Per-model routing for OpenCode services
+- [Model Fallback](./fallback.md) - An ordered chain of models across providers
 - [Ollama (Local)](./ollama.md) - Run models locally with Ollama
 - [Local Models (mistral.rs)](./mistralrs.md) - Native Rust inference
 - [LlmAgent](../agents/llm-agent.md) - Using models with agents

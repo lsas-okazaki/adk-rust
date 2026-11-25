@@ -220,9 +220,12 @@ fn delegated_run_config(parent: RunConfig) -> RunConfig {
         tool_confirmation_decisions: _,
         tool_confirmation_fingerprints: _,
         tool_confirmation_handler,
+        tool_reviewer,
+        requested_call_seal,
         runtime_toolsets: _,
         cached_content: _,
         transfer_targets: _,
+        transfer_target_descriptions: _,
         parent_agent: _,
         auto_cache,
         history_max_events,
@@ -251,6 +254,8 @@ fn delegated_run_config(parent: RunConfig) -> RunConfig {
         acting,
         deny_on_confirmation_timeout,
         requested_call: _,
+        intra_compaction,
+        history_compactor,
     } = parent;
     RunConfig {
         // The delegate's output is read whole.
@@ -263,9 +268,12 @@ fn delegated_run_config(parent: RunConfig) -> RunConfig {
         runtime_toolsets: Vec::new(),
         cached_content: None,
         transfer_targets: Vec::new(),
+        transfer_target_descriptions: std::collections::HashMap::new(),
         parent_agent: None,
         // Limits, governance, approvals, ledgers and identity span the whole invocation.
         tool_confirmation_handler,
+        tool_reviewer,
+        requested_call_seal,
         auto_cache,
         history_max_events,
         tool_concurrency,
@@ -296,6 +304,10 @@ fn delegated_run_config(parent: RunConfig) -> RunConfig {
         deny_on_confirmation_timeout,
         // The person asked the caller's agent; a delegate never takes the call.
         requested_call: None,
+        // The delegate compacts as its caller does; the runner's compactor records a
+        // compaction only for its own invocation, so the delegate's stays in its history.
+        intra_compaction,
+        history_compactor,
     }
 }
 

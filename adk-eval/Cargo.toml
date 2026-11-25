@@ -9,18 +9,21 @@ description = "Agent evaluation framework for ADK-Rust"
 repository = "https://github.com/zavora-ai/adk-rust"
 documentation = "https://docs.rs/adk-eval"
 readme = "README.md"
+exclude = ["tests/"]
 homepage.workspace = true
+keywords = ["ai", "agent", "evaluation", "testing", "llm"]
+categories = ["development-tools::testing"]
 
 [package.metadata.docs.rs]
 features = ["embedding", "ci-helpers", "statistics", "vertex-eval", "personas", "experiments"]
-keywords = ["ai", "agent", "evaluation", "testing", "llm"]
-categories = ["development-tools::testing"]
 
 [dependencies]
 adk-core.workspace = true
 adk-runner.workspace = true
 adk-session.workspace = true
 adk-model.workspace = true
+# The online evaluator's run hooks.
+adk-plugin.workspace = true
 adk-memory = { workspace = true, optional = true }
 adk-gcp = { workspace = true, optional = true }
 
@@ -32,8 +35,11 @@ uuid.workspace = true
 chrono.workspace = true
 futures.workspace = true
 tracing.workspace = true
+# Image fixtures are pinned by SHA-256 and verified on load.
+sha2.workspace = true
+# The online evaluator's worker, queue and JSONL store.
+tokio = { workspace = true, features = ["sync", "rt", "fs", "io-util"] }
 quick-xml = { version = "0.41", optional = true }
-statrs = { version = "0.18", optional = true }
 libm = { version = "0.2", optional = true }
 reqwest = { workspace = true, optional = true }
 google-cloud-auth = { version = "1.8", optional = true, default-features = false, features = ["default-rustls-provider"] }
@@ -47,16 +53,20 @@ embedding = ["dep:adk-memory", "adk-memory/embedding-trait"]
 # JUnit XML generation for CI integration
 ci-helpers = ["dep:quick-xml"]
 # Statistical testing (Wilcoxon signed-rank) for A/B comparison
-statistics = ["dep:statrs"]
+statistics = ["dep:libm"]
 # Sequential and Bayesian analysis of web experiments with guardrails (spec 3.5 §7.12)
 experiments = ["dep:libm"]
 # Gen AI Evaluation Service bridge (Vertex AI projects.locations:evaluateInstances)
-vertex-eval = ["adk-gcp", "google-cloud-auth", "reqwest"]
+vertex-eval = ["dep:adk-gcp", "dep:google-cloud-auth", "dep:reqwest"]
 
 [dev-dependencies]
 adk-agent = { path = "../adk-agent" }
-tokio = { workspace = true, features = ["rt", "macros"] }
-tokio-test = "0.4"
+# The live tests (`tests/live_anthropic.rs`, ignored by default) run on Claude.
+adk-model = { path = "../adk-model", features = ["anthropic"] }
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "time"] }
+# A runner with plugins, for the online evaluator's integration tests.
+adk-runner = { path = "../adk-runner", features = ["plugins"] }
+tracing-subscriber = { workspace = true }
 tempfile = "3.0"
 proptest = "1.5"
 axum = "0.8"

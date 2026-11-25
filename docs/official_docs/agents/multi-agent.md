@@ -54,7 +54,7 @@ In this guide, you'll create a **Customer Service System** where a coordinator r
 ## Portable TeamSpec
 
 Use `TeamSpec` when the same team must execute identically in generated
-projects, the CLI, Studio preview, and Enterprise deployments. The spec is
+projects, the CLI, and Enterprise deployments. The spec is
 serializable data; `compile` binds each declared name to any existing `Agent`
 implementation and returns an executable `CompiledTeam` root. It does not add a
 new atomic agent kind.
@@ -222,7 +222,7 @@ use std::sync::Arc;
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 
     // Specialist: Billing Agent
     let billing_agent = LlmAgentBuilder::new("billing_agent")
@@ -469,7 +469,7 @@ use std::sync::Arc;
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 
     // Level 3: Leaf specialists
     let researcher = LlmAgentBuilder::new("researcher")
@@ -892,6 +892,23 @@ This enables seamless data flow between parent and child agents when using the A
 a fresh stack, so agent tools nest to any depth within a runtime worker thread's 2 MiB stack.
 Dropping the run, or the call's timeout, aborts the task; a panic in it fails the call as
 `tool.panicked`, as it does for any tool.
+
+## Background Sub-Agents
+
+Every pattern above waits: a transfer hands the turn over, and an `AgentTool` or a `TeamSpec`
+delegation returns the member's answer in the same turn. A
+[background sub-agent](background-subagents.md) does not: `start_subagent` runs another agent
+as a durable run and returns at once, the parent keeps working, and it is told when the
+sub-agent finishes — in its running turn, or by a new turn. The parent can check on it with
+`subagent_status`, send it follow-ups with `message_subagent`, and stop it with
+`cancel_subagent`. A sub-agent runs on a budget slice carved from the parent's run, can call
+only tools its parent has, and survives a crash of its host.
+
+| Choose | When |
+|---|---|
+| Transfer | Another agent should own the conversation from here |
+| `AgentTool`, `TeamSpec` delegation | The parent needs the answer before its next step |
+| Background sub-agent | The work is long, independent, or many-at-once, and the parent has other work meanwhile |
 
 ## Running Multi-Agent Systems
 

@@ -10,8 +10,8 @@ Session management and state persistence for Rust Agent Development Kit (ADK-Rus
 
 `adk-session` provides session and state management for the Rust Agent Development Kit ([ADK-Rust](https://github.com/zavora-ai/adk-rust)):
 
-- **InMemorySessionService** - Simple in-memory session storage
-- **SqliteSessionService** - SQLite-backed persistence (`sqlite` feature)
+- **InMemorySessionService** - In-process session storage; a read shares the stored events instead of copying them, and copies only the `num_recent_events` window it returns
+- **SqliteSessionService** - SQLite-backed persistence (`sqlite` feature); `new` opens a file database in write-ahead-log mode with `synchronous = FULL`, and events are indexed by session
 - **Durable stores** - `SpendLedger`, `ActionLedger`, and `ApprovalStore` for SQLite, PostgreSQL, Redis, MongoDB, Neo4j, and Firestore, each behind its backend's feature and proven by the `adk-core` conformance suites; the approval stores also hold the requests and delegations of the `adk-core` approval service
 - **Durable runtime stores** - `LeaseStore`, `DurableRunStore`, `ScheduleStore`, and `GovernanceStateStore` for SQLite, PostgreSQL, Redis, MongoDB, Neo4j, and Firestore, each proven by the `adk-core` conformance suites
 - **PostgresSessionService** - PostgreSQL-backed persistence (`postgres` feature)
@@ -24,6 +24,8 @@ Session management and state persistence for Rust Agent Development Kit (ADK-Rus
 - **Identifier validation** - Every backend rejects an empty, oversized, or NUL-containing app name, user ID, or session ID with an `InvalidInput` error before it touches storage
 - **One session contract** - On every backend, `create` for an existing identity fails with `session.already_exists` and writes nothing, appends to a missing session fail with `session.not_found`, events with equal timestamps keep their append order, and `list` returns the most recently updated session first; the shared conformance suite checks each backend
 - **Rewind** - `rewind` and `rewind_steps` address a session by its full identity and keep the state it was created with (in-memory, SQLite, and `EncryptedSession`)
+- **Archive** - `archive`, `unarchive`, `list_active`, `list_archived` and `export_session` on every backend: an archived session keeps its history, leaves the listing people see, takes no new turn (`session.archived`), and exports as one JSON bundle (`adk.session.bundle/v1`)
+- **Moved history** - `Session::take_events` moves a loaded session's events out instead of copying them; every backend implements it, and the runner uses it for each invocation
 
 ## Installation
 
@@ -84,12 +86,14 @@ async fn main() -> adk_core::Result<()> {
 
 ## Feature Flags
 
+No feature is enabled by default; `InMemorySessionService` needs none.
+
 | Feature | Backend | Description |
 |---------|---------|-------------|
 | `sqlite` | SQLite | Single-node persistence via sqlx |
 | `database` | SQLite | Alias for `sqlite` |
-| `postgres` | PostgreSQL | Production-grade relational persistence |
-| `redis` | Redis | Low-latency in-memory persistence via fred |
+| `postgres` | PostgreSQL | Relational persistence via sqlx, with TLS |
+| `redis` | Redis | Persistence on a standalone server or Redis Cluster via fred |
 | `mongodb` | MongoDB | Document-oriented persistence |
 | `neo4j` | Neo4j | Graph database persistence |
 | `firestore` | Firestore | Google Cloud Firestore persistence |
@@ -116,7 +120,8 @@ adk-rust = { version = "3.0.0", features = ["vertex-session"] }
 ## Vertex AI Sessions
 
 `VertexAiSessionService` stores sessions through the GA `v1` Vertex AI Agent
-Engine Session API:
+Engine Session API. The blocks in this section need the `vertex-session` feature, which no
+`adk-rust` tier enables:
 
 ```rust
 use adk_session::{VertexAiSessionConfig, VertexAiSessionService};
@@ -282,7 +287,8 @@ IDs are Firestore document IDs, so they must not contain `/`.
 ## Encrypted Sessions
 
 Wrap any `SessionService` with `EncryptedSession` to encrypt session state and event
-payloads at rest using AES-256-GCM:
+payloads at rest using AES-256-GCM. The blocks in this section need the `encrypted-session`
+feature, which no `adk-rust` tier enables:
 
 ```rust
 use adk_session::{EncryptedSession, EncryptionKey, InMemorySessionService};
@@ -351,7 +357,9 @@ async fn main() -> adk_core::Result<()> {
 }
 ```
 
-Each backend detects pre-existing tables (baseline detection) and registers them as already applied, so `migrate()` is safe to call on both fresh and existing databases. `schema_version()` returns 0 only when the registry table does not exist; a failed read is an error. PostgreSQL `migrate()` holds the advisory lock `PostgresSessionService::ADVISORY_LOCK_KEY` on one connection and closes that connection afterwards. The `migration::sqlite_runner` and `migration::pg_runner` runners take `&'static` migration steps and ASCII registry table names of at most 63 bytes.
+SQLite version 3 adds the `idx_events_session_ts` index, so loading one session reads only its rows however many other sessions share the file.
+
+Each backend detects pre-existing tables (baseline detection) and registers them as already applied, so `migrate()` is safe to call on both fresh and existing databases. `schema_version()` returns 0 only when the registry table does not exist; a failed read is an error. PostgreSQL `migrate()` holds the advisory lock `PostgresSessionService::ADVISORY_LOCK_KEY` on one connection and closes that connection afterwards. SQLite runs each step in a `BEGIN IMMEDIATE` transaction that re-reads the registry, and MongoDB and Neo4j create indexes and constraints idempotently and record each version once, with an upsert or `MERGE`, so several processes can migrate one database at once. The `migration::sqlite_runner` and `migration::pg_runner` runners take `&'static` migration steps and ASCII registry table names of at most 63 bytes.
 
 ## Durable Stores
 
@@ -406,9 +414,12 @@ The SQL types have `new(url)` and `from_pool` over the pool a session service us
 Redis, MongoDB, Neo4j, and Firestore types have `new(...)` and a constructor over a shared
 handle (`from_client`, `from_database`, `from_graph`, `from_db`). Every type has `migrate()`; the lease, run, and governance stores add `with_clock`. PostgreSQL claims runs
 with `SELECT ... FOR UPDATE SKIP LOCKED`, SQLite under `BEGIN IMMEDIATE`, and every worker
-write is fenced on the run's lease epoch. Every type passes the `adk-core` conformance
+write is fenced on the run's lease epoch. A run requeued by a retryable `RunOutcome::Failed`
+becomes claimable once its `backoff` has passed. Every type passes the `adk-core` conformance
 suites; see the
 [Durable Runtime guide](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/core/durable-runtime.md).
+
+This block needs the `postgres` feature (`adk-rust`'s `postgres-session`), which no tier enables:
 
 ```rust
 use std::time::Duration;
@@ -484,20 +495,28 @@ for `session_continuity`, and `user:` keys only with consent for `persistent_pro
 it a session lives in process memory and the keys are dropped. A subject being erased can write
 nothing. See [Subject Rights](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/security/subject-rights.md#consent-gates).
 
-## Rewind
+## Fork, Rewind, and Edit History
 
-`rewind(&identity, event_id)` removes the events after `event_id`, and `rewind_steps(&identity, n)` removes the last `n`. Both address the session by its full `AdkIdentity` — app, user, and session — and rebuild the session-scoped state from the state the session was created with plus the remaining events' deltas; app and user state are shared with other sessions and are not rewound. The in-memory and SQLite backends and `EncryptedSession` implement rewind; every other backend returns `session.rewind.unsupported`.
+`fork(ForkRequest)` creates a session of the same app and user holding the source's events up to an event, with the state the source had there, and records its origin under `adk:forked_from`. `rewind(&identity, event_id)` removes the events after `event_id`, `rewind_steps(&identity, n)` removes the last `n`, and `rewrite_history` with `HistoryRewrite::Edit` replaces or removes events. Each rebuilds the session-scoped state from the state the session was created with plus the kept events' deltas; app and user state are shared with other sessions and do not change. A result never separates a tool call from its response, a call held for a decision blocks rewinds and edits, and `expected_version` refuses a rewrite of a history that changed since it was read.
+
+| Backend | Fork | Rewind and edit |
+|---------|------|-----------------|
+| In-memory, SQLite, PostgreSQL, Redis, MongoDB, Neo4j, Firestore | Yes | Yes, atomically per session |
+| Vertex AI | Yes | `session.history.unsupported`: the Session API cannot delete events |
+| `EncryptedSession`, `ConsentGatedSessionService` | Yes | Through the inner backend |
 
 ```rust
 use adk_core::{AdkIdentity, AppName, SessionId, UserId};
-use adk_session::{InMemorySessionService, SessionService};
+use adk_session::{ForkRequest, InMemorySessionService, SessionService};
 
-async fn undo_last_turn(service: &InMemorySessionService) -> adk_core::Result<()> {
+async fn branch_and_undo(service: &InMemorySessionService, event_id: &str) -> adk_core::Result<()> {
     let identity = AdkIdentity::new(
         AppName::try_from("my_app")?,
         UserId::try_from("user_123")?,
         SessionId::try_from("session_456")?,
     );
+    let fork = service.fork(ForkRequest::new(identity.clone()).at_event(event_id)).await?;
+    println!("fork {} holds {} events", fork.session.id(), fork.session.events().len());
     let _session = service.rewind_steps(&identity, 2).await?;
     Ok(())
 }
@@ -505,10 +524,16 @@ async fn undo_last_turn(service: &InMemorySessionService) -> adk_core::Result<()
 
 | Error | Category |
 |-------|----------|
-| `session.rewind.unsupported` | `Unsupported` |
+| `session.history.unsupported` | `Unsupported` |
 | `session.not_found` | `NotFound` |
 | `session.event_not_found` | `NotFound` |
+| `session.already_exists` | `Conflict` |
+| `session.history.held_call` | `Conflict` |
+| `session.history.version_mismatch` | `Conflict` |
+| `session.history.splits_tool_call` | `InvalidInput` |
 | `session.rewind.too_many_steps` | `InvalidInput` |
+
+See [Fork, Rewind, and Edit History](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/sessions/history.md).
 
 ## Changes in 3.0
 
@@ -521,7 +546,10 @@ async fn undo_last_turn(service: &InMemorySessionService) -> adk_core::Result<()
 | `get` and `list` read the current `app:` and `user:` tiers | — |
 | `delete_all_sessions` also erases the user's `user:` tier; Vertex AI implements it; the default returns `session.delete_all.unsupported` | Keep a value that must outlive the user's sessions in `app:` state or outside the session store |
 | Concurrent appends keep every state delta; equal timestamps keep append order | — |
-| SQL backends use SQLx 0.9; `sqlx` and `pgvector` are no longer implicit features | Depend on SQLx 0.9 when sharing a pool; enable `sqlite` or `postgres` |
+| SQL backends use SQLx 0.9 | Depend on SQLx 0.9 when sharing a pool |
+| Features named after optional dependencies (`sqlx`, `fred`, `tokio`, `reqwest`, `sha2`, `aes-gcm`, `rand`, `base64`, `adk-gcp`, `google-cloud-auth`) are removed | Enable the backend feature that uses the dependency: `sqlite`, `postgres`, `redis`, `mongodb`, `firestore`, `neo4j`, `vertex-session`, or `encrypted-session` |
+| Session stores add schema migrations: SQLite `sessions.initial_state` and the `idx_events_session_ts` index, PostgreSQL `events.seq`, and a MongoDB index | Call the service's `migrate()` |
+| `RedisSessionService` writes sessions through Lua scripts | Allow `EVAL` for the service's Redis user |
 | `sql_schema_version` and `schema_version()` return read failures as errors | — |
 | Migration runners take `&'static` steps | — |
 | Durable stores, durable runtime stores, and audit log stores on every backend | — |

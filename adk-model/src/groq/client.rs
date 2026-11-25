@@ -178,6 +178,12 @@ impl GroqClient {
             frequency_penalty: config.and_then(|c| c.frequency_penalty),
             presence_penalty: config.and_then(|c| c.presence_penalty),
             reasoning_effort,
+            response_format: config.and_then(|c| c.response_schema.as_ref()).map(|schema| {
+                serde_json::json!({
+                    "type": "json_schema",
+                    "json_schema": {"name": "response", "schema": schema},
+                })
+            }),
         })
     }
 }
@@ -192,6 +198,10 @@ impl Llm for GroqClient {
             request,
             None,
         )
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        crate::pricing::PricingCatalog::standard().context_window(Some("groq"), self.name())
     }
 
     fn name(&self) -> &str {
@@ -218,7 +228,8 @@ impl Llm for GroqClient {
             &mut request.contents,
             &adk_core::history::ProviderOrigin::new("groq", &self.config.model),
         );
-        let usage_span = adk_telemetry::llm_generate_span("groq", &self.config.model, stream);
+        let usage_span =
+            crate::telemetry::inference_span("groq", &self.config.model, stream, &request);
         let api_url = self.api_url();
         let api_key = self.config.api_key.clone();
         let chat_request = self.build_request(&request, stream)?;
@@ -549,5 +560,29 @@ mod tests {
             )
             .expect_err("Groq models do not return log probabilities");
         assert_eq!(error.code, "model.unsupported_config");
+    }
+
+    #[test]
+    fn a_response_schema_is_sent_as_a_json_schema_response_format() {
+        let client = GroqClient::new(GroqConfig::new("test-key", "qwen/qwen3.8-27b")).unwrap();
+        let schema =
+            serde_json::json!({"type": "object", "properties": {"choice": {"type": "string"}}});
+        let built = client
+            .build_request(
+                &request(GenerateContentConfig {
+                    response_schema: Some(schema.clone()),
+                    ..Default::default()
+                }),
+                false,
+            )
+            .unwrap();
+        let wire = serde_json::to_value(built).unwrap();
+        assert_eq!(
+            wire["response_format"],
+            serde_json::json!({"type": "json_schema", "json_schema": {"name": "response", "schema": schema}})
+        );
+        let plain =
+            client.build_request(&request(GenerateContentConfig::default()), false).unwrap();
+        assert!(serde_json::to_value(plain).unwrap().get("response_format").is_none());
     }
 }

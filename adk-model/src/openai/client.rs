@@ -28,7 +28,7 @@ use async_trait::async_trait;
 /// use adk_model::openai::{OpenAIClient, OpenAIConfig};
 ///
 /// // Tool-carrying requests for this model use the Responses API automatically.
-/// let client = OpenAIClient::new(OpenAIConfig::new("sk-key", "gpt-5.6-terra"))?;
+/// let client = OpenAIClient::new(OpenAIConfig::new("sk-key", "gpt-6.1-sol"))?;
 /// # Ok::<(), adk_core::AdkError>(())
 /// ```
 pub struct OpenAIClient {
@@ -190,7 +190,7 @@ impl OpenAIClient {
     /// use adk_model::openai::{OpenAIClient, OpenAIConfig};
     /// use adk_model::HttpTimeouts;
     ///
-    /// let client = OpenAIClient::new(OpenAIConfig::new("sk-key", "gpt-5.6-terra"))?
+    /// let client = OpenAIClient::new(OpenAIConfig::new("sk-key", "gpt-6.1-sol"))?
     ///     .with_timeouts(HttpTimeouts::new(Duration::from_secs(10), Duration::from_secs(120)))?;
     /// # let _ = client;
     /// # Ok::<(), adk_core::AdkError>(())
@@ -211,6 +211,15 @@ impl OpenAIClient {
 impl Llm for OpenAIClient {
     fn max_cost_micro_usd(&self, request: &adk_core::LlmRequest) -> Option<u64> {
         self.inner.max_cost_micro_usd(request)
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        self.inner.context_window()
+    }
+
+    // The tool route shares the configured base URL.
+    fn data_locality(&self) -> adk_core::DataLocality {
+        self.inner.data_locality()
     }
 
     fn name(&self) -> &str {

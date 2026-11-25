@@ -7,9 +7,11 @@ license.workspace = true
 authors.workspace = true
 description = "AgentSkills parser, index, and runtime injection helpers for ADK-Rust"
 repository.workspace = true
+homepage.workspace = true
 documentation = "https://docs.rs/adk-skill"
 readme = "README.md"
-keywords = ["adk", "skills", "agent", "prompt"]
+exclude = ["tests/"]
+keywords = ["adk", "skills", "agent", "prompt", "agentskills"]
 categories = ["development-tools", "asynchronous"]
 
 [features]
@@ -37,7 +39,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-serde_yaml = "0.9"
+serde-saphyr.workspace = true
 walkdir = "2.5"
 sha2 = "0.10"
 tempfile = "3"

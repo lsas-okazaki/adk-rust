@@ -15,7 +15,8 @@ use serde_json::Value;
 use super::api::{
     AgendaItemResponse, AgendaQuery, AgendaResponse, ApprovalItem, AttachRequest, AttachResponse,
     FreezeRequest, FreezeResponse, KillRequest, NiceRequest, ProcessResponse, ProcessesQuery,
-    ProcessesResponse, RejectRequest, ScheduleRequest, SpawnRequest,
+    ProcessesResponse, RejectRequest, RunNowRequest, ScheduleRequest, SpawnRequest, SteerRequest,
+    SteerResponse,
 };
 use super::{ControlPlaneConfig, paths};
 use crate::agenda::AgendaItem;
@@ -613,6 +614,39 @@ impl ControlClient {
         self.process_action(paths::RESUME, pid, &()).await
     }
 
+    /// `POST /kernel/processes/{pid}/run-now`: runs a cron sleeper now, outside its schedule
+    /// ([`Kernel::run_now`](crate::Kernel::run_now)); a retry with the same `request_id`
+    /// queues nothing new.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::ControlPlane`] when the kernel cannot be reached, or the
+    /// error the kernel answered, such as `kernel.frozen`.
+    pub async fn run_now(
+        &self,
+        pid: &str,
+        request_id: Option<&str>,
+    ) -> Result<crate::kernel::RunNow> {
+        let path = paths::RUN_NOW.replace("{pid}", &encode(pid));
+        self.call(Method::POST, path, Some(&run_now_request(request_id))).await
+    }
+
+    /// `POST /kernel/triggers/{name}/run-now`: runs a standing cron trigger now, outside its
+    /// schedule ([`Kernel::run_now`](crate::Kernel::run_now)).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::ControlPlane`] when the kernel cannot be reached, or the
+    /// error the kernel answered.
+    pub async fn run_trigger_now(
+        &self,
+        name: &str,
+        request_id: Option<&str>,
+    ) -> Result<crate::kernel::RunNow> {
+        let path = paths::TRIGGER_RUN_NOW.replace("{name}", &encode(name));
+        self.call(Method::POST, path, Some(&run_now_request(request_id))).await
+    }
+
     /// `GET /kernel/drivers`: the mounted drivers (spec 3.2 §7.7).
     ///
     /// # Errors
@@ -818,6 +852,42 @@ impl ControlClient {
     ) -> Result<AttachResponse> {
         let path = paths::ATTACH.replace("{session}", &encode(session_id));
         self.call(Method::POST, path, Some(request)).await
+    }
+
+    /// `POST /kernel/sessions/{session}/steer`: sends `text` to the running turn of the
+    /// caller's session `session_id` (spec 3.3 §6 "steer").
+    ///
+    /// [`SteerResponse::Accepted`] means the turn holds the message, not that it took it: the
+    /// message is delivered once [`attach`](Self::attach) shows an event whose steering marker
+    /// carries the answer's steer id, and handed back once the process leaves the answer's
+    /// claim without one. On [`SteerResponse::Returned`], [`spawn`](Self::spawn) it as the
+    /// session's next message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::ControlPlane`] when the kernel cannot be reached, or the error
+    /// the kernel answered: `403` without the `operator` scope or for a device token, `503`
+    /// while everything is stopped, `400` for a blank message, or an input guardrail's
+    /// refusal.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use adk_kernel::control::ControlClient;
+    /// use adk_kernel::control::api::{SpawnRequest, SteerResponse};
+    ///
+    /// # async fn example(client: ControlClient) -> adk_kernel::Result<()> {
+    /// let text = "use the staging database";
+    /// if client.steer("s-1", text).await? == SteerResponse::Returned {
+    ///     let next = SpawnRequest::new("adk-rust", serde_json::json!({ "text": text }));
+    ///     client.spawn(&next.with_session_id("s-1")).await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn steer(&self, session_id: &str, text: &str) -> Result<SteerResponse> {
+        let path = paths::SESSION_STEER.replace("{session}", &encode(session_id));
+        self.call(Method::POST, path, Some(&SteerRequest::new(text))).await
     }
 
     /// `GET /kernel/agenda` (spec 3.2 §7.5, §8.1 `adk-rust agenda list`).
@@ -1271,6 +1341,14 @@ fn known_code(code: &str) -> &'static str {
 }
 
 /// Percent-encodes `text` for a path segment or a query value.
+/// The body of a run now with `request_id`, when one is given.
+fn run_now_request(request_id: Option<&str>) -> RunNowRequest {
+    match request_id {
+        Some(id) => RunNowRequest::default().with_request_id(id),
+        None => RunNowRequest::default(),
+    }
+}
+
 pub(super) fn encode(text: &str) -> String {
     let mut encoded = String::with_capacity(text.len());
     for byte in text.bytes() {

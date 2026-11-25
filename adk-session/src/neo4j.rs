@@ -22,16 +22,20 @@
 //! service.migrate().await?;
 //! ```
 
+use crate::history::{
+    HistoryOutcome, ImportSessionRequest, RewriteHistoryRequest, RewrittenHistory, SessionHistory,
+};
 use crate::neo4j_stores::{Inline, detached};
 use crate::service::{
-    session_already_exists, session_id_not_found, session_not_found_for, validate_scope,
-    validate_session_id,
+    identity_not_found, session_already_exists, session_id_not_found, session_not_found_for,
+    validate_scope, validate_session_id,
 };
 use crate::{
     AppendEventRequest, CreateRequest, DeleteRequest, Event, Events, GetRequest, KEY_PREFIX_TEMP,
     ListRequest, Session, SessionService, State, state_utils,
 };
 use adk_core::Result;
+use adk_core::identity::AdkIdentity;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use neo4rs::Graph;
@@ -104,29 +108,35 @@ impl Neo4jSessionService {
     ///
     /// The runner:
     /// 1. Creates a uniqueness constraint on registry nodes.
-    /// 2. Detects baseline — if `session_unique` constraint exists but
-    ///    registry is empty, records v1 as already applied.
+    /// 2. Detects baseline — if v1's last rule, the `user_state_unique`
+    ///    constraint, exists but the registry is empty, records v1 as applied.
     /// 3. Reads the maximum applied version from the registry.
     /// 4. Returns an error if the database version exceeds the compiled-in max.
     /// 5. Executes each unapplied step idempotently and records it.
+    ///
+    /// Several processes may migrate one database at once: a schema statement that
+    /// loses a race to create the same rule succeeds, and each version is recorded with
+    /// `MERGE`, so a version another process recorded first is not an error.
     pub async fn migrate(&self) -> Result<()> {
         // Step 1: Ensure registry has a uniqueness constraint on `version`
-        self.graph
-            .run(neo4rs::query(&format!(
+        run_schema_statement(
+            &self.graph,
+            &format!(
                 "CREATE CONSTRAINT {}_version_unique IF NOT EXISTS \
                  FOR (m:{}) REQUIRE (m.version) IS UNIQUE",
                 Self::REGISTRY_LABEL.to_lowercase(),
                 Self::REGISTRY_LABEL,
-            )))
-            .await
-            .map_err(|e| {
-                adk_core::AdkError::session(format!("migration registry creation failed: {e}"))
-            })?;
+            ),
+        )
+        .await
+        .map_err(|e| {
+            adk_core::AdkError::session(format!("migration registry creation failed: {e}"))
+        })?;
 
         // Step 2: Read current max applied version
         let mut max_applied = self.read_max_applied_version().await?;
 
-        // Step 3: Baseline detection — if registry is empty but session_unique
+        // Step 3: Baseline detection — if registry is empty but v1's last
         // constraint already exists, record v1 as applied.
         if max_applied == 0 {
             let existing = self.detect_existing_tables().await?;
@@ -157,7 +167,7 @@ impl Neo4jSessionService {
             }
 
             for cypher in cypher_statements {
-                self.graph.run(neo4rs::query(cypher)).await.map_err(|e| {
+                run_schema_statement(&self.graph, cypher).await.map_err(|e| {
                     adk_core::AdkError::session(format!(
                         "{}",
                         crate::migration::MigrationError {
@@ -199,12 +209,14 @@ impl Neo4jSessionService {
         }
     }
 
-    /// Detect whether the `session_unique` constraint already exists (baseline).
+    /// Detect whether v1's last rule, the `user_state_unique` constraint, already
+    /// exists (baseline). A first `migrate` running in another process creates v1's
+    /// rules in order, so an earlier rule existing does not mean v1 is complete.
     async fn detect_existing_tables(&self) -> Result<bool> {
         let mut row_stream = self
             .graph
             .execute(neo4rs::query(
-                "SHOW CONSTRAINTS YIELD name WHERE name = 'session_unique' RETURN name",
+                "SHOW CONSTRAINTS YIELD name WHERE name = 'user_state_unique' RETURN name",
             ))
             .await
             .map_err(|e| adk_core::AdkError::session(format!("baseline detection failed: {e}")))?;
@@ -218,10 +230,13 @@ impl Neo4jSessionService {
         Ok(found)
     }
 
-    /// Record a successfully applied migration step as a registry node.
+    /// Records an applied migration step as a registry node, unless another process
+    /// recorded it first. The uniqueness constraint on `version` makes `MERGE` take a lock,
+    /// so concurrent records create one node.
     async fn record_migration(&self, version: i64, description: &str) -> Result<()> {
         let query_str = format!(
-            "CREATE (m:{} {{version: $version, description: $description, applied_at: datetime()}})",
+            "MERGE (m:{} {{version: $version}}) \
+             ON CREATE SET m.description = $description, m.applied_at = datetime()",
             Self::REGISTRY_LABEL,
         );
         self.graph
@@ -242,6 +257,18 @@ impl Neo4jSessionService {
                 ))
             })?;
         Ok(())
+    }
+}
+
+/// Runs one idempotent schema statement, succeeding when a concurrent `migrate` created
+/// the same rule first.
+async fn run_schema_statement(
+    graph: &Graph,
+    cypher: &str,
+) -> std::result::Result<(), neo4rs::Error> {
+    match graph.run(neo4rs::query(cypher)).await {
+        Err(error) if crate::neo4j_stores::lost_schema_race(&error) => Ok(()),
+        result => result,
     }
 }
 
@@ -392,6 +419,19 @@ async fn write_event(
         .map_err(|e| adk_core::AdkError::session(format!("update failed: {e}")))?;
     }
 
+    create_event(txn, app_name, user_id, session_id, event, seq).await
+}
+
+/// Creates the node of `event` at append position `seq` under its session, without touching
+/// any state.
+async fn create_event(
+    txn: &mut neo4rs::Txn,
+    app_name: &str,
+    user_id: &str,
+    session_id: &str,
+    event: &Event,
+    seq: i64,
+) -> Result<()> {
     let llm_response_json = serde_json::to_string(&event.llm_response)
         .map_err(|e| adk_core::AdkError::session(format!("serialize failed: {e}")))?;
     let actions_json = serde_json::to_string(&event.actions)
@@ -433,6 +473,187 @@ async fn write_event(
     .map_err(|e| adk_core::AdkError::session(format!("insert failed: {e}")))?;
 
     Ok(())
+}
+
+/// Reads the history of `identity` inside `txn`, with the names of its per-key state
+/// properties. `lock` writes the session node first, which takes the lock every append takes.
+async fn load_history(
+    txn: &mut neo4rs::Txn,
+    identity: &AdkIdentity,
+    lock: bool,
+) -> Result<(SessionHistory, Vec<String>)> {
+    let lock_clause = if lock { "SET s.history_rev = coalesce(s.history_rev, 0) + 1 " } else { "" };
+    let mut rows = txn
+        .execute(
+            neo4rs::query(&format!(
+                "MATCH (s:Session {{app_name: $app_name, user_id: $user_id, \
+                        session_id: $session_id}}) {lock_clause}\
+                 RETURN s.state AS state, {} AS state_entries, s.initial_state AS initial_state",
+                state_entries("s"),
+            ))
+            .param("app_name", identity.app_name.as_ref().to_string())
+            .param("user_id", identity.user_id.as_ref().to_string())
+            .param("session_id", identity.session_id.as_ref().to_string()),
+        )
+        .await
+        .map_err(|e| adk_core::AdkError::session(format!("query failed: {e}")))?;
+    let row = rows
+        .next(&mut *txn)
+        .await
+        .map_err(|e| adk_core::AdkError::session(format!("query failed: {e}")))?
+        .ok_or_else(|| identity_not_found(identity))?;
+    let properties: Vec<String> = row
+        .get::<Vec<(String, String)>>("state_entries")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(property, _)| property)
+        .collect();
+    // Session records written by earlier releases also hold a copy of the app and user tiers.
+    let (_, _, state) = state_utils::extract_state_deltas(&row_state(&row, "state")?);
+    let initial_state = match row.get::<Option<String>>("initial_state").ok().flatten() {
+        Some(json) => Some(json_string_to_state(&json)?),
+        None => None,
+    };
+    drop(rows);
+
+    let mut event_rows = txn
+        .execute(
+            neo4rs::query(
+                "MATCH (s:Session {app_name: $app_name, user_id: $user_id, \
+                        session_id: $session_id})-[:HAS_EVENT]->(e:Event) \
+                 RETURN e.id AS id, e.invocation_id AS invocation_id, \
+                        e.branch AS branch, e.author AS author, \
+                        e.timestamp AS timestamp, e.llm_response AS llm_response, \
+                        e.actions AS actions, \
+                        e.long_running_tool_ids AS long_running_tool_ids \
+                 ORDER BY e.timestamp, e.seq",
+            )
+            .param("app_name", identity.app_name.as_ref().to_string())
+            .param("user_id", identity.user_id.as_ref().to_string())
+            .param("session_id", identity.session_id.as_ref().to_string()),
+        )
+        .await
+        .map_err(|e| adk_core::AdkError::session(format!("query failed: {e}")))?;
+    let mut events = Vec::new();
+    while let Some(row) = event_rows
+        .next(&mut *txn)
+        .await
+        .map_err(|e| adk_core::AdkError::session(format!("query failed: {e}")))?
+    {
+        if let Some(event) = row_to_event(&row) {
+            events.push(event);
+        }
+    }
+    Ok((SessionHistory::new(events, state, initial_state), properties))
+}
+
+/// Applies a history rewrite inside `txn`, which holds the session node's lock from the read
+/// to the commit.
+async fn rewrite_in(
+    txn: &mut neo4rs::Txn,
+    req: &RewriteHistoryRequest,
+    now: DateTime<Utc>,
+) -> Result<RewrittenHistory> {
+    let identity = &req.identity;
+    let (app_name, user_id, session_id) =
+        (identity.app_name.as_ref(), identity.user_id.as_ref(), identity.session_id.as_ref());
+    let (history, properties) = load_history(txn, identity, true).await?;
+    let rewritten = history.rewrite(identity, &req.rewrite, req.expected_version.as_deref())?;
+    let change = &rewritten.change;
+
+    if !change.removed.is_empty() {
+        txn.run(
+            neo4rs::query(
+                "MATCH (s:Session {app_name: $app_name, user_id: $user_id, \
+                        session_id: $session_id})-[:HAS_EVENT]->(e:Event) \
+                 WHERE e.id IN $ids DETACH DELETE e",
+            )
+            .param("app_name", app_name.to_string())
+            .param("user_id", user_id.to_string())
+            .param("session_id", session_id.to_string())
+            .param("ids", change.removed.clone()),
+        )
+        .await
+        .map_err(|e| adk_core::AdkError::session(format!("delete events failed: {e}")))?;
+    }
+    for event in rewritten.events.iter().filter(|e| change.replaced.contains(&e.id)) {
+        txn.run(
+            neo4rs::query(
+                "MATCH (s:Session {app_name: $app_name, user_id: $user_id, \
+                        session_id: $session_id})-[:HAS_EVENT]->(e:Event {id: $id}) \
+                 SET e.invocation_id = $invocation_id, e.branch = $branch, \
+                     e.author = $author, e.llm_response = $llm_response, \
+                     e.actions = $actions, e.long_running_tool_ids = $long_running_tool_ids",
+            )
+            .param("app_name", app_name.to_string())
+            .param("user_id", user_id.to_string())
+            .param("session_id", session_id.to_string())
+            .param("id", event.id.clone())
+            .param("invocation_id", event.invocation_id.clone())
+            .param("branch", event.branch.clone())
+            .param("author", event.author.clone())
+            .param("llm_response", to_json(&event.llm_response)?)
+            .param("actions", to_json(&event.actions)?)
+            .param("long_running_tool_ids", to_json(&event.long_running_tool_ids)?),
+        )
+        .await
+        .map_err(|e| adk_core::AdkError::session(format!("update event failed: {e}")))?;
+    }
+
+    // The rebuilt state replaces the `state` object; every per-key property is removed.
+    let cleared: HashMap<String, Option<String>> =
+        properties.into_iter().map(|property| (property, None)).collect();
+    txn.run(
+        neo4rs::query(
+            "MATCH (s:Session {app_name: $app_name, user_id: $user_id, session_id: $session_id}) \
+             SET s += $cleared, s.state = $state, s.updated_at = $now",
+        )
+        .param("app_name", app_name.to_string())
+        .param("user_id", user_id.to_string())
+        .param("session_id", session_id.to_string())
+        .param("cleared", cleared)
+        .param("state", state_to_json_string(&rewritten.state)?)
+        .param("now", now.to_rfc3339()),
+    )
+    .await
+    .map_err(|e| adk_core::AdkError::session(format!("update failed: {e}")))?;
+    Ok(rewritten)
+}
+
+fn to_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<String> {
+    serde_json::to_string(value)
+        .map_err(|e| adk_core::AdkError::session(format!("serialize failed: {e}")))
+}
+
+/// Reads the current app and user tiers.
+async fn read_tiers(
+    graph: &Graph,
+    app_name: &str,
+    user_id: &str,
+) -> Result<(HashMap<String, Value>, HashMap<String, Value>)> {
+    let mut rows = graph
+        .execute(
+            neo4rs::query(&format!(
+                "OPTIONAL MATCH (a:AppState {{app_name: $app_name}}) \
+                 OPTIONAL MATCH (u:UserState {{app_name: $app_name, user_id: $user_id}}) \
+                 RETURN a.state AS app_state, {} AS app_state_entries, \
+                        u.state AS user_state, {} AS user_state_entries",
+                state_entries("a"),
+                state_entries("u"),
+            ))
+            .param("app_name", app_name.to_string())
+            .param("user_id", user_id.to_string()),
+        )
+        .await
+        .map_err(|e| adk_core::AdkError::session(format!("query failed: {e}")))?;
+    match rows
+        .next()
+        .await
+        .map_err(|e| adk_core::AdkError::session(format!("query failed: {e}")))?
+    {
+        Some(row) => Ok((row_state(&row, "app_state")?, row_state(&row, "user_state")?)),
+        None => Ok((HashMap::new(), HashMap::new())),
+    }
 }
 
 /// Convert a Neo4j row to an `Event`.
@@ -540,6 +761,7 @@ impl SessionService for Inline<Neo4jSessionService> {
                      user_id: $user_id, \
                      session_id: $session_id, \
                      state: $state, \
+                     initial_state: $state, \
                      created_at: $now, \
                      updated_at: $now \
                  })",
@@ -922,6 +1144,135 @@ impl SessionService for Inline<Neo4jSessionService> {
     }
 
     #[instrument(skip_all)]
+    async fn history(&self, identity: &AdkIdentity) -> Result<SessionHistory> {
+        let mut txn = self
+            .graph
+            .start_txn()
+            .await
+            .map_err(|e| adk_core::AdkError::session(format!("transaction failed: {e}")))?;
+        let (history, _) = load_history(&mut txn, identity, false).await?;
+        txn.rollback()
+            .await
+            .map_err(|e| adk_core::AdkError::session(format!("rollback failed: {e}")))?;
+        Ok(history)
+    }
+
+    async fn rewrite_history(&self, req: RewriteHistoryRequest) -> Result<HistoryOutcome> {
+        let now = Utc::now();
+        let mut txn = self
+            .graph
+            .start_txn()
+            .await
+            .map_err(|e| adk_core::AdkError::session(format!("transaction failed: {e}")))?;
+        let rewritten = match rewrite_in(&mut txn, &req, now).await {
+            Ok(rewritten) => rewritten,
+            Err(error) => {
+                txn.rollback().await.ok();
+                return Err(error);
+            }
+        };
+        txn.commit()
+            .await
+            .map_err(|e| adk_core::AdkError::session(format!("commit failed: {e}")))?;
+        let identity = &req.identity;
+        let (app_state, user_state) =
+            read_tiers(&self.graph, identity.app_name.as_ref(), identity.user_id.as_ref()).await?;
+        let session = Box::new(Neo4jSession {
+            app_name: identity.app_name.as_ref().to_string(),
+            user_id: identity.user_id.as_ref().to_string(),
+            session_id: identity.session_id.as_ref().to_string(),
+            state: state_utils::merge_states(&app_state, &user_state, &rewritten.state),
+            events: rewritten.events,
+            updated_at: now,
+        });
+        Ok(HistoryOutcome::new(session, rewritten.change))
+    }
+
+    async fn import_session(&self, req: ImportSessionRequest) -> Result<Box<dyn Session>> {
+        let identity = &req.identity;
+        let (app_name, user_id, session_id) =
+            (identity.app_name.as_ref(), identity.user_id.as_ref(), identity.session_id.as_ref());
+        let (_, _, state) = state_utils::extract_state_deltas(&req.state);
+        let (_, _, initial_state) = state_utils::extract_state_deltas(&req.initial_state);
+        let updated_at = req.events.last().map_or_else(Utc::now, |event| event.timestamp);
+        let conflict = || session_already_exists(app_name, user_id, session_id);
+
+        let mut txn = self
+            .graph
+            .start_txn()
+            .await
+            .map_err(|e| adk_core::AdkError::session(format!("transaction failed: {e}")))?;
+        let mut existing = txn
+            .execute(
+                neo4rs::query(
+                    "MATCH (s:Session {app_name: $app_name, user_id: $user_id, \
+                            session_id: $session_id}) \
+                     RETURN s.session_id AS session_id",
+                )
+                .param("app_name", app_name.to_string())
+                .param("user_id", user_id.to_string())
+                .param("session_id", session_id.to_string()),
+            )
+            .await
+            .map_err(|e| adk_core::AdkError::session(format!("query failed: {e}")))?;
+        if existing
+            .next(&mut txn)
+            .await
+            .map_err(|e| adk_core::AdkError::session(format!("query failed: {e}")))?
+            .is_some()
+        {
+            return Err(conflict());
+        }
+        drop(existing);
+
+        let event_count = i64::try_from(req.events.len()).unwrap_or(i64::MAX);
+        txn.run(
+            neo4rs::query(
+                "MERGE (a:AppState {app_name: $app_name}) ON CREATE SET a.updated_at = $created \
+                 MERGE (u:UserState {app_name: $app_name, user_id: $user_id}) \
+                     ON CREATE SET u.updated_at = $created \
+                 CREATE (s:Session { \
+                     app_name: $app_name, user_id: $user_id, session_id: $session_id, \
+                     state: $state, initial_state: $initial_state, event_seq: $event_seq, \
+                     created_at: $created, updated_at: $updated \
+                 }) \
+                 CREATE (s)-[:HAS_APP_STATE]->(a), (s)-[:HAS_USER_STATE]->(u)",
+            )
+            .param("app_name", app_name.to_string())
+            .param("user_id", user_id.to_string())
+            .param("session_id", session_id.to_string())
+            .param("state", state_to_json_string(&state)?)
+            .param("initial_state", state_to_json_string(&initial_state)?)
+            .param("event_seq", event_count)
+            .param("created", Utc::now().to_rfc3339())
+            .param("updated", updated_at.to_rfc3339()),
+        )
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("ConstraintValidationFailed") {
+                conflict()
+            } else {
+                adk_core::AdkError::session(format!("import failed: {e}"))
+            }
+        })?;
+        for (event, seq) in req.events.iter().zip(1_i64..) {
+            create_event(&mut txn, app_name, user_id, session_id, event, seq).await?;
+        }
+        txn.commit()
+            .await
+            .map_err(|e| adk_core::AdkError::session(format!("commit failed: {e}")))?;
+
+        let (app_state, user_state) = read_tiers(&self.graph, app_name, user_id).await?;
+        Ok(Box::new(Neo4jSession {
+            app_name: app_name.to_string(),
+            user_id: user_id.to_string(),
+            session_id: session_id.to_string(),
+            state: state_utils::merge_states(&app_state, &user_state, &state),
+            events: req.events,
+            updated_at,
+        }))
+    }
+
     async fn health_check(&self) -> Result<()> {
         let _ = self
             .graph
@@ -978,6 +1329,22 @@ impl SessionService for Neo4jSessionService {
         detached(async move { inline.delete_all_sessions(&app_name, &user_id).await }).await
     }
 
+    async fn history(&self, identity: &AdkIdentity) -> Result<SessionHistory> {
+        let inline = Inline(self.clone());
+        let identity = identity.clone();
+        detached(async move { inline.history(&identity).await }).await
+    }
+
+    async fn rewrite_history(&self, req: RewriteHistoryRequest) -> Result<HistoryOutcome> {
+        let inline = Inline(self.clone());
+        detached(async move { inline.rewrite_history(req).await }).await
+    }
+
+    async fn import_session(&self, req: ImportSessionRequest) -> Result<Box<dyn Session>> {
+        let inline = Inline(self.clone());
+        detached(async move { inline.import_session(req).await }).await
+    }
+
     async fn health_check(&self) -> Result<()> {
         let inline = Inline(self.clone());
         detached(async move { inline.health_check().await }).await
@@ -1016,6 +1383,10 @@ impl Session for Neo4jSession {
 
     fn last_update_time(&self) -> DateTime<Utc> {
         self.updated_at
+    }
+
+    fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
     }
 }
 

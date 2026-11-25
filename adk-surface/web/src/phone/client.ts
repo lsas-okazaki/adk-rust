@@ -13,7 +13,14 @@ import type {
   DecisionsResponse,
   PhoneInfo,
   StatusLine,
+  ViewerView,
+  CameraView,
+  CamerasView,
+  CardRaised,
+  StageView,
 } from "../generated/api";
+import type { ViewerPlace } from "../viewer/route";
+import type { CameraClient, CameraFeedMessage } from "../camera/client";
 import { ApiError } from "../client";
 import { parseSse } from "../sse";
 import type { TokenStore } from "./idb";
@@ -33,6 +40,12 @@ export interface PhoneClient {
   /** The open decisions, and those decided since `decidedSince`. */
   decisions(decidedSince?: string): Promise<DecisionCard[]>;
   decision(id: string): Promise<DecisionCard>;
+  /** An image a decision holds, at the `href` its card names, read with the device's token (spec 3.7 §8.2). */
+  image?(href: string): Promise<Blob>;
+  /** The annotated viewer of one image, read-only (spec 3.7 §8.2, board choice V15). */
+  viewer?(place: ViewerPlace): Promise<ViewerView>;
+  /** The live camera surface through the device's routes (spec 3.7 §8.2, board choice C14). */
+  cameraClient?(): CameraClient;
   /**
    * Answers through the device's own route, with the changed arguments of an Edit; never for
    * an answer that needs presence.
@@ -124,12 +137,71 @@ export class HttpPhoneClient implements PhoneClient {
     return this.request<DecisionCard>(`/surface/decisions/${encodeURIComponent(id)}?surface=phone`);
   }
 
+  viewer(place: ViewerPlace) {
+    const query = new URLSearchParams({ surface: "phone" });
+    if (place.answer) query.set("answer", place.answer);
+    if (place.compare) query.set("compare", place.compare);
+    return this.request<ViewerView>(
+      `/surface/vision/${encodeURIComponent(place.session)}/images/${encodeURIComponent(place.image)}/view?${query.toString()}`,
+    );
+  }
+
+  cameraClient(): CameraClient {
+    const camera = (id: string) => `/surface/cameras/${encodeURIComponent(id)}`;
+    const unanswerable = () => Promise.reject(new ApiError(403, "Decide on the decision's own screen"));
+    return {
+      cameras: () => this.request<CamerasView>("/surface/cameras?surface=phone"),
+      camera: (id) => this.request<CameraView>(`${camera(id)}?surface=phone`),
+      feed: (id, signal) => this.cameraFeed(camera(id), signal),
+      switchTo: (id, on) => this.post<CameraView>(`${camera(id)}/${on ? "on" : "off"}?surface=phone`),
+      stop: (id) => this.post<CameraView>(`${camera(id)}/stop?surface=phone`),
+      retry: (id) => this.post<CameraView>(`${camera(id)}/retry?surface=phone`),
+      freeze: (id, frame) => this.post<StageView>(`${camera(id)}/freeze?surface=phone`, { frame }),
+      raiseCard: (id, card) => this.post<CardRaised>(`${camera(id)}/cards?surface=phone`, card),
+      // The phone answers a decision on its own screen, with its own route (spec 3.3 §10 K2).
+      decide: unanswerable,
+    };
+  }
+
+  private async *cameraFeed(path: string, signal: AbortSignal): AsyncIterable<CameraFeedMessage> {
+    const response = await fetch(`${this.base}${path}/feed?surface=phone`, {
+      credentials: "same-origin",
+      signal,
+      headers: { accept: "text/event-stream", ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) },
+    });
+    if (!response.ok) throw await problem(response);
+    if (!response.body) return;
+    for await (const frame of parseSse(response.body)) {
+      if (frame.event === "frame" && frame.data) yield { type: "frame", stage: JSON.parse(frame.data) as StageView };
+      else if (frame.event === "changed") yield { type: "changed" };
+    }
+  }
+
+  async image(href: string) {
+    if (
+      !href.startsWith(`${this.base}/surface/decisions/`) &&
+      !href.startsWith(`${this.base}/surface/vision/`) &&
+      !href.startsWith(`${this.base}/surface/cameras/`)
+    ) {
+      throw new ApiError(400, "Not an image of a decision or a session");
+    }
+    const response = await fetch(`${href}?surface=phone`, {
+      credentials: "same-origin",
+      headers: { accept: "image/*", ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) },
+    });
+    if (!response.ok) throw await problem(response);
+    return response.blob();
+  }
+
   answer(card: DecisionCard, answer: Answer, expanded: boolean, editedArgs?: unknown) {
+    // An answer that lets a call with images run names the images the phone showed (V-I5).
+    const evidence = card.media?.images.map((image) => image.digest) ?? [];
     return this.post<CommandOutcome>(`/surface/decisions/${encodeURIComponent(card.id)}/answer`, {
       version: card.version,
       answer,
       expanded,
       ...(editedArgs === undefined ? {} : { editedArgs }),
+      ...(evidence.length > 0 ? { evidence } : {}),
     });
   }
 

@@ -867,7 +867,10 @@ impl TenantKernel {
         for (expr, missed) in crons {
             let name = cron_source_name(&expr);
             let watermark = SourceWatermark::new(Arc::clone(&inner.watermarks), name.clone());
-            let source = CronWakeSource::watermarked(name, &expr, missed, Arc::new(watermark))?;
+            let mut source = CronWakeSource::watermarked(name, &expr, missed, Arc::new(watermark))?;
+            if let Some(jitter) = inner.config.salted_cron_jitter() {
+                source = source.with_jitter(jitter);
+            }
             builder = builder.wake_source(Arc::new(source));
         }
         builder.build()
@@ -944,9 +947,11 @@ fn partition_target(target: &str, partition: &PartitionId) -> String {
 /// own, so a definition never hears the signals of another's partitions.
 fn triggers(tenant: &str, target: &str, run_target: &str, set: &WakeSetDef) -> Vec<Trigger> {
     let name = format!("{target}/{}", set.name);
+    // `skip` is held by the store too, so two replicas that route two firings at once start
+    // one process; `queueOne` coalesces in the router.
     let on_conflict = match set.overlap {
-        WakeOverlap::Queue => OnConflict::Enqueue,
         WakeOverlap::Skip => OnConflict::Reject,
+        _ => OnConflict::Enqueue,
     };
     let run = NewRun::new(
         set.queue_class().as_str(),
@@ -966,7 +971,9 @@ fn triggers(tenant: &str, target: &str, run_target: &str, set: &WakeSetDef) -> V
                 }
                 other => other.clone(),
             };
-            Trigger::new(name.clone(), wake, run.clone()).with_partition(partition.clone())
+            Trigger::new(name.clone(), wake, run.clone())
+                .with_partition(partition.clone())
+                .with_overlap(set.overlap)
         })
         .collect()
 }

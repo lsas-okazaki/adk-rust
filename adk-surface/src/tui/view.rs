@@ -39,8 +39,14 @@ const MIN_BOX_ROWS: usize = 8;
 /// The words of the §7.1 "Details" part, on the `?` key.
 const DETAILS: &str = "Details";
 
+/// The key that opens a decision's image in the home (spec 3.7 §8.2).
+const OPEN_IMAGE: &str = "open image";
+
 /// How many rendered agent messages the cache keeps before it starts again.
 const MARKDOWN_CACHE: usize = 512;
+
+/// How many of a run's last lines the terminal shows under it.
+const RUN_TAIL: usize = 6;
 
 /// What marks a line break inside a one-line view of model or tool text, so a multi-line
 /// value never reads as one line (§7.1 "the exact call").
@@ -85,6 +91,8 @@ pub(crate) struct Renderer {
     /// The drawings of the thread drawn last: which version of each is live, and each sent
     /// form's state (spec 3.3 §7.4 rule 5).
     pub(crate) drawings: super::drawn::Drawings,
+    /// The web home's address, which a decision with images links to (spec 3.7 §8.2).
+    pub home: Option<String>,
 }
 
 /// One row of a decision box: its spans and its background.
@@ -126,6 +134,7 @@ impl Renderer {
             view_max_scroll: 0,
             view_page: 1,
             drawings: super::drawn::Drawings::default(),
+            home: None,
         }
     }
 
@@ -385,7 +394,7 @@ impl Renderer {
         let mut lines = Vec::new();
         for (index, item) in entry.items.iter().enumerate() {
             match item {
-                ThreadItem::Message { from, author, text } => {
+                ThreadItem::Message { from, author, text, images } => {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(
                         format!("{} · {}", safe_line(author), entry.at_text),
@@ -399,6 +408,13 @@ impl Renderer {
                                     width,
                                     0,
                                 ));
+                            }
+                            // The terminal cannot show them; it says they are there.
+                            if !images.is_empty() {
+                                lines.push(Line::from(Span::styled(
+                                    format!("[{}]", words::images_attached(images.len())),
+                                    t.label(),
+                                )));
                             }
                         }
                         Speaker::Agent => {
@@ -441,7 +457,42 @@ impl Renderer {
                         Span::styled(right, t.label()),
                     ]));
                 }
-                ThreadItem::Result { tool, call_id, ok, text } => {
+                // Suggested replies: the terminal lists them; the person types what they send.
+                ThreadItem::Suggestions { replies, .. } => {
+                    let shown: Vec<String> = replies.iter().map(|reply| safe_line(reply)).collect();
+                    lines.push(Line::from(Span::styled(
+                        fit(&format!("{}: {}", words::SUGGESTED_REPLIES, shown.join(" · ")), width),
+                        t.label(),
+                    )));
+                }
+                // A run: its line unless its activity shows it, then its last lines.
+                ThreadItem::Run { tool, call_id, ok, text, run } => {
+                    if !(results.is_some() && call_id.is_some()) {
+                        let (mark, style) = if *ok {
+                            ('✓', t.fg(t.palette().working))
+                        } else {
+                            ('✗', t.fg(t.palette().failed))
+                        };
+                        let what = run.command.as_deref().unwrap_or(tool);
+                        lines.push(Line::from(vec![
+                            Span::styled(mark.to_string(), style),
+                            Span::raw(" "),
+                            Span::styled(fit(&safe_line(what), width / 2), t.secondary()),
+                            Span::styled(format!(" · {text}"), t.label()),
+                        ]));
+                    }
+                    for line in run.output.iter().rev().take(RUN_TAIL).rev() {
+                        let style = if line.stderr { t.fg(t.palette().failed) } else { t.label() };
+                        lines.push(Line::from(vec![
+                            Span::styled("  │ ".to_string(), t.label()),
+                            Span::styled(
+                                fit(&safe_line(&line.text), width.saturating_sub(4)),
+                                style,
+                            ),
+                        ]));
+                    }
+                }
+                ThreadItem::Result { tool, call_id, ok, text, .. } => {
                     let shown_on_activity = results.is_some() && call_id.is_some();
                     if !shown_on_activity {
                         let (mark, style) = if *ok {
@@ -514,8 +565,12 @@ impl Renderer {
         for entry in &app.entries {
             named.extend(named_decisions(entry));
             for item in &entry.items {
-                if let ThreadItem::Result { call_id: Some(id), ok, text, .. } = item {
-                    results.insert(id.clone(), (*ok, text.clone()));
+                match item {
+                    ThreadItem::Result { call_id: Some(id), ok, text, .. }
+                    | ThreadItem::Run { call_id: Some(id), ok, text, .. } => {
+                        results.insert(id.clone(), (*ok, text.clone()));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -646,6 +701,123 @@ impl Renderer {
             width,
             2,
         )
+    }
+
+    /// The images of a decision as rows of its box (spec 3.7 §8.2, board choice A16).
+    fn media_rows(
+        &self,
+        card: &crate::model::DecisionCard,
+        media: &crate::evidence::CardMedia,
+        inner: usize,
+        body: Style,
+    ) -> Vec<Row> {
+        let t = &self.theme;
+        let mut rows: Vec<Row> = Vec::new();
+        let line = |rows: &mut Vec<Row>, label: &str, value: String, style: Style| {
+            for wrapped in wrap_spans(
+                vec![
+                    Span::styled(format!("{label:<9}"), t.label()),
+                    Span::styled(safe_line(&value), style),
+                ],
+                inner,
+                9,
+            ) {
+                rows.push((wrapped.spans, body));
+            }
+        };
+        let one = media.images.len() == 1;
+        for image in &media.images {
+            let label = if one { "image".to_string() } else { format!("{}", image.index + 1) };
+            line(&mut rows, &label, image.digest.clone(), t.text());
+            let mut about = vec![image.size_text.clone()];
+            about.extend(image.field.clone());
+            about.extend(image.why.clone());
+            if one {
+                about.extend(media.cut_from.as_ref().map(|from| format!("cut from {from}")));
+                about.extend(media.cut_note.clone());
+            }
+            line(&mut rows, "", about.join(" · "), t.label());
+            if let Some(purged) = &image.purged {
+                line(&mut rows, "", format!("{} — {}", purged.title, purged.text), t.accent());
+            }
+        }
+        if let Some(to) = &media.goes_to {
+            let who = match (&to.provider, &to.model) {
+                (Some(provider), Some(model)) => format!("{provider} {model} → "),
+                (None, Some(model)) => format!("{model} → "),
+                (Some(provider), None) => format!("{provider} → "),
+                (None, None) => String::new(),
+            };
+            let what = media
+                .what
+                .as_ref()
+                .map(|what| format!(" · {}", what.to_lowercase()))
+                .unwrap_or_default();
+            line(&mut rows, "goes to", format!("{who}{}{what}", to.host), t.text());
+        }
+        let mut covered: Vec<String> = media
+            .covered
+            .iter()
+            .map(|covered| match &covered.note {
+                Some(note) => format!("{} {note}", covered.text),
+                None => covered.text.clone(),
+            })
+            .collect();
+        if covered.is_empty() {
+            covered.push(crate::words::NOTHING_COVERED.to_string());
+        }
+        covered.extend(media.covered_all_text.clone());
+        line(&mut rows, "covered", covered.join(" · "), t.text());
+        let regions: Vec<&crate::evidence::EvidenceRegion> =
+            media.images.iter().flat_map(|image| image.regions.iter()).collect();
+        if !regions.is_empty() {
+            let count = format!("{}, in the image's pixels (x0,y0 → x1,y1)", regions.len());
+            line(&mut rows, "regions", count, t.text());
+            // The tag column fits the longest tag, so "face · whole person" reads in full.
+            let tag_width =
+                regions.iter().map(|region| region.tag.width()).max().unwrap_or(0).min(24);
+            for (number, region) in regions.iter().enumerate() {
+                rows.push((
+                    vec![
+                        Span::styled(format!("  {:>2}  ", number + 1), t.label()),
+                        Span::styled(
+                            format!("{:<tag_width$}  ", fit(&region.tag, tag_width)),
+                            t.accent(),
+                        ),
+                        Span::styled(
+                            format!(
+                                "covered  {},{} → {},{}",
+                                region.x0.round(),
+                                region.y0.round(),
+                                region.x1.round(),
+                                region.y1.round()
+                            ),
+                            t.text(),
+                        ),
+                    ],
+                    body,
+                ));
+            }
+        }
+        if let Some(cost) = &media.cost_text {
+            let detail =
+                media.cost_detail.as_ref().map(|detail| format!(" · {detail}")).unwrap_or_default();
+            line(&mut rows, "cost", format!("{}{detail}", cost.to_lowercase()), t.text());
+        }
+        let path = crate::evidence::decision_path(&card.id);
+        let link = match &self.home {
+            Some(home) => format!("{home}{path} (o opens it)"),
+            None => format!("{path} in the home"),
+        };
+        line(&mut rows, "see it", link, t.fg(t.palette().brand));
+        if let Some(notice) = &media.notice {
+            line(&mut rows, "", format!("{} {}", notice.title, notice.text), t.accent());
+        }
+        if let Some(kept) = &media.kept_text {
+            let kept = format!("{kept} · {}", crate::words::IMAGES_LEAVE_ONLY_COVERED);
+            line(&mut rows, "", kept, t.label());
+        }
+        rows
     }
 
     /// A decision as a box answered by key (spec 3.3 §5.2, §7.1): who and when, what will
@@ -804,6 +976,18 @@ impl Renderer {
             }
         }
 
+        // The images the call would send, as text: the full digest, what was covered, the
+        // regions in the image's pixels, where it goes and a link (spec 3.7 §8.2, A16).
+        if let Some(media) = &card.media {
+            call.push(blank.clone());
+            call.extend(self.media_rows(card, media, inner, body));
+        }
+        if let Some(parked) = &card.parked {
+            for line in wrap_spans(vec![Span::styled(parked.text.clone(), t.accent())], inner, 0) {
+                call.push((line.spans, body));
+            }
+        }
+
         // How it got here, in one line (the details show each step).
         let mut timeline: Vec<Row> = Vec::new();
         if !open.details {
@@ -830,6 +1014,10 @@ impl Renderer {
         if card.adds_agent.is_some() {
             keys.push(Span::styled(" c ", cap));
             keys.push(Span::styled(format!(" {}   ", words::CHANGE_IT_FIRST), words_style));
+        }
+        if card.media.is_some() {
+            keys.push(Span::styled(" o ", cap));
+            keys.push(Span::styled(format!(" {OPEN_IMAGE}   "), words_style));
         }
         keys.push(Span::styled(" ? ", cap));
         keys.push(Span::styled(format!(" {DETAILS}"), words_style));

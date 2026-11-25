@@ -26,7 +26,7 @@ use super::api::{
     AgendaItemResponse, AgendaQuery, AgendaResponse, AttachRequest, AttachResponse, EventsQuery,
     FreezeRequest, FreezeResponse, KillRequest, NiceRequest, PartitionModeRequest,
     PartitionResponse, PartitionsResponse, ProcessResponse, ProcessesQuery, ProcessesResponse,
-    RejectRequest, ScheduleRequest, SpawnRequest,
+    RejectRequest, RunNowRequest, ScheduleRequest, SpawnRequest, SteerRequest, SteerResponse,
 };
 use super::{ControlTransport, paths};
 use crate::agenda::{Agenda, AgendaItem};
@@ -57,6 +57,17 @@ pub(crate) trait ControlBackend: Send + Sync + 'static {
     fn targets(&self) -> Vec<String>;
     fn has_target(&self, target: &str) -> bool;
     async fn spawn(&self, run: NewRun, spec: ProcessSpec) -> Result<Process>;
+    /// Sends `text` to the running turn of `user`'s session `session` (spec 3.3 §6 "steer");
+    /// `None` when no turn takes it here, and on a backend that runs none.
+    async fn steer(
+        &self,
+        user: &str,
+        session: &str,
+        text: &str,
+    ) -> Result<Option<crate::kernel::Steering>> {
+        let _ = (user, session, text);
+        Ok(None)
+    }
     async fn ps(&self, filter: ProcessFilter) -> Result<Vec<Process>>;
     async fn process(&self, pid: &str) -> Result<Option<Process>>;
     async fn kill(&self, pid: &str, reason: &str) -> Result<()>;
@@ -64,6 +75,16 @@ pub(crate) trait ControlBackend: Send + Sync + 'static {
     async fn nice(&self, pid: &str, queue: QueueClass) -> Result<Process>;
     async fn suspend(&self, pid: &str) -> Result<()>;
     async fn resume(&self, pid: &str) -> Result<()>;
+    /// Runs a cron sleeper or a standing cron trigger now ([`Kernel::run_now`]).
+    async fn run_now(
+        &self,
+        target: crate::kernel::RunNowTarget,
+        request_id: Option<&str>,
+        by: AuditActor,
+    ) -> Result<crate::kernel::RunNow> {
+        let _ = (target, request_id, by);
+        Err(KernelError::Config { reason: "this backend runs no schedules".into() })
+    }
     /// Freezes and returns how many running processes this replica parked.
     async fn freeze(&self, reason: &str, by: AuditActor) -> Result<usize>;
     async fn unfreeze(&self, by: AuditActor) -> Result<()>;
@@ -167,6 +188,15 @@ impl ControlBackend for Kernel {
         self.processes().spawn(run, spec).await
     }
 
+    async fn steer(
+        &self,
+        user: &str,
+        session: &str,
+        text: &str,
+    ) -> Result<Option<crate::kernel::Steering>> {
+        Kernel::steer(self, user, session, text).await
+    }
+
     async fn ps(&self, filter: ProcessFilter) -> Result<Vec<Process>> {
         self.processes().ps(filter).await
     }
@@ -189,6 +219,15 @@ impl ControlBackend for Kernel {
 
     async fn resume(&self, pid: &str) -> Result<()> {
         self.processes().resume(pid).await
+    }
+
+    async fn run_now(
+        &self,
+        target: crate::kernel::RunNowTarget,
+        request_id: Option<&str>,
+        by: AuditActor,
+    ) -> Result<crate::kernel::RunNow> {
+        Kernel::run_now(self, target, request_id, by).await
     }
 
     async fn freeze(&self, reason: &str, by: AuditActor) -> Result<usize> {
@@ -234,7 +273,23 @@ impl ControlBackend for Kernel {
     }
 
     async fn put_partition(&self, partition: Partition, by: AuditActor) -> Result<Partition> {
+        let before = Kernel::partitions(self).get(&partition.id).await?;
         Kernel::partitions(self).put(partition.clone(), by).await?;
+        // A changed cap or quiet window meets the work admission held for the old one at its
+        // next step, as a changed setting does (spec 3.3 §10 K3).
+        if let Some(before) = before {
+            let reasons: Vec<&str> = [
+                (before.quotas != partition.quotas, "budget"),
+                (before.quiet_hours != partition.quiet_hours, "quiet_hours"),
+            ]
+            .into_iter()
+            .filter_map(|(changed, reason)| changed.then_some(reason))
+            .collect();
+            if !reasons.is_empty() {
+                let filter = ProcessFilter::default().partition(partition.id.clone());
+                self.supervision().readmit(&filter, &reasons).await;
+            }
+        }
         Ok(partition)
     }
 
@@ -258,8 +313,11 @@ pub(crate) fn routes(backend: Arc<dyn ControlBackend>) -> Router {
         .route(paths::NICE, post(nice))
         .route(paths::SUSPEND, post(suspend))
         .route(paths::RESUME, post(resume))
+        .route(paths::RUN_NOW, post(run_process_now))
+        .route(paths::TRIGGER_RUN_NOW, post(run_trigger_now))
         .route(paths::EVENTS, get(events))
         .route(paths::ATTACH, post(attach))
+        .route(paths::SESSION_STEER, post(steer))
         .route(paths::FREEZE, post(freeze))
         .route(paths::UNFREEZE, post(unfreeze))
         .route(paths::AGENDA, get(agenda))
@@ -530,6 +588,42 @@ async fn resume(
     after_action(backend.as_ref(), &pid).await
 }
 
+async fn run_process_now(
+    State(backend): Backend,
+    caller: Caller,
+    UrlPath(pid): UrlPath<String>,
+    Json(request): Json<RunNowRequest>,
+) -> Result<Json<crate::kernel::RunNow>> {
+    caller.require_operator("run a schedule now")?;
+    let target = crate::kernel::RunNowTarget::Process { pid: pid.clone() };
+    run_now(backend.as_ref(), &caller, target, &pid, request).await
+}
+
+async fn run_trigger_now(
+    State(backend): Backend,
+    caller: Caller,
+    UrlPath(name): UrlPath<String>,
+    Json(request): Json<RunNowRequest>,
+) -> Result<Json<crate::kernel::RunNow>> {
+    caller.require_operator("run a schedule now")?;
+    let target = crate::kernel::RunNowTarget::Trigger { name: name.clone() };
+    run_now(backend.as_ref(), &caller, target, &format!("trigger:{name}"), request).await
+}
+
+/// Records the control action, then runs `target` now as the caller.
+async fn run_now(
+    backend: &dyn ControlBackend,
+    caller: &Caller,
+    target: crate::kernel::RunNowTarget,
+    named: &str,
+    request: RunNowRequest,
+) -> Result<Json<crate::kernel::RunNow>> {
+    record(backend, caller, "run-now", Some(named), &[("requestId", json!(request.request_id))])
+        .await?;
+    let run_now = backend.run_now(target, request.request_id.as_deref(), caller.actor()).await?;
+    Ok(Json(run_now))
+}
+
 async fn events(
     State(backend): Backend,
     caller: Caller,
@@ -603,6 +697,29 @@ async fn attach(
     let cursor = transcript.last().map(|event| event.timestamp).or(request.after);
     let process = session_process(backend.as_ref(), &user_id, &session_id).await?;
     Ok(Json(AttachResponse { session_id, transcript, cursor, pending, process }))
+}
+
+/// `POST /kernel/sessions/{session}/steer` (spec 3.3 §6 "steer"): the caller's message for
+/// the running turn of their own session. The person only, as a command is: a steered
+/// message is input to an agent, which a paired device's token never sends (S-I7).
+async fn steer(
+    State(backend): Backend,
+    caller: Caller,
+    UrlPath(session_id): UrlPath<String>,
+    Json(request): Json<SteerRequest>,
+) -> Result<Json<SteerResponse>> {
+    super::settings::require_owner(&caller, "send a message to a running turn")?;
+    // Recorded before the turn holds the message: a message nobody recorded is not sent.
+    record(backend.as_ref(), &caller, "steer", Some(&session_id), &[]).await?;
+    let answer = match backend.steer(&caller.context.user_id, &session_id, &request.text).await? {
+        Some(steering) => SteerResponse::Accepted {
+            steer_id: steering.receipt.steer_id().to_string(),
+            pid: steering.pid,
+            lease_epoch: steering.lease_epoch,
+        },
+        None => SteerResponse::Returned,
+    };
+    Ok(Json(answer))
 }
 
 /// The calls `events` hold for a decision, for every agent that held one.

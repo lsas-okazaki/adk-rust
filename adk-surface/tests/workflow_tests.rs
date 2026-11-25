@@ -231,6 +231,7 @@ impl Rig {
                     agent: "invoice-run".into(),
                     session_id: session.into(),
                     text: "Bill Acme for October".into(),
+                    images: Vec::new(),
                 },
             )
             .await
@@ -266,6 +267,7 @@ impl Rig {
                     edited_args: None,
                     reason: None,
                     expanded: true,
+                    evidence: Vec::new(),
                 },
             )
             .await
@@ -804,7 +806,14 @@ async fn a_fork_preview_names_only_its_own_runs_nodes() {
     rig.done("s1").await;
     let c1 = rig.after_draft("s1").await;
     rig.engine
-        .execute(&web(), Command::Send { session_id: "s1".into(), text: "And for November".into() })
+        .execute(
+            &web(),
+            Command::Send {
+                session_id: "s1".into(),
+                text: "And for November".into(),
+                images: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     rig.until("s1", RunStatus::Waiting).await;

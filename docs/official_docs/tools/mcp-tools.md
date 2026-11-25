@@ -2,8 +2,8 @@
 
 > **Documentation map:** [Overview and architecture](../mcp/index.md) ·
 > [Client](../mcp/client.md) · [Dynamic manager](../mcp/manager.md) ·
-> [Server authoring](../mcp/server.md) · [Security](../mcp/security.md) ·
-> [Testing](../mcp/testing.md)
+> [Server authoring](../mcp/server.md) · [Agent server](../mcp/agent-server.md) ·
+> [Security](../mcp/security.md) · [Testing](../mcp/testing.md)
 
 MCP gives an AI application a standard way to discover and use capabilities
 owned by another process or service. A server can publish:
@@ -22,10 +22,11 @@ advanced protocol work, ADK-Rust re-exports the exact `rmcp` SDK version it
 uses.
 
 ADK-Rust uses `rmcp` 3, the official Rust SDK (`adk-tool` requires
-`rmcp = "3.1"`). A client connects with the `initialize` handshake by default,
+`rmcp = "3.9"`). A client connects with the `initialize` handshake by default,
 which servers of every protocol revision answer; `ClientLifecycleMode::Auto` and
 `ClientLifecycleMode::Discover` opt in to the `2026-07-28` `server/discover`
-lifecycle. `examples/mcp_protocol_revisions` demonstrates both and the SEP-2663
+lifecycle. The `mcp_protocol_revisions` example in
+[adk-playground](https://github.com/zavora-ai/adk-playground) demonstrates both and the SEP-2663
 tasks extension against a bundled server.
 
 ## Architecture
@@ -215,13 +216,8 @@ connection supervision, not an application-level health check: use a domain
 tool or a separate service probe when you need to verify the server's backing
 database or external API.
 
-Run the deterministic example:
-
-```bash
-cargo run --manifest-path examples/mcp_manager/Cargo.toml
-```
-
-It starts a real Rust MCP child server and exercises discovery, a tool call,
+The deterministic `mcp_manager` example in [adk-playground](https://github.com/zavora-ai/adk-playground)
+starts a real Rust MCP child server and exercises discovery, a tool call,
 runtime add/enable/update/disable/remove, config persistence, and shutdown. It
 does not download packages or require an API key.
 
@@ -271,7 +267,8 @@ converted into a decline so the MCP connection remains usable. Validate the
 returned values and apply consent rules in the application before accepting a
 consequential request.
 
-See `examples/mcp_elicitation` for a complete server and interactive client.
+See the `mcp_elicitation` example in [adk-playground](https://github.com/zavora-ai/adk-playground) for a complete
+server and interactive client.
 
 ## MCP Apps
 
@@ -323,6 +320,11 @@ the extension, so two settings are needed:
 |------|-----|
 | `AdkClientHandler::with_tasks()` | Declares the extension during the handshake; without it the server answers inline |
 | `McpToolset::with_task_support(config)` | Lets the toolset poll a task and sets how |
+
+Over Streamable HTTP, `McpHttpClientBuilder::with_task_support(config)` does both for
+`connect_with_elicitation`; `connect` refuses it, since a task may ask for input. An agent
+another ADK-Rust server publishes over MCP answers every call with a task backed by a durable
+run ([Serve an agent over MCP](../mcp/agent-server.md)).
 
 ```rust
 use adk_tool::mcp::rmcp::{ServiceExt, transport::TokioChildProcess};
@@ -450,5 +452,5 @@ These limits are stated so that deployment decisions remain explicit.
 
 - [MCP specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25)
 - [Official Rust SDK (`rmcp`)](https://github.com/modelcontextprotocol/rust-sdk)
-- [`rmcp` API documentation](https://docs.rs/rmcp/3.5.1/rmcp/) — the release the workspace lockfile resolves
+- [`rmcp` API documentation](https://docs.rs/rmcp/3.9/rmcp/) — the newest release that `adk-tool`'s `rmcp = "3.9"` requirement accepts
 - [Provider-aware schema normalization](schema-normalization.md)

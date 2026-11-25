@@ -16,8 +16,10 @@ Agent execution runtime for ADK-Rust.
 - **Services** — gives agents and tools the artifact service (scoped to the session), the memory service, and the request context
 - **Agent transfers** — runs transfer targets, enforcing each source agent's transfer restrictions
 - **Steering** — `Runner::steer` sends a screened message to a run in flight, which its agent takes at the next safe point
+- **Prewarm** — `Runner::prewarm` opens the model's connection, starts the servers an agent starts on its first turn and reads the session before the first message, under the kill switch and a time budget
+- **Archived sessions** — a turn on a session archived with `SessionService::archive` fails with `session.archived` before anything is saved
 - **Governance** — the run's tool policy, kill switch, budgets, spend ledger, action ledger, approval store, and audit trail
-- **Context compaction** — summarizes older events to bound model context
+- **Context compaction** — summarizes older session events after a run, and installs the auto-compaction agents apply before every model call
 - **`Launcher`** — a minimal stdin/stdout console loop
 
 ## Installation
@@ -40,8 +42,8 @@ adk-rust = "3.0.0"
 |---------|---------|---------|
 | `artifacts` | yes | `artifact_service` through `adk-artifact` |
 | `plugins` | yes | `plugin_manager` through `adk-plugin` |
-| `skills` | yes | `Runner::with_auto_skills` and skill injection through `adk-skill` |
-| `context-compaction` | no | The `compaction` module: `CompactionStrategy`, `TruncationCompaction`, `SummarisationCompaction`, and `RunnerConfigBuilder::context_compaction` for token-budget overflow |
+| `skills` | no | `Runner::with_skill_injector`, `Runner::with_auto_skills_mut`, and skill injection through `adk-skill` |
+| `context-compaction` | no | The `compaction` module: `CompactionStrategy`, `TruncationCompaction`, `SummarisationCompaction`, and `RunnerConfigBuilder::context_compaction`, a strategy auto-compaction applies in place of a summary |
 | `sandbox-runner` | no | The `sandbox_runner` module: `SandboxRunner` provisions an `adk-sandbox` workspace, binds its tools for the run, and stops it afterwards |
 
 ## Quick Start
@@ -61,7 +63,7 @@ use futures::StreamExt;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
     let agent = LlmAgentBuilder::new("assistant").model(model).build()?;
 
     let sessions = Arc::new(InMemorySessionService::new());
@@ -108,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `run_config` | The base `RunConfig` for every run |
 | `budget` | A `RunBudget` applied to every run with fresh counters |
 | `tool_policy` | The `ToolPolicy` for every run |
+| `egress_policy` | The operator's network egress ceiling (`adk_core::egress::EgressPolicy`); a tool whose `Tool::egress` declaration it does not admit is refused before it runs, and a run's own policy only narrows it |
 | `governance` | Share a `GovernanceControl` (kill switch) across runners |
 | `action_ledger`, `approval_store`, `spend_ledger` | Durable stores installed on every run whose `RunConfig` leaves them unset |
 | `durable_run_store` | `interrupt` also requests cancellation of the session's durable runs on every replica |
@@ -115,8 +118,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `identity_source`, `agent_principal` | The principal the root agent acts as |
 | `subject_delegation` | Which runs may act for a subject other than the session's user |
 | `compaction_config` | Post-invocation `EventsCompactionConfig` |
-| `intra_compaction_config`, `intra_compaction_summarizer` | Compaction within an invocation |
-| `context_compaction` | Overflow compaction (`context-compaction`) |
+| `intra_compaction_config`, `intra_compaction_summarizer`, `without_intra_compaction` | Auto-compaction before each model call; on by default at 80% of the model's context window; `IntraCompactionConfig::in_background` writes the summary off the critical path |
+| `context_compaction` | A compaction strategy in place of the summary (`context-compaction`) |
 | `context_cache_config`, `cache_capable` | Provider prompt-cache lifecycle |
 | `request_context` | Auth middleware context |
 | `cancellation_token` | Cooperative cancellation of every run |
@@ -148,9 +151,10 @@ In an ordinary agent tree, the runner checks every handoff — from a model's `t
 | Input screening | Every agent's input guardrails screen the user message before it is saved |
 | Plugin `on_event` | Sees every event the run yields, including a `before_run` early exit, a cancelled run's answers to its calls in flight, and a budget stop event |
 | Cancellation | `Runner::interrupt(session_id)` stops a run; each call still in flight is answered `{"status": "outcome_unknown"}`, persisted, and yielded |
-| Steering | `Runner::steer(identity, content)` screens a message like the run's own and queues it on that run; an agent takes it after a tool step and the runner saves it as a user event, or its `SteerReceipt` returns it when the run ends first |
+| Steering | `Runner::steer(identity, content)` screens a message like the run's own and queues it on that run; an agent takes it after a tool step and the runner saves it as a user event, or its `SteerReceipt` returns it when the run ends first. `adk-surface`'s `send` and `steer` commands, `Kernel::steer` and the kernel's chat gateway call it for a message that arrives while a turn runs |
 | Plugin `after_run` | Runs once for every run whose `before_run` ran, however it ends — including a consumer that drops the stream, whose calls in flight are answered outcome-unknown first. A durable attempt its worker drops writes nothing; the recovering worker finishes the run |
 | `Runner::close` | Closes every agent's toolsets through `Agent::close`, then the plugins |
+| `Runner::prewarm` | Calls `Agent::prewarm` on the root agent — `LlmAgent` opens its model's pooled connection with `Llm::prewarm`, a harness also starts its MCP servers — and with `Prewarm::session` reads the session, refusing an archived one; refused while frozen, stopped by `Prewarm::budget` (10 s by default); sends no prompt |
 
 `Runner::recover_unanswered_calls` answers function calls a stopped process left unanswered from the action ledger (`already_succeeded`, `already_failed`, or `outcome_unknown`) without executing them.
 
@@ -177,7 +181,7 @@ fn budgeted(agent: Arc<dyn Agent>, sessions: Arc<dyn SessionService>) -> Result<
 
 ## Spend Ledger
 
-When `RunConfig::spend_ledger` is set, every model call of the run — agent turns, compaction summaries (post-run, intra-invocation, and `context-compaction`), LLM routing, and MCP sampling — reserves its upper-bound cost (`Llm::max_cost_micro_usd`) before it is sent and commits its reported `UsageMetadata::cost`, keyed by app, agent, and vendor, through `adk_core::ModelCallScope`. A reservation the ledger refuses fails the call with `spend.limit_exceeded`, so a capped run never spends past its cap. `Runner::with_llm_spend_estimate` sets what an unpriced call commits when it reports no cost. See [Spend Ledger](../docs/official_docs/security/spend-ledger.md).
+When `RunConfig::spend_ledger` is set, every model call of the run — agent turns, compaction summaries (session compaction and auto-compaction), LLM routing, and MCP sampling — reserves its upper-bound cost (`Llm::max_cost_micro_usd`) before it is sent and commits its reported `UsageMetadata::cost`, keyed by app, agent, and vendor, through `adk_core::ModelCallScope`. A reservation the ledger refuses fails the call with `spend.limit_exceeded`, so a capped run never spends past its cap. `Runner::with_llm_spend_estimate` sets what an unpriced call commits when it reports no cost. See [Spend Ledger](../docs/official_docs/security/spend-ledger.md).
 
 ## Model History After Overlapping or Interrupted Turns
 
@@ -187,6 +191,15 @@ When `RunConfig::spend_ledger` is set, every model call of the run — agent tur
 - **Persistence:** source session events are unchanged by this projection.
 
 `temp:` state keys stay visible for the rest of their invocation — to later tools, transferred agents, and `{temp:key}` instructions — and session services drop them when they persist the event.
+
+## Session History
+
+`runner.history_control()` forks, rewinds, and edits sessions under the runtime's rules: it
+refuses a session while a turn runs on it (`session.history.run_active`), across every runner
+sharing a `SessionActivity` (`RunnerBuilder::session_activity`) and the durable run store, and
+records a decision and an outcome per operation in the runner's audit trail.
+`RewindTarget::BeforeInvocation` undoes a turn. See
+[Fork, Rewind, and Edit History](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/sessions/history.md).
 
 ## Context Compaction
 
@@ -216,7 +229,9 @@ fn compacting(
 }
 ```
 
-Compaction runs after each invocation completes. When the session's count of user events is a multiple of the interval, older events are summarized into a single compacted event, and `MutableSession::conversation_history()` uses the most recent summary instead of the original events. No compaction covers a tool call still held for confirmation: session, intra-invocation, and context compaction all stop before it, so its approval can still resume it. `BaseEventsSummarizer` and `EventsCompactionConfig` are re-exported from `adk-core`.
+Compaction runs after each invocation completes. When the session's count of user events is a multiple of the interval, older events are summarized into a single compacted event, and `MutableSession::conversation_history()` uses the most recent summary instead of the original events. No compaction covers a tool call still held for confirmation: session compaction and auto-compaction both stop before it, so its approval can still resume it.
+
+Auto-compaction is on by default. Before every model call, `LlmAgent` and `CodeActAgent` pass their history to the compactor the runner installs on `RunConfig::history_compactor` (`IntraInvocationCompactor`); once the request passes 80% of the model's context window (`Llm::context_window`), or 100,000 estimated tokens when the model reports none, all but the most recent history entries (at most 10, within half the threshold) are summarized by the agent's model — by its provider when the model compacts natively (`Llm::native_compaction`, such as Claude on the Claude API), whose signed result then opens later requests — and the compaction is recorded in the session so later runs start from the summary. A request the model rejects as too long is compacted and sent once more. See [Context Compaction](../docs/official_docs/sessions/context-compaction.md#auto-compaction-within-a-run). `BaseEventsSummarizer` and `EventsCompactionConfig` are re-exported from `adk-core`.
 
 See [Context Compaction](../docs/official_docs/sessions/context-compaction.md) for the full guide.
 
@@ -224,9 +239,9 @@ See [Context Compaction](../docs/official_docs/sessions/context-compaction.md) f
 
 | Change | Migration |
 |--------|-----------|
-| `RunnerConfig` gains `tool_policy`, `governance`, `action_ledger`, `approval_store`, `spend_ledger`, `durable_runs`, `audit`, `identity_source`, and `subject_delegation` | Set them to `None` in struct literals, or use `Runner::builder()` |
+| `RunnerConfig` gains `tool_policy`, `egress_policy`, `governance`, `action_ledger`, `approval_store`, `spend_ledger`, `durable_runs`, `audit`, `identity_source`, and `subject_delegation` | Set them to `None` in struct literals, or use `Runner::builder()` |
+| Agents compact their history before every model call, on by default; the runner no longer compacts once before the agent runs or retries `agent.run()` on a token-limit error | `without_intra_compaction()` turns it off; `intra_compaction_config(IntraCompactionConfig::at_tokens(n))` keeps a fixed threshold |
 | `adk_runner::Callbacks` and its callback aliases are removed; runner plugins' agent, model, and tool callbacks now run | Register callbacks on the agent builder or as plugins |
-| `LlmSpendRecorder` is removed; model calls meter through `ModelCallScope` | `LlmSpendEstimate` is re-exported from `adk-core` |
 | Every transfer obeys the source agent's restrictions | — |
 | A cancelled run persists `outcome_unknown` answers to its in-flight calls | — |
 | Nested agents' input guardrails screen every user message before it is saved | — |

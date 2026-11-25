@@ -39,18 +39,19 @@
 //!
 //! `session/request_permission` is a nested, agent-to-client request issued
 //! *while* the server is still handling the outer `session/prompt` request. The
-//! SDK's [`block_task`](agent_client_protocol::ConnectionTo) is only safe to
+//! SDK's [`block_task`](agent_client_protocol::v1::ConnectionTo) is only safe to
 //! await inside a task spawned with `ConnectionTo::spawn`. The prompt handler
 //! runs inside exactly such a spawned task (see `transport/stdio.rs`), so the
 //! nested request does not block the connection's dispatch loop and the outer
 //! prompt response still completes.
 
 use adk_core::{ApprovalScope, ToolConfirmationDecision, ToolConfirmationRequest};
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::Client;
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::v1::schema::{
     PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
     SessionId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
-use agent_client_protocol::{Client, ConnectionTo};
 use async_trait::async_trait;
 
 use super::error::AcpServerError;
@@ -201,7 +202,7 @@ impl PermissionBridge {
     ///
     /// Allow once and deny are always offered. An `offer` adds the two remembered
     /// answers, worded with what they cover.
-    fn options(offer: Option<&StandingOffer>) -> Vec<PermissionOption> {
+    pub(crate) fn options(offer: Option<&StandingOffer>) -> Vec<PermissionOption> {
         let mut options = vec![PermissionOption::new(
             ALLOW_OPTION_ID,
             "Allow once",
@@ -232,6 +233,12 @@ impl PermissionBridge {
         options
     }
 
+    /// The tool-call id a confirmation is presented under: its `function_call_id`, or the
+    /// streamer's `"{tool_name}-call"` fallback.
+    pub(crate) fn call_id(request: &ToolConfirmationRequest) -> String {
+        request.function_call_id.clone().unwrap_or_else(|| format!("{}-call", request.tool_name))
+    }
+
     /// Build the ACP `session/request_permission` request describing a tool call
     /// awaiting confirmation.
     ///
@@ -244,10 +251,7 @@ impl PermissionBridge {
         request: &ToolConfirmationRequest,
         offer: Option<&StandingOffer>,
     ) -> RequestPermissionRequest {
-        let call_id = request
-            .function_call_id
-            .clone()
-            .unwrap_or_else(|| format!("{}-call", request.tool_name));
+        let call_id = Self::call_id(request);
         let fields = ToolCallUpdateFields::new()
             .kind(infer_tool_kind(&request.tool_name))
             .status(ToolCallStatus::Pending)
@@ -267,7 +271,10 @@ impl PermissionBridge {
     /// request `offered_always`. A cancelled request denies (Requirement 7.4). An
     /// unrecognized selected option id is treated as a denial so an unauthorized call
     /// never executes.
-    fn answer_for(outcome: &RequestPermissionOutcome, offered_always: bool) -> PermissionAnswer {
+    pub(crate) fn answer_for(
+        outcome: &RequestPermissionOutcome,
+        offered_always: bool,
+    ) -> PermissionAnswer {
         let deny = PermissionAnswer { decision: ToolConfirmationDecision::Deny, always: false };
         match outcome {
             RequestPermissionOutcome::Selected(selected) => {
@@ -319,7 +326,7 @@ impl PermissionBridge {
 
 #[cfg(test)]
 mod tests {
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         PermissionOptionId, SelectedPermissionOutcome, ToolKind,
     };
 
@@ -332,6 +339,7 @@ mod tests {
             args: serde_json::json!({"path": "/tmp/x"}),
             origin: None,
             acting: None,
+            evidence: Vec::new(),
         }
     }
 

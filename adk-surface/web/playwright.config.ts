@@ -97,7 +97,7 @@ const surfaces: Surface[] = [
     prefix: "SHELL",
     command: "bash adk-surface/web/e2e/fixture-server.sh",
     port: 8800,
-    testMatch: ["shell.spec.ts"],
+    testMatch: ["shell.spec.ts", "a11y.spec.ts"],
     ready: "/ui/fixture.html",
   },
   {
@@ -177,6 +177,24 @@ const surfaces: Surface[] = [
     ready: "/ui/",
   },
   {
+    // The live camera surface on the real frame pipeline (spec 3.7 §8.2, S12): the conveyor
+    // clip over RTSP, two cameras through the stream pipeline, a zone edited, a camera switched
+    // off, and a card that holds the line stop with its frame; and this browser's camera, which
+    // Chromium's fake camera stands in for, feeding the web home's camera without the voice
+    // screen. `CAMERA_E2E_BIN` names an example built with another detector, such as RF-DETR.
+    name: "camera",
+    prefix: "CAMERA",
+    example: "live_camera_home",
+    features: "web,vision-camera",
+    // 8791 to 8812 are taken.
+    port: 8815,
+    testMatch: ["camera.spec.ts", "camera-browser.spec.ts"],
+    ready: "/ui/",
+    use: {
+      launchOptions: { args: ["--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream"] },
+    },
+  },
+  {
     // Agent-drawn UI (spec 3.3 §6.1 `genui`, §12 "Governed form"): Finance draws the invoice
     // form, the person sends it, and the call waits for them.
     name: "genui",
@@ -196,6 +214,21 @@ const surfaces: Surface[] = [
     port: 8806,
     testMatch: ["genui-states.spec.ts"],
     ready: "/ui/fixture.html",
+  },
+  {
+    // 3D scenes in an extension catalog (spec 3.3 §6.1 `genui`): a yard drawn with WebGL
+    // (SwiftShader), a dock picked into the form, the call it asks for, and the words without
+    // WebGL.
+    name: "genui-scenes",
+    prefix: "GENUI_SCENES",
+    example: "scripted_genui_scenes",
+    features: "web,genui",
+    port: 8807,
+    testMatch: ["genui-scenes.spec.ts"],
+    ready: "/ui/",
+    use: {
+      launchOptions: { args: ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"] },
+    },
   },
   {
     // Apps from MCP servers (spec 3.3 §6.1 `genui-apps`): Weather's app framed sandboxed over

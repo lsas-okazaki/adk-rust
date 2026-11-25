@@ -22,10 +22,13 @@
 //!
 //! Approval decisions come from, in order: a decision keyed by call ID
 //! ([`RunConfig::tool_confirmation_decisions`]), a decision keyed by fingerprint
-//! ([`RunConfig::tool_approvals`]), the run's [`ApprovalStore`], and the live
-//! [`ToolConfirmationHandler`](crate::ToolConfirmationHandler), asked through
-//! [`decide_approval`](crate::ToolConfirmationHandler::decide_approval), which is bounded by
-//! [`RunConfig::tool_confirmation_timeout`] and denies when it expires.
+//! ([`RunConfig::tool_approvals`]), the run's [`ApprovalStore`], the run's
+//! [`ToolReviewer`](crate::ToolReviewer) ([`RunConfig::tool_reviewer`]) for a call the
+//! policy holds, and the live [`ToolConfirmationHandler`](crate::ToolConfirmationHandler),
+//! asked through [`decide_approval`](crate::ToolConfirmationHandler::decide_approval), which
+//! is bounded by [`RunConfig::tool_confirmation_timeout`] and denies when it expires. A
+//! reviewer that escalates leaves the call to the handler or, without one, to the approval
+//! inbox; see [`review`](crate::review) for what it never decides.
 //!
 //! The kill switch also ends that wait. A freeze while the handler decides refuses the call
 //! with the freeze error and records it as denied by the switch, and what the wait left open
@@ -1018,6 +1021,7 @@ pub struct PendingApproval {
 ///     args: json!({ "amount": 40 }),
 ///     acting: None,
 ///     origin: None,
+///     evidence: Vec::new(),
 /// };
 ///
 /// store.record_pending(&scope, &request).await?;
@@ -1395,6 +1399,11 @@ pub struct GovernedCall {
     /// run's egress policy before anything else may run it. [`for_tool`](Self::for_tool) sets
     /// it from the call's arguments as the agent built them.
     pub egress: crate::egress::ToolEgress,
+    /// What an approver sees with the call if it is held ([`Tool::approval_evidence`]).
+    /// [`for_tool`](Self::for_tool) sets it from the call's arguments as the agent built
+    /// them; a held request carries it, and its digests are part of the request's
+    /// [fingerprint](ToolConfirmationRequest::fingerprint).
+    pub evidence: Vec<crate::Evidence>,
 }
 
 impl GovernedCall {
@@ -1414,6 +1423,7 @@ impl GovernedCall {
             resumes: None,
             requested: false,
             egress: crate::egress::ToolEgress::Undeclared,
+            evidence: Vec::new(),
         }
     }
 
@@ -1421,9 +1431,11 @@ impl GovernedCall {
     /// [`ToolOrigin`] from the tool.
     pub fn for_tool(tool: &dyn Tool, function_call_id: impl Into<String>, args: Value) -> Self {
         let egress = tool.egress(&args);
+        let evidence = tool.approval_evidence(&args);
         let mut call = Self::new(tool.name(), function_call_id, args).with_effect(tool.effect());
         call.origin = Some(ToolOrigin::of(tool));
         call.egress = egress;
+        call.evidence = evidence;
         call
     }
 
@@ -1538,6 +1550,14 @@ impl GovernedCall {
         self
     }
 
+    /// Sets what an approver sees with the call if it is held; see
+    /// [`GovernedCall::evidence`].
+    #[must_use]
+    pub fn with_evidence(mut self, evidence: impl IntoIterator<Item = crate::Evidence>) -> Self {
+        self.evidence = evidence.into_iter().collect();
+        self
+    }
+
     /// Marks the tool as read-only, or as having side effects ([`ToolEffect::NonIdempotent`]).
     #[must_use]
     pub fn with_read_only(self, read_only: bool) -> Self {
@@ -1615,6 +1635,10 @@ pub struct RequestedVia {
     pub version: u64,
     /// The declared action the person used.
     pub action_id: String,
+    /// The digest of the drawing the person saw, when the surface records one: what an
+    /// approval seal binds the call to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
 }
 
 impl RequestedVia {
@@ -1625,8 +1649,41 @@ impl RequestedVia {
             surface_id: surface_id.into(),
             version,
             action_id: action_id.into(),
+            digest: None,
         }
     }
+
+    /// The same, naming the digest of the drawing the person saw.
+    #[must_use]
+    pub fn with_digest(mut self, digest: impl Into<String>) -> Self {
+        self.digest = Some(digest.into());
+        self
+    }
+}
+
+/// A requested call, approved and about to run, as a [`RequestedCallSeal`] checks it.
+#[derive(Debug, Clone, Copy)]
+pub struct SealedCall<'a> {
+    /// The call's function-call id.
+    pub function_call_id: &'a str,
+    /// The tool.
+    pub tool_name: &'a str,
+    /// The arguments it would run with, after any edit the approver made.
+    pub args: &'a Value,
+}
+
+/// Checks a requested call — one a person asked for through something an agent drew — against
+/// the seal made when the person approved it, right before it runs (spec 3.3 §7.4 rule 5): a
+/// call whose tool or arguments changed since, or whose seal was forged or spent, is refused.
+/// Set it on [`RunConfig::requested_call_seal`](crate::RunConfig::requested_call_seal).
+pub trait RequestedCallSeal: std::fmt::Debug + Send + Sync {
+    /// `Ok` when `call` may run: its seal matches and is spent now, or it has no seal and none
+    /// is required. `Err` says why it may not, in plain words.
+    ///
+    /// # Errors
+    ///
+    /// The reason the call is refused.
+    fn verify(&self, call: &SealedCall<'_>) -> std::result::Result<(), String>;
 }
 
 /// A tool call a person asked for through something an agent drew — a form's Send, or a
@@ -2051,6 +2108,9 @@ pub struct ToolGate<'a> {
     screen: Option<&'a dyn ToolCallScreen>,
     abandon: Option<tokio::sync::watch::Receiver<bool>>,
     actor: Option<AuditActor>,
+    /// The invocation, when the gate was built from one: a reviewer reads the user's recent
+    /// messages from its session.
+    context: Option<&'a dyn InvocationContext>,
 }
 
 impl<'a> ToolGate<'a> {
@@ -2075,18 +2135,21 @@ impl<'a> ToolGate<'a> {
             screen: None,
             abandon: None,
             actor: None,
+            context: None,
         }
     }
 
     /// A gate reading the run config and identity of `ctx`.
     pub fn for_context(ctx: &'a dyn InvocationContext) -> Self {
-        Self::new(
+        let mut gate = Self::new(
             ctx.run_config(),
             ctx.agent_name(),
             ctx.invocation_id(),
             ApprovalScope::new(ctx.app_name(), ctx.user_id(), ctx.session_id()),
         )
-        .with_acting_context(ctx.acting_context())
+        .with_acting_context(ctx.acting_context());
+        gate.context = Some(ctx);
+        gate
     }
 
     /// Sets the acting context every policy request, held call, and audit record of
@@ -2235,6 +2298,7 @@ pub async fn authorize_tool_call(
         resumes,
         requested,
         egress,
+        evidence,
     } = call;
     let audited = AuditedCall {
         gate,
@@ -2242,6 +2306,7 @@ pub async fn authorize_tool_call(
         function_call_id: &function_call_id,
         effect,
         origin: origin.as_ref(),
+        evidence: &evidence,
     };
     if let Err(frozen) = config.check_governance() {
         audited.decision(&args, AuditDecision::Denied, Some(POLICY_REF_GOVERNANCE), None).await?;
@@ -2377,6 +2442,7 @@ pub async fn authorize_tool_call(
             args: args.clone(),
             acting: Some(Box::new(gate.acting.clone())),
             origin: origin.clone(),
+            evidence: evidence.clone(),
         };
         // A decision recorded before the person asked would otherwise answer the call when
         // it resumes.
@@ -2423,10 +2489,17 @@ pub async fn authorize_tool_call(
         args: args.clone(),
         acting: Some(Box::new(gate.acting.clone())),
         origin: origin.clone(),
+        evidence: evidence.clone(),
     };
-    let (approval, source) = match resolve_confirmation(gate, &request, requested).await? {
+    // A reviewer decides only what the policy holds: never a call the agent's confirmation
+    // policy asks a person about, one a person asked for, or a held call being resumed.
+    let review = approval_reason
+        .as_deref()
+        .filter(|_| !requires_confirmation && resumes.is_none())
+        .map(|reason| ReviewInput { reason, effect });
+    let (approval, source) = match resolve_confirmation(gate, &request, requested, review).await? {
         Resolution::Decided(approval, source) => (approval, source),
-        Resolution::Undecided => {
+        Resolution::Undecided(escalated) => {
             let held_by = if approval_reason.is_some() {
                 policy_ref.as_deref()
             } else {
@@ -2440,10 +2513,13 @@ pub async fn authorize_tool_call(
                     approval_reason.as_deref(),
                 )
                 .await?;
-            let reason = match approval_reason {
+            let mut reason = match approval_reason {
                 Some(reason) => format!("Tool '{tool_name}' requires confirmation: {reason}"),
                 None => format!("Tool '{tool_name}' requires confirmation"),
             };
+            if let Some(escalated) = escalated {
+                reason.push_str(&format!(" ({escalated})"));
+            }
             record_held_call(gate, &request, &reason).await?;
             return Ok(ToolAuthorization::Pending { request, reason });
         }
@@ -2470,8 +2546,8 @@ pub async fn authorize_tool_call(
                     .await?;
                 return Err(frozen);
             }
-            match edited {
-                Some(edited) => authorize_edited_args(&audited, edited).await,
+            let authorization = match edited {
+                Some(edited) => authorize_edited_args(&audited, edited).await?,
                 None => {
                     audited
                         .decision(
@@ -2481,12 +2557,33 @@ pub async fn authorize_tool_call(
                             None,
                         )
                         .await?;
-                    Ok(ToolAuthorization::Execute {
+                    ToolAuthorization::Execute {
                         args,
                         confirmation: Some(ToolConfirmationDecision::Approve),
-                    })
+                    }
                 }
+            };
+            // A requested call runs only as the person approved it: its seal, made when they
+            // decided, must still match the tool and the arguments it is about to run with.
+            if requested
+                && resumes.is_some()
+                && let Some(seal) = &config.requested_call_seal
+                && let ToolAuthorization::Execute { args: final_args, .. } = &authorization
+                && let Err(why) = seal.verify(&SealedCall {
+                    function_call_id: &function_call_id,
+                    tool_name: &tool_name,
+                    args: final_args,
+                })
+            {
+                audited
+                    .decision(final_args, AuditDecision::Denied, Some(POLICY_REF_GOVERNANCE), None)
+                    .await?;
+                return Ok(ToolAuthorization::Refuse {
+                    reason: format!("Tool '{tool_name}' was not run: {why}"),
+                    confirmation: Some(ToolConfirmationDecision::Approve),
+                });
             }
+            Ok(authorization)
         }
         ToolConfirmationDecision::Deny => {
             // The approver's message is free text, so it stays out of the record.
@@ -2565,8 +2662,10 @@ async fn close_waiting_call(
     };
     // Whether a decision for the call may have reached the store: the store was read
     // without one before this decision, or through a request for the call.
-    let mut absorb =
-        matches!(source, "handler" | "handler_timeout" | "withdrawn" | SOURCE_GOVERNANCE);
+    let mut absorb = matches!(
+        source,
+        "handler" | "handler_timeout" | "withdrawn" | SOURCE_GOVERNANCE | crate::REVIEW_SOURCE
+    );
     if let Some(service) = &config.approval_service {
         // Every request not yet applied: pending, or resolved with its outcome on the way. A
         // request already applied wrote its outcome, which may not have been taken yet.
@@ -2769,9 +2868,10 @@ pub async fn confirm_tool_call(
 ) -> Result<Option<ToolApproval>> {
     let config = gate.run_config;
     config.check_governance()?;
-    let (approval, source) = match resolve_confirmation(gate, request, false).await? {
+    // A tool's own escalation is a person's to answer, so no reviewer is asked.
+    let (approval, source) = match resolve_confirmation(gate, request, false, None).await? {
         Resolution::Decided(approval, source) => (approval, source),
-        Resolution::Undecided => {
+        Resolution::Undecided(_) => {
             tracing::info!(
                 tool.name = %request.tool_name,
                 agent.id = %gate.acting.agent.id,
@@ -2912,6 +3012,7 @@ struct AuditedCall<'g, 'a> {
     function_call_id: &'g str,
     effect: ToolEffect,
     origin: Option<&'g ToolOrigin>,
+    evidence: &'g [crate::Evidence],
 }
 
 impl AuditedCall<'_, '_> {
@@ -2926,6 +3027,11 @@ impl AuditedCall<'_, '_> {
             draft = draft
                 .ext("toolSource", Value::String(origin.source.clone()))
                 .ext("declarationDigest", Value::String(origin.declaration_digest.clone()));
+        }
+        // The images the decision binds to, by digest; never their pixels.
+        if !self.evidence.is_empty() {
+            let digests = self.evidence.iter().map(|item| Value::from(item.digest())).collect();
+            draft = draft.ext("evidenceDigests", Value::Array(digests));
         }
         Some(draft)
     }
@@ -3013,8 +3119,9 @@ async fn evaluate_policy(
 enum Resolution {
     /// A decision, and the source it came from.
     Decided(ToolApproval, &'static str),
-    /// No decision: the call is held for one.
-    Undecided,
+    /// No decision: the call is held for one. Carries the reviewer's escalation, shown with
+    /// the held call, when a reviewer escalated it.
+    Undecided(Option<String>),
     /// A kill switch refused work while the handler was deciding, or when it stopped
     /// without a decision; the error is the switch's.
     Refused(AdkError),
@@ -3029,6 +3136,7 @@ async fn resolve_confirmation(
     gate: &ToolGate<'_>,
     request: &ToolConfirmationRequest,
     people_only: bool,
+    review: Option<ReviewInput<'_>>,
 ) -> Result<Resolution> {
     let config = gate.run_config;
     let fingerprint = request.fingerprint();
@@ -3065,8 +3173,19 @@ async fn resolve_confirmation(
         return Ok(Resolution::Decided(approval, "approval_store"));
     }
 
+    let mut escalated = None;
+    if let (Some(reviewer), Some(review), false) = (&config.tool_reviewer, review, people_only) {
+        match review_held_call(gate, reviewer.as_ref(), request, review).await? {
+            Reviewed::Decided(approval) => {
+                return Ok(Resolution::Decided(approval, crate::REVIEW_SOURCE));
+            }
+            Reviewed::Escalated(note) => escalated = note,
+            Reviewed::Refused(refusal) => return Ok(Resolution::Refused(refusal)),
+        }
+    }
+
     let Some(handler) = config.tool_confirmation_handler.as_ref().filter(|_| !people_only) else {
-        return Ok(Resolution::Undecided);
+        return Ok(Resolution::Undecided(escalated));
     };
     let timeout = config.tool_confirmation_timeout;
     let decide = tokio::time::timeout(timeout, handler.decide_approval(request));
@@ -3119,7 +3238,7 @@ async fn resolve_confirmation(
             timeout = ?config.tool_confirmation_timeout,
             "confirmation handler did not decide in time; the call waits for a decision"
         );
-        return Ok(Resolution::Undecided);
+        return Ok(Resolution::Undecided(escalated));
     }
     match decided {
         Ok(Ok(approval)) => Ok(Resolution::Decided(approval, "handler")),
@@ -3133,6 +3252,180 @@ async fn resolve_confirmation(
             Ok(Resolution::Decided(ToolApproval::deny(), "handler_timeout"))
         }
     }
+}
+
+/// What a call's reviewer is asked with: the policy's reason and the call's effect.
+#[derive(Clone, Copy)]
+struct ReviewInput<'r> {
+    reason: &'r str,
+    effect: ToolEffect,
+}
+
+/// What [`review_held_call`] concluded.
+enum Reviewed {
+    /// The reviewer approved or denied the call.
+    Decided(ToolApproval),
+    /// The reviewer left the call to a person: it does not cover the call, or it escalated
+    /// it, with the note shown with the held call.
+    Escalated(Option<String>),
+    /// A kill switch refused work while the reviewer was deciding.
+    Refused(AdkError),
+}
+
+/// How many of the user's recent messages a reviewer sees.
+const REVIEW_MESSAGES: usize = 3;
+
+/// Asks the run's reviewer about a call the policy holds (spec 3.0 parity item 2).
+///
+/// A call already pending for a person stays theirs. A reviewer that fails or times out
+/// escalates. Every verdict is recorded in the run's audit trail with the reviewer as the
+/// actor before it takes effect, and an approval or denial is filed in the run's approval
+/// inbox as a request the reviewer decided.
+async fn review_held_call(
+    gate: &ToolGate<'_>,
+    reviewer: &dyn crate::ToolReviewer,
+    request: &ToolConfirmationRequest,
+    input: ReviewInput<'_>,
+) -> Result<Reviewed> {
+    use crate::ReviewVerdict;
+
+    let config = gate.run_config;
+    let fingerprint = request.fingerprint();
+    if let Some(store) = &config.approval_store
+        && store.pending(&gate.scope).await?.iter().any(|entry| entry.fingerprint == fingerprint)
+    {
+        return Ok(Reviewed::Escalated(None));
+    }
+    let context = gate
+        .context
+        .map(|ctx| {
+            crate::review::recent_user_messages(
+                &ctx.session().conversation_history(),
+                REVIEW_MESSAGES,
+            )
+        })
+        .unwrap_or_default();
+    let mut review = crate::ToolReview::new(request.clone(), gate.scope.clone())
+        .with_reason(input.reason)
+        .with_agent(gate.agent_name, gate.invocation_id)
+        .with_effect(input.effect)
+        .with_context(context)
+        .with_metering(crate::ModelCallScope::for_run(
+            config,
+            &gate.scope.app_name,
+            gate.agent_name,
+        ));
+    review.fingerprint = fingerprint;
+    if !reviewer.covers(&review).await {
+        return Ok(Reviewed::Escalated(None));
+    }
+    let subject = reviewer.reviewer();
+    let timeout = reviewer.timeout();
+    let abandoned = async {
+        if let Some(mut abandon) = gate.abandon.clone()
+            && abandon.wait_for(|failed| *failed).await.is_ok()
+        {
+            return;
+        }
+        std::future::pending::<()>().await;
+    };
+    let outcome = tokio::select! {
+        biased;
+        refusal = config.governance_refused() => return Ok(Reviewed::Refused(refusal)),
+        () = abandoned => {
+            return Err(AdkError::tool(format!(
+                "the review of tool '{}' was abandoned because another approval in the same \
+                 batch failed",
+                request.tool_name
+            )));
+        }
+        outcome = tokio::time::timeout(timeout, reviewer.review(&review)) => outcome,
+    };
+    let verdict = match outcome {
+        Ok(Ok(verdict)) => verdict,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                tool.name = %request.tool_name,
+                reviewer.id = %subject.id,
+                error = %error,
+                "the reviewer failed; a person decides the call"
+            );
+            ReviewVerdict::escalate(format!("the reviewer could not decide ({})", error.code))
+        }
+        Err(_) => ReviewVerdict::escalate(format!(
+            "the reviewer did not answer within {}s",
+            timeout.as_secs()
+        )),
+    };
+    tracing::info!(
+        tool.name = %request.tool_name,
+        reviewer.id = %subject.id,
+        review.verdict = verdict.label(),
+        "a reviewer decided a held call"
+    );
+    let audited = AuditedCall {
+        gate,
+        tool_name: &request.tool_name,
+        function_call_id: request.function_call_id.as_deref().unwrap_or_default(),
+        effect: input.effect,
+        origin: request.origin.as_ref(),
+        evidence: &request.evidence,
+    };
+    if let (Some(trail), Some(draft)) =
+        (&config.audit, audited.draft(AuditRecordKind::Approval, &request.args))
+    {
+        let decision = match &verdict {
+            ReviewVerdict::Approve { .. } => AuditDecision::Approved,
+            ReviewVerdict::Deny { .. } => AuditDecision::Rejected,
+            ReviewVerdict::Escalate { .. } => AuditDecision::ApprovalRequired,
+        };
+        // The rationale is model text about the call, so the record keeps its digest.
+        let draft = draft
+            .decision(decision)
+            .actor(AuditActor::subject(subject.clone()))
+            .ext("source", Value::String(crate::REVIEW_SOURCE.to_string()))
+            .ext("reviewer", Value::String(subject.id.clone()))
+            .ext("verdict", Value::String(verdict.label().to_string()))
+            .ext(
+                "rationaleDigest",
+                Value::String(trail.digest(&Value::String(verdict.rationale().to_string()))),
+            )
+            .ext("actingAgent", Value::String(gate.acting.agent.id.to_string()))
+            .ext("sessionId", Value::String(gate.scope.session_id.clone()));
+        trail.record(draft).await?;
+    }
+    let decision = match &verdict {
+        ReviewVerdict::Approve { rationale } => {
+            crate::ApprovalDecision::approve(subject.clone()).with_reason(rationale.clone())
+        }
+        ReviewVerdict::Deny { rationale } => {
+            crate::ApprovalDecision::reject(subject.clone(), rationale.clone())
+        }
+        ReviewVerdict::Escalate { rationale } => {
+            return Ok(Reviewed::Escalated(Some(format!(
+                "{} escalated it to a person: {rationale}",
+                subject.id
+            ))));
+        }
+    };
+    if let Some(service) = &config.approval_service {
+        let call = crate::approval::ApprovalCall {
+            scope: gate.scope.clone(),
+            request: request.clone(),
+            reason: format!("Tool '{}' requires confirmation: {}", request.tool_name, input.reason),
+            agent_name: gate.agent_name.to_string(),
+            invocation_id: gate.invocation_id.to_string(),
+            run_id: config.durable_run_id.clone(),
+            acting: Some(gate.acting.clone()),
+        };
+        service.record_review(call, decision).await?;
+    }
+    Ok(Reviewed::Decided(match verdict {
+        ReviewVerdict::Deny { rationale } => {
+            ToolApproval::deny().with_message(format!("{}: {rationale}", subject.id))
+        }
+        ReviewVerdict::Approve { .. } | ReviewVerdict::Escalate { .. } => ToolApproval::approve(),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -3233,6 +3526,7 @@ pub struct HeldToolCall {
 ///     args: json!({ "amount": 5 }),
 ///     acting: None,
 ///     origin: None,
+///     evidence: Vec::new(),
 /// });
 ///
 /// let calls = held_tool_calls(&[held], "agent", "");
@@ -3254,13 +3548,17 @@ struct ScannedHold {
 }
 
 fn scan_held_calls(events: &[Event], agent_name: &str, branch: &str) -> Vec<ScannedHold> {
+    // Only an event carrying a request holds a call; every agent run asks, most hold nothing.
+    if !events.iter().any(|event| event.actions.tool_confirmation.is_some()) {
+        return Vec::new();
+    }
     let boundary = events
         .iter()
         .rev()
         .find_map(|event| event.actions.compaction.as_ref().map(|c| c.end_timestamp));
     // Calls the agent issued, by ID; calls saved without one by invocation and name.
-    let mut issued = HashMap::<String, (String, Value, usize)>::new();
-    let mut idless = Vec::<(String, String, Value, usize)>::new();
+    let mut issued = HashMap::<&str, (&str, &Value, usize)>::new();
+    let mut idless = Vec::<(&str, &str, &Value, usize)>::new();
     let mut held = Vec::<ScannedHold>::new();
 
     for (index, event) in events.iter().enumerate() {
@@ -3280,22 +3578,18 @@ fn scan_held_calls(events: &[Event], agent_name: &str, branch: &str) -> Vec<Scan
             match part {
                 Part::FunctionCall { name, args, id, .. } if own => match id {
                     Some(id) => {
-                        issued.insert(id.clone(), (name.clone(), args.clone(), index));
+                        issued.insert(id, (name, args, index));
                     }
-                    None => idless.push((
-                        event.invocation_id.clone(),
-                        name.clone(),
-                        args.clone(),
-                        index,
-                    )),
+                    None => idless.push((&event.invocation_id, name, args, index)),
                 },
                 Part::FunctionResponse { function_response, id, .. }
-                    if !is_confirmation_pending(&function_response.response) =>
+                    if !held.is_empty()
+                        && !is_confirmation_pending(&function_response.response) =>
                 {
                     match id {
                         Some(id) => {
                             let answered = issued
-                                .get(id)
+                                .get(id.as_str())
                                 .map(|(name, args, _)| tool_call_fingerprint(name, args));
                             held.retain(|hold| {
                                 let call = &hold.call;
@@ -3316,13 +3610,13 @@ fn scan_held_calls(events: &[Event], agent_name: &str, branch: &str) -> Vec<Scan
         if own && let Some(request) = &event.actions.tool_confirmation {
             let (id, name, args, issued_at) = match request.function_call_id.as_deref() {
                 Some(call_id) if issued.contains_key(call_id) => {
-                    let (name, args, at) = &issued[call_id];
-                    (Some(call_id.to_string()), name.clone(), args.clone(), *at)
+                    let (name, args, at) = issued[call_id];
+                    (Some(call_id.to_string()), name.to_string(), args.clone(), at)
                 }
                 _ => match idless.iter().rev().find(|(invocation, name, _, _)| {
                     *invocation == event.invocation_id && *name == request.tool_name
                 }) {
-                    Some((_, name, args, at)) => (None, name.clone(), args.clone(), *at),
+                    Some((_, name, args, at)) => (None, name.to_string(), Value::clone(args), *at),
                     None => (
                         request.function_call_id.clone(),
                         request.tool_name.clone(),
@@ -3402,6 +3696,7 @@ fn scan_all_held_calls(events: &[Event]) -> Vec<ScannedHold> {
 ///     args: json!({ "amount": 5 }),
 ///     acting: None,
 ///     origin: None,
+///     evidence: Vec::new(),
 /// });
 ///
 /// let events = vec![ask, call, hold];
@@ -3446,6 +3741,7 @@ pub fn held_call_compaction_limit(events: &[Event], end: usize) -> usize {
 ///     args: json!({ "amount": 5 }),
 ///     acting: None,
 ///     origin: None,
+///     evidence: Vec::new(),
 /// });
 /// hold.actions.workflow_positions.insert("pipeline".into(), WorkflowPosition::new(0, "ops"));
 ///
@@ -3747,7 +4043,8 @@ pub struct WithheldBuiltinTool {
 ///
 /// ```rust
 /// use adk_core::{
-///     ApprovalScope, BuiltinToolGovernor, DeclarativePolicy, RunConfig, Tool, ToolGate,
+///     ApprovalScope, BuiltinToolGovernor, DeclarativePolicy, RunConfig, Tool, ToolDeclarations,
+///     ToolGate,
 /// };
 /// use serde_json::json;
 /// use std::collections::HashMap;
@@ -3758,9 +4055,9 @@ pub struct WithheldBuiltinTool {
 ///     .tool_policy(Arc::new(DeclarativePolicy::builder().allow("lookup").build()))
 ///     .build();
 /// let gate = ToolGate::new(&config, "agent", "inv-1", ApprovalScope::new("app", "u", "s"));
-/// let mut declarations = HashMap::from([
-///     ("lookup".to_string(), json!({ "name": "lookup" })),
-///     ("google_search".to_string(), json!({ "x-adk-gemini-tool": { "google_search": {} } })),
+/// let mut declarations = ToolDeclarations::from_iter([
+///     ("lookup", json!({ "name": "lookup" })),
+///     ("google_search", json!({ "x-adk-gemini-tool": { "google_search": {} } })),
 /// ]);
 ///
 /// let tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
@@ -3799,7 +4096,7 @@ impl BuiltinToolGovernor {
     pub async fn govern(
         &mut self,
         gate: &ToolGate<'_>,
-        declarations: &mut HashMap<String, Value>,
+        declarations: &mut crate::ToolDeclarations,
         tools: &HashMap<String, Arc<dyn Tool>>,
     ) -> Result<Vec<WithheldBuiltinTool>> {
         let config = gate.run_config;
@@ -3970,8 +4267,8 @@ mod tests {
         }
     }
 
-    fn native_tools() -> (HashMap<String, Value>, HashMap<String, Arc<dyn Tool>>) {
-        let declarations = HashMap::from([
+    fn native_tools() -> (crate::ToolDeclarations, HashMap<String, Arc<dyn Tool>>) {
+        let declarations = crate::ToolDeclarations::from_iter([
             ("lookup".to_string(), json!({ "name": "lookup" })),
             (
                 "web_search".to_string(),
@@ -3998,7 +4295,7 @@ mod tests {
         (declarations, tools)
     }
 
-    fn names(declarations: &HashMap<String, Value>) -> Vec<&str> {
+    fn names(declarations: &crate::ToolDeclarations) -> Vec<&str> {
         let mut names: Vec<&str> = declarations.keys().map(String::as_str).collect();
         names.sort_unstable();
         names
@@ -5351,6 +5648,7 @@ mod tests {
             args,
             acting: None,
             origin: None,
+            evidence: Vec::new(),
         });
         event
     }
@@ -5383,6 +5681,7 @@ mod tests {
                     args: json!({ "amount": 500 }),
                     acting: None,
                     origin: None,
+                    evidence: Vec::new(),
                 },
                 id: Some("c1".into()),
                 name: "pay".into(),
@@ -5419,6 +5718,7 @@ mod tests {
                     args: json!({ "path": "a.txt" }),
                     acting: None,
                     origin: None,
+                    evidence: Vec::new(),
                 },
                 id: Some("c1".into()),
                 name: "helper".into(),
@@ -5452,6 +5752,25 @@ mod tests {
             vec![function_response("pay", json!({ "ok": 1 }), "c1")],
         ));
         assert!(held_tool_calls(&events, "ops", "").is_empty());
+    }
+
+    #[test]
+    fn answered_calls_hold_nothing_and_leave_a_later_hold_held() {
+        let answered: Vec<Event> = (0..50)
+            .flat_map(|index| {
+                let id = format!("done-{index}");
+                [
+                    event("ops", "inv-0", vec![function_call("pay", json!({ "amount": 5 }), &id)]),
+                    event("ops", "inv-0", vec![function_response("pay", json!({ "ok": 1 }), &id)]),
+                ]
+            })
+            .collect();
+        assert!(held_tool_calls(&answered, "ops", "").is_empty());
+
+        let events: Vec<Event> = answered.into_iter().chain(held_run()).collect();
+        let ids: Vec<Option<String>> =
+            held_tool_calls(&events, "ops", "").into_iter().map(|held| held.id).collect();
+        assert_eq!(ids, [Some("c1".to_string())]);
     }
 
     #[test]
@@ -5712,6 +6031,7 @@ mod tests {
             args: json!({ "amount": 5 }),
             acting: None,
             origin: None,
+            evidence: Vec::new(),
         };
         let none = RunConfig::default();
         assert!(!confirmation_decision_available(&gate(&none), &request).await.unwrap());

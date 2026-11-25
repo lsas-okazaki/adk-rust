@@ -67,7 +67,11 @@ pub trait SessionService: Send + Sync {
     /// Append an event to a session
     async fn append_event(&self, session_id: &str, event: Event) -> Result<()>;
 
-    /// Rewind a session to an event, or by a number of events (default: Unsupported)
+    /// Read, rewrite, and import history; fork, rewind, and rewind_steps build on these
+    async fn history(&self, identity: &AdkIdentity) -> Result<SessionHistory>;
+    async fn rewrite_history(&self, req: RewriteHistoryRequest) -> Result<HistoryOutcome>;
+    async fn import_session(&self, req: ImportSessionRequest) -> Result<Box<dyn Session>>;
+    async fn fork(&self, req: ForkRequest) -> Result<HistoryOutcome>;
     async fn rewind(&self, identity: &AdkIdentity, target_event_id: &str) -> Result<Box<dyn Session>>;
     async fn rewind_steps(&self, identity: &AdkIdentity, steps: usize) -> Result<Box<dyn Session>>;
 }
@@ -75,7 +79,9 @@ pub trait SessionService: Send + Sync {
 
 The trait also has identity-addressed methods (`get_for_identity`, `append_event_for_identity`,
 `delete_for_identity`), `delete_all_sessions`, and `health_check`; see
-[Typed Session Identity](#typed-session-identity).
+[Typed Session Identity](#typed-session-identity). `archive`, `unarchive`, `export_session`,
+`list_active`, and `list_archived` work on every backend; see
+[Archive, Unarchive and Export](#archive-unarchive-and-export).
 
 ### Behaviour Every Backend Follows
 
@@ -86,7 +92,8 @@ The trait also has identity-addressed methods (`get_for_identity`, `append_event
 | `append_event`, `append_event_for_identity` to a missing session | Fails with `session.not_found` |
 | Event order | Timestamp order; events with equal timestamps keep their append order |
 | `list` | Most recently updated first; equal update times by session ID, descending, so `offset`/`limit` pages are stable |
-| `rewind`, `rewind_steps` | Change only the session the identity names, and rebuild its state from the state it was created with plus the remaining events' deltas; app and user state are not rewound |
+| `rewind`, `rewind_steps`, `rewrite_history` | Change only the session the identity names, and rebuild its state from the state it was created with plus the remaining events' deltas; app and user state are not rewound. See [Fork, Rewind, and Edit History](history.md) |
+| `fork` | Creates a session of the same app and user with the source's events up to an event and the state there; the source does not change |
 | `delete_all_sessions(app, user)` | Erases every session of the user in the app with its events, and the user's `user:` tier, also when no session is left; the `app:` tier, the user's data in other apps and other users' data stay; a repeated call succeeds |
 
 `delete_all_sessions` is the call that erases a user's session data: no other method removes
@@ -109,8 +116,10 @@ Strings containing U+0000 in event content and state read back unchanged. Postgr
 them in an escaped form, since `JSONB` cannot hold U+0000; strings without U+0000 are stored as
 they are.
 
-Rewind is implemented by `InMemorySessionService`, `SqliteSessionService`, and
-`EncryptedSession` over either; the other backends return `session.rewind.unsupported`.
+Every backend forks, and every backend except Vertex AI rewinds and edits history in place;
+the Vertex AI Session API cannot delete events, so it returns `session.history.unsupported` and
+a fork takes the place of a rewind. [Fork, Rewind, and Edit History](history.md) covers the
+operations, their rules, and each backend.
 
 ```rust
 use adk_core::identity::{AdkIdentity, AppName, SessionId, UserId};
@@ -172,8 +181,9 @@ async fn get_or_create(
 }
 ```
 
-`adk-server`'s `/api/run` and `/api/run_sse`, both A2A executors, the background worker, and
-the runner's externally triggered invocations follow this pattern.
+`adk-server`'s `/api/run_sse` for a UI protocol's thread, both A2A executors, the background
+worker, and the runner's externally triggered invocations follow this pattern. An ADK run on
+`/api/run` or `/api/run_sse` does not create its session: a missing one answers `404`.
 
 ## Request Types
 
@@ -497,6 +507,12 @@ exact private scalar presence.
 
 Stores sessions in memory. Ideal for development, testing, and single-instance deployments.
 
+A read shares the stored events with the session it returns instead of copying them, and
+`num_recent_events` (the runner's `RunConfig::history_max_events`) selects the window before
+anything leaves the store, so a windowed turn costs the same on the thousandth turn as on the
+tenth. The runner moves the loaded events into its invocation (`Session::take_events`) rather
+than copying them again.
+
 ```rust
 use adk_session::{InMemorySessionService, SessionService, CreateRequest};
 use std::collections::HashMap;
@@ -551,6 +567,14 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+`SqliteSessionService::new` switches a file database to write-ahead-log mode
+(`journal_mode = WAL`, kept in the file; SQLite creates `<file>-wal` and `<file>-shm` beside it
+while it is open) and keeps `synchronous = FULL` on every connection, so each committed event is
+synced to disk and survives power loss. A file another process holds in rollback mode keeps that
+mode, with a warning. `SqliteSessionService::from_pool` leaves both settings to the pool you
+build, for example `synchronous = NORMAL` to sync less often at the cost of the last commits
+before a power loss.
 
 > **Note**: The `SqliteSessionService` requires the `sqlite` feature flag:
 > ```toml
@@ -793,10 +817,75 @@ A session ID is unique within an app, and the owning `user_id` is a field of the
 
 A new session never inherits events left under its path. App names, user IDs, and session IDs are document IDs, so they must not contain `/`.
 
+Firestore aborts a transaction that contends with another for a document. Such a write applied nothing, so the service runs it again from its reads, with backoff, for up to two minutes; a failure Firestore reports as retryable carries `session.firestore.retryable` (`Unavailable`). The subject registry's `ensure` retries its create the same way.
+
 > **Note**: Requires the `firestore` feature flag:
 > ```toml
 > adk-session = { version = "3.0.0", features = ["firestore"] }
 > ```
+
+## Archive, Unarchive and Export
+
+Archiving puts a finished conversation away without deleting it: the session keeps its events
+and state, leaves the listing people see, and takes no new turn until it is unarchived. Every
+backend supports it through default `SessionService` methods built on `get_for_identity`,
+`append_event_for_identity` and `list`, and the shared archive contract
+(`adk-session/tests/common/archive_contract.rs`) runs on each one.
+
+| Method | What it does |
+|--------|--------------|
+| `archive(identity, reason)` | Appends a content-less marker event (author `adk.session`) that writes an `ArchiveMark { archived_at, reason }` to the session's own state under `adk:archived`; archiving an archived session returns its mark and writes nothing |
+| `unarchive(identity)` | Appends a marker event that sets `adk:archived` to `null`; unarchiving a session that is not archived writes nothing |
+| `list_active(req)` | The sessions that are not archived, in `list` order; `offset` and `limit` count only these |
+| `list_archived(req)` | The archived sessions, in `list` order; `offset` and `limit` count only these |
+| `export_session(identity)` | A `SessionBundle`: one JSON document (`adk.session.bundle/v1`) with the identity, the session's own state, every event and the archive mark; the `app:` and `user:` tiers stay out |
+| `ensure_writable(&session)` | Refuses an archived session with `session.archived` (`Conflict`, HTTP 409) |
+
+`list` still lists every session, archived ones with their mark in their state; a host shows
+people `list_active`. The marker events carry no content, so no model sees them, and the
+archive and unarchive are part of the session's history.
+
+| Where | What an archived session gets |
+|-------|-------------------------------|
+| `adk_runner::Runner` | Every turn, and `recover_unanswered_calls`, fails with `session.archived` before the user message is saved and before any agent runs, so no agent, schedule, chat or API turn adds to it |
+| `adk-server` | `GET /api/apps/{app}/users/{user}/sessions` leaves it out; `?archived=true` lists the archived sessions instead |
+| `adk-rust sessions` | `list` leaves it out (`list --archived` shows them), `--continue` skips it, `archive <id> [--reason …]`, `unarchive <id>`, `export <id> [--out FILE]`, and `rewind` refuses it |
+
+```rust
+use adk_core::identity::{AdkIdentity, AppName, SessionId, UserId};
+use adk_session::{ListRequest, SessionService};
+
+async fn shelve(service: &dyn SessionService) -> adk_core::Result<String> {
+    let identity = AdkIdentity::new(
+        AppName::try_from("my_app")?,
+        UserId::try_from("user_123")?,
+        SessionId::try_from("session_abc")?,
+    );
+    let mark = service.archive(&identity, Some("trip booked".into())).await?;
+    println!("archived at {}", mark.archived_at);
+
+    // What a person sees no longer includes it.
+    let active = service
+        .list_active(ListRequest {
+            app_name: "my_app".into(),
+            user_id: "user_123".into(),
+            limit: None,
+            offset: None,
+        })
+        .await?;
+    println!("{} active sessions", active.len());
+
+    // The whole conversation as one portable JSON document.
+    let bundle = service.export_session(&identity).await?;
+    let json = serde_json::to_string_pretty(&bundle).map_err(|e| adk_core::AdkError::session(e.to_string()))?;
+
+    service.unarchive(&identity).await?;
+    Ok(json)
+}
+```
+
+A turn started while a session is archived fails; a turn already running when the session is
+archived finishes its writes.
 
 ## Subject Export and Erasure
 
@@ -816,11 +905,11 @@ Every backend also ships a `SubjectRegistry` and a `ConsentStore`
 
 All database-backed session services (SQLite, PostgreSQL, MongoDB, Neo4j) include a versioned, forward-only migration system. Applied versions are recorded in the `_adk_session_migrations` table (SQLite, PostgreSQL) or collection (MongoDB), or as `_AdkSessionMigration` nodes (Neo4j).
 
-| Backend | Version 2 |
-|---------|-----------|
-| SQLite | Adds `sessions.initial_state`, the state a session was created with, which rewind rebuilds from. Sessions created before it rewind to their keys that no event has written |
-| PostgreSQL | Adds `events.seq`, an insertion sequence that orders events with equal timestamps; existing rows are numbered in their physical order |
-| MongoDB | Adds the `idx_events_read_order` index on the event read order (timestamp, then `seq`) |
+| Backend | Version 2 | Version 3 |
+|---------|-----------|-----------|
+| SQLite | Adds `sessions.initial_state`, the state a session was created with, which rewind rebuilds from. Sessions created before it rewind to their keys that no event has written | Adds the `idx_events_session_ts` index on `events (app_name, user_id, session_id, timestamp)`, so loading, rewinding or deleting one session reads only its rows |
+| PostgreSQL | Adds `events.seq`, an insertion sequence that orders events with equal timestamps; existing rows are numbered in their physical order | — |
+| MongoDB | Adds the `idx_events_read_order` index on the event read order (timestamp, then `seq`) | — |
 
 ### Encrypted Sessions
 
@@ -955,6 +1044,7 @@ On PostgreSQL only tables in the connection's current schema (`current_schema()`
 - **Idempotent**: Running `migrate()` multiple times is safe
 - **Transactional**: Each SQL step runs in its own transaction and is recorded with its version, description, and time
 - **Serialized**: PostgreSQL `migrate()` holds an advisory lock (`PostgresSessionService::ADVISORY_LOCK_KEY`) on one connection for the whole run, so instances starting together do not race
+- **Concurrent**: SQLite runs each step in a `BEGIN IMMEDIATE` transaction and re-reads the registry inside it, so processes migrating one file at once apply each step once. MongoDB and Neo4j `migrate()` can run from several instances at once: every index and constraint is created idempotently, a statement that loses a race to create the same rule succeeds, and each version is recorded once — with an upsert on MongoDB and `MERGE` on Neo4j
 
 ## Session Lifecycle
 
@@ -1078,7 +1168,7 @@ use std::sync::Arc;
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 
     let agent = LlmAgentBuilder::new("assistant")
         .model(model)

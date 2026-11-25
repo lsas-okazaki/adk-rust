@@ -82,6 +82,9 @@ pub struct ChatCompletionRequest {
     /// Reasoning effort of a GPT-OSS model (spec 3.1 §7.23).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// `{"type": "json_schema", ...}` from the request's response schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
 }
 
 /// Groq chat completion response.
@@ -255,7 +258,7 @@ pub fn content_to_message(content: &Content) -> Message {
 }
 
 /// Convert ADK tools to Groq tools.
-pub fn convert_tools(tools: &std::collections::HashMap<String, Value>) -> Vec<Tool> {
+pub fn convert_tools(tools: &adk_core::ToolDeclarations) -> Vec<Tool> {
     tools
         .values()
         .filter_map(|tool| {

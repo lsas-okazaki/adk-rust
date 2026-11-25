@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft / RFC — rewritten 2026-10-24. Replaces the first draft ("one decision contract, five renderers", #936), which specified a contract-only crate and no surface a person could open. Amended 2026-10-25: agents you create ([§5.7](#57-your-agents), K7) |
+| **Status** | Draft / RFC — rewritten 2026-10-24. Replaces the first draft ("one decision contract, five renderers", #936), which specified a contract-only crate and no surface a person could open. Amended 2026-10-25: agents you create ([§5.7](#57-your-agents), K7). Amended 2026-11-15: steer is delivered ([§6](#6-architecture), [§7.4](#74-rules-on-every-surface) rule 2, K8). Amended 2026-11-16: extension catalogs, accepted in #1393 ([§6.1](#61-crate-layout-and-features), [§7.4](#74-rules-on-every-surface) rule 5, [decision 11](#13-open-decisions)). Proposed 2026-11-17: scenes and depth in extension catalogs ([§7.4](#74-rules-on-every-surface) rule 5) |
 | **Builds on** | [`spec-3.1-harness-agent.md`](spec-3.1-harness-agent.md) (the harness: modes, standing rules, approvals, memory, voice) and [`spec-3.2-agent-kernel.md`](spec-3.2-agent-kernel.md) (the always-on kernel: processes, wakes, agenda, quiet hours, event bus, control plane, `/proc`). Together they make an always-on personal agent; this spec is its interface |
 | **Target** | Design labels only: work from specs 3.1–3.4 ships in the unreleased 3.0.0 (owner, 2026-10-21) |
 | **Grounding commit** | `origin/main` @ `c5bdf4f1` for every file reference, except [§5.7](#57-your-agents) and its rows in §6–§14, which cite `origin/main` @ `c991dae3` |
@@ -100,6 +100,39 @@ The system of record. Three sections share one header with the status line and *
 |---|---|
 | ![Web home, threads and decisions](images/spec-3.3/web-home-light.png) | ![Web home, threads and decisions, dark](images/spec-3.3/web-home-dark.png) |
 
+**Images in a message.** The message box takes images, picked, pasted or dropped: at most four PNG, JPEG, WebP or GIF images of up to 3 MB each. The page shrinks a larger still picture before sending it, and never sends SVG. `send`, `queue` and `newThread` carry them as `images`; the engine checks each image's bytes against the type it claims and refuses anything else before the message reaches an agent. The images reach the agent as parts of the person's message, so a model that sees images reads them with the text. A message with images is never offered to a running turn; it waits for the next one. The thread shows the images the person sent beside their words, and opens one large when pressed. The terminal says `[2 images]`. A send's audit record counts the images; it never holds them.
+
+**Decisions.** `/ui/decisions` lists everything waiting for the person in one place. Each entry shows its question, who asks, since when and its risk; a high-risk one is marked in the accent. The list can be narrowed to who asks. The selected decision's own card sits beside the list and is answered there as in its thread; Enter on the list only opens a decision. **Open in its thread** shows it in place. The Decisions mark carries the count of what waits. A decision's deep link (`/ui/decisions/<id>`) still opens in its thread.
+
+**Stop the turn.** While an agent works in the thread shown, **Stop the turn** sits beside **Send**. `stopTurn` stops that session's running turn, and the agent waits for the next message. The person gives it, never an agent, and only for their own session. It is recorded (`surface.stop_turn`) before it takes effect. Nothing held for a decision is answered by it, and a run waiting on a decision keeps waiting. A kernel kills the session's running and queued runs; a harness or a runner cancels its run in flight.
+
+**Suggested replies.** An agent given `adk_surface::suggest::SuggestReplies` may offer up to four short replies the person might send next (`suggest_replies`; each one line of at most 80 characters, repeats dropped). The tool only shows; it changes nothing. The thread shows the latest offer under the agent's message (`ThreadItem::Suggestions`) until the person writes. Tapping one fills the message box, and the person still sends it. Once sent it is their own message, never an answer to a decision (§7.4, S-I4). The terminal lists them.
+
+**Ask for a drawing.** **Ask for a drawing** in the message box puts "Show this as a drawing I can look at:" in front of what is typed. It is sent only with **Send**, so the person sees exactly what goes.
+
+**How you answered this week.** Today shows how the person answered over the last seven days: each answer counted (allowed once, always allowed, edited, denied) and on which surfaces, from `GET /surface/answers`. The engine reads its answer log (`AnswerLog::since`), and the card is left out where the server keeps no such count.
+
+**Thread history.** **Thread history** in a thread's header lists the person's earlier threads with the agent, newest first, from `GET /surface/agents/{id}/threads`. Choosing one shows it in place of the conversation, with the way back.
+
+**The icon rail.** On a wide screen the sections stand in a rail down the left edge: a mark for each of Threads, Today, Memory & rules and Developer (and Website where the server serves one). Hovering a mark shows its name, assistive technology reads it, and the Threads mark carries the Decisions count. On narrower screens the sections stay in the header.
+
+**The canvas.** **Show beside** on a drawing keeps it in a canvas next to the thread while the conversation goes on. The canvas shows the drawing's latest version as the agent patches it, with tabs for its earlier versions and for the A2UI it arrived as. Its form sends and its decisions work there as in the thread. The thread keeps a line saying the drawing is shown beside it, with **Bring back**. On a narrower screen the canvas slides over the page from the right. **Open in its own window** shows the canvas alone at `/ui/canvas?session=…&surface=…`. That window follows the session, so the drawing can stay on another screen.
+
+**Question first.** A waiting decision leads with what the person is asked, drawn as a question. Under it come what the call costs (its risk, whether it can be undone, where else it is shown), then who asks and since when, then the exact call in full, then the answers. The question mark is drawn but not spoken, so the card is named by its heading on every surface.
+
+**Search and jump.** ⌘K or Ctrl+K, or **Search** in the header, opens a palette that finds a section, an agent's thread, a decision waiting for the person, or an action: **Stop all**, the theme, voice, adding an agent. Typing narrows the list, the arrow keys move through it, Enter goes and Esc closes. A decision found there opens on its card; nothing in the palette answers one (§7.4).
+
+**The work log.** Three or more plain tool steps in a row fold into one line of the thread. The line says how long they took ("Worked for 38 s"), how many steps there were, how many failed and what the last one was, and it opens to show them all. A command's run keeps its own card, and a step still working stays in view.
+
+**What an agent ran.** A command an agent ran (`bash`) or code it ran in the sandbox (`sandbox_exec`) reads as a run, not a line that says "Done":
+- what ran;
+- how it exited, or why it stopped short (timed out, out of memory, refused by the sandbox, could not run);
+- how long it took;
+- its last 40 lines, with standard error marked;
+- whether the tool cut its output, which the agent can still read in full.
+
+A failed run opens on its output. Each run says where it ran: **Sandbox** for the sandbox's own tool, and for a command, where the agent's commands run.
+
 **Today.** "While you were away": what was spent, whether quiet time was respected, how many things wait, then one line per event since the person left, each with a status pill and a link to its details. Questions from the kernel's `/proc` observations ([`control/mod.rs:136-140`](../../adk-kernel/src/control/mod.rs)) are answered here or on the phone, never assumed.
 
 | Light | Dark |
@@ -157,6 +190,15 @@ Voice through `adk-realtime` (Gemini Live or OpenAI Realtime). A spoken "allow o
 | ![Voice and video](images/spec-3.3/voice-light.png) | ![Voice and video, dark](images/spec-3.3/voice-dark.png) |
 
 ### 5.7 Your agents
+
+**Where commands run.** Each roster row says where the agent's commands run, as its harness reports it:
+- in the OS sandbox, with its enforcer;
+- in a container;
+- in a remote sandbox;
+- on this computer;
+- on this computer because a sandbox was asked for and is unavailable, with the reason.
+
+The thread's header shows it as a badge. It is green when commands are kept apart from this computer, amber when a sandbox was asked for and is unavailable, and quiet when commands run on this computer by choice.
 
 A person adds agents of their own beside the primary agent, by asking or by hand. Each one is kept by the kernel, appears in the roster on the left of the web home and the terminal, keeps working across restarts, and is changed, paused or removed from either surface. An agent may suggest a new agent; only a person adds one.
 
@@ -298,6 +340,8 @@ The terminal changes agents through the kernel's `/agent` command, which `adk-ru
 
 Process events come from the kernel bus, which keeps a recent window in memory ([`bus.rs:270`](../../adk-kernel/src/bus.rs)) and can stay that way, because every state it reports can be re-read from its store. The per-session feed derives its sequence from the session store, so a reconnect after a restart loses at most an unfinished stream of tokens, never a decision.
 
+**Steer.** A message sent while a turn of its session runs reaches that turn. The engine offers it to the runtime (`Runner::steer`), which screens it as it screens a turn's own message; the agent takes it after its current tool step, before its next model call, and the thread shows it there. A turn that ends first hands it back, and it goes as the session's next message, once. `send` answers at once and the message waits in the session's queue until it is taken or sent; `steer` answers with what became of it. A message is offered only to a turn the answering process runs: a turn another kernel replica runs hands it back at once. A steered message is a user message under the same input screening and the same stop, and never an answer to a decision ([§7.4](#74-rules-on-every-surface) rule 2).
+
 Every decision has one write path: `ApprovalService::decide` with the version the surface saw ([`approval.rs:1381-1400`](../../adk-core/src/approval.rs)). A second answer gets `approval.version_conflict` and is shown as "already decided by …", never retried silently.
 
 The engine owns its stream (HTTP with server-sent events for reads, REST for commands, WebSocket only for a terminal pane and audio) and publishes OpenAPI generated from Rust, with TypeScript generated from it and a drift check in CI. AG-UI, ACP and MCP Apps are adapters over that stream, not its core.
@@ -313,7 +357,7 @@ The engine owns its stream (HTTP with server-sent events for reads, REST for com
 | `tui` | Terminal: full-screen, inline, JSON | `ratatui`, `crossterm`, `syntect`, `pulldown-cmark` | Beta |
 | `channels` | Chat adapters over the kernel's `channels` contract | per adapter | Beta |
 | `voice` | Voice and video in `web` and `tui` | `adk-realtime` | Beta |
-| `genui` | Agent-drawn UI: the absorbed `adk-ui` core, A2UI renderers, AG-UI and MCP Apps adapters | — | Beta |
+| `genui` | Agent-drawn UI: the absorbed `adk-ui` core, A2UI renderers, AG-UI and MCP Apps adapters, and extension catalogs another crate registers (`adk-ui` 3: charts, metrics, pages, scenes), each a superset of `forms` 1.0 whose components only show ([§7.4](#74-rules-on-every-surface) rule 5) | — | Beta |
 | `genui-apps` | Sub-feature of `genui`: the MCP Apps host, apps framed sandboxed on their own origin; implies `web` (wave 4 decision 16) | `adk-harness` `mcp`, `adk-tool` `mcp-apps` (rmcp) | Beta |
 | `workflow` | Graph run observer and debugger | `adk-graph` with `time-travel`; `adk-harness` `web` (secret redaction) | Beta |
 | `desktop` | Tauri shell and tray | `tauri` | Experimental |
@@ -358,11 +402,15 @@ A decision nobody answers waits through quiet time and restarts. When the confir
 ### 7.4 Rules on every surface
 
 1. Esc never decides.
-2. Typing while a decision is open is queued, never an answer.
+2. Typing while a decision is open is queued, never an answer. Typing while a turn runs reaches that turn as a message, at its next step, and answers nothing.
 3. An unanswered decision waits; it never becomes a yes or a no on its own.
 4. Voice and chat say yes once or no, never "always", never money.
 5. Agent-drawn UI never contains approval controls; a submit from it becomes a call that goes through approval like any other.
 6. No agent approves its own call.
+
+**Extension catalogs and rule 5** (amended 2026-11-16, decision 11). A crate may add components to `forms` 1.0 as an extension catalog: A2UI gives a surface one catalog, so the extension is a superset of `forms` under its own id. It can never loosen rule 5. Its components only show — no action, event or check, and no field — so every submit still comes from a `forms` button and goes through approval. Every string in them, every string and key of the data they bind, and every string their home view writes is checked like any drawn string; each says what the web home and the terminal show for it in `forms` components and one home-native element, a chart, with every component it holds shown exactly once; and a drawing is checked again against its own catalog wherever it is shown, sent or carried, so one in a catalog the home does not register is refused. The home draws a chart in its own colours; a host that embeds the renderer may draw an extension's resolved properties with its own components, never with controls.
+
+**Scenes and depth** (proposed 2026-11-17). An extension's home view may also be a bounded 3D scene or components presented in depth, drawn natively by the home. A scene's colours are the home's palette and state names, never colours the agent picks. It has no textures, models, fonts, shaders or links. Its labels, ticks and panels are checked strings, and its summary and pick note are the server's. A scene's pick fills a choice field shown in the same drawing; it never sends, and the form's Send still asks. A scene's panels and a wall's or stage's children hold no button or field. A hidden face of a flip card or carousel is unreachable until turned to, and turns to the front when it holds a field with a problem.
 
 <a id="710-diff-before-write-and-honest-rewind"></a>
 
@@ -441,21 +489,23 @@ Surfaces a person uses speak plainly. The terminal and developer panels may use 
 
 ## 9. Visual language
 
-The look follows [adk-rust.com](https://adk-rust.com): Inter and JetBrains Mono, rust orange as the one accent, two-tone display headings, a soft rust glow in one corner. Light and dark come from one set of tokens, and every dark screen is the light screen rendered with the dark set.
+Calm mission control. The look keeps [adk-rust.com](https://adk-rust.com)'s rust orange and soft corner glow, set in Geist and Geist Mono over warm neutrals. One accent is kept for what waits on the person and for the primary action; data takes blues, teals and violets, never the accent. Light and dark come from one set of tokens, and every dark screen is the light screen rendered with the dark set. Dark is layered from near black, so depth reads without extra borders. The tokens live in `adk-surface/web/src/styles/tokens.css`, and a script checks their contrast when it writes them.
 
 | Token | Light | Dark |
 |---|---|---|
-| Background | `#FFFFFF` | `#0A1628` |
-| Card | `#FFFFFF` | `#15233B` |
-| Raised (chips, switchers) | `#F6F7F9` | `#1C2B45` |
-| Border | `#E6E8EC` | `#2A3D5C` |
-| Text / secondary / labels | `#0F172A` / `#475569` / `#64748B` | `#F1F5F9` / `#D5DEE8` / `#A7B4C6` |
-| Brand (display, dots) | `#F74C00` | `#F74C00` |
-| Accent text and primary button | `#C03A00` with white text | `#FF9C78` text; `#F74C00` button with navy text |
-| Decision background | `#FFF8F3` | `#2A2432` |
-| Stop control | navy `#0A1628` | light `#F1F5F9` |
+| Background / sidebar | `#FAFAF9` / `#F4F4F2` | `#0E0F11` / `#0B0C0E` |
+| Card | `#FFFFFF` | `#16171A` |
+| Raised (chips, switchers) | `#F4F4F1` | `#1E1F23` |
+| Border / strong border | `#E7E6E2` / `#D6D4CF` | `#26272C` / `#36373D` |
+| Text / secondary / labels | `#18181B` / `#4B4B53` / `#6B6B74` | `#EDEDEF` / `#B5B5BD` / `#8E8E97` |
+| Brand (display, dots) | `#F74C00` | `#FF6A1F` |
+| Accent text and primary button | `#C2410C` with white text | `#FF8A4C` with near-black text |
+| Decision background / border | `#FFF7F1` / `#F6CDB4` | `#1F1610` / `#5C3119` |
+| Stop control | `#18181B` | `#EDEDEF` |
 
-Text colours target WCAG AA contrast (4.5:1) against their background; the bright brand orange appears only on large type and dots. Agents have rounded monogram avatars in their own colour. Status uses a word and a colour, never colour alone.
+Type is a seven-step scale: 12/16, 13/18, 14/20, 16/24, 20/28, 24/32 and 32/40. Radii are 6, 10 and 14 px, plus round pills. Shadows have two layers, a contact shadow and a soft lift. Motion uses 120, 160 and 240 ms on one ease-out curve, and none of it runs when the person asks for reduced motion.
+
+Text colours meet WCAG AA contrast (4.5:1) against their background; the bright brand orange appears only on large type and dots. What waits on the person carries one accent edge. Agents have rounded monogram avatars in their own colour. Status uses a word and a colour, never colour alone. On a phone, touch targets are at least 44 px.
 
 ## 10. Changes outside the new crate
 
@@ -479,6 +529,7 @@ Text colours target WCAG AA contrast (4.5:1) against their background; the brigh
 | S4 | adk-server | `DurableWorker` reads a shared target table, so a target hosted after start runs on every queue; a run for a target the table expects but has not built yet is handed back for a later claim, not failed ([`worker.rs:1079`](../../adk-server/src/background/worker.rs)) | Your agents |
 | H3 | adk-harness | `propose_agent` (class `Todo`, only on the primary agent) with the suggesting agent's own limits as its ceiling; a harness built from an `AgentRecord`; the session stamp `harness:agent` on every harness the kernel hosts; an added agent applies only standing rules pinned to its own id, and "Always allow" on its cards pins the rule to it; `assess_agent` (risk and plain-words abilities) | Your agents |
 | L1 | adk-cli | `adk-rust up` opens the `AgentStore` beside the kernel's other stores and registers an agent factory over the composition the primary agent uses ([`harness_cli.rs:375`](../../adk-cli/src/harness_cli.rs)), each agent's model built from the providers whose keys it has; the `/agent` command in the REPL's command set, which the full-screen terminal runs and `up` serves over `GET /api/kernel/commands` and `POST /api/kernel/commands/run`; `adk-rust agents` | Your agents |
+| K8 | adk-kernel | Steer: `Kernel::steer` sends a person's message to the turn of their session that the replica runs, through `Runner::steer` on the process's target; `POST /kernel/sessions/{session}/steer` and `ControlClient::steer` answer `accepted` with the steer id, the process and its lease epoch, or `returned`; the channel gateway hands a message that arrives while its thread's turn runs to that turn, and starts the next turn with one handed back | Steer on every surface |
 
 The control plane has no route that changes an agent: changes come through the engine in `up`'s process and through the `/agent` command. The read routes stay under `/api/kernel/agents`, because `adk-server`'s agent registry already serves `/api/agents` ([`registry/routes.rs:10`](../../adk-server/src/registry/routes.rs)).
 
@@ -548,7 +599,7 @@ Each phase ships only when its scenario passes end to end on SQLite and on one s
 | 8 | Who writes the morning briefing | Counts and links from the stores; the model may add prose only about the person's own items |
 | 9 | One agent or many | **Decided (owner, 2026-10-25):** one primary agent per kernel; the person adds more by asking or by hand ([§5.7](#57-your-agents)); each added agent is hosted by the kernel with its own id, lives in one area, persists, and is configured in the web home and the terminal; areas stay partitions |
 | 10 | Reaching the home from outside | Loopback by default; a documented private-network recipe; never an open tunnel without the app's own sign-in |
-| 11 | `adk-ui` retirement | Drop the AWP profile unless a user exists; publish the React package as `@zavora-ai/adk-surface-react`; deprecate, do not yank |
+| 11 | `adk-ui` retirement | Drop the AWP profile unless a user exists; publish the React package as `@zavora-ai/adk-surface-react`; deprecate, do not yank. **Amended (owner, 2026-11-16, #1393):** `adk-ui` 3 returns as an extension of `genui`, not a second render stack: it ships extension catalogs (charts, metrics, key-value, progress, badges; pages and primitive 3D scenes for embedding hosts), builders and React renderers for `DrawnView`, and owns no protocol, tool name, provenance or approval path. `genui` keeps drawing, versions, the digest record, rule 5 and the governed send. `adk-ui` 2.x stays on crates.io for ADK-Rust 2 |
 | 12 | `adk-studio` and the enterprise line | Confirm both licences before reusing code; observer open, tenancy and release pipelines commercial |
 | 13 | Debug eval tab | Build it on `adk-eval` so results match `adk-rust eval` |
 | 14 | Mobile investment | Installable web app, with the triggers in [§5.4](#54-phone) written down |

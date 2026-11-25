@@ -6,7 +6,7 @@ files, the Interactions API (Beta), and Vertex AI.
 
 [![Crates.io](https://img.shields.io/crates/v/adk-gemini.svg)](https://crates.io/crates/adk-gemini)
 [![Documentation](https://docs.rs/adk-gemini/badge.svg)](https://docs.rs/adk-gemini)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT AND Apache-2.0](https://img.shields.io/badge/License-MIT%20AND%20Apache--2.0-blue.svg)](#license)
 
 ## Overview
 
@@ -36,10 +36,11 @@ adk-gemini = "3.0.0"
 
 | Feature | Enables |
 |---------|---------|
-| `studio` (default) | Marker only; the AI Studio backend is always compiled |
 | `vertex` | Vertex AI constructors and `VertexBackend` |
 | `interactions` | The Interactions API module and client methods |
 | `backtrace` | `snafu`'s `backtraces-impl-backtrace-crate` feature |
+
+The AI Studio backend has no feature flag and is always compiled; no feature is on by default.
 
 `adk-model` uses this crate for `GeminiModel`:
 
@@ -68,13 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`Gemini::new` uses the default model, `gemini-3.7-flash`, on the `v1beta` API.
+`Gemini::new` uses the default model, `gemini-3.8-flash`, on the `v1beta` API.
 
 ## Client constructors
 
 | Constructor | Backend and model |
 |-------------|-------------------|
-| `Gemini::new(api_key)` | AI Studio, `gemini-3.7-flash`, `v1beta` |
+| `Gemini::new(api_key)` | AI Studio, `gemini-3.8-flash`, `v1beta` |
 | `Gemini::pro(api_key)` | AI Studio, `gemini-3.1-pro-preview` |
 | `Gemini::with_model(api_key, model)` | AI Studio, any model |
 | `Gemini::with_v1(api_key)`, `Gemini::with_model_v1(api_key, model)` | AI Studio on the stable `v1` API |
@@ -223,7 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 `ThinkingLevel` has `Minimal`, `Low`, `Medium`, and `High`; Gemini 3.1 Pro does not support
 `Minimal`. `with_thinking_budget(tokens)` is the budget-based control of Gemini 2.5 models, and
 a config that sets both a budget and a level is rejected. For `gemini-3.6-flash` and
-`gemini-3.7-flash`, a request that sets `temperature`, `top_p`, `top_k`, `candidate_count`, or a
+`gemini-3.8-flash`, a request that sets `temperature`, `top_p`, `top_k`, `candidate_count`, or a
 thinking budget fails with `ClientError::InvalidGenerationConfig` before it is sent.
 
 ### Thought signatures
@@ -488,8 +489,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 `cancel_interaction` manage stored interactions. The stream fails when it ends before
 `interaction.completed` or reports a `failed` or `budget_exceeded` status. The
 [`interactions_basic`](examples/interactions_basic.rs) example covers streaming and multi-turn
-continuation, and [`examples/gemini_managed_agents/`](../examples/gemini_managed_agents/) covers
-managed agents and environments.
+continuation, and the `gemini_managed_agents` example in
+[adk-playground](https://github.com/zavora-ai/adk-playground) covers managed agents and environments.
 
 ### Vertex AI
 
@@ -509,12 +510,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A service account key.
     let key = std::fs::read_to_string("service-account.json")?;
     let service_account =
-        Gemini::with_google_cloud_service_account_json(&key, "my-project", "us-central1", "gemini-3.7-flash".to_string())?;
+        Gemini::with_google_cloud_service_account_json(&key, "my-project", "us-central1", "gemini-3.8-flash".to_string())?;
 
     // Workload Identity Federation.
     let wif = std::fs::read_to_string("wif-credentials.json")?;
     let federated =
-        Gemini::with_google_cloud_wif_json(&wif, "my-project", "us-central1", "gemini-3.7-flash".to_string())?;
+        Gemini::with_google_cloud_wif_json(&wif, "my-project", "us-central1", "gemini-3.8-flash".to_string())?;
 
     let _ = (regional, global, service_account, federated);
     Ok(())
@@ -544,6 +545,9 @@ request is never replayed through another transport.
 instead of decoding it as an empty response. Through `adk_model::GeminiModel`, a stream that ends
 before any chunk carries `finishReason` fails with `model.gemini.unfinished_stream`, and a blocked
 prompt (`promptFeedback.blockReason`) ends the turn with `FinishReason::Safety`.
+
+`FinishReason` is `#[non_exhaustive]`, so a `match` on it needs a wildcard arm; a value this
+version does not know deserializes as `FinishReason::Other`.
 
 ## API modules
 
@@ -598,9 +602,18 @@ cargo run -p adk-gemini --features interactions --example interactions_basic
 
 ## License
 
-MIT
+`MIT AND Apache-2.0` — both licences apply to the crate:
 
-Original work Copyright (c) 2024 [@flachesis](https://github.com/flachesis)
+| Licence | File | Covers |
+|---------|------|--------|
+| MIT | [`LICENSE-MIT`](LICENSE-MIT) | The code forked from [gemini-rust](https://github.com/flachesis/gemini-rust), under its original notice (Copyright (c) 2025 Michael Yang) |
+| Apache-2.0 | [`LICENSE-APACHE`](LICENSE-APACHE) | Changes and additions made in ADK-Rust, licensed like the rest of the workspace |
+
+The fork keeps the MIT notice because the MIT licence requires it in every copy; ADK-Rust's own
+work is Apache-2.0. Redistributing the crate means keeping both files.
+
+Original work Copyright (c) 2025 Michael Yang, as stated in [`LICENSE-MIT`](LICENSE-MIT)
+
 Modifications Copyright (c) 2024 Zavora AI
 
 ## Part of ADK-Rust
@@ -611,23 +624,20 @@ This crate is part of the [ADK-Rust](https://adk-rust.com) framework for buildin
 
 ## Attribution
 
-This crate is a fork of the [gemini-rust](https://github.com/flachesis/gemini-rust) library by [@flachesis](https://github.com/flachesis). We are grateful for their work in creating and maintaining this Gemini API client.
+This crate is a fork of the [gemini-rust](https://github.com/flachesis/gemini-rust) library by
+[@flachesis](https://github.com/flachesis), and keeps its MIT notice (see [License](#license)).
 
-**Upstream Project**
-- Repository: [github.com/flachesis/gemini-rust](https://github.com/flachesis/gemini-rust)
-- Crates.io: [crates.io/crates/gemini-rust](https://crates.io/crates/gemini-rust)
-- Original Author: [@flachesis](https://github.com/flachesis)
+| Upstream | |
+|----------|---|
+| Repository | [github.com/flachesis/gemini-rust](https://github.com/flachesis/gemini-rust) |
+| Crates.io | [crates.io/crates/gemini-rust](https://crates.io/crates/gemini-rust) |
+| Original author | [@flachesis](https://github.com/flachesis) |
 
-**Why a Fork?**
-
-The ADK-Rust project requires certain extensions for deep integration with the Agent Development Kit — exporting additional types (e.g., `GroundingMetadata`, `GroundingChunk`) for grounding support, future ADK-specific extensions for agent workflows, and workspace-level version management. We regularly sync with upstream to incorporate improvements and fixes.
-
-**Our Commitment**
-1. Staying aligned with the upstream gemini-rust project as much as possible
-2. Contributing back any general improvements that benefit the broader community
-3. Maintaining attribution and respecting the original MIT license
-4. Minimizing divergence — only adding ADK-specific extensions when necessary
+ADK-Rust forked the client to export additional types (such as `GroundingMetadata` and
+`GroundingChunk`) for grounding support, to add ADK-specific extensions, and to version it with
+the workspace.
 
 **Acknowledgments**
-- [@flachesis](https://github.com/flachesis) — Creator and maintainer of the original gemini-rust library
-- [@npatsakula](https://github.com/npatsakula) — Major contributions to the upstream project
+
+- [@flachesis](https://github.com/flachesis) — creator and maintainer of the original gemini-rust library
+- [@npatsakula](https://github.com/npatsakula) — major contributions to the upstream project

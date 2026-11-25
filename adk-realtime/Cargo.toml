@@ -11,16 +11,17 @@ documentation = "https://docs.rs/adk-realtime"
 keywords = ["adk", "ai", "realtime", "voice", "audio"]
 categories = ["api-bindings", "asynchronous"]
 readme = "README.md"
+exclude = ["tests/", "examples/", "benches/", "AGENTS.md"]
 homepage.workspace = true
 
 [package.metadata.docs.rs]
 # openai-webrtc builds the Opus C library with cmake and is left out.
-features = ["full", "heygen-avatar", "did-avatar", "integration"]
+features = ["full", "heygen-avatar", "did-avatar", "integration", "openai-sip", "livekit-sip", "guardrails", "scripted"]
 
 [dependencies]
 # Core ADK dependencies
 # `rustls` makes `ensure_crypto_provider()` install aws-lc-rs before a connect builds TLS:
-# the `gemini` feature compiles in both rustls providers, so rustls cannot pick one.
+# `livekit` (livekit-api's reqwest 0.12) also compiles in `ring`, so rustls cannot pick one.
 adk-core = { workspace = true, features = ["rustls"] }
 
 # Async runtime
@@ -52,9 +53,6 @@ base64 = "0.22"
 # UUID for session IDs
 uuid.workspace = true
 
-# OpenAI realtime types (optional)
-async-openai = { version = "0.41", optional = true, features = ["realtime"] }
-
 # Random bytes for WebSocket key generation (optional)
 getrandom = { version = "0.3", optional = true }
 
@@ -84,6 +82,13 @@ livekit-datatrack = { workspace = true, optional = true }
 livekit-data-stream = { workspace = true, optional = true }
 libwebrtc = { workspace = true, optional = true }
 webrtc-sys = { workspace = true, optional = true }
+# Not used directly: declared only so the workspace pin holds webrtc-sys's build helper at the
+# release whose libwebrtc matches webrtc-sys 0.3.40, for consumers' resolves as well as ours.
+webrtc-sys-build = { workspace = true, optional = true }
+# Not used directly either: they hold livekit's own protocol and common crates at the releases
+# livekit 0.8.1 compiles against.
+livekit-protocol = { workspace = true, optional = true }
+livekit-common = { workspace = true, optional = true }
 
 # OpenAI WebRTC (optional)
 # NOTE: `audiopus` builds the Opus C library from source and requires `cmake`.
@@ -92,12 +97,12 @@ webrtc-sys = { workspace = true, optional = true }
 str0m = { version = "0.17", optional = true }
 audiopus = { version = "0.3.0-rc.0", optional = true }
 reqwest = { workspace = true, optional = true }
-rustls = { workspace = true }
 secrecy = "0.10.3"
 url = "2.5"
 parking_lot = "0.12.5"
 
 [dev-dependencies]
+rustls = { workspace = true }
 adk-runner = { path = "../adk-runner" }
 adk-session = { path = "../adk-session", features = ["sqlite"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util"] }
@@ -107,6 +112,10 @@ url = "2.5"
 anyhow = "1.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 criterion = "0.5"
+wiremock = "0.6"
+# LiveKit SIP contract tests: protobuf request bodies and signed webhooks.
+prost = "0.12"
+sha2 = { workspace = true }
 stats_alloc = "0.1.10"
 
 [[example]]
@@ -181,13 +190,23 @@ guardrails = ["dep:adk-guardrail"]
 # a script, for tests of the runners, the integration layer and voice surfaces.
 scripted = []
 # Enable OpenAI Realtime API support
-openai = ["dep:async-openai", "dep:tokio-tungstenite", "dep:getrandom"]
+openai = ["dep:tokio-tungstenite", "dep:getrandom"]
 # Enable Gemini Live API support
 gemini = ["dep:tokio-tungstenite", "dep:adk-gemini"]
 # Enable Vertex AI Live API support (requires gemini + OAuth2/ADC auth)
 vertex-live = ["gemini", "dep:google-cloud-auth"]
 # Enable LiveKit WebRTC bridge
-livekit = ["dep:livekit", "dep:livekit-api", "dep:tokio-tungstenite", "dep:libwebrtc", "dep:webrtc-sys", "dep:livekit-datatrack", "dep:livekit-data-stream"]
+livekit = ["dep:livekit", "dep:livekit-api", "dep:tokio-tungstenite", "dep:libwebrtc", "dep:webrtc-sys", "dep:webrtc-sys-build", "dep:livekit-protocol", "dep:livekit-common", "dep:livekit-datatrack", "dep:livekit-data-stream"]
+# Provider-neutral phone-call control (`telephony`): call handles, the freeze guard, and the
+# transfer, end-call, DTMF and dialling tools.
+telephony = []
+# OpenAI Realtime SIP (`openai::sip`): verifies `realtime.call.incoming` webhooks, accepts,
+# rejects, transfers and hangs up calls, and attaches a session to a call.
+openai-sip = ["openai", "telephony", "dep:reqwest", "dep:chrono", "adk-core/webhooks"]
+# LiveKit SIP (`telephony::livekit`): inbound trunks and dispatch rules, verified
+# `participant_joined` webhooks, outbound calls, transfers and hang-up over LiveKit's server
+# API. TLS matches the `livekit` feature's, so enabling both links one stack.
+livekit-sip = ["telephony", "dep:livekit-api", "dep:livekit-protocol", "livekit-api/native-tls", "livekit-api/webhooks"]
 # Enable OpenAI WebRTC transport (requires openai + Sans-IO WebRTC + Opus codec)
 openai-webrtc = ["openai", "dep:str0m", "dep:audiopus", "dep:reqwest"]
 # Enable video avatar support for realtime sessions

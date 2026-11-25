@@ -80,6 +80,7 @@ async fn answer(s: &Scenario, card: &DecisionCard, answer: Answer) {
                 edited_args: None,
                 reason: None,
                 expanded: true,
+                evidence: Vec::new(),
             },
         )
         .await
@@ -100,7 +101,14 @@ async fn always_allow_for_this_folder_covers_every_file_write_in_it() {
     std::os::unix::fs::symlink(outside.path(), s.path.join("notes/out")).unwrap();
 
     s.engine
-        .execute(&web(), Command::Send { session_id: "n1".into(), text: "take notes".into() })
+        .execute(
+            &web(),
+            Command::Send {
+                session_id: "n1".into(),
+                text: "take notes".into(),
+                images: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     let first = next_card(&s, &[]).await.expect("the first write asks");

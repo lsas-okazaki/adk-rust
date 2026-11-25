@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import type { DecisionCard } from "../generated/api";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react";
+import type { DecisionCard, StageView } from "../generated/api";
 import { ApiError, problemText } from "../client";
 import { usePoll } from "../poll";
 import { applyTheme, storedTheme } from "../theme";
@@ -9,10 +9,17 @@ import { Decisions } from "./Decisions";
 import { Agents, ThisPhone, TodayLines } from "./Glance";
 import { phoneLabels } from "./labels";
 import { Pair } from "./Pair";
+import { ImageLoaderContext, sameOriginLoader } from "../evidence/images";
+import { viewerOf } from "../viewer/route";
 import { badge } from "./push";
 import type { PhoneScreen } from "./route";
 import { phonePathOf, phoneScreenOf } from "./route";
 import "./phone.css";
+
+// The read-only viewer loads only when it opens (spec 3.7 §8.2, board choice V15).
+const PhoneViewer = lazy(() => import("../viewer/PhoneViewer").then((module) => ({ default: module.PhoneViewer })));
+// So does the live camera surface (spec 3.7 §8.2, board choice C14).
+const PhoneCamera = lazy(() => import("../camera/PhoneCamera").then((module) => ({ default: module.PhoneCamera })));
 
 /** How far back Decisions shows answered decisions, here or elsewhere. */
 const DECIDED_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -34,11 +41,21 @@ const TABS: Array<{ tab: Tab; label: string }> = [
  * do is not shown: no composer, no Resume all, no pairing, no operator rows. A read that
  * fails is said, never shown as nothing waiting; a pairing that ended offers to pair again.
  */
-export function PhoneApp({ client, initial }: { client: PhoneClient; initial?: PhoneScreen }) {
+export function PhoneApp({
+  client,
+  initial,
+  initialCard,
+}: {
+  client: PhoneClient;
+  initial?: PhoneScreen;
+  /** A card being raised on the camera first (fixtures). */
+  initialCard?: StageView;
+}) {
   const [screen, setScreen] = useState<PhoneScreen>(() => initial ?? phoneScreenOf(window.location));
   const [settled, setSettled] = useState<Record<string, DecisionCard>>({});
   const [problem, setProblem] = useState("");
   const [, setPairedAt] = useState(0);
+  const cameraClient = useMemo(() => client.cameraClient?.(), [client]);
 
   useEffect(() => applyTheme(storedTheme()), []);
   useEffect(() => {
@@ -46,6 +63,24 @@ export function PhoneApp({ client, initial }: { client: PhoneClient; initial?: P
     window.addEventListener("popstate", back);
     return () => window.removeEventListener("popstate", back);
   }, []);
+  // A card's "Open the source image" opens the read-only viewer in place (spec 3.7 §8.2, V15).
+  useEffect(() => {
+    if (!client.viewer) return;
+    const onClick = (event: MouseEvent) => {
+      if (event.defaultPrevented || event.button !== 0) return;
+      const link = (event.target as Element | null)?.closest?.("a[href]");
+      if (!(link instanceof HTMLAnchorElement) || link.target) return;
+      const url = new URL(link.href, window.location.href);
+      const place = url.origin === window.location.origin ? viewerOf(url) : undefined;
+      if (!place) return;
+      event.preventDefault();
+      const path = `${url.pathname}${url.search}`;
+      window.history.pushState(null, "", path);
+      setScreen({ screen: "viewer", place });
+    };
+    document.addEventListener("click", onClick);
+    return () => document.removeEventListener("click", onClick);
+  }, [client]);
 
   const go = useCallback((next: PhoneScreen) => {
     const path = phonePathOf(next);
@@ -122,13 +157,42 @@ export function PhoneApp({ client, initial }: { client: PhoneClient; initial?: P
     }
   }
 
-  const tab: Tab = screen.screen === "decide" ? "decisions" : screen.screen;
+  const tab: Tab =
+    screen.screen === "decide"
+      ? "decisions"
+      : screen.screen === "viewer" || screen.screen === "camera"
+        ? "threads"
+        : screen.screen;
   const line = [status.value?.mode?.status, status.value?.spend?.text].filter(Boolean).join(" · ");
   const title = TABS.find((entry) => entry.tab === tab)?.label ?? phoneLabels.decisions;
 
   return (
     <div className="phone">
-      {screen.screen === "decide" ? (
+      {screen.screen === "camera" && cameraClient ? (
+        <ImageLoaderContext.Provider value={client.image ? (href: string) => client.image!(href) : sameOriginLoader}>
+          <Suspense fallback={<main className="phone-main" aria-busy="true" />}>
+            <PhoneCamera
+              client={cameraClient}
+              place={screen.place}
+              onBack={() => (window.history.length > 1 ? window.history.back() : go({ screen: "threads" }))}
+              onNavigate={(place) => go({ screen: "camera", place })}
+              onOpenDecision={(card) => go({ screen: "decide", id: card.id })}
+              initialCard={initialCard}
+            />
+          </Suspense>
+        </ImageLoaderContext.Provider>
+      ) : screen.screen === "viewer" && client.viewer ? (
+        <ImageLoaderContext.Provider value={client.image ? (href: string) => client.image!(href) : sameOriginLoader}>
+          <Suspense fallback={<main className="phone-main" aria-busy="true" />}>
+            <PhoneViewer
+              client={{ viewer: client.viewer.bind(client) }}
+              place={screen.place}
+              onBack={() => (window.history.length > 1 ? window.history.back() : go({ screen: "threads" }))}
+              onOpenThread={() => go({ screen: "threads" })}
+            />
+          </Suspense>
+        </ImageLoaderContext.Provider>
+      ) : screen.screen === "decide" ? (
         <Decide client={client} id={screen.id} onBack={() => go({ screen: "decisions" })} onSettled={onSettled} />
       ) : (
         <main className="phone-main">

@@ -42,6 +42,7 @@
 //!     args: json!({ "amount": 900 }),
 //!     origin: None,
 //!     acting: None,
+//!     evidence: Vec::new(),
 //! };
 //! let policy = ApprovalPolicy::new([ApproverSelector::group("finance")]).with_quorum(2);
 //! let request = service
@@ -535,6 +536,7 @@ impl ApprovalDecision {
 ///     args: json!({ "amount": 500, "card": "4242424242424242" }),
 ///     origin: None,
 ///     acting: None,
+///     evidence: Vec::new(),
 /// };
 /// let request = ApprovalRequest::new(
 ///     "req-1",
@@ -566,6 +568,13 @@ pub struct ApprovalRequest {
     pub origin: Option<ToolOrigin>,
     /// The call's arguments as shown to approvers, with secrets removed.
     pub args_redacted: Value,
+    /// What approvers see with the call, such as the exact image it would send: the held
+    /// call's own [`evidence`](ToolConfirmationRequest::evidence), whose digests its
+    /// [`fingerprint`](Self::fingerprint) binds, then any the route added
+    /// ([`ApprovalRoute::evidence`]). Surfaces load each image through the artifact service
+    /// with the viewer's own authorisation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<crate::Evidence>,
     /// The agent making the call and on whose behalf.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acting: Option<ActingContext>,
@@ -627,6 +636,7 @@ impl ApprovalRequest {
             tool_name: call.tool_name.clone(),
             origin: call.origin.clone(),
             args_redacted: call.args.clone(),
+            evidence: call.evidence.clone(),
             acting: None,
             requester: None,
             summary: format!("Approve a call to '{}'", call.tool_name),
@@ -712,6 +722,47 @@ impl ApprovalRequest {
     #[must_use]
     pub fn with_redacted_args(mut self, args: Value) -> Self {
         self.args_redacted = args;
+        self
+    }
+
+    /// Shows approvers `evidence` after the call's own. Only the call's own evidence is part
+    /// of its [`fingerprint`](Self::fingerprint).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_core::{
+    ///     ApprovalPolicy, ApprovalRequest, ApprovalScope, ApproverSelector, ArtifactLocator,
+    ///     Evidence, ImageEvidence, ToolConfirmationRequest,
+    /// };
+    /// use serde_json::json;
+    ///
+    /// let image = |digest: &str, file: &str| {
+    ///     Evidence::from(ImageEvidence::new(
+    ///         digest,
+    ///         ArtifactLocator::new("desk", "ana", "s1", file, 1),
+    ///         "image/png",
+    ///         640,
+    ///         180,
+    ///     ))
+    /// };
+    /// let crop = image("sha256:aa", "egress/crop.png");
+    /// let call = ToolConfirmationRequest::new("vision_describe", json!({ "question": "Total?" }))
+    ///     .with_evidence([crop.clone()]);
+    /// let overlay = image("sha256:bb", "egress/crop-regions.png");
+    /// let request = ApprovalRequest::new(
+    ///     "apr-1",
+    ///     ApprovalScope::new("desk", "ana", "s1"),
+    ///     &call,
+    ///     ApprovalPolicy::new([ApproverSelector::human("ana")]),
+    /// )
+    /// .with_evidence([overlay.clone()]);
+    /// assert_eq!(request.evidence, vec![crop, overlay]);
+    /// assert_eq!(request.fingerprint, call.fingerprint());
+    /// ```
+    #[must_use]
+    pub fn with_evidence(mut self, evidence: impl IntoIterator<Item = crate::Evidence>) -> Self {
+        self.evidence.extend(evidence);
         self
     }
 
@@ -1601,6 +1652,10 @@ pub struct ApprovalRoute {
     pub redacted_args: Option<Value>,
     /// What approvers may do; defaults to every action.
     pub allowed_actions: Option<Vec<ApprovalAction>>,
+    /// Evidence shown to approvers after the call's own, such as an overlay the router drew.
+    /// The decision binds only to the call's own evidence
+    /// ([`ToolConfirmationRequest::evidence`]).
+    pub evidence: Vec<crate::Evidence>,
 }
 
 impl ApprovalRoute {
@@ -1612,6 +1667,7 @@ impl ApprovalRoute {
             risk: ApprovalRisk::default(),
             redacted_args: None,
             allowed_actions: None,
+            evidence: Vec::new(),
         }
     }
 
@@ -1643,6 +1699,13 @@ impl ApprovalRoute {
         actions: impl IntoIterator<Item = ApprovalAction>,
     ) -> Self {
         self.allowed_actions = Some(actions.into_iter().collect());
+        self
+    }
+
+    /// Shows approvers `evidence` after the call's own.
+    #[must_use]
+    pub fn with_evidence(mut self, evidence: impl IntoIterator<Item = crate::Evidence>) -> Self {
+        self.evidence.extend(evidence);
         self
     }
 }
@@ -1828,6 +1891,127 @@ pub trait ApprovalService: fmt::Debug + Send + Sync {
     fn approval_store(&self) -> Option<Arc<dyn ApprovalStore>> {
         None
     }
+
+    /// Files held calls under `router` when the service has no router of its own, so a host
+    /// that decides calls in an inbox, such as a kernel, receives every call the governed
+    /// path holds. A router the service was built with keeps deciding, including to leave a
+    /// call in the store only. Returns whether held calls reach the inbox afterwards.
+    ///
+    /// The default files none and answers `false`; a wrapper forwards it to the service it
+    /// wraps.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use adk_core::{
+    ///     ApprovalPolicy, ApprovalService, ApproverSelector, InMemoryApprovalStore,
+    ///     StoreApprovalService,
+    /// };
+    ///
+    /// let service = StoreApprovalService::new(Arc::new(InMemoryApprovalStore::new()));
+    /// let operator = ApprovalPolicy::new([ApproverSelector::group("operator")]);
+    /// assert!(service.route_unrouted(Arc::new(operator)));
+    /// ```
+    fn route_unrouted(&self, router: Arc<dyn ApprovalRouter>) -> bool {
+        let _ = router;
+        false
+    }
+
+    /// Adds `notifier` to a service already built, for a host built after it, such as a
+    /// kernel that publishes each request on its event bus. Returns whether the service took
+    /// it.
+    ///
+    /// The default takes none and answers `false`; a wrapper forwards it to the service it
+    /// wraps.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use adk_core::{
+    ///     ApprovalNotification, ApprovalNotifier, ApprovalService, InMemoryApprovalStore,
+    ///     StoreApprovalService, async_trait,
+    /// };
+    ///
+    /// #[derive(Debug)]
+    /// struct Log;
+    ///
+    /// #[async_trait]
+    /// impl ApprovalNotifier for Log {
+    ///     async fn notify(&self, notification: &ApprovalNotification) -> adk_core::Result<()> {
+    ///         tracing::info!(approval.id = %notification.request.id, "approval event");
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let service = StoreApprovalService::new(Arc::new(InMemoryApprovalStore::new()));
+    /// assert!(service.add_notifier(Arc::new(Log)));
+    /// ```
+    fn add_notifier(&self, notifier: Arc<dyn ApprovalNotifier>) -> bool {
+        let _ = notifier;
+        false
+    }
+
+    /// Files a call a [`ToolReviewer`](crate::ToolReviewer) approved or denied in the run as
+    /// a request it decided, so the inbox's history shows the decision and who made it
+    /// (`decided_by: model:<id>` for a [`ModelApprover`](crate::ModelApprover)). Returns
+    /// `None` when the service routes no request for the call.
+    ///
+    /// The run applies the verdict itself, so the request is created resolved, with its
+    /// outcome applied: nothing is written to the store and no run is woken. Notifiers hear
+    /// [`Decided`](ApprovalEventKind::Decided) and [`Resolved`](ApprovalEventKind::Resolved).
+    ///
+    /// The default files nothing and answers `None`; a wrapper forwards it to the service
+    /// it wraps.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error, or the audit trail's when the service records decisions.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use adk_core::principal::SubjectRef;
+    /// use adk_core::{
+    ///     ApprovalCall, ApprovalDecision, ApprovalPolicy, ApprovalScope, ApprovalService,
+    ///     ApprovalState, ApproverSelector, InMemoryApprovalStore, StoreApprovalService,
+    ///     ToolConfirmationRequest,
+    /// };
+    /// use serde_json::json;
+    ///
+    /// # futures::executor::block_on(async {
+    /// let service = StoreApprovalService::new(Arc::new(InMemoryApprovalStore::new()))
+    ///     .with_router(ApprovalPolicy::new([ApproverSelector::group("operator")]));
+    /// let call = ApprovalCall {
+    ///     scope: ApprovalScope::new("app", "u", "s"),
+    ///     request: ToolConfirmationRequest::new("bash", json!({ "command": "cargo test" })),
+    ///     reason: "host commands wait for approval".into(),
+    ///     agent_name: "harness".into(),
+    ///     invocation_id: "inv-1".into(),
+    ///     run_id: None,
+    ///     acting: None,
+    /// };
+    /// let reviewer = SubjectRef::service("model:claude-sonnet-5-5");
+    /// let filed = service
+    ///     .record_review(call, ApprovalDecision::approve(reviewer.clone()))
+    ///     .await?
+    ///     .unwrap();
+    /// assert_eq!(filed.state, ApprovalState::Approved);
+    /// assert_eq!(filed.decisions[0].approver, reviewer);
+    /// assert!(filed.outcome_applied);
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// # }).unwrap();
+    /// ```
+    async fn record_review(
+        &self,
+        call: ApprovalCall,
+        decision: ApprovalDecision,
+    ) -> Result<Option<ApprovalRequest>> {
+        let _ = (call, decision);
+        Ok(None)
+    }
 }
 
 /// Who belongs to which approver group, as the deployment knows it.
@@ -1911,6 +2095,10 @@ pub struct StoreApprovalService {
     router: Option<Arc<dyn ApprovalRouter>>,
     audit: Option<crate::audit_log::AuditTrail>,
     directory: Option<Arc<dyn ApproverDirectory>>,
+    /// The router a host gave a service built without one (`route_unrouted`).
+    fallback_router: std::sync::OnceLock<Arc<dyn ApprovalRouter>>,
+    /// Notifiers a host added after the service was built (`add_notifier`).
+    late_notifiers: std::sync::RwLock<Vec<Arc<dyn ApprovalNotifier>>>,
 }
 
 impl fmt::Debug for StoreApprovalService {
@@ -1921,6 +2109,11 @@ impl fmt::Debug for StoreApprovalService {
             .field("notifiers", &self.notifiers)
             .field("run_store", &self.run_store.is_some())
             .field("router", &self.router.is_some())
+            .field("fallback_router", &self.fallback_router.get().is_some())
+            .field(
+                "late_notifiers",
+                &self.late_notifiers.read().unwrap_or_else(|e| e.into_inner()).len(),
+            )
             .field("audit", &self.audit)
             .field("directory", &self.directory.is_some())
             .finish()
@@ -1929,7 +2122,8 @@ impl fmt::Debug for StoreApprovalService {
 
 impl StoreApprovalService {
     /// A service over `store`, reading the system clock, with no notifiers, run store,
-    /// or router.
+    /// or router. Without a router held calls stay in the store only, unless a host such
+    /// as a kernel gives it one ([`ApprovalService::route_unrouted`]).
     pub fn new(store: Arc<dyn ApprovalStore>) -> Self {
         Self {
             store,
@@ -1939,6 +2133,8 @@ impl StoreApprovalService {
             router: None,
             audit: None,
             directory: None,
+            fallback_router: std::sync::OnceLock::new(),
+            late_notifiers: std::sync::RwLock::new(Vec::new()),
         }
     }
 
@@ -2032,7 +2228,8 @@ impl StoreApprovalService {
         decision: Option<&ApprovalDecision>,
         escalation_step: Option<u32>,
     ) {
-        if self.notifiers.is_empty() {
+        let late = self.late_notifiers.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if self.notifiers.is_empty() && late.is_empty() {
             return;
         }
         let notification = ApprovalNotification {
@@ -2043,7 +2240,7 @@ impl StoreApprovalService {
             escalation_step,
             at: self.clock.now(),
         };
-        for notifier in &self.notifiers {
+        for notifier in self.notifiers.iter().chain(&late) {
             if let Err(error) = notifier.notify(&notification).await {
                 tracing::warn!(
                     approval.id = %request.id,
@@ -2295,7 +2492,8 @@ impl ApprovalService for StoreApprovalService {
     }
 
     async fn submit_call(&self, call: ApprovalCall) -> Result<Option<ApprovalRequest>> {
-        let Some(route) = self.router.as_ref().and_then(|router| router.route(&call)) else {
+        let router = self.router.as_ref().or_else(|| self.fallback_router.get());
+        let Some(route) = router.and_then(|router| router.route(&call)) else {
             return Ok(None);
         };
         self.store.record_pending(&call.scope, &call.request).await?;
@@ -2336,6 +2534,7 @@ impl ApprovalService for StoreApprovalService {
         if let Some(actions) = route.allowed_actions {
             request = request.with_allowed_actions(actions);
         }
+        request = request.with_evidence(route.evidence);
         if let Some(acting) = call.acting {
             request = request.with_acting(acting);
         }
@@ -2478,6 +2677,11 @@ impl ApprovalService for StoreApprovalService {
                 .ext("sessionId", Value::String(request.scope.session_id.clone()));
             if let Some(acting) = &request.acting {
                 draft = draft.ext("actingAgent", Value::String(acting.agent.id.to_string()));
+            }
+            // The images the decision was made on, by digest.
+            if !request.evidence.is_empty() {
+                let digests = request.evidence.iter().map(|item| Value::from(item.digest()));
+                draft = draft.ext("evidenceDigests", Value::Array(digests.collect()));
             }
             if let Some(edited) = &decision.edited_args {
                 draft = draft.ext("editedArgsDigest", Value::String(trail.digest(edited)));
@@ -2669,6 +2873,105 @@ impl ApprovalService for StoreApprovalService {
 
     fn approval_store(&self) -> Option<Arc<dyn ApprovalStore>> {
         Some(self.store.clone())
+    }
+
+    async fn record_review(
+        &self,
+        call: ApprovalCall,
+        mut decision: ApprovalDecision,
+    ) -> Result<Option<ApprovalRequest>> {
+        let router = self.router.as_ref().or_else(|| self.fallback_router.get());
+        let Some(route) = router.and_then(|router| router.route(&call)) else {
+            return Ok(None);
+        };
+        route.policy.validate()?;
+        let now = self.clock.now();
+        let fingerprint = call.request.fingerprint();
+        let id = ApprovalRequest::id_for_call(&call.scope, &fingerprint, now);
+        let mut request = ApprovalRequest::new(id, call.scope.clone(), &call.request, route.policy)
+            .with_summary(route.summary.unwrap_or(call.reason))
+            .with_risk(route.risk);
+        if let Some(args) = route.redacted_args {
+            request = request.with_redacted_args(args);
+        }
+        if let Some(actions) = route.allowed_actions {
+            request = request.with_allowed_actions(actions);
+        }
+        request = request.with_evidence(route.evidence);
+        if let Some(acting) = call.acting {
+            request = request.with_acting(acting);
+        }
+        if request.requester.is_none() {
+            request = request.with_requester(SubjectRef::human(call.scope.user_id.clone()));
+        }
+        if let Some(run_id) = call.run_id {
+            request = request.with_run_id(run_id);
+        }
+        decision.decided_at = now;
+        request.created_at = now;
+        request.state = match decision.kind {
+            ApprovalAction::Approve | ApprovalAction::Edit => ApprovalState::Approved,
+            ApprovalAction::Reject => ApprovalState::Rejected,
+            ApprovalAction::Respond => ApprovalState::Responded,
+        };
+        request.decisions = vec![decision.clone()];
+        request.resolved_at = Some(now);
+        // The run applied the verdict itself: there is no outcome to write and no run to wake.
+        request.outcome_applied = true;
+
+        if let Some(trail) = &self.audit {
+            use crate::audit_log::{AuditActor, AuditDecision, AuditRecordDraft, AuditRecordKind};
+            let audited = match decision.kind {
+                ApprovalAction::Approve | ApprovalAction::Edit => AuditDecision::Approved,
+                ApprovalAction::Reject | ApprovalAction::Respond => AuditDecision::Rejected,
+            };
+            let action = serde_json::to_value(decision.kind).unwrap_or(Value::Null);
+            let mut draft = AuditRecordDraft::new(AuditRecordKind::Approval, &request.tool_name)
+                .actor(AuditActor::subject(decision.approver.clone()))
+                .args_digest(trail.digest(&request.args_redacted))
+                .decision(audited)
+                .ext("source", Value::String(crate::REVIEW_SOURCE.to_string()))
+                .ext("approvalId", Value::String(request.id.clone()))
+                .ext("approvalAction", action)
+                .ext("version", Value::from(request.version))
+                .ext("sessionId", Value::String(request.scope.session_id.clone()));
+            if let Some(acting) = &request.acting {
+                draft = draft.ext("actingAgent", Value::String(acting.agent.id.to_string()));
+            }
+            // The images the decision was made on, by digest.
+            if !request.evidence.is_empty() {
+                let digests = request.evidence.iter().map(|item| Value::from(item.digest()));
+                draft = draft.ext("evidenceDigests", Value::Array(digests.collect()));
+            }
+            trail.record(draft).await?;
+        }
+
+        let stored = self.store.create_request(&request).await?;
+        tracing::info!(
+            approval.id = %stored.id,
+            tool.name = %stored.tool_name,
+            approval.state = stored.state.as_str(),
+            reviewer.id = %decision.approver.id,
+            "approval request decided by a reviewer"
+        );
+        if stored == request {
+            self.notify(ApprovalEventKind::Decided, &stored, Some(&decision), None).await;
+            self.notify(ApprovalEventKind::Resolved, &stored, None, None).await;
+        }
+        Ok(Some(stored))
+    }
+
+    fn route_unrouted(&self, router: Arc<dyn ApprovalRouter>) -> bool {
+        if self.router.is_none() {
+            // The first host's router stays: a second has nothing to add.
+            let _ = self.fallback_router.set(router);
+        }
+        true
+    }
+
+    fn add_notifier(&self, notifier: Arc<dyn ApprovalNotifier>) -> bool {
+        self.late_notifiers.write().unwrap_or_else(|e| e.into_inner()).push(notifier);
+        true
     }
 }
 
@@ -2864,6 +3167,7 @@ mod tests {
             args: json!({ "amount": 5 }),
             origin: None,
             acting: None,
+            evidence: Vec::new(),
         };
         let scope = ApprovalScope::new("app", "u", "s");
         let request = service
@@ -3043,6 +3347,7 @@ mod tests {
             args: json!({ "to": "acct-secret", "amount": 5 }),
             origin: None,
             acting: None,
+            evidence: Vec::new(),
         };
         let scope = ApprovalScope::new("app", "u", "s");
         let request = |id: &str| {
@@ -3174,5 +3479,67 @@ mod tests {
             json!({ "source": "verbs:adk-rust", "declarationDigest": verb_origin().declaration_digest })
         );
         assert_eq!(serde_json::from_value::<ApprovalRequest>(written).unwrap(), named);
+    }
+
+    /// A host routes and hears the held calls of a service built without a router or
+    /// notifiers; a router the service was built with keeps its own decisions.
+    #[tokio::test]
+    async fn a_host_routes_and_hears_a_service_built_without_a_router() {
+        use crate::InMemoryApprovalStore;
+
+        #[derive(Debug, Default)]
+        struct Heard(std::sync::Mutex<Vec<(ApprovalEventKind, ApprovalState)>>);
+
+        #[async_trait]
+        impl ApprovalNotifier for Heard {
+            async fn notify(&self, notification: &ApprovalNotification) -> Result<()> {
+                let heard = (notification.kind, notification.request.state);
+                self.0.lock().unwrap().push(heard);
+                Ok(())
+            }
+        }
+
+        let call = |args: Value| ApprovalCall {
+            scope: ApprovalScope::new("app", "ana", "s-1"),
+            request: ToolConfirmationRequest::new("bash", args),
+            reason: "needs approval".into(),
+            agent_name: "agent".into(),
+            invocation_id: "inv".into(),
+            run_id: Some("run-1".into()),
+            acting: None,
+        };
+        let operator = || -> Arc<dyn ApprovalRouter> {
+            Arc::new(
+                ApprovalPolicy::new([ApproverSelector::group("operator")]).allow_self_approval(),
+            )
+        };
+
+        let service = StoreApprovalService::new(Arc::new(InMemoryApprovalStore::new()));
+        assert_eq!(service.submit_call(call(json!({ "command": "ls" }))).await.unwrap(), None);
+        let heard = Arc::new(Heard::default());
+        assert!(service.route_unrouted(operator()));
+        assert!(service.add_notifier(heard.clone()));
+        let filed = service.submit_call(call(json!({ "command": "date" }))).await.unwrap();
+        let filed = filed.expect("the host's router files the call");
+        assert_eq!(filed.policy.approvers, vec![ApproverSelector::group("operator")]);
+        let decision =
+            ApprovalDecision::approve(SubjectRef::human("ana")).with_groups(["operator"]);
+        service.decide(&filed.id, filed.version, decision).await.unwrap();
+        assert_eq!(
+            *heard.0.lock().unwrap(),
+            vec![
+                (ApprovalEventKind::Submitted, ApprovalState::Pending),
+                (ApprovalEventKind::Decided, ApprovalState::Approved),
+                (ApprovalEventKind::Resolved, ApprovalState::Approved),
+            ]
+        );
+
+        // A service's own router may leave a call in the store only; a host's does not
+        // replace it.
+        let declines = |_: &ApprovalCall| -> Option<ApprovalRoute> { None };
+        let own =
+            StoreApprovalService::new(Arc::new(InMemoryApprovalStore::new())).with_router(declines);
+        assert!(own.route_unrouted(operator()));
+        assert_eq!(own.submit_call(call(json!({ "command": "ls" }))).await.unwrap(), None);
     }
 }

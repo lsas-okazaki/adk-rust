@@ -1,0 +1,386 @@
+[package]
+name = "adk-vision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Local-first perception for ADK-Rust agents: artifact-backed images, regions in source pixels with their transform chains, model manifests pinned by revision and SHA-256, perception traits with conformance suites, routing with crop escalation, and a governed egress boundary"
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/adk-vision"
+readme = "README.md"
+keywords = ["adk", "agent", "vision", "detection", "ocr"]
+categories = ["computer-vision", "asynchronous"]
+exclude = ["tests/"]
+
+[package.metadata.docs.rs]
+# docs.rs has no CUDA or Metal toolchain, so the GPU features are left out; ort-sys skips
+# linking on docs.rs.
+features = ["fetch", "conformance", "eval", "guardrail", "onnx", "ocr", "ocr-vl", "cloud", "nim", "sam", "sam-codec", "mistralrs", "track", "gemini-video", "memory", "analyst"]
+
+# Spec 3.7 §7.1: media, geometry, manifests, the traits, `VisionRuntime`, the egress boundary
+# and the deterministic `Editor` always build; each runtime and provider is a feature, added
+# by the workstream that brings it (`onnx`, `ocr`, `cloud`, `sam`, `nim`, ...).
+[features]
+default = []
+# The model fetcher: Hugging Face downloads by revision, SHA-256 checked before load (§7.4).
+fetch = ["dep:hf-hub", "dep:ureq"]
+# The conformance suite every backend runs, and its test macros (§7.18).
+conformance = ["tokio/rt-multi-thread"]
+# `VisionEvalAgent`: a runtime task answering `adk-eval` cases in the governed tools' response
+# form, in process or over the `cargo adk eval` agent protocol (§7.16).
+eval = ["dep:futures", "tokio/io-util"]
+# `ImagePrivacyGuardrail` as an adk-guardrail `Guardrail` and `ToolGuardrail` and a
+# `BeforeModelCallback`, and `PersonalTextRedactor` over `PiiRedactor`'s byte ranges (§7.8).
+guardrail = ["dep:adk-guardrail", "dep:base64"]
+# Local `ort` backends (§7.6): RF-DETR, EfficientSAM-Ti, SAM 2.1 Tiny and SigLIP 2, with the
+# onnxruntime binary downloaded at build time over rustls. Their weights come through the fetcher.
+onnx = ["fetch", "dep:ort", "adk-core/ort", "dep:tokenizers", "ort/download-binaries", "ort/tls-rustls", "ort/copy-dylibs"]
+# The same backends against an onnxruntime library loaded at run time from `ORT_DYLIB_PATH`,
+# for offline and production builds.
+onnx-dynamic = ["fetch", "dep:ort", "adk-core/ort", "dep:tokenizers", "ort/load-dynamic"]
+# `OnnxExecutionProvider::CoreMl` and `Cuda`; without them a session warns and runs on the CPU.
+# `onnx-cuda` downloads the CUDA build of onnxruntime; `onnx-coreml` links only on Apple targets.
+onnx-coreml = ["onnx", "ort/coreml"]
+onnx-cuda = ["onnx", "ort/cuda"]
+# `Sam3` and `Sam3Tracker`: Meta's SAM 3 on the `onnx` runtime, from weights a person supplies
+# with their own manifest under the SAM License (use-restricted, not Apache-2.0). In no adk-rust
+# tier; nothing loads until a person records acceptance of the licence.
+sam3-local = ["onnx"]
+# `LlmDescriber` over any `adk_core::Llm` that takes images, with the Gemini, Claude and
+# 0-1000 region adapters and provider-formula preflight estimates (§7.7, §7.9).
+cloud = ["dep:adk-model", "dep:base64", "dep:futures"]
+# NVIDIA NIM (§7.7): the vision-language models over adk-model's OpenAI-compatible client, and
+# the document reader over the hosted or self-hosted CV endpoints for OCR, page elements, table
+# structure and chart elements.
+nim = ["cloud", "adk-model/openai", "dep:reqwest", "dep:base64"]
+# The Meta `sam-3.1` client: request building, the stream parser and mask placement (§7.7).
+sam = ["dep:adk-model", "adk-model/muse", "dep:base64", "dep:futures", "dep:reqwest", "tokio/io-util", "tokio/process"]
+# `LicensedMaskDecoder`: `sam-3.1` masks decoded in process by `adk-vision-sam-codec`, the port
+# of Meta's codec, which is under the SAM License rather than Apache-2.0. In no adk-rust tier;
+# the decoder refuses until a person records acceptance of the licence.
+sam-codec = ["sam", "dep:adk-vision-sam-codec"]
+# PP-OCRv6 text lines and words through `oar-ocr` on ONNX Runtime (§7.6), the runtime
+# downloaded at build time over rustls as `onnx` does. Weights come through the manifest and
+# fetcher; `oar-ocr`'s own ModelScope `auto-download` stays off.
+ocr = ["fetch", "dep:oar-ocr", "dep:ort", "adk-core/ort", "ort/download-binaries", "ort/tls-rustls", "ort/copy-dylibs", "oar-ocr/simd", "dep:serde-saphyr"]
+# PaddleOCR-VL-1.6 with PP-DocLayoutV3 through `oar-ocr-vl` on Candle (§7.6): layout,
+# reading order, tables, formulas and seals.
+ocr-vl = ["fetch", "dep:oar-ocr-vl"]
+# `ocr-vl` on Apple GPUs through Candle's Metal backend.
+ocr-vl-metal = ["ocr-vl", "oar-ocr-vl/metal"]
+# `LlmDescriber::mistralrs`: a verified vision-language model (Qwen3-VL) in this process
+# through adk-mistralrs (§7.6), `InProcess`, so its images never reach the egress gate.
+mistralrs = ["cloud", "fetch", "dep:adk-mistralrs"]
+# `mistralrs` on Apple GPUs (Metal) or NVIDIA GPUs (CUDA toolkit required).
+mistralrs-metal = ["mistralrs", "adk-mistralrs/metal"]
+mistralrs-cuda = ["mistralrs", "adk-mistralrs/cuda"]
+# Frame ingestion (§7.13): `FrameSource`, the sampler, the frame governor, frame retention and
+# the stream pipeline (source, sampler, privacy, detector, tracker, observation sink).
+stream = ["dep:futures"]
+# `RtspSource`: cameras over RTSP through `retina` (MIT OR Apache-2.0). MJPEG decodes in
+# process; H.264 and H.265 need the `ffmpeg` feature too.
+rtsp = ["stream", "dep:retina", "dep:url"]
+# `FileSource` (MP4, MOV) and H.264/H.265 decoding through a user-installed `ffmpeg` binary,
+# spawned through `ffmpeg-sidecar` with its download feature off: nothing is vendored or
+# downloaded (spec 3.7 D-11, Q9).
+ffmpeg = ["stream", "dep:ffmpeg-sidecar"]
+# `DeviceSource`: a camera on this machine through the same user-installed `ffmpeg` —
+# AVFoundation on macOS, v4l2 on Linux, DirectShow on Windows — and `DeviceSource::list`.
+device = ["ffmpeg"]
+# `ScreenSource`: screenshots from a `ComputerActuator` or computer-use-mcp observations at an
+# interval.
+screen = ["stream", "dep:base64"]
+# `BrowserSource`: the `browser_screenshot` tool at an interval.
+browser = ["stream", "dep:base64"]
+# `SurfaceCameraSource`: the frames the web home captures, pushed through a `CameraFeed`.
+surface-camera = ["stream"]
+# The generated conveyor clip and an in-process RTSP test server (MJPEG in process, H.264
+# from a user-installed ffmpeg), for tests and the phase B scenarios.
+stream-fixtures = ["stream", "dep:base64", "tokio/net", "tokio/io-util"]
+# `GeminiVideoAnalyzer`: Gemini native video through adk-model's Gemini client, uploading
+# clips above 20 MB through the File API (§7.13, X8, X9).
+gemini-video = ["cloud", "adk-model/gemini"]
+# `GroundedTarget::target_evidence`: a chosen mark as adk-computer-use `TargetEvidence`, bounds
+# in logical points at the screenshot's device pixel ratio (§7.14, V-I14).
+computer-use = ["dep:adk-computer-use"]
+# `ByteTracker`: ByteTrack through `trackforge` (MIT, pure Rust) for anonymous tracks with
+# stable identifiers across frames (§7.13).
+track = ["dep:trackforge"]
+# Visual memory (§7.15): image embeddings as adk-rag chunks in any vector store, one embedding
+# space per collection, text and example-image queries, captions with artifact references in
+# adk-memory, sources and labels in its graph memory, erasure by source; and the week corpus
+# of scenario S16.
+memory = ["dep:adk-rag", "dep:adk-memory", "adk-memory/graph-memory"]
+# The video analyst (§7.13, §7.15, S17): a video cut into fixed or scene chunks, each captioned
+# by the runtime's video analyzer, indexed in any vector store with captions in adk-memory and
+# the clip in its graph memory; questions answered from retrieved chunks, citing their time
+# ranges; cost per hour of video; erasure by clip; and the warehouse clip of scenario S17.
+analyst = ["cloud", "memory", "stream"]
+# The visual memory tests against adk-rag's embedded LanceDB backend (protoc needed).
+memory-lancedb = ["memory", "adk-rag/lancedb"]
+# The perceiver, reasoner and verifier roles and `VisionTeam` (§7.12): each role an adk-core
+# `Agent`, the perceiver's model through adk-agent's `LlmAgent`, disagreements held on the
+# governed path with the frame as evidence.
+team = ["guardrail", "dep:adk-agent", "dep:futures"]
+
+[dependencies]
+adk-core.workspace = true
+# `MediaStore` keeps every image an operation stores as a versioned artifact (§7.2).
+adk-artifact.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+hex.workspace = true
+# PNG, JPEG and WebP decoding, and GIF's first frame; no other format is accepted (§7.2).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", default-features = false }
+# `.adk/vision.toml`, the egress rules (§7.8).
+toml.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+# `computer-use`: the target evidence a grounded mark fills.
+adk-computer-use = { workspace = true, optional = true }
+adk-guardrail = { workspace = true, optional = true }
+# `memory`: graph memory and captions with artifact references.
+adk-memory = { workspace = true, optional = true }
+# `memory`: chunks, collections and every vector store backend.
+adk-rag = { workspace = true, optional = true }
+# `team`: a perceiver with a model runs as an `LlmAgent`.
+adk-agent = { workspace = true, optional = true }
+# `mistralrs`: Qwen3-VL and the other mistral.rs vision models in process.
+adk-mistralrs = { workspace = true, optional = true }
+# Provider prices for preflight estimates, and the clients `nim` and `sam` build on.
+adk-model = { workspace = true, optional = true }
+# `sam-codec`: the SAM-licensed port of Meta's mask codec, kept in its own crate.
+adk-vision-sam-codec = { workspace = true, optional = true }
+# Base64 images inside tool results (`guardrail`), data URLs and mask payloads (`cloud`, `sam`), NIM data URIs (`nim`), screenshots (`screen`, `browser`) and H.264 parameter sets in SDP (`stream-fixtures`).
+base64 = { version = "0.22", optional = true }
+futures = { workspace = true, optional = true }
+# `sam` streams; `nim`'s CV endpoints take JSON bodies with inline data URIs.
+reqwest = { workspace = true, optional = true }
+
+# Same client configuration as adk-rag: the blocking ureq client, no default TLS stack.
+hf-hub = { version = "0.5", optional = true, default-features = false, features = ["ureq"] }
+# Only to read the HTTP status of a refused download (401 and 403 mean licence acceptance).
+ureq = { version = "3", optional = true, default-features = false }
+# The workspace `ort` pin, with no `api-*` level (see the root `ort` pin); each `onnx*` feature
+# adds how onnxruntime is linked.
+ort = { workspace = true, optional = true, features = ["std", "tracing"] }
+# SigLIP 2's Gemma tokenizer. `onig` alone, as adk-rag: `esaxx_fast` links a static-CRT object
+# that rust-lld refuses next to ort's dynamic-CRT objects on MSVC.
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
+
+# `ocr`: 0.11.x pins `ort` =2.0.0-rc.15, the workspace pin (spec 3.7 Q7).
+oar-ocr = { version = "0.11.0", optional = true, default-features = false }
+# `ocr`: the character dictionary ships inside PaddlePaddle's `inference.yml`.
+serde-saphyr = { workspace = true, optional = true }
+# `ocr-vl`: the release matching `oar-ocr`; no `auto-download`.
+oar-ocr-vl = { version = "0.11.0", optional = true, default-features = false }
+
+# `rtsp`: RTSP sessions and RTP depacketising for H.264, H.265 and MJPEG.
+retina = { version = "0.4.21", optional = true }
+# `rtsp`: the camera URL `retina` takes.
+url = { version = "2.5", optional = true }
+# `ffmpeg`: spawns the ffmpeg binary the user installed. `download_ffmpeg` stays off.
+ffmpeg-sidecar = { version = "2.7", optional = true, default-features = false }
+# `track`: ByteTrack and its Kalman filter; default features off, so no ONNX or OpenCV.
+trackforge = { version = "0.5.1", optional = true, default-features = false }
+
+[dev-dependencies]
+# Path-only self dependency, so the crate's own tests run the conformance suite.
+adk-vision = { path = ".", features = ["conformance"] }
+# The governed-toolset scenarios (S1–S4, S7) run through `Runner` and `LlmAgent` with a
+# scripted model; the cloud contract tests replay recorded responses through the real
+# provider clients.
+adk-agent = { path = "../adk-agent", features = ["team-tools"] }
+# The eval agent scored by `adk-eval`'s vision criteria, in process.
+adk-eval = { path = "../adk-eval" }
+# `ollama`: a vision model on Ollama as a local describer (X19), replayed and live.
+adk-model = { path = "../adk-model", default-features = false, features = ["anthropic", "gemini", "muse", "ollama", "openai"] }
+adk-runner = { path = "../adk-runner" }
+adk-session = { path = "../adk-session" }
+futures = { workspace = true }
+jsonschema = { workspace = true }
+proptest = "1.5"
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+wiremock = "0.6"
+
+[[test]]
+name = "screen_live_tests"
+required-features = ["computer-use"]
+
+[[test]]
+name = "fetch_tests"
+required-features = ["fetch"]
+
+[[test]]
+name = "eval_agent_tests"
+required-features = ["eval"]
+
+[[test]]
+name = "privacy_guardrail_tests"
+required-features = ["guardrail"]
+
+[[test]]
+name = "governed_toolset_tests"
+required-features = ["guardrail"]
+
+[[test]]
+name = "egress_property_tests"
+required-features = ["guardrail"]
+
+[[test]]
+name = "fetch_live_tests"
+required-features = ["fetch"]
+
+[[test]]
+name = "cloud_tests"
+required-features = ["cloud", "nim"]
+
+[[test]]
+name = "cloud_live_tests"
+required-features = ["cloud", "nim"]
+
+[[test]]
+name = "nim_tests"
+required-features = ["nim"]
+
+[[test]]
+name = "sam_tests"
+required-features = ["sam"]
+
+[[test]]
+name = "sam_live_tests"
+required-features = ["sam"]
+
+[[test]]
+name = "sam_codec_tests"
+required-features = ["sam-codec"]
+
+[[test]]
+name = "sam3_local_tests"
+required-features = ["sam3-local"]
+
+[[test]]
+name = "sam3_local_live_tests"
+required-features = ["sam3-local"]
+
+[[test]]
+name = "ocr_live_tests"
+required-features = ["ocr", "fetch", "conformance"]
+
+[[test]]
+name = "nim_contract_tests"
+required-features = ["nim", "conformance"]
+
+[[test]]
+name = "nim_live_tests"
+required-features = ["nim", "ocr", "guardrail", "fetch", "conformance"]
+
+[[test]]
+name = "ocr_vl_live_tests"
+required-features = ["ocr-vl", "fetch", "conformance"]
+
+[[test]]
+name = "local_redactor_tests"
+required-features = ["onnx", "ocr", "guardrail"]
+
+[[test]]
+name = "face_privacy_tests"
+required-features = ["stream"]
+
+[[test]]
+name = "ort_environment_tests"
+required-features = ["ocr"]
+
+[[test]]
+name = "mistralrs_tests"
+required-features = ["mistralrs", "conformance"]
+
+[[test]]
+name = "stream_tests"
+required-features = ["stream"]
+
+[[test]]
+name = "stream_watch_tests"
+required-features = ["stream"]
+
+[[test]]
+name = "stream_property_tests"
+required-features = ["stream"]
+
+[[test]]
+name = "stream_rtsp_tests"
+required-features = ["rtsp", "stream-fixtures"]
+
+[[test]]
+name = "stream_file_tests"
+required-features = ["ffmpeg", "stream-fixtures"]
+
+[[test]]
+name = "stream_device_tests"
+required-features = ["device"]
+
+[[test]]
+name = "stream_device_live_tests"
+required-features = ["device", "onnx"]
+
+[[test]]
+name = "stream_sources_tests"
+required-features = ["screen", "browser", "surface-camera"]
+
+[[test]]
+name = "stream_live_tests"
+required-features = ["rtsp", "onnx", "stream-fixtures"]
+
+[[test]]
+name = "track_property_tests"
+required-features = ["track", "conformance"]
+
+[[test]]
+name = "video_tests"
+required-features = ["cloud", "sam", "gemini-video"]
+
+[[test]]
+name = "video_live_tests"
+required-features = ["cloud", "sam", "gemini-video"]
+
+[[test]]
+name = "video_local_live_tests"
+required-features = ["mistralrs"]
+
+[[test]]
+name = "memory_tests"
+required-features = ["memory"]
+
+[[test]]
+name = "analyst_tests"
+required-features = ["analyst", "conformance"]
+
+[[test]]
+name = "analyst_live_tests"
+required-features = ["analyst"]
+
+[[test]]
+name = "memory_lancedb_tests"
+required-features = ["memory-lancedb"]
+
+[[test]]
+name = "memory_live_tests"
+required-features = ["memory", "onnx"]
+
+[[test]]
+name = "team_tests"
+required-features = ["team"]
+
+[[test]]
+name = "team_live_tests"
+required-features = ["team", "nim"]

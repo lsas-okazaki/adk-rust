@@ -10,7 +10,6 @@
 
 use adk_core::{Content, FinishReason, GenerateContentConfig, LlmResponse, Part, UsageMetadata};
 use serde_json::Value;
-use std::collections::HashMap;
 
 /// Build an Azure AI Inference chat completions request body from an ADK `LlmRequest`.
 ///
@@ -25,7 +24,7 @@ use std::collections::HashMap;
 pub(crate) fn build_request_body(
     model: &str,
     contents: &[Content],
-    tools: &HashMap<String, Value>,
+    tools: &adk_core::ToolDeclarations,
     config: Option<&GenerateContentConfig>,
     stream: bool,
 ) -> Result<Value, adk_core::AdkError> {
@@ -100,6 +99,12 @@ pub(crate) fn build_request_body(
         }
         if let Some(penalty) = cfg.presence_penalty {
             body["presence_penalty"] = serde_json::json!(penalty);
+        }
+        if let Some(schema) = &cfg.response_schema {
+            body["response_format"] = serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "response", "schema": schema},
+            });
         }
     }
 
@@ -429,7 +434,14 @@ mod tests {
             role: "user".to_string(),
             parts: vec![Part::Text { text: "Hello".to_string() }],
         }];
-        let body = build_request_body("my-model", &contents, &HashMap::new(), None, false).unwrap();
+        let body = build_request_body(
+            "my-model",
+            &contents,
+            &adk_core::ToolDeclarations::new(),
+            None,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(body["model"], "my-model");
         assert_eq!(body["stream"], false);
@@ -447,18 +459,36 @@ mod tests {
             max_output_tokens: Some(1024),
             ..Default::default()
         };
-        let body = build_request_body("m", &[], &HashMap::new(), Some(&config), true).unwrap();
+        let body =
+            build_request_body("m", &[], &adk_core::ToolDeclarations::new(), Some(&config), true)
+                .unwrap();
 
         assert_eq!(body["stream"], true);
         // Use f32-safe values (0.5 is exactly representable in f32)
         assert_eq!(body["temperature"], 0.5);
         assert_eq!(body["top_p"], 0.5);
         assert_eq!(body["max_tokens"], 1024);
+        assert!(body.get("response_format").is_none());
+    }
+
+    #[test]
+    fn a_response_schema_is_sent_as_a_json_schema_response_format() {
+        let schema =
+            serde_json::json!({"type": "object", "properties": {"choice": {"type": "string"}}});
+        let config =
+            GenerateContentConfig { response_schema: Some(schema.clone()), ..Default::default() };
+        let body =
+            build_request_body("m", &[], &adk_core::ToolDeclarations::new(), Some(&config), false)
+                .unwrap();
+        assert_eq!(
+            body["response_format"],
+            serde_json::json!({"type": "json_schema", "json_schema": {"name": "response", "schema": schema}})
+        );
     }
 
     #[test]
     fn test_build_request_body_with_tools() {
-        let mut tools = HashMap::new();
+        let mut tools = adk_core::ToolDeclarations::new();
         tools.insert(
             "get_weather".to_string(),
             serde_json::json!({
@@ -768,8 +798,14 @@ mod tests {
             role: "user".to_string(),
             parts: vec![Part::Text { text: "What is Rust?".to_string() }],
         }];
-        let body =
-            build_request_body("test-model", &contents, &HashMap::new(), None, false).unwrap();
+        let body = build_request_body(
+            "test-model",
+            &contents,
+            &adk_core::ToolDeclarations::new(),
+            None,
+            false,
+        )
+        .unwrap();
 
         // Simulate a response with the same text
         let response_json = serde_json::json!({
@@ -1116,15 +1152,18 @@ mod tests {
             frequency_penalty: Some(0.25),
             ..Default::default()
         };
-        let body = build_request_body("m", &[], &HashMap::new(), Some(&config), false).unwrap();
+        let body =
+            build_request_body("m", &[], &adk_core::ToolDeclarations::new(), Some(&config), false)
+                .unwrap();
         assert_eq!(body["stop"], serde_json::json!(["END"]));
         assert_eq!(body["seed"], 42);
         assert_eq!(body["presence_penalty"], 0.5);
         assert_eq!(body["frequency_penalty"], 0.25);
 
         let config = GenerateContentConfig { top_logprobs: Some(2), ..Default::default() };
-        let error = build_request_body("m", &[], &HashMap::new(), Some(&config), false)
-            .expect_err("Azure AI Inference has no logprobs field");
+        let error =
+            build_request_body("m", &[], &adk_core::ToolDeclarations::new(), Some(&config), false)
+                .expect_err("Azure AI Inference has no logprobs field");
         assert_eq!(error.code, "model.unsupported_config");
     }
 
@@ -1147,7 +1186,9 @@ mod tests {
                 annotations: None,
             }],
         }];
-        let body = build_request_body("m", &contents, &HashMap::new(), None, false).unwrap();
+        let body =
+            build_request_body("m", &contents, &adk_core::ToolDeclarations::new(), None, false)
+                .unwrap();
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages[0]["role"], "tool");
         assert_eq!(messages[1]["role"], "user");

@@ -38,14 +38,16 @@ use std::time::Duration;
 
 use adk_core::audit_log::{AuditActor, AuditTrail};
 use adk_core::queue_source::QueueIngress;
+use adk_core::schedule::Jitter;
 use adk_core::{
-    ApprovalService, Clock, DurableRunStore, Enqueued, GovernanceControl, GovernanceMirrorConfig,
-    GovernanceStateStore, ScheduleStore, SpendLedger, SystemClock,
+    ApprovalPolicy, ApprovalService, ApproverSelector, Clock, DurableRunStore, Enqueued,
+    GovernanceControl, GovernanceMirrorConfig, GovernanceStateStore, ScheduleStore, SpendLedger,
+    SystemClock,
 };
 use adk_runner::Runner;
 use adk_server::background::{
-    DurableScheduler, DurableWorker, DurableWorkerConfig, WorkflowExecutor, WorkflowRunContext,
-    WorkflowState,
+    DurableScheduler, DurableSubagents, DurableWorker, DurableWorkerConfig, SubagentBackend,
+    SubagentConfig, WorkflowExecutor, WorkflowRunContext, WorkflowState,
 };
 use adk_server::rest::{FreezeDelegate, FreezeReport};
 use adk_session::SessionService;
@@ -75,7 +77,7 @@ use crate::stores::{KernelStores, ProcessFilter, StoreOrigin, StoreUse};
 use crate::supervise::{KernelHooks, Supervision};
 use crate::wake::{
     CronWakeSource, FileWakeSource, KernelWakeExecutor, RunFinishedWakeSource, Trigger, Wake,
-    WakeRouter, WakeSource,
+    WakeEvent, WakeRouter, WakeSource, keys,
 };
 use crate::watermark::{CronWatermarkStore, SourceWatermark};
 
@@ -145,6 +147,11 @@ pub struct KernelConfig {
     /// Every partition's quotas: max running, max queued, the daily spend cap (spec 3.2
     /// §7.9). Defaults to none.
     pub quotas: Quotas,
+    /// Spreads the kernel's cron ticks and schedule fires: each is delayed by a share of the
+    /// gap to the next one, under half of it, the share derived from the source or schedule
+    /// and the [`app_name`](Self::app_name). The tick keeps its scheduled time as its key and
+    /// watermark. Defaults to none.
+    pub cron_jitter: Option<Jitter>,
 }
 
 impl Default for KernelConfig {
@@ -162,6 +169,7 @@ impl Default for KernelConfig {
             proactivity: ProactivityPolicy::default(),
             quiet_hours: None,
             quotas: Quotas::default(),
+            cron_jitter: None,
         }
     }
 }
@@ -186,6 +194,32 @@ impl KernelConfig {
     pub fn with_quotas(mut self, quotas: Quotas) -> Self {
         self.quotas = quotas;
         self
+    }
+
+    /// Delays each cron tick and schedule fire by `jitter` (see
+    /// [`cron_jitter`](Self::cron_jitter)): the kernel's own cron sources, the cron wakes of
+    /// sleepers, a managed tenant's cron sources and the schedule store's `DurableScheduler`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use adk_core::schedule::Jitter;
+    /// use adk_kernel::KernelConfig;
+    ///
+    /// let config = KernelConfig::default().with_cron_jitter(Jitter::new(15, Duration::from_secs(540)));
+    /// assert_eq!(config.cron_jitter, Some(Jitter::default()));
+    /// ```
+    #[must_use]
+    pub fn with_cron_jitter(mut self, jitter: Jitter) -> Self {
+        self.cron_jitter = Some(jitter);
+        self
+    }
+
+    /// [`cron_jitter`](Self::cron_jitter) salted with the application name, so two kernels
+    /// or tenants whose sources share names spread apart.
+    pub(crate) fn salted_cron_jitter(&self) -> Option<Jitter> {
+        self.cron_jitter.map(|jitter| jitter.salted(&self.app_name))
     }
 
     /// The mirrored kill switch's poll interval on multi-replica (K-I8): no backend
@@ -372,6 +406,66 @@ pub struct KernelHealth {
     pub store_latency: Option<Duration>,
 }
 
+/// The runner's code for a run that has not built its context yet, whose plugins cannot
+/// screen a steering message.
+const STEER_RUN_NOT_READY_CODE: &str = "agent.steer.run_not_ready";
+
+/// A message a running process holds for its agent's next safe point (spec 3.3 §6 "steer"):
+/// what [`Kernel::steer`] answers.
+///
+/// The message is delivered when the session holds an event whose steering marker carries
+/// the receipt's steer id; it is handed back when the claim ends without one.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Steering {
+    /// The process that holds the message.
+    pub pid: String,
+    /// The lease epoch of the claim that holds it; a later claim of the process never
+    /// delivers it.
+    pub lease_epoch: u64,
+    /// Resolves once the turn takes the message, or ends first and hands it back.
+    pub receipt: adk_core::SteerReceipt,
+}
+
+/// What [`Kernel::run_now`] runs now.
+///
+/// # Example
+///
+/// ```rust
+/// use adk_kernel::RunNowTarget;
+///
+/// let target = RunNowTarget::Trigger { name: "nightly".into() };
+/// assert_eq!(serde_json::to_value(&target).unwrap(), serde_json::json!({"trigger": {"name": "nightly"}}));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[non_exhaustive]
+pub enum RunNowTarget {
+    /// A process asleep on a cron wake, such as one `adk-rust wake --cron` started.
+    Process {
+        /// The process id.
+        pid: String,
+    },
+    /// A standing trigger on a cron wake.
+    Trigger {
+        /// The trigger's name.
+        name: String,
+    },
+}
+
+/// What [`Kernel::run_now`] queued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct RunNow {
+    /// The wake's key, [`keys::run_now`].
+    pub key: String,
+    /// The `kernel.wake` run that routes it.
+    pub wake_run_id: String,
+    /// `true` when an earlier request with the same id queued it.
+    pub existing: bool,
+}
+
 /// One worker's health (spec 3.2 §7.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -419,7 +513,7 @@ pub struct Kernel {
     inner: Arc<KernelInner>,
 }
 
-struct KernelInner {
+pub(crate) struct KernelInner {
     config: KernelConfig,
     sup: Arc<Supervision>,
     processes: ProcessTable,
@@ -451,6 +545,8 @@ struct KernelInner {
     status: Arc<RwLock<Status>>,
     #[cfg(feature = "proc")]
     ledger: Option<Ledger>,
+    /// The background sub-agent host ([`KernelBuilder::subagents`]).
+    subagents: Option<DurableSubagents>,
 }
 
 /// What a started kernel runs besides its claim loops.
@@ -461,6 +557,9 @@ struct Runtime {
     control: Option<ControlPlane>,
     /// Claim loops a pause shut down, finishing their attempts.
     stopping: Vec<JoinHandle<()>>,
+    /// The kernel is paused by a drain, whose attempts are parked or abandoned, so `stop`
+    /// has nothing left to drain.
+    drained: bool,
 }
 
 /// The health the loops measure, read by [`Kernel::health`].
@@ -562,6 +661,7 @@ impl Kernel {
                     target: trigger.run.target.clone(),
                     queue: trigger.run.queue.clone(),
                     partition: trigger.partition.clone(),
+                    overlap: trigger.overlap,
                     served,
                 }
             })
@@ -793,10 +893,26 @@ impl Kernel {
             tracing::warn!(error = %error, "could not host the added agents yet; the next tick retries");
         }
         self.spawn_workers();
+        if let Some(subagents) = self.inner.subagents.clone() {
+            // A parent is told about a sub-agent that finished while no kernel ran.
+            tasks.push(tokio::spawn(async move {
+                match subagents.reconcile().await {
+                    Ok(looked) => {
+                        tracing::debug!(subagents.looked = looked, "sub-agent notices reconciled")
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "could not reconcile sub-agent notices")
+                    }
+                }
+            }));
+        }
         if let Some(schedules) = &self.inner.schedules {
-            let scheduler = DurableScheduler::new(Arc::clone(schedules), Arc::clone(&sup.runs))
+            let mut scheduler = DurableScheduler::new(Arc::clone(schedules), Arc::clone(&sup.runs))
                 .with_governance(governance.clone())
                 .with_clock(Arc::clone(&config.clock));
+            if let Some(jitter) = config.salted_cron_jitter() {
+                scheduler = scheduler.with_jitter(jitter);
+            }
             tasks.push(spawn_scheduler(
                 scheduler,
                 Arc::clone(&sup),
@@ -932,13 +1048,14 @@ impl Kernel {
     ///
     /// Returns [`KernelError::Lifecycle`] when the kernel is not paused.
     pub async fn resume(&self) -> Result<()> {
-        let _runtime = self.inner.runtime.lock().await;
+        let mut runtime = self.inner.runtime.lock().await;
         let state = self.state();
         if state != KernelState::Paused {
             return Err(KernelError::Lifecycle { state, action: "resume" });
         }
         self.spawn_workers();
         self.inner.sup.wake_suspended(&Suspension::Drain).await;
+        runtime.drained = false;
         self.set_state(KernelState::Running);
         self.record_lifecycle(audit::KERNEL_RESUMED, None).await;
         Ok(())
@@ -1001,6 +1118,7 @@ impl Kernel {
                 stopping.abort();
             }
         }
+        runtime.drained = true;
         drop(runtime);
         sup.draining.store(false, Ordering::SeqCst);
         self.set_state(KernelState::Paused);
@@ -1009,16 +1127,22 @@ impl Kernel {
         Ok(())
     }
 
-    /// Drains, stops drivers and closes the control plane. Records `kernel.stopped`.
+    /// Drains for [`SIGTERM_DRAIN`](Self::SIGTERM_DRAIN), unless a [`drain`](Self::drain)
+    /// already paused the kernel, stops drivers and closes the control plane. Records
+    /// `kernel.stopped`.
     ///
     /// # Errors
     ///
     /// Returns a store or control-plane error; the kernel is stopped regardless.
     pub async fn stop(&self) -> Result<()> {
         let mut first_error = None;
-        if matches!(self.state(), KernelState::Running | KernelState::Paused)
-            && let Err(error) = self.drain(Self::SIGTERM_DRAIN).await
-        {
+        let drained = self.inner.runtime.lock().await.drained;
+        let drains = match self.state() {
+            KernelState::Running => true,
+            KernelState::Paused => !drained,
+            KernelState::Built | KernelState::Draining | KernelState::Stopped => false,
+        };
+        if drains && let Err(error) = self.drain(Self::SIGTERM_DRAIN).await {
             first_error = Some(error);
         }
         let mut runtime = self.inner.runtime.lock().await;
@@ -1054,6 +1178,7 @@ impl Kernel {
         }
         // The agents a person added close with the kernel (spec 3.3 §5.7).
         self.inner.agent_table.close_hosted().await;
+        runtime.drained = false;
         drop(runtime);
         let was = self.state();
         self.set_state(KernelState::Stopped);
@@ -1064,12 +1189,12 @@ impl Kernel {
     }
 
     /// Waits for `SIGTERM` or Ctrl-C — or, in a Windows service, the service manager's stop
-    /// (spec 3.2 §10 W3) — then [`drain`](Self::drain)s for
-    /// [`SIGTERM_DRAIN`](Self::SIGTERM_DRAIN) and [`stop`](Self::stop)s.
+    /// (spec 3.2 §10 W3) — then [`stop`](Self::stop)s, which drains once for
+    /// [`SIGTERM_DRAIN`](Self::SIGTERM_DRAIN).
     ///
     /// # Errors
     ///
-    /// Returns the error of `drain` or `stop`, or [`KernelError::Io`] when the signal
+    /// Returns the error of `stop`, or [`KernelError::Io`] when the signal
     /// handler cannot be installed.
     pub async fn shutdown_on_signal(&self) -> Result<()> {
         #[cfg(unix)]
@@ -1089,9 +1214,6 @@ impl Kernel {
         #[cfg(all(not(unix), not(feature = "service")))]
         tokio::signal::ctrl_c().await?;
         tracing::info!("shutdown signal received; draining the kernel");
-        if matches!(self.state(), KernelState::Running | KernelState::Paused) {
-            self.drain(Self::SIGTERM_DRAIN).await?;
-        }
         self.stop().await
     }
 
@@ -1128,9 +1250,252 @@ impl Kernel {
         Ok(())
     }
 
+    /// Runs a cron sleeper or a standing cron trigger now, outside its schedule, for `by`.
+    ///
+    /// The run now is a wake like a tick's: an event keyed [`keys::run_now`] that becomes its
+    /// `kernel.wake` run, so a retried request with the same `request_id` routes once, and the
+    /// router wakes the sleeper, or fires the trigger, as a tick would. The woken run passes
+    /// admission like any other: quiet hours defer it, a spent budget parks it, a quota holds
+    /// it. The schedule is untouched: no watermark moves, the next tick fires as planned, and
+    /// a recurring sleeper's successor sleeps on the same cron wake after the run. The turn
+    /// is told it was run now: its wake reason's payload carries `run_now`, the expression
+    /// and who asked. The call is recorded as `kernel.run_now`.
+    ///
+    /// A run now of a trigger follows the trigger's [`WakeOverlap`](crate::WakeOverlap) as a
+    /// tick does: while a process the trigger started is unfinished, `skip` refuses it here,
+    /// `queueOne` queues one behind it or joins the one already waiting, and `queue` queues
+    /// behind it.
+    ///
+    /// | Target | Must be |
+    /// |---|---|
+    /// | [`RunNowTarget::Process`] | `Waiting`, not suspended, its wake set holding a cron wake |
+    /// | [`RunNowTarget::Trigger`] | A standing trigger of this kernel on a cron wake |
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use adk_core::audit_log::AuditActor;
+    /// use adk_kernel::{Kernel, RunNowTarget};
+    ///
+    /// # async fn example(kernel: Kernel) -> adk_kernel::Result<()> {
+    /// let run_now = kernel
+    ///     .run_now(RunNowTarget::Trigger { name: "nightly-digest".into() }, None, AuditActor::default())
+    ///     .await?;
+    /// println!("queued {}", run_now.key);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::Frozen`] while the kill switch refuses work, so nothing is
+    /// queued; [`KernelError::NotFound`] or [`KernelError::InvalidState`] for a process that
+    /// is missing or not asleep on a cron wake; [`KernelError::Config`] for a name no cron
+    /// trigger has; [`KernelError::InvalidState`], naming the unfinished process, for a
+    /// trigger whose overlap is `skip`; or a store error.
+    pub async fn run_now(
+        &self,
+        target: RunNowTarget,
+        request_id: Option<&str>,
+        by: AuditActor,
+    ) -> Result<RunNow> {
+        let governance = &self.inner.config.governance;
+        if let Err(error) = governance.check() {
+            return Err(KernelError::Frozen {
+                reason: governance.reason().unwrap_or(error.message),
+            });
+        }
+        let sup = &self.inner.sup;
+        let (key_target, expression, mut payload) = match &target {
+            RunNowTarget::Process { pid } => {
+                let run = sup
+                    .runs
+                    .get(pid)
+                    .await?
+                    .ok_or_else(|| KernelError::NotFound { pid: pid.clone() })?;
+                let meta = sup.processes.get(pid).await?;
+                let cron =
+                    meta.as_ref().filter(|meta| meta.suspended_by.is_none()).and_then(|meta| {
+                        meta.wake.iter().flat_map(|wake| wake.any_of.iter()).find_map(|wake| {
+                            match wake {
+                                Wake::Cron { expr, .. } => Some(expr.clone()),
+                                _ => None,
+                            }
+                        })
+                    });
+                let Some(expression) = cron.filter(|_| run.state == adk_core::RunState::Waiting)
+                else {
+                    return Err(KernelError::InvalidState {
+                        pid: pid.clone(),
+                        state: run.state,
+                        action: "run now (it is not asleep on a cron wake; `adk-rust resume` \
+                                 wakes any sleeper)",
+                    });
+                };
+                (pid.clone(), expression, json!({ "pid": pid }))
+            }
+            RunNowTarget::Trigger { name } => {
+                let expression = self.inner.router.triggers().iter().find_map(|trigger| {
+                    match (&trigger.wake, trigger.name == *name) {
+                        (Wake::Cron { expr, .. }, true) => Some(expr.clone()),
+                        _ => None,
+                    }
+                });
+                let Some(expression) = expression else {
+                    return Err(KernelError::Config {
+                        reason: format!(
+                            "no standing trigger `{name}` on a cron wake; `adk-rust inventory` \
+                             lists the kernel's triggers"
+                        ),
+                    });
+                };
+                // Under `skip`, a run now while the trigger's process is unfinished would start
+                // nothing; say so now rather than queue a wake that does nothing.
+                if let Some(blocking) = self.inner.router.skips_run_now(name).await? {
+                    return Err(KernelError::InvalidState {
+                        pid: blocking.run_id,
+                        state: blocking.state,
+                        action: "joined by a run now of its trigger, whose overlap is `skip` \
+                                 (let it finish, or `adk-rust kill` it)",
+                    });
+                }
+                (format!("trigger:{name}"), expression, json!({ "trigger": name }))
+            }
+        };
+        let request_id =
+            request_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
+        let key = keys::run_now(&key_target, &request_id);
+        if let serde_json::Value::Object(fields) = &mut payload {
+            fields.insert("run_now".into(), json!(true));
+            fields.insert("expression".into(), json!(expression));
+            fields.insert("requested_by".into(), json!(by.on_behalf_of));
+        }
+        let event = WakeEvent::new(crate::wake::RUN_NOW_SOURCE, key.clone(), payload);
+        let (wake_run_id, existing) =
+            match self.inner.router.submit(&event, &self.inner.config.app_name).await? {
+                Enqueued::Created(run) => (run.run_id, false),
+                Enqueued::Existing(run) => (run.run_id, true),
+                Enqueued::Rejected { blocking_run_id } => {
+                    return Err(KernelError::Config {
+                        reason: format!(
+                            "the run now `{key}` was refused by run {blocking_run_id}'s \
+                             concurrency key"
+                        ),
+                    });
+                }
+            };
+        sup.nudge();
+        sup.record(
+            audit::RUN_NOW,
+            by,
+            json!({ "target": target, "key": key, "expression": expression, "wakeRun": wake_run_id, "existing": existing }),
+        )
+        .await;
+        tracing::info!(run_now.key = %key, run_now.existing = existing, "run now queued");
+        Ok(RunNow { key, wake_run_id, existing })
+    }
+
+    /// Sends `text` to the turn of `user_id`'s session `session_id` that this replica runs
+    /// (spec 3.3 §6 "steer"): `Runner::steer` on the runner of the process's target, so the
+    /// message is screened as a turn's own message is and the agent takes it at its next safe
+    /// point.
+    ///
+    /// Returns `None` when no turn of the session takes messages here: none runs, another
+    /// replica runs it, its target is a workflow, or its run has not reached its agent yet.
+    /// Send the message as the session's next message then. An added agent's turn that
+    /// started before the agent was changed finishes on the build it started on, which is no
+    /// longer hosted, so it answers `None` too.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::Frozen`] while everything is stopped, or the runner's error
+    /// when `text` is blank or an input guardrail or plugin refuses the message.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use adk_core::SteerOutcome;
+    ///
+    /// # async fn example(kernel: adk_kernel::Kernel) -> adk_kernel::Result<()> {
+    /// match kernel.steer("ana", "s-1", "use the staging database").await? {
+    ///     Some(steering) => match steering.receipt.outcome().await? {
+    ///         SteerOutcome::Delivered { event_id } => println!("delivered as {event_id}"),
+    ///         SteerOutcome::Returned(_) => println!("send it as the next message"),
+    ///     },
+    ///     None => println!("no turn runs here: send it as the next message"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn steer(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        text: &str,
+    ) -> Result<Option<Steering>> {
+        let governance = &self.inner.config.governance;
+        if governance.is_frozen() {
+            return Err(KernelError::Frozen { reason: governance.reason().unwrap_or_default() });
+        }
+        let message = adk_core::Content::new("user").with_text(text);
+        adk_core::validate_steering_message(&message)?;
+        let sup = &self.inner.sup;
+        // The newest claim of the session on this replica; the session is the one its worker
+        // runs the claim in, `run-{pid}` for a process spawned without one.
+        let claimed = {
+            let local = sup.local.lock().unwrap_or_else(|e| e.into_inner());
+            local
+                .values()
+                .filter(|claim| {
+                    let run = &claim.run;
+                    run.app_name == sup.app_name
+                        && run.user_id == user_id
+                        && crate::supervise::run_session(run) == session_id
+                })
+                .max_by_key(|claim| claim.claimed_at)
+                .map(|claim| claim.run.clone())
+        };
+        let Some(run) = claimed else { return Ok(None) };
+        let runner = match self.inner.agents.get(&run.target) {
+            Some(runner) => Arc::clone(runner),
+            None => match sup.targets.hosted(&run.target) {
+                Some(added) => added.runner,
+                None => return Ok(None),
+            },
+        };
+        let identity = adk_core::AdkIdentity::new(
+            adk_core::AppName::try_from(runner.app_name()).map_err(adk_core::AdkError::from)?,
+            adk_core::UserId::try_from(user_id).map_err(adk_core::AdkError::from)?,
+            adk_core::SessionId::try_from(session_id).map_err(adk_core::AdkError::from)?,
+        );
+        match runner.steer(&identity, message).await {
+            Ok(receipt) => {
+                Ok(Some(Steering { pid: run.run_id, lease_epoch: run.lease_epoch, receipt }))
+            }
+            // The claim has not started its run, or the run ended meanwhile.
+            Err(error)
+                if error.code == adk_core::STEER_NO_ACTIVE_RUN_CODE
+                    || error.code == STEER_RUN_NOT_READY_CODE =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// The process table.
     pub fn processes(&self) -> &ProcessTable {
         &self.inner.processes
+    }
+
+    /// The background sub-agent host, when the kernel was built with
+    /// [`KernelBuilder::subagents`].
+    pub fn subagents(&self) -> Option<&DurableSubagents> {
+        self.inner.subagents.as_ref()
+    }
+
+    pub(crate) fn from_inner(inner: Arc<KernelInner>) -> Self {
+        Self { inner }
     }
 
     /// The agenda (spec 3.2 §7.5).
@@ -1597,10 +1962,10 @@ fn spawn_maintenance(
                 sup.admit_waiters().await;
             }
             let today = sup.clock.now().date_naive();
-            for partition in sup.replenished_partitions().await {
+            for (partition, asleep) in sup.replenished_partitions().await {
                 let event = crate::wake::WakeEvent::new(
                     "budget",
-                    crate::wake::keys::budget(partition.as_str(), today),
+                    crate::wake::keys::budget(partition.as_str(), today, &asleep),
                     json!({ "partition": partition, "day": today }),
                 );
                 if let Err(error) = router.submit(&event, &sup.app_name).await {
@@ -1838,6 +2203,8 @@ pub struct KernelBuilder {
     #[cfg(feature = "charter")]
     signal_stores: BTreeMap<PartitionId, Arc<dyn crate::charter::SignalStore>>,
     inventory_warnings: Vec<InventoryWarning>,
+    subagents: Option<SubagentConfig>,
+    subagent_handles: Vec<crate::subagents::SubagentHandle>,
 }
 
 impl fmt::Debug for KernelBuilder {
@@ -1896,10 +2263,34 @@ impl KernelBuilder {
     }
 
     /// Sets the approval service, built with `StoreApprovalService::with_run_store` so a
-    /// decision wakes the parked run. The kernel cannot add a notifier to a built service:
-    /// for [`Wake::Approval`] sleepers, build the service with
+    /// decision wakes the parked run; pass the same service to the agents' `RunConfig`.
+    ///
+    /// The kernel files every call the service would hold with no route into its inbox for
+    /// the `operator` group, self-approval allowed, as `adk-rust up` routes them
+    /// (`ApprovalService::route_unrouted`): a router the service was built with keeps
+    /// deciding. It publishes `held` when a request is filed and `decided` when a decision
+    /// resolves one (`ApprovalService::add_notifier`). A service that takes neither is named
+    /// in [`Kernel::inventory`]. For [`Wake::Approval`] sleepers, build the service with
     /// `with_notifier(source)` over an [`ApprovalWakeSource`](crate::ApprovalWakeSource) and
     /// pass the same source to [`wake_source`](Self::wake_source).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use adk_core::{InMemoryApprovalStore, InMemoryRunStore, StoreApprovalService};
+    /// use adk_kernel::Kernel;
+    ///
+    /// let runs = Arc::new(InMemoryRunStore::new());
+    /// let approvals = Arc::new(
+    ///     StoreApprovalService::new(Arc::new(InMemoryApprovalStore::new()))
+    ///         .with_run_store(runs.clone()),
+    /// );
+    /// // The agents' runner takes the same service: `RunConfig::builder().approval_service(..)`.
+    /// let kernel = Kernel::builder().run_store(runs).approval_service(approvals).build()?;
+    /// assert!(!kernel.inventory().warnings.iter().any(|w| w.code.starts_with("kernel.approvals")));
+    /// # Ok::<(), adk_kernel::KernelError>(())
+    /// ```
     #[must_use]
     pub fn approval_service(mut self, approvals: Arc<dyn ApprovalService>) -> Self {
         self.approvals = Some(approvals);
@@ -2110,6 +2501,50 @@ impl KernelBuilder {
     #[must_use]
     pub fn agenda_handle(mut self, handle: AgendaHandle) -> Self {
         self.agenda_handles.push(handle);
+        self
+    }
+
+    /// Hosts background sub-agents (`adk_core::subagent`): a parent agent's
+    /// `start_subagent` runs another agent as a process of this kernel's `background`
+    /// queue — or of the queue `config` names, when the kernel has it — with a budget slice
+    /// carved from the parent's run, the parent's tools as its ceiling, and its status on
+    /// the bus. Off by default, since a sub-agent works without a person watching it.
+    ///
+    /// Needs a [`session_service`](Self::session_service): a fork copies the parent's
+    /// session, and a parent is told once by the notice its session holds.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    /// use adk_core::{InMemoryRunStore, RunBudget};
+    /// use adk_kernel::{Kernel, SubagentHandle};
+    /// use adk_server::background::SubagentConfig;
+    ///
+    /// # fn example(runner: Arc<adk_runner::Runner>, sessions: Arc<dyn adk_session::SessionService>) -> adk_kernel::Result<()> {
+    /// let handle = SubagentHandle::new(); // give the lead agent `SubagentTools::new(Arc::new(handle.clone()))`
+    /// let kernel = Kernel::builder()
+    ///     .run_store(Arc::new(InMemoryRunStore::new()))
+    ///     .session_service(sessions)
+    ///     .agent("lead", runner)
+    ///     .subagents(SubagentConfig::default().with_default_budget(RunBudget::new().max_model_calls(20)))
+    ///     .subagent_handle(handle)
+    ///     .build()?;
+    /// assert!(kernel.subagents().is_some());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn subagents(mut self, config: SubagentConfig) -> Self {
+        self.subagents = Some(config);
+        self
+    }
+
+    /// Binds `handle` to the built kernel's sub-agent host, so the sub-agent tools of an
+    /// agent built before the kernel reach it.
+    #[must_use]
+    pub fn subagent_handle(mut self, handle: crate::subagents::SubagentHandle) -> Self {
+        self.subagent_handles.push(handle);
         self
     }
 
@@ -2465,8 +2900,35 @@ impl KernelBuilder {
         for sink in self.sinks {
             bus.add_sink(sink);
         }
+        let mut inventory_warnings = self.inventory_warnings;
+        if let Some(approvals) = &self.approvals {
+            // Every held call reaches the inbox and the bus, however the host built the
+            // service: a call no one can see is a process no one can resume.
+            let operator =
+                ApprovalPolicy::new([ApproverSelector::group(crate::agenda::OPERATOR_GROUP)])
+                    .allow_self_approval();
+            if !approvals.route_unrouted(Arc::new(operator)) {
+                inventory_warnings.push(InventoryWarning::new(
+                    InventoryWarning::APPROVALS_UNROUTED,
+                    "the approval service takes no router from the kernel: a call it holds \
+                     with no route of its own reaches no inbox. Build it with `with_router`",
+                ));
+            }
+            if !approvals.add_notifier(Arc::new(crate::bus::ApprovalEvents::new(bus.clone()))) {
+                inventory_warnings.push(InventoryWarning::new(
+                    InventoryWarning::APPROVALS_UNHEARD,
+                    "the approval service takes no notifier from the kernel: no `held` or \
+                     `decided` event is published",
+                ));
+            }
+        }
         let trigger_names = self.triggers.iter().map(|trigger| trigger.name.clone()).collect();
-        let trigger_crons = trigger_cron_sources(&self.triggers, &self.wake_sources, &watermarks)?;
+        let trigger_crons = trigger_cron_sources(
+            &self.triggers,
+            &self.wake_sources,
+            &watermarks,
+            config.salted_cron_jitter(),
+        )?;
         #[cfg(feature = "proc")]
         let ledger = self.ledger.map(|ledger| ledger.with_clock(Arc::clone(&config.clock)));
         #[cfg(feature = "proc")]
@@ -2539,6 +3001,7 @@ impl KernelBuilder {
             crons: std::sync::Mutex::new(BTreeMap::new()),
             watermarks,
             cron_started: std::sync::Mutex::new(None),
+            cron_jitter: config.salted_cron_jitter(),
             triggers: trigger_names,
             #[cfg(feature = "proc-baselines")]
             proc: proc.clone(),
@@ -2547,8 +3010,47 @@ impl KernelBuilder {
             control: Arc::new(crate::control::LastRead::new(config.control.control_store.clone())),
         });
         let run_finished = Arc::new(RunFinishedWakeSource::new());
-        let hooks =
-            Arc::new(KernelHooks { sup: Arc::clone(&sup), run_finished: run_finished.clone() });
+        let subagent_backend = self.subagents.is_some().then(|| {
+            Arc::new(crate::subagents::KernelSubagentBackend {
+                processes: ProcessTable::supervised(Arc::clone(&sup), spend.clone()),
+                sup: Arc::clone(&sup),
+                kernel: std::sync::OnceLock::new(),
+            })
+        });
+        let subagents = match (self.subagents, &subagent_backend) {
+            (Some(mut sub_config), Some(backend)) => {
+                let Some(sessions) = self.sessions.clone() else {
+                    return Err(KernelError::Config {
+                        reason: "background sub-agents need a session service; call \
+                                 KernelBuilder::session_service"
+                            .into(),
+                    });
+                };
+                // A sub-agent runs on one of this kernel's queues.
+                if !config.queues.iter().any(|queue| queue.as_str() == sub_config.queue) {
+                    sub_config.queue = config
+                        .queues
+                        .iter()
+                        .find(|queue| queue.as_str() == QueueClass::BACKGROUND)
+                        .unwrap_or(&config.queues[0])
+                        .as_str()
+                        .to_string();
+                }
+                let backend: Arc<dyn SubagentBackend> = backend.clone();
+                Some(DurableSubagents::new(runs.clone(), sessions, backend, sub_config))
+            }
+            _ => None,
+        };
+        for handle in &self.subagent_handles {
+            if let Some(subagents) = &subagents {
+                handle.bind(subagents);
+            }
+        }
+        let hooks = Arc::new(KernelHooks {
+            sup: Arc::clone(&sup),
+            run_finished: run_finished.clone(),
+            subagents: subagents.clone(),
+        });
         let mut chain = self.workflows;
         #[cfg(feature = "charter")]
         if !self.kpi_trackers.is_empty() {
@@ -2633,7 +3135,7 @@ impl KernelBuilder {
         for handle in &self.agents_handles {
             handle.bind(&agent_table);
         }
-        Ok(Kernel {
+        let kernel = Kernel {
             inner: Arc::new(KernelInner {
                 config,
                 sup,
@@ -2653,7 +3155,7 @@ impl KernelBuilder {
                 adds_agents,
                 #[cfg(feature = "charter")]
                 signal_stores: self.signal_stores,
-                inventory_warnings: self.inventory_warnings,
+                inventory_warnings,
                 consolidation,
                 #[cfg(feature = "drivers")]
                 drivers: self.drivers,
@@ -2661,8 +3163,13 @@ impl KernelBuilder {
                 status: Arc::new(RwLock::new(Status::default())),
                 #[cfg(feature = "proc")]
                 ledger,
+                subagents,
             }),
-        })
+        };
+        if let Some(backend) = subagent_backend {
+            let _ = backend.kernel.set(Arc::downgrade(&kernel.inner));
+        }
+        Ok(kernel)
     }
 }
 
@@ -2793,11 +3300,12 @@ fn store_remedy(store: &str) -> &'static str {
 /// The kernel's own source for each cron expression of `triggers` no source in `sources`
 /// ticks on (spec 3.2 §7.4, spec 3.5 §7.11): one per expression, so every trigger on it
 /// matches each tick once, planned with the widest missed-tick policy of its triggers, its
-/// cursor kept in `watermarks` across restarts.
+/// cursor kept in `watermarks` across restarts, each tick delayed by `jitter`.
 fn trigger_cron_sources(
     triggers: &[Trigger],
     sources: &[Arc<dyn WakeSource>],
     watermarks: &Arc<dyn CronWatermarkStore>,
+    jitter: Option<Jitter>,
 ) -> Result<Vec<Arc<dyn WakeSource>>> {
     let covered: std::collections::BTreeSet<&str> =
         sources.iter().filter_map(|source| source.cron_expression()).collect();
@@ -2818,7 +3326,10 @@ fn trigger_cron_sources(
             let name =
                 format!("trigger-cron:{}", expr.split_whitespace().collect::<Vec<_>>().join("_"));
             let watermark = SourceWatermark::new(Arc::clone(watermarks), name.clone());
-            let source = CronWakeSource::watermarked(name, expr, missed, Arc::new(watermark))?;
+            let mut source = CronWakeSource::watermarked(name, expr, missed, Arc::new(watermark))?;
+            if let Some(jitter) = jitter {
+                source = source.with_jitter(jitter);
+            }
             Ok(Arc::new(source) as Arc<dyn WakeSource>)
         })
         .collect()
@@ -3259,14 +3770,17 @@ mod tests {
         .await;
         assert_eq!(model.requests().len(), 0, "asleep until the hour");
 
-        clock.advance(Duration::from_secs(3_601));
+        // Each hour is routed a second after it is due: a `skip` wake fires on time only.
+        let spec = adk_core::ScheduleSpec::Cron { expr: hourly.into(), timezone: "UTC".into() };
+        let first_hour = spec.next_after(clock.now()).unwrap().unwrap();
+        clock.set(first_hour + chrono::Duration::seconds(1));
         wait_for("the first occurrence's run", first.clone(), RunState::Completed).await;
         let second = successor(first.clone()).await;
         wait_for("the successor asleep", second.clone(), RunState::Waiting).await;
         let meta = kernel.processes().get(&second).await.unwrap().unwrap().meta;
         assert_eq!(meta.wake, Some(wake.clone()), "the successor sleeps on the same cron wake");
 
-        clock.advance(Duration::from_secs(3_601));
+        clock.set(spec.next_after(first_hour).unwrap().unwrap() + chrono::Duration::seconds(1));
         wait_for("the second occurrence's run", second.clone(), RunState::Completed).await;
         assert_eq!(model.requests().len(), 2, "one run per occurrence");
         let third = successor(second).await;
@@ -3281,6 +3795,201 @@ mod tests {
             !processes.iter().any(|p| p.meta.parent.as_deref() == Some(third.as_str())),
             "a killed sleeper is not re-armed"
         );
+        kernel.stop().await.unwrap();
+    }
+
+    /// A cron sleeper run now (spec 3.2 §7.4 parity): refused while frozen, queued once per
+    /// request id, woken with a wake reason that says so, re-armed on the same cron wake, and
+    /// the expression's watermark untouched; the next tick is jittered: submitted at its
+    /// scheduled time and keyed by it, routed only after the offset. A standing cron trigger
+    /// runs now too, and a name no cron trigger has is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cron_sleeper_runs_now_and_its_next_tick_waits_out_the_jitter() {
+        use adk_core::schedule::{Jitter, ScheduleSpec};
+        use adk_core::{Llm, ManualClock, RunFilter, RunState};
+        use adk_model::{ScriptedLlm, ScriptedResponse};
+
+        let clock = ManualClock::new(
+            chrono::DateTime::parse_from_rfc3339("2026-11-18T09:10:00Z").unwrap().into(),
+        );
+        let runs: Arc<dyn DurableRunStore> =
+            Arc::new(InMemoryRunStore::new().with_clock(Arc::new(clock.clone())));
+        let model = Arc::new(ScriptedLlm::new(
+            "scripted",
+            ["ran now", "the hourly tick", "the trigger now"].map(ScriptedResponse::text),
+        ));
+        let agent = adk_agent::LlmAgentBuilder::new("agent")
+            .model(Arc::clone(&model) as Arc<dyn Llm>)
+            .build()
+            .unwrap();
+        let runner = Arc::new(
+            Runner::builder()
+                .app_name("adk-rust")
+                .agent(Arc::new(agent))
+                .session_service(Arc::new(adk_session::InMemorySessionService::new()))
+                .build()
+                .unwrap(),
+        );
+        let jitter = Jitter::new(50, Duration::from_secs(3600));
+        let yearly = "0 0 0 1 1 *";
+        let kernel = Kernel::builder()
+            .config(
+                KernelConfig::default()
+                    .with_scheduler_tick(Duration::from_millis(50))
+                    .with_clock(Arc::new(clock.clone()))
+                    .with_cron_jitter(jitter)
+                    .with_control(ControlPlaneConfig::default().without_socket()),
+            )
+            .run_store(Arc::clone(&runs))
+            .agent("adk-rust", runner)
+            .trigger(Trigger::new(
+                "digest",
+                Wake::Cron { expr: yearly.into(), missed: adk_core::MissedFirePolicy::Skip },
+                NewRun::new("background", "adk-rust", "alice", "adk-rust", json!({ "text": "d" })),
+            ))
+            .build()
+            .unwrap();
+        kernel.start().await.unwrap();
+        let hourly = "0 0 * * * *";
+        let wake = WakeSet::any_of([Wake::Cron {
+            expr: hourly.into(),
+            missed: adk_core::MissedFirePolicy::Skip,
+        }]);
+        let run =
+            NewRun::new("background", "adk-rust", "alice", "adk-rust", json!({ "text": "x" }));
+        let first = kernel
+            .processes()
+            .spawn(run, ProcessSpec::new(ProcessKind::Scheduled).with_wake(wake.clone()))
+            .await
+            .unwrap()
+            .meta
+            .pid;
+        let state = |pid: String| {
+            let runs = Arc::clone(&runs);
+            async move { runs.get(&pid).await.unwrap().map(|run| run.state) }
+        };
+        let wait_for = |what: &'static str, pid: String, wanted: RunState| async move {
+            let started = tokio::time::Instant::now();
+            while state(pid.clone()).await != Some(wanted) {
+                assert!(started.elapsed() < Duration::from_secs(5), "timed out waiting for {what}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        wait_for("the sleeper asleep", first.clone(), RunState::Waiting).await;
+        eventually("the expression to be fired by the kernel", || {
+            kernel.inner.sup.watched_crons() == [hourly]
+        })
+        .await;
+        let source = format!("kernel:{hourly}");
+        let watermark = || async { kernel.inner.sup.watermarks.read(&source).await.unwrap() };
+        let cursor = watermark().await;
+
+        let target = || RunNowTarget::Process { pid: first.clone() };
+        kernel.freeze("incident", AuditActor::default()).await.unwrap();
+        let refused = kernel.run_now(target(), Some("r-1"), AuditActor::default()).await;
+        assert!(matches!(refused, Err(KernelError::Frozen { .. })), "{refused:?}");
+        kernel.unfreeze(AuditActor::default()).await.unwrap();
+
+        let queued = kernel.run_now(target(), Some("r-1"), AuditActor::default()).await.unwrap();
+        assert_eq!(
+            (queued.key.as_str(), queued.existing),
+            (format!("now:{first}:r-1").as_str(), false)
+        );
+        let again = kernel.run_now(target(), Some("r-1"), AuditActor::default()).await.unwrap();
+        assert!(
+            again.existing && again.wake_run_id == queued.wake_run_id,
+            "one wake per request id"
+        );
+        wait_for("the run now", first.clone(), RunState::Completed).await;
+        let reason = crate::WakeReason::recorded(
+            &kernel.processes().get(&first).await.unwrap().unwrap().meta,
+        )
+        .expect("the run now records its wake reason");
+        assert_eq!(reason.source, crate::wake::RUN_NOW_SOURCE);
+        assert!(reason.payload.contains(r#""run_now":true"#), "{}", reason.payload);
+        assert_eq!(watermark().await, cursor, "a run now moves no watermark");
+        let second = loop {
+            let processes = kernel.processes().ps(ProcessFilter::default()).await.unwrap();
+            if let Some(next) =
+                processes.iter().find(|p| p.meta.parent.as_deref() == Some(first.as_str()))
+            {
+                break next.meta.pid.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        wait_for("the successor asleep", second.clone(), RunState::Waiting).await;
+        assert_eq!(
+            kernel.processes().get(&second).await.unwrap().unwrap().meta.wake,
+            Some(wake.clone()),
+            "the successor sleeps on the same cron wake"
+        );
+        let refused = kernel
+            .run_now(RunNowTarget::Process { pid: "missing".into() }, None, AuditActor::default())
+            .await;
+        assert!(matches!(refused, Err(KernelError::NotFound { .. })), "{refused:?}");
+
+        // The 10:00 tick is submitted when it falls due, keyed by 10:00, and waits out its
+        // offset before it is routed.
+        let ten = chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00Z").unwrap().into();
+        let spec = ScheduleSpec::Cron { expr: hourly.into(), timezone: "UTC".into() };
+        let offset = jitter.salted("adk-rust").offset_in(&spec, &source, ten);
+        assert!(offset < Duration::from_secs(30 * 60), "under half the hour: {offset:?}");
+        clock.set(ten + chrono::Duration::seconds(1));
+        let key = crate::wake::keys::cron(&source, ten);
+        let wake_run = loop {
+            let found = runs
+                .list(RunFilter::default())
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|run| run.idempotency_key.as_deref() == Some(key.as_str()));
+            if let Some(found) = found {
+                break found;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        if offset >= Duration::from_secs(2) {
+            assert_eq!(
+                wake_run.not_before,
+                Some(ten + chrono::Duration::from_std(offset).unwrap())
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                state(second.clone()).await,
+                Some(RunState::Waiting),
+                "not before the offset"
+            );
+        }
+        clock.set(ten + chrono::Duration::from_std(offset).unwrap() + chrono::Duration::seconds(1));
+        wait_for("the jittered tick's run", second.clone(), RunState::Completed).await;
+        assert_eq!(model.requests().len(), 2, "the run now and the tick");
+
+        let refused = kernel
+            .run_now(RunNowTarget::Trigger { name: "nope".into() }, None, AuditActor::default())
+            .await;
+        assert!(matches!(refused, Err(KernelError::Config { .. })), "{refused:?}");
+        kernel
+            .run_now(
+                RunNowTarget::Trigger { name: "digest".into() },
+                Some("t-1"),
+                AuditActor::default(),
+            )
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        loop {
+            let processes = kernel.processes().ps(ProcessFilter::default()).await.unwrap();
+            let fired = processes.iter().find(|p| {
+                p.meta.kind == ProcessKind::Triggered { source: "digest".into() }
+                    && p.run.state == RunState::Completed
+            });
+            if fired.is_some() {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "the trigger did not run now");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(model.requests().len(), 3, "and the trigger run now");
         kernel.stop().await.unwrap();
     }
 }

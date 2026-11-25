@@ -1,6 +1,6 @@
 # Browser Tools
 
-The `adk-browser` crate provides 46 browser automation tools, 44 of them in a default `BrowserToolset`, that enable AI agents to interact with web pages. Built on the WebDriver protocol (Selenium), it works with any WebDriver-compatible browser.
+The `adk-browser` crate provides 47 browser automation tools, 45 of them in a default `BrowserToolset`, that enable AI agents to interact with web pages. Built on the WebDriver protocol (Selenium), it works with any WebDriver-compatible browser.
 
 ## Overview
 
@@ -56,14 +56,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let browser = Arc::new(BrowserSession::new(config));
     browser.start().await?;
 
-    // Create toolset with the 44 default tools (browser_evaluate_js and
+    // Create toolset with the 45 default tools (browser_evaluate_js and
     // browser_file_upload are opt-in)
     let toolset = BrowserToolset::new(browser.clone());
     let tools = toolset.all_tools();
 
     // Create AI agent with browser tools
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 
     let mut builder = LlmAgentBuilder::new("web_agent")
         .model(model)
@@ -106,10 +106,10 @@ Or start from a profile, or a helper that returns a fixed set:
 
 | Constructor | Tools |
 |-------------|-------|
-| `BrowserToolset::with_profile(browser, BrowserProfile::Minimal)` | 19: navigation, interaction, extraction, wait, screenshot |
-| `BrowserProfile::FormFilling` | 19: the same categories, for form-filling agents |
-| `BrowserProfile::Scraping` | 13: navigation, extraction, screenshot, scroll, hover, alert handling |
-| `BrowserProfile::Full` | 44: every tool except `browser_evaluate_js` and `browser_file_upload` |
+| `BrowserToolset::with_profile(browser, BrowserProfile::Minimal)` | 20: navigation, interaction, extraction, wait, screenshot |
+| `BrowserProfile::FormFilling` | 20: the same categories, for form-filling agents |
+| `BrowserProfile::Scraping` | 14: navigation, extraction, screenshot, scroll, hover, alert handling |
+| `BrowserProfile::Full` | 45: every tool except `browser_evaluate_js` and `browser_file_upload` |
 | `minimal_browser_tools(browser)` | 6 |
 | `readonly_browser_tools(browser)` | 7 |
 
@@ -148,6 +148,15 @@ an interaction tool, such as a link click or a form submission, and the subresou
 loads are not checked. Isolate the browser's network when it must not reach internal
 services at all.
 
+## Claude's Browser Use Toolset
+
+`BrowserUseToolset` offers the members of Claude's `browser_toolset_20260801`
+(`browser.navigate`, `browser.read_page`, `browser.left_click`, ...) over the same
+`BrowserSession`, with the navigation policy above. The model adapter declares them as one
+toolset entry, and each action runs on the governed tool path; `WebDriverComputer` makes the
+viewport a display for the computer use toolset. See
+[Governed Computer Use and Browser Use](../computer-use/toolsets.md).
+
 ## Multi-Tenant Usage with Pool-Backed Toolsets
 
 For production multi-tenant deployments, use `BrowserToolset::with_pool()` together with `LlmAgentBuilder::toolset()`. Each user gets an isolated browser session resolved from the pool at runtime:
@@ -174,7 +183,7 @@ let agent = LlmAgentBuilder::new("web_agent")
 
 Browser sessions auto-start and auto-recover from stale WebDriver connections, so `browser.start()` is optional. A host that manages the browser itself sets `BrowserConfig::require_explicit_start(true)`: tools then return an error until the host calls `start()`, and again after the session is lost.
 
-## Available Tools (46 Total, 44 by Default)
+## Available Tools (47 Total, 45 by Default)
 
 ### Navigation (4 tools)
 
@@ -185,7 +194,7 @@ Browser sessions auto-start and auto-recover from stale WebDriver connections, s
 | `browser_forward` | Go forward in history |
 | `browser_refresh` | Refresh current page |
 
-### Extraction (5 tools)
+### Extraction (6 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -194,6 +203,17 @@ Browser sessions auto-start and auto-recover from stale WebDriver connections, s
 | `browser_extract_links` | Extract all links on page |
 | `browser_page_info` | Get current URL and title |
 | `browser_page_source` | Get HTML source |
+| `browser_elements` | Visible interactive elements with rectangles in CSS pixels and a unique selector each; see [Set-of-marks grounding](#set-of-marks-grounding) |
+
+### Set-of-marks grounding
+
+`browser_elements` returns the page's device pixel ratio and, for each visible link, button,
+input and control in the viewport, its rectangle in CSS pixels, its role and name, and a CSS
+selector checked to match only it. Draw the rectangles as numbered marks on a
+`browser_screenshot` with `vision_annotate` (`units: "css"` and the answer's
+`devicePixelRatio`), ask the model for a number, and click the chosen element with
+`browser_click` and its selector: no coordinate click is needed. See
+[Screen Grounding](../vision/screen.md#in-a-browser).
 
 ### Interaction (5 tools)
 

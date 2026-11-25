@@ -151,12 +151,23 @@ pub fn openapi() -> Value {
     let voice_ticket = schema_ref::<VoiceTicket>(&mut out);
     let voice_update = schema_ref::<VoiceUpdate>(&mut out);
     let agent_detail = schema_ref::<crate::agents::AgentDetail>(&mut out);
+    let agent_threads = schema_ref::<crate::agents::AgentThreads>(&mut out);
+    let answer_summary = schema_ref::<crate::answers::AnswerSummary>(&mut out);
     let agent_choices = schema_ref::<crate::agents::AgentChoices>(&mut out);
     let agent_preview = schema_ref::<crate::agents::AgentPreview>(&mut out);
     let genui_capabilities = schema_ref::<super::genui::GenuiCapabilities>(&mut out);
     let genui_forms = schema_ref::<super::genui::FormsResponse>(&mut out);
+    let genui_catalogs = schema_ref::<super::genui::CatalogDocuments>(&mut out);
     let app_open = schema_ref::<super::genui::AppOpen>(&mut out);
     let app_answer = schema_ref::<super::genui::AppAnswer>(&mut out);
+    let viewer = schema_ref::<crate::viewer::ViewerView>(&mut out);
+    let saved_example = schema_ref::<crate::viewer::SavedExample>(&mut out);
+    let cameras_view = schema_ref::<crate::camera::CamerasView>(&mut out);
+    let camera_view = schema_ref::<crate::camera::CameraView>(&mut out);
+    let stage_view = schema_ref::<crate::camera::StageView>(&mut out);
+    let zone_saved = schema_ref::<crate::camera::ZoneSaved>(&mut out);
+    let card_raised = schema_ref::<crate::camera::CardRaised>(&mut out);
+    let frame_taken = schema_ref::<crate::camera::FrameTaken>(&mut out);
     let mut schemas = out.take_definitions(true);
 
     let mut input = generator(Contract::Deserialize);
@@ -176,6 +187,10 @@ pub fn openapi() -> Value {
     let preview_body = schema_ref::<crate::agents::AgentPreviewRequest>(&mut input);
     let app_request = schema_ref::<super::genui::AppRequest>(&mut input);
     let app_message = schema_ref::<super::genui::AppMessageRequest>(&mut input);
+    let example_body = schema_ref::<crate::viewer::LabelledExample>(&mut input);
+    let zone_body = schema_ref::<crate::camera::ZoneChange>(&mut input);
+    let card_body = schema_ref::<crate::camera::RaiseCard>(&mut input);
+    let freeze_body = schema_ref::<crate::camera::FreezeFrame>(&mut input);
     let surface_query = input.subschema_for::<SurfaceQuery>().to_value();
     for (name, schema) in input.take_definitions(true) {
         schemas.entry(name).or_insert(schema);
@@ -204,6 +219,228 @@ pub fn openapi() -> Value {
                 query("surface", "The surface the answers are computed for", surface.clone())
             ]),
             answer("The decision", card),
+        ),
+    );
+    routes.insert(
+        with(paths::EVIDENCE),
+        json!({ "get": {
+            "summary": "One image a decision holds as evidence (spec 3.7 §8.2): the exact bytes whose digest the card shows, for a viewer who may see the decision; never cached",
+            "parameters": [
+                path_param("id"),
+                { "name": "index", "in": "path", "required": true, "description": "The image's place in the card's `media.images`", "schema": { "type": "integer", "minimum": 0 } },
+                query("surface", "The surface asking", surface.clone()),
+            ],
+            "responses": errors({
+                let mut ok = Map::new();
+                ok.insert("200".into(), json!({
+                    "description": "The image",
+                    "content": {
+                        "image/png": { "schema": { "type": "string", "format": "binary" } },
+                        "image/jpeg": { "schema": { "type": "string", "format": "binary" } },
+                        "image/webp": { "schema": { "type": "string", "format": "binary" } }
+                    }
+                }));
+                ok
+            }),
+        } }),
+    );
+    let image_param = json!({
+        "name": "image", "in": "path", "required": true,
+        "description": "A `sha256:` digest, or the name of an image the session holds",
+        "schema": { "type": "string" },
+    });
+    routes.insert(
+        with(paths::VISION_VIEW),
+        read(
+            "The annotated viewer of one image of a session (spec 3.7 §8.2, X12): every answer the vision tools gave for it, with each region's backend, frame and transform chain; for the session's owner",
+            json!([
+                path_param("session"),
+                image_param.clone(),
+                query("surface", "The surface asking", surface.clone()),
+                query("answer", "The answer to show, by its call; the newest otherwise", json!({ "type": "string" })),
+                query("compare", "A second answer to show beside it", json!({ "type": "string" })),
+            ]),
+            answer("The viewer", viewer),
+        ),
+    );
+    routes.insert(
+        with(paths::VISION_IMAGE),
+        json!({ "get": {
+            "summary": "One image of a session (spec 3.7 §8.3): the exact bytes whose digest the viewer shows, for the session's owner; never cached",
+            "parameters": [path_param("session"), image_param, query("surface", "The surface asking", surface.clone())],
+            "responses": errors({
+                let mut ok = Map::new();
+                ok.insert("200".into(), json!({
+                    "description": "The image",
+                    "content": {
+                        "image/png": { "schema": { "type": "string", "format": "binary" } },
+                        "image/jpeg": { "schema": { "type": "string", "format": "binary" } },
+                        "image/webp": { "schema": { "type": "string", "format": "binary" } }
+                    }
+                }));
+                ok
+            }),
+        } }),
+    );
+    routes.insert(
+        with(paths::VISION_REGIONS),
+        read(
+            "One answer's RegionSet, as `adk-vision/schema/region-set.json` publishes it, to save as a file (board choice V14); with `with`, both answers' sets in an array",
+            json!([
+                path_param("session"),
+                path_param("answer"),
+                query("surface", "The surface asking", surface.clone()),
+                query("with", "A second answer, exported beside it", json!({ "type": "string" })),
+            ]),
+            answer("The RegionSet, or an array of two", json!({ "type": ["object", "array"] })),
+        ),
+    );
+    routes.insert(
+        with(paths::VISION_EXAMPLES),
+        write(
+            "post",
+            "Save a labelled example from an answer (board choices V11–V13): an adk-eval case pointing at the image by path and digest, the image beside its file; the run's answer is unchanged and the example recorded. Not from a paired phone",
+            json!([path_param("session")]),
+            Some(example_body),
+            ("200", answer("Where it was saved", saved_example)),
+        ),
+    );
+    // The live camera surface (spec 3.7 §8.2): only the cameras of the caller's own sessions.
+    routes.insert(
+        with(paths::CAMERAS),
+        read(
+            "Every camera the caller may see, as a grid (spec 3.7 §8.2, board choice C8): each with its state, switch, picture and frames today",
+            json!([query("surface", "The surface asking", surface.clone())]),
+            answer("The cameras", cameras_view),
+        ),
+    );
+    let camera_param = json!({
+        "name": "camera", "in": "path", "required": true,
+        "description": "The camera's id, such as `line-2`",
+        "schema": { "type": "string" },
+    });
+    routes.insert(
+        with(paths::CAMERA),
+        read(
+            "One camera, watched large (board choice C1): live frames with overlays, tracks, watch conditions and zones, the frame governor's state, the agent's decisions and every source",
+            json!([camera_param.clone(), query("surface", "The surface asking", surface.clone())]),
+            answer("The camera", camera_view.clone()),
+        ),
+    );
+    routes.insert(
+        with(paths::CAMERA_FRAME),
+        json!({ "get": {
+            "summary": "A frame the server holds in memory for a camera (spec 3.7 §8.2): the exact bytes whose digest the picture names; a camera switched off holds none; never cached",
+            "parameters": [
+                camera_param.clone(),
+                { "name": "frame", "in": "path", "required": true, "description": "The frame's `sha256:` digest", "schema": { "type": "string" } },
+                query("surface", "The surface asking", surface.clone()),
+            ],
+            "responses": errors({
+                let mut ok = Map::new();
+                ok.insert("200".into(), json!({
+                    "description": "The frame",
+                    "content": {
+                        "image/jpeg": { "schema": { "type": "string", "format": "binary" } },
+                        "image/png": { "schema": { "type": "string", "format": "binary" } }
+                    }
+                }));
+                ok
+            }),
+        } }),
+    );
+    routes.insert(
+        with(paths::CAMERA_FEED),
+        json!({ "get": {
+            "summary": "A camera's picture after each frame that passes the server's gate, as server-sent events: `frame` carries a StageView, `changed` says to read the camera again",
+            "parameters": [camera_param.clone(), query("surface", "The surface asking", surface.clone())],
+            "responses": errors({
+                let mut ok = Map::new();
+                ok.insert("200".into(), json!({
+                    "description": "`text/event-stream`; a `frame` event's data is a StageView",
+                    "content": { "text/event-stream": { "schema": stage_view.clone() } },
+                }));
+                ok
+            }),
+        } }),
+    );
+    routes.insert(
+        with(paths::CAMERA_FRAMES),
+        json!({ "post": {
+            "summary": "One frame this screen's camera captured, for a camera that takes them (`actions.sendFrames`), at most 10 a second: handed to the camera's pipeline through the server's gate, or dropped with the reason while the camera is off, stopped or paused by Stop all, when the screen stops capturing. Nothing is written. A paired phone needs the decide scope",
+            "parameters": [camera_param.clone(), query("surface", "The surface asking", surface.clone())],
+            "requestBody": {
+                "required": true,
+                "content": {
+                    "image/jpeg": { "schema": { "type": "string", "format": "binary" } },
+                    "image/png": { "schema": { "type": "string", "format": "binary" } },
+                    "image/webp": { "schema": { "type": "string", "format": "binary" } }
+                }
+            },
+            "responses": errors({
+                let mut ok = Map::new();
+                ok.insert("200".into(), answer("What became of the frame", frame_taken));
+                ok.insert("400".into(), problem());
+                ok.insert("413".into(), problem());
+                ok.insert("429".into(), problem());
+                ok
+            }),
+        } }),
+    );
+    for (path, summary) in [
+        (
+            paths::CAMERA_ON,
+            "Switch a camera on (board choice C2); recorded first. A paired phone needs the decide scope",
+        ),
+        (
+            paths::CAMERA_OFF,
+            "Switch a camera off (board choice C2): the server drops its frames from then on and forgets those it held; nothing is captured or sent. Recorded",
+        ),
+        (paths::CAMERA_STOP, "End a camera's stream (board choice C2); recorded"),
+        (paths::CAMERA_RETRY, "Try a lost camera again now (board choice C6); recorded"),
+    ] {
+        routes.insert(
+            with(path),
+            write(
+                "post",
+                summary,
+                json!([
+                    camera_param.clone(),
+                    query("surface", "The surface asking", surface.clone())
+                ]),
+                None,
+                ("200", answer("The camera now", camera_view.clone())),
+            ),
+        );
+    }
+    routes.insert(
+        with(paths::CAMERA_ZONE),
+        write(
+            "put",
+            "Change a zone (board choice C12): the watches that use it read the new corners from their next frame; a zone changed since the person started is refused. Recorded; not from a paired phone",
+            json!([camera_param.clone(), path_param("zone")]),
+            Some(zone_body),
+            ("200", answer("The zone now", zone_saved)),
+        ),
+    );
+    routes.insert(
+        with(paths::CAMERA_FREEZE),
+        write(
+            "post",
+            "Freeze the frame on screen for a card (board choice C11): held in memory for 15 minutes while the person writes it, forgotten when the camera is switched off; nothing is written",
+            json!([camera_param.clone(), query("surface", "The surface asking", surface.clone())]),
+            Some(freeze_body),
+            ("200", answer("The frozen frame's picture", stage_view.clone())),
+        ),
+    );
+    routes.insert(
+        with(paths::CAMERA_CARDS),
+        write(
+            "post",
+            "Raise a card from a frozen frame (board choice C11): that one frame is kept as evidence, everyone in it covered first, with the regions on it, and the card goes to the watching agent as the caller's message naming the evidence by digest. Nothing else is stored",
+            json!([camera_param, query("surface", "The surface asking", surface.clone())]),
+            Some(card_body),
+            ("200", answer("The evidence kept and what sending the card did", card_raised)),
         ),
     );
     routes.insert(
@@ -252,6 +489,26 @@ pub fn openapi() -> Value {
             "One agent the caller added: its definition, version and how it was added",
             json!([path_param("id")]),
             answer("The agent", agent_detail),
+        ),
+    );
+    routes.insert(
+        with(paths::ANSWERS),
+        read(
+            "How the caller answered since a time (spec 3.3 §5.1 \"How you answered\")",
+            json!([query(
+                "since",
+                "Since when; default the last 7 days",
+                json!({ "type": "string", "format": "date-time" })
+            )]),
+            answer("Each answer counted", answer_summary),
+        ),
+    );
+    routes.insert(
+        with(paths::AGENT_THREADS),
+        read(
+            "The caller's threads with one agent, newest first (spec 3.3 §5.1 \"Thread history\")",
+            json!([path_param("id")]),
+            answer("The threads", agent_threads),
         ),
     );
     routes.insert(
@@ -512,6 +769,14 @@ pub fn openapi() -> Value {
             "What this home claims of A2UI, AG-UI and MCP Apps, and the catalogs it renders; served with the `genui` feature",
             json!([]),
             answer("The claims", genui_capabilities),
+        ),
+    );
+    routes.insert(
+        with(super::genui::paths::CATALOGS),
+        read(
+            "Every catalog this home renders, forms first, as A2UI catalog documents of one version (1.0 unless `version` names v0.9.1); served with the `genui` feature",
+            json!([query("version", "The A2UI version of the documents: 1.0 (the default) or v0.9.1", json!({ "type": "string" }))]),
+            answer("The catalog documents", genui_catalogs),
         ),
     );
     routes.insert(

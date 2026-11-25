@@ -12,6 +12,7 @@ documentation = "https://docs.rs/adk-artifact"
 keywords = ["ai", "agent", "adk", "artifact", "storage"]
 categories = ["api-bindings", "asynchronous"]
 readme = "README.md"
+exclude = ["tests/"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -35,4 +36,4 @@ axum = "0.8"
 
 [features]
 default = []
-gcs = ["adk-gcp", "google-cloud-auth", "reqwest", "serde", "tracing", "tokio/sync", "tokio/time"]
+gcs = ["dep:adk-gcp", "dep:google-cloud-auth", "dep:reqwest", "dep:serde", "dep:tracing", "tokio/sync", "tokio/time"]

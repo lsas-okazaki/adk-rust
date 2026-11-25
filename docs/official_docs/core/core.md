@@ -136,7 +136,7 @@ let mut turn = Content {
 mark_origin(&mut turn, Some(&anthropic));
 
 let mut for_gemini = vec![turn];
-retain_replayable(&mut for_gemini, &ProviderOrigin::new("gemini", "gemini-3.7-flash"));
+retain_replayable(&mut for_gemini, &ProviderOrigin::new("gemini", "gemini-3.8-flash"));
 assert!(for_gemini.is_empty());
 ```
 
@@ -176,7 +176,9 @@ fn main() -> adk_core::Result<()> {
 
 ## Agent Trait
 
-Every agent type — LLM agents, workflow agents, custom agents — implements `Agent`.
+Every agent type — LLM agents, workflow agents, custom agents — implements `Agent`. The table
+lists the methods most agents use; [Implementing the Core Traits](traits.md#agent) lists every
+method, and how a custom agent takes steering messages.
 
 | Method | Required | Purpose |
 |--------|----------|---------|
@@ -226,6 +228,9 @@ transfers as it goes.
 ---
 
 ## Tool Trait
+
+The methods most tools use; [Implementing the Core Traits](traits.md#tool) lists every method,
+including `batch_group`, `egress` and `approval_evidence`, and what a wrapper forwards.
 
 | Method | Default | Purpose |
 |--------|---------|---------|
@@ -290,6 +295,7 @@ the model receives and for `FunctionTool` and `#[tool]`.
 ## Toolset Trait
 
 A `Toolset` provides tools per context — by user, from an MCP server, or changing during a run.
+See also [Implementing the Core Traits](traits.md#toolset).
 
 | Method | Default | Purpose |
 |--------|---------|---------|
@@ -421,7 +427,8 @@ fn main() {
 | `Unsupported` | 501 | No |
 | `Unavailable` | 503 | Yes |
 
-`ResourceExhausted` marks a used-up run, team, or spend budget, and `Conflict` a write that
+`ResourceExhausted` marks a used-up run, team, or spend budget, or a model provider account
+out of quota or credit, and `Conflict` a write that
 lost a race or used a stale version (`lease.stale_epoch`, `run_store.stale_epoch`,
 `governance.conflict`, `approval.version_conflict`). `AdkError::diagnostics()` displays an
 error by everything but its message, for log lines that must not carry request content.
@@ -592,7 +599,8 @@ See [Events](../events/events.md).
 
 ## Llm Trait
 
-Every model provider implements `Llm`:
+Every model provider implements `Llm`. The methods a provider implements first; every method,
+and what a model wrapper forwards, is in [Implementing the Core Traits](traits.md#llm):
 
 | Method | Default | Purpose |
 |--------|---------|---------|
@@ -614,7 +622,7 @@ use adk_core::{Content, GenerateContentConfig, LlmRequest};
 use serde_json::json;
 
 fn main() {
-    let request = LlmRequest::new("gemini-3.7-flash", vec![Content::new("user").with_text("Hello!")])
+    let request = LlmRequest::new("gemini-3.8-flash", vec![Content::new("user").with_text("Hello!")])
         .with_config(GenerateContentConfig {
             temperature: Some(0.7),
             max_output_tokens: Some(1024),

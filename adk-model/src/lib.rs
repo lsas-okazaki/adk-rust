@@ -11,7 +11,7 @@
 //! | `OpenAIClient` | OpenAI Chat Completions | `openai` |
 //! | `openai::OpenAIResponsesClient` | OpenAI Responses API | `openai` |
 //! | `AzureOpenAIClient` | Azure OpenAI | `openai` |
-//! | `OpenAICompatible` | Any OpenAI-compatible endpoint, with presets for xAI, Fireworks AI, Together AI, Mistral AI, Perplexity, Cerebras, SambaNova, OrcaRouter, Cheaper Inference, API Route, MiniMax, Zhipu AI, Baidu, Cohere, ByteDance, and Gemini | `openai` |
+//! | `OpenAICompatible` | Any OpenAI-compatible endpoint, with presets for xAI, Fireworks AI, Together AI, Mistral AI, Perplexity, Cerebras, SambaNova, OrcaRouter, Vultr Serverless Inference, API Route, MiniMax, Zhipu AI, Baidu, Cohere, ByteDance, and Gemini | `openai` |
 //! | `AnthropicClient` | Anthropic Claude | `anthropic` |
 //! | `DeepSeekClient` | DeepSeek | `deepseek` |
 //! | `GroqClient` | Groq | `groq` |
@@ -21,8 +21,21 @@
 //! | `OpenCodeClient` | OpenCode Go and Zen | `opencode` |
 //! | `BedrockClient` | Amazon Bedrock | `bedrock` |
 //! | `AzureAIClient` | Azure AI Inference | `azure-ai` |
+//! | [`FallbackLlm`] | An ordered chain of any of the above, each tried when the one before it fails | always |
 //! | [`ScriptedLlm`] | Test double that answers each call with the next scripted reply and records every request | always |
 //! | [`MockLlm`] | Test double that replays the same responses on every call | always |
+//!
+//! Transport and option features add to a provider:
+//!
+//! | Feature | Enables |
+//! |---------|---------|
+//! | `gemini-interactions` | `GeminiModel::use_interactions_api`, the Gemini Interactions API transport (Beta) |
+//! | `openai-ws` | The Responses API WebSocket transport (`WsTransport`) |
+//! | `openai-conversations` | The Conversations API client (`ConversationsClient`) |
+//! | `openai-responses-full` | `openai-ws` and `openai-conversations` |
+//! | `muse-responses` | `MuseApi::Responses` through the Open Responses engine; implies `muse` and `openai` |
+//! | `muse-realtime` | `MuseRealtimeAsrClient`, live transcription over Meta's realtime WebSocket; implies `muse` |
+//! | `all-providers` | `gemini`, `openai`, `anthropic`, `deepseek`, `ollama`, `groq`, `muse`, `openrouter`, `opencode`, `bedrock` and `azure-ai` |
 //!
 //! [`catalog`] holds the recommended model per provider and the lifecycle of known model IDs;
 //! [`pricing::PricingCatalog`] prices usage for every provider.
@@ -36,9 +49,9 @@
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let model = GeminiModel::new(std::env::var("GOOGLE_API_KEY")?, "gemini-3.7-flash")?;
+//! let model = GeminiModel::new(std::env::var("GOOGLE_API_KEY")?, "gemini-3.8-flash")?;
 //! let request = LlmRequest::new(
-//!     "gemini-3.7-flash",
+//!     "gemini-3.8-flash",
 //!     vec![Content::new("user").with_text("Name one planet in a short sentence.")],
 //! );
 //!
@@ -68,11 +81,11 @@
 //! use adk_model::openai::{OpenAIClient, OpenAIConfig, OpenAIResponsesClient, OpenAIResponsesConfig};
 //! use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
 //!
-//! let chat = OpenAIClient::new(OpenAIConfig::new("sk-...", "gpt-5.6-terra"))?;
-//! let responses = OpenAIResponsesClient::new(OpenAIResponsesConfig::new("sk-...", "gpt-5.6-terra"))?;
-//! let claude = AnthropicClient::new(AnthropicConfig::new("sk-ant-...", "claude-sonnet-5"))?;
+//! let chat = OpenAIClient::new(OpenAIConfig::new("sk-...", "gpt-6.1-sol"))?;
+//! let responses = OpenAIResponsesClient::new(OpenAIResponsesConfig::new("sk-...", "gpt-6.1-sol"))?;
+//! let claude = AnthropicClient::new(AnthropicConfig::new("sk-ant-...", "claude-sonnet-5-5"))?;
 //! let deepseek = DeepSeekClient::v4_flash("sk-...")?;
-//! let grok = OpenAICompatible::new(OpenAICompatibleConfig::xai("xai-...", "grok-4.6"))?;
+//! let grok = OpenAICompatible::new(OpenAICompatibleConfig::xai("xai-...", "grok-4.7"))?;
 //! # let _ = (chat, responses, claude, deepseek, grok);
 //! # Ok(())
 //! # }
@@ -133,6 +146,7 @@ pub mod deepseek;
     feature = "openrouter"
 ))]
 mod error_metadata;
+pub mod fallback;
 /// Gemini model provider (Google AI Studio and Vertex AI).
 #[cfg(feature = "gemini")]
 pub mod gemini;
@@ -169,7 +183,6 @@ pub mod opencode;
 pub mod openrouter;
 /// Conversion outcomes for content parts sent to a provider.
 pub mod part_conversion;
-/// Token prices for every provider and cost calculation from usage.
 pub mod pricing;
 
 /// Canonical provider identifiers and metadata.
@@ -197,6 +210,7 @@ mod sse;
     feature = "openrouter"
 ))]
 mod stream_error;
+pub mod telemetry;
 #[cfg(any(
     feature = "openai",
     feature = "anthropic",
@@ -238,6 +252,7 @@ pub use azure_ai::{AzureAIClient, AzureAIConfig};
 pub use bedrock::{BedrockClient, BedrockConfig};
 #[cfg(feature = "deepseek")]
 pub use deepseek::{DeepSeekClient, DeepSeekConfig};
+pub use fallback::{FallbackLlm, FallbackLlmBuilder, FallbackTrigger};
 #[cfg(feature = "gemini")]
 pub use gemini::GeminiModel;
 #[cfg(feature = "groq")]

@@ -10,6 +10,7 @@ Agent evaluation in ADK-Rust supports multiple evaluation strategies:
 - **Response Similarity**: Compare agent responses using various algorithms (Jaccard, Levenshtein, ROUGE)
 - **LLM-Judged Evaluation**: Use another LLM to assess semantic similarity and quality
 - **Rubric-Based Scoring**: Evaluate against custom criteria with weighted scoring
+- **Rubric-Graded Outcomes**: Grade a deliverable per criterion at run time, and loop an agent until the rubric passes
 
 ## Quick Start
 
@@ -83,6 +84,9 @@ Test cases are defined in JSON files with the `.test.json` extension:
   ]
 }
 ```
+
+A turn can also carry `expected_vision`, what the agent must perceive in an image, and its
+`user_content` an `image` part that names a fixture pinned by SHA-256; see [Vision](#vision).
 
 ### Multi-Turn Cases and Session Input
 
@@ -179,7 +183,7 @@ use adk_eval::{Evaluator, EvaluationConfig, EvaluationCriteria, LlmJudge};
 use adk_model::GeminiModel;
 
 // Create evaluator with LLM judge
-let judge_model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+let judge_model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 let config = EvaluationConfig::with_criteria(
     EvaluationCriteria::semantic_match(0.85)
 );
@@ -229,6 +233,31 @@ let evaluator = Evaluator::with_llm_judge(EvaluationConfig::with_criteria(criter
 ```
 
 A `SAFE: NO` or `HALLUCINATION_FREE: NO` verdict from the judge fails the criterion regardless of its score.
+
+### Vision
+
+`EvaluationCriteria::vision` scores what an agent perceives against each turn's
+`expected_vision`: regions, masks, page text, document fields, click targets and a count. The
+answer is read from the responses of the vision tools the agent called (`vision_detect`,
+`vision_segment`, `vision_read`, `vision_describe`), and every score is computed in the source
+image's pixels. A score is computed only when it has a threshold:
+
+```rust
+use adk_eval::EvaluationCriteria;
+use adk_eval::vision::VisionCriteria;
+
+fn main() {
+    let criteria = EvaluationCriteria::default().with_vision(VisionCriteria {
+        region_iou: Some(0.75),
+        ocr_char_accuracy: Some(0.98),
+        ..Default::default()
+    });
+    assert!(criteria.has_criteria());
+}
+```
+
+[Vision Evals](../vision/evals.md) covers image fixtures, the `expected_vision` parts, every score,
+and running a vision backend as an eval agent.
 
 ### Criteria That Cannot Be Judged
 
@@ -328,6 +357,99 @@ for report in &reports {
 }
 ```
 
+## Repeated Runs and Flakiness
+
+An agent on a sampling model can pass a case once and fail it the next time, so one run cannot
+tell a reliable case from a lucky one. `Evaluator::evaluate_test_file_runs` runs every case of
+an eval set `num_runs` times, each time in a fresh session, and summarises each case across the
+runs:
+
+```rust
+use std::sync::Arc;
+
+use adk_core::Agent;
+use adk_eval::{EvaluationConfig, EvaluationCriteria, Evaluator, MultiRunConfig, TestFile};
+
+async fn five_runs(agent: Arc<dyn Agent>) -> adk_eval::Result<()> {
+    let evaluator = Evaluator::new(EvaluationConfig::with_criteria(
+        EvaluationCriteria::exact_tools(),
+    ));
+    let test_file = TestFile::load("tests/weather.test.json")?;
+    // A case passes when it passes in at least 4 of the 5 runs.
+    let config = MultiRunConfig::new(5)?.with_min_pass_rate(0.8)?;
+
+    let report = evaluator.evaluate_test_file_runs(agent, &test_file, &config).await?;
+    for case in report.flaky_cases() {
+        println!("{} passed {} of {} runs", case.eval_id, case.passed_runs, case.runs);
+    }
+    assert!(report.all_passed(), "{}", report.format_summary());
+    Ok(())
+}
+```
+
+| `CaseRunSummary` field | Meaning |
+|------------------------|---------|
+| `runs`, `passed_runs`, `pass_rate` | Runs the case ran in, runs it passed, and their ratio; a case that errored fails that run |
+| `scores` | `ScoreStats` per criterion: `mean`, sample `variance` (`n − 1` denominator), `std_dev`, `min`, `max`, `count` |
+| `flaky` | The case passed in some runs and failed in others |
+| `passed` | `pass_rate` reached `MultiRunConfig::min_pass_rate`, which defaults to 1.0: every run |
+| `failed_criteria` | Runs in which each criterion failed |
+
+Every run evaluates every case, whatever `continue_on_failure` says. `MultiRunReport::all_passed`
+is `false` unless every requested run completed and every case passed.
+`MultiRunReport::baseline_metrics` holds the mean score of each criterion plus a `pass_rate`
+metric per case, so a [regression baseline](#regression-baselines) catches a case that became
+flaky. `MultiRunReport::case_results` gives one result per case for the JUnit reporter.
+
+## Metering an Evaluation
+
+`Evaluator::set_run_config` runs every case with a `RunConfig` and puts the judges under it: the
+agent's model calls and every LLM-judge call count against the config's budget and spend ledger,
+and both stop while one of its kill switches is frozen.
+
+```rust
+use std::sync::Arc;
+
+use adk_core::{GovernanceControl, InMemorySpendLedger, RunBudget, RunConfig};
+use adk_eval::{EvaluationConfig, EvaluationCriteria, Evaluator};
+
+fn metered(judge: Arc<dyn adk_core::Llm>, kill_switch: GovernanceControl) -> Evaluator {
+    let mut evaluator = Evaluator::with_llm_judge(
+        EvaluationConfig::with_criteria(EvaluationCriteria::semantic_match(0.8)),
+        judge,
+    );
+    evaluator.set_run_config(
+        RunConfig::builder()
+            .budget(RunBudget::new().max_model_calls(200).max_cost_usd(2.0))
+            .spend_ledger(Arc::new(InMemorySpendLedger::default()))
+            .governance(kill_switch)
+            .build(),
+    );
+    evaluator
+}
+```
+
+- **One budget for the evaluation.** A `RunConfig::budget` without a `budget_tracker` becomes one
+  tracker shared by every run and judge call, so the budget bounds the whole evaluation rather
+  than each run.
+- **Judge spend is attributed separately.** Judge calls reserve under the case's app name and the
+  agent `eval-judge` (`JUDGE_AGENT_NAME`), so the ledger tells judging apart from the agent.
+- **A refusal is not a verdict.** A run or judge call refused by the budget, the spend ledger or a
+  frozen kill switch returns `EvalError::Refused` from `evaluate_case` and `evaluate_test_file`.
+  `evaluate_test_file_runs` keeps the runs that completed, drops the one the refusal
+  interrupted, and sets `MultiRunReport::stopped`.
+
+`LlmJudge` and `StructuredJudge` call their model through `adk_core::generate_metered`, which
+meters against whichever `ModelCallScope` is current; do not also wrap the judge model in
+`MeteredLlm`, which would meter each call twice.
+
+## Online Evaluation
+
+`adk_eval::online::OnlineEvaluator` applies the reference-free criteria — rubrics, safety,
+hallucination, trajectory efficiency and thread-level conversation metrics — to a seeded sample of
+production runs after they finish, off the request path and under its own budget and kill switch.
+See [Online Evaluation](online-evaluation.md).
+
 ## Integration with cargo test
 
 Use evaluation in standard Rust tests:
@@ -386,6 +508,70 @@ The judge attempts function-calling (response schema) first, then falls back to 
 
 `Evaluator::set_structured_judge` runs the judge on the last turn's expected and actual responses. A `fail` verdict, a judge error, or a missing agent response fails the case; `pass` and `partial` verdicts record the score without failing it.
 
+### Rubric-Graded Outcomes
+
+`OutcomeGrader` grades one deliverable against a rubric of independently gradeable criteria at
+run time, in a context of its own: its single request holds the task, the numbered criteria and
+the deliverable, never the history of the agent that produced it. It returns an `OutcomeGrade`
+with a `CriterionGrade` (pass or fail, with feedback) per criterion.
+
+```rust,no_run
+use std::sync::Arc;
+
+use adk_eval::{OutcomeGrader, RubricConfig};
+
+async fn grade(model: Arc<dyn adk_core::Llm>) -> adk_core::Result<()> {
+    let rubric = RubricConfig::from_markdown(
+        "- Names the product, Ferris Notes\n- States the monthly price\n- At most 60 words",
+    );
+    let grade = OutcomeGrader::new(model)
+        .grade("Write a launch blurb", "Ferris Notes keeps your notes in sync.", &rubric)
+        .await?;
+    println!("{} of {} pass", grade.passed(), grade.criteria.len());
+    if !grade.satisfied() {
+        println!("{}", grade.feedback()); // "- FAILED: States the monthly price\n  Feedback: …"
+    }
+    Ok(())
+}
+```
+
+`RubricCheckAgent` turns the grader into a loop condition: placed after the agent that produces
+the deliverable in a `LoopAgent`, it grades each attempt, yields the failed criteria and their
+feedback for the next attempt, and escalates once every criterion passes or its cap is reached.
+
+```rust,no_run
+use std::sync::Arc;
+
+use adk_agent::{LlmAgentBuilder, LoopAgent};
+use adk_eval::{RubricCheckAgent, RubricConfig};
+
+fn blurb_loop(model: Arc<dyn adk_core::Llm>) -> adk_core::Result<LoopAgent> {
+    let writer = LlmAgentBuilder::new("writer")
+        .instruction("Write the product blurb the user asks for.")
+        .model(model.clone())
+        .output_key("draft")
+        .build()?;
+    let rubric = RubricConfig::from_criteria(["Names the product", "States the monthly price"]);
+    let check = RubricCheckAgent::new("rubric_check", model, rubric)
+        .with_deliverable_key("draft")
+        .with_max_iterations(3);
+    Ok(LoopAgent::new("blurb", vec![Arc::new(writer), Arc::new(check)]))
+}
+```
+
+| Behaviour | Detail |
+|---|---|
+| Deliverable | session state `with_deliverable_key(key)` (the writer's `output_key`), else the latest model reply |
+| Task | `with_task(text)`, else the invocation's user message |
+| Cap | `with_max_iterations(n)`: default 3 (`DEFAULT_OUTCOME_ITERATIONS`), at most 20 (`MAX_OUTCOME_ITERATIONS`); attempts count within one invocation; any other value fails the run with `eval.outcome.invalid_cap` |
+| Result | `{invocationId, iteration, maxIterations, outcome, grade}` in state key `rubric_check` (`with_output_key`); `outcome` is `satisfied`, `needs_revision` or `max_iterations_reached` |
+| Budget | The grading call runs in the run's `ModelCallScope`, so it counts against the run budget and spend ledger |
+| Fail closed | A criterion without a verdict fails; a reply with no readable JSON fails every criterion; no deliverable fails every criterion without a model call |
+
+`Rubric`'s `weight` and `levels` apply to scored rubric evaluation, not to pass/fail grading.
+The harness grades goals with the same grader; see
+[Rubric-graded goals](../harness/plan-and-goals.md#rubric-graded-goals).
+
 ### Cost and Latency Tracking
 
 Track token usage and compute estimated dollar costs per evaluation:
@@ -396,8 +582,8 @@ use adk_eval::{CostTracker, CostMetrics};
 let tracker = CostTracker::new();  // Uses default pricing tables
 
 // Compute cost for a known model
-let cost = tracker.compute_cost("gpt-4o", 2000, 800);
-// → Some(0.013)
+let cost = tracker.compute_cost("claude-sonnet-5-5", 2000, 800);
+// → Some(0.012)
 
 // Extract metrics from event streams
 let metrics = tracker.extract_metrics(&events, duration);
@@ -445,6 +631,8 @@ for reg in &regressions {
 ```
 
 Every metric and case recorded in the baseline must have a score in the current run. A case that errored or did not run has no scores, so it is reported as a regression with `current_value: None`.
+
+Baselines from [repeated runs](#repeated-runs-and-flakiness) (`MultiRunReport::baseline_metrics`) hold mean scores and a `pass_rate` metric per case, so a drop in pass rate is a regression like a drop in score.
 
 A missing baseline file is an error (`EvalError::BaselineError`), not an empty list, so a mistyped path or an uncommitted baseline cannot pass the gate. Save one with `BaselineStore::save` first.
 
@@ -546,7 +734,7 @@ let score = scorer.score("expected text", "actual text").await?;
 |---------|-----------|------------|
 | `embedding` | `adk-memory` | Embedding-based semantic similarity |
 | `ci-helpers` | `quick-xml` | JUnit XML report generation |
-| `statistics` | `statrs` | Wilcoxon signed-rank test for A/B comparison |
+| `statistics` | `libm` | Wilcoxon signed-rank test for A/B comparison |
 | `experiments` | `libm` | `ExperimentAnalyzer`: sequential analysis of web experiments with guardrails; see [Web Experiments](experiments.md) |
 
 All other features (structured judge, cost tracker, trace analyzer, baselines, ledger statistics, annotations, test generator, conversation scorer) work without any additional feature flags.
@@ -640,8 +828,19 @@ cargo adk eval tests/ --agent-cmd "target/release/eval_agent" --check-regression
 | `--format` | `table`, `json`, or `junit` | `table` |
 | `--output` | Write the report to a file instead of stdout | stdout |
 | `--turn-timeout` | Seconds to wait for each response | `300` |
+| `--num-runs` | Run the eval sets this many times and report each case's pass rate, score statistics and flakiness | `1` |
+| `--min-pass-rate` | Fraction of runs, from 0.0 to 1.0, a case must pass | `1.0` (every run) |
+| `--judge-max-calls` | Most `--judge-model` calls across every run; the evaluation stops when they are spent | Unlimited |
+| `--judge-max-cost-usd` | Most `--judge-model` spend in US dollars across every run | Unlimited |
 
-The command exits with status 0 only when every case passed and no score regressed. A criteria file that sets no threshold, or sets `custom` criteria, which `Evaluator` does not score, is refused before any case runs.
+The command exits with status 0 only when every case reached the minimum pass rate, every run completed, and no score regressed.
+
+With `--num-runs` above 1, the table lists each case's passed runs, pass rate and verdict (`PASS`, `PASS (flaky)`, `FAIL (flaky)` or `FAIL`), then the mean, standard deviation, minimum and maximum of each criterion; `--format json` writes one `MultiRunReport` per eval set, and `--format junit` one test case per eval case, failing below the minimum pass rate. A baseline saved by `--save-baseline` holds each criterion's mean score and a `pass_rate` per case, and `--check-regression` reports a drop in either. Judge calls are counted across every run and printed after the report (`judge: 9 model call(s), 2982 tokens, $0.0007`); when `--judge-max-calls` or `--judge-max-cost-usd` is spent, the evaluation stops, keeps the runs that completed, and exits non-zero.
+
+```bash
+cargo adk eval tests/ --agent-cmd "target/release/eval_agent" --num-runs 5 --min-pass-rate 0.8 \
+  --judge-model claude-haiku-5-5 --judge-max-calls 100 --check-regression
+``` A criteria file that sets no threshold, or sets `custom` criteria, which `Evaluator` does not score, is refused before any case runs.
 
 A Rust agent binary that speaks the protocol, built from the same agent as the application:
 
@@ -668,7 +867,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 async fn main() -> anyhow::Result<()> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
     let agent = LlmAgentBuilder::new("weather_agent")
-        .model(Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?))
+        .model(Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?))
         .instruction("You answer weather questions.")
         .build()?;
     let sessions = Arc::new(InMemorySessionService::new());
@@ -886,13 +1085,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Example
 
-A complete working example demonstrating all features is available:
-
-```bash
-cargo run --manifest-path examples/eval_showcase/Cargo.toml
-```
-
-See `examples/eval_showcase/` for the source code.
+The `eval_showcase` example in [adk-playground](https://github.com/zavora-ai/adk-playground) is a complete
+working example of every feature on this page.
 
 ---
 

@@ -23,6 +23,7 @@ mod blackboard;
 mod discovery;
 mod evaluation;
 mod lifecycle;
+pub mod perception;
 mod runtime;
 mod templates;
 pub use blackboard::{
@@ -38,6 +39,10 @@ pub use evaluation::{
 pub use lifecycle::{
     TeamLifecycleContext, TeamLifecycleDecision, TeamLifecycleHook, TeamLifecycleOutcome,
     TeamLifecyclePhase,
+};
+pub use perception::{
+    PERCEIVER_CAPABILITY, REASONER_CAPABILITY, VERIFIER_CAPABILITY, opinion_schema,
+    perceiver_input_schema, reasoner_input_schema, verifier_input_schema,
 };
 use runtime::{EventDisposition, TeamEdgeStart, TeamRuntimeRegistry};
 pub use runtime::{
@@ -1388,6 +1393,13 @@ impl Agent for CompiledTeam {
         }
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        for member in &self.members {
+            member.prewarm().await?;
+        }
+        Ok(())
+    }
+
     async fn govern_transfer(
         &self,
         request: &adk_core::AgentTransferRequest,
@@ -1579,6 +1591,10 @@ impl Agent for TeamMemberAgent {
     // `sub_agents` is empty on purpose, so the default `close` would stop here.
     async fn close(&self) {
         self.agent.close().await;
+    }
+
+    async fn prewarm(&self) -> Result<()> {
+        self.agent.prewarm().await
     }
 
     fn configure_run(&self, _agent_name: &str, config: &mut RunConfig) {
@@ -2444,6 +2460,14 @@ impl Tool for BoundedDelegateTool {
 
     fn egress(&self, args: &serde_json::Value) -> adk_core::egress::ToolEgress {
         self.inner.egress(args)
+    }
+
+    fn approval_evidence(&self, args: &serde_json::Value) -> Vec<adk_core::Evidence> {
+        self.inner.approval_evidence(args)
+    }
+
+    fn batch_group(&self) -> Option<adk_core::BatchGroup> {
+        self.inner.batch_group()
     }
 
     fn origin(&self) -> &str {

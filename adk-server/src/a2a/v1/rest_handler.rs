@@ -12,14 +12,15 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::response::sse::{Event, KeepAlive};
-use axum::response::{IntoResponse, Response, Sse};
+use axum::response::sse::Event;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use serde::Deserialize;
 
 use a2a_protocol_types::TaskPushNotificationConfig;
+use a2a_protocol_types::responses::{ListPushConfigsResponse, SendMessageResponse};
 
 use super::error::A2aError;
 use super::request_handler::RequestHandler;
@@ -33,9 +34,12 @@ pub fn rest_router(handler: Arc<RequestHandler>) -> Router {
     Router::new()
         .route("/message:send", post(handle_message_send))
         .route("/message:stream", post(handle_message_stream))
-        .route("/tasks/{taskId}", get(handle_tasks_get))
-        .route("/tasks/{taskId}/cancel", post(handle_tasks_cancel))
+        // `/tasks/{id}:cancel` and `/tasks/{id}:subscribe` (A2A §11.3) share this route with
+        // `GET /tasks/{id}`: the router cannot match a verb after a parameter.
+        .route("/tasks/{taskId}", get(handle_task_get_or_subscribe).post(handle_task_verb))
         .route("/tasks", get(handle_tasks_list))
+        // The paths adk-server served before 3.0.
+        .route("/tasks/{taskId}/cancel", post(handle_tasks_cancel))
         .route("/tasks/{taskId}/subscribe", post(handle_tasks_subscribe))
         .route(
             "/tasks/{taskId}/pushNotificationConfigs",
@@ -46,7 +50,22 @@ pub fn rest_router(handler: Arc<RequestHandler>) -> Router {
             get(handle_push_config_get).delete(handle_push_config_delete),
         )
         .route("/extendedAgentCard", get(handle_extended_agent_card))
+        .layer(axum::middleware::from_fn_with_state(handler.clone(), require_extensions))
         .with_state(handler)
+}
+
+/// Refuses a request that leaves out an extension the agent card requires (400
+/// `FAILED_PRECONDITION`, reason `EXTENSION_SUPPORT_REQUIRED`), as a2a-go does.
+async fn require_extensions(
+    State(handler): State<Arc<RequestHandler>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let requested = super::extensions::RequestedExtensions::from_headers(request.headers());
+    match handler.require_extensions(&requested).await {
+        Ok(()) => next.run(request).await,
+        Err(error) => error_response(&error),
+    }
 }
 
 // ── Error response helpers ───────────────────────────────────────────────────
@@ -83,19 +102,30 @@ struct TaskListQuery {
 
 // ── Route handlers ───────────────────────────────────────────────────────────
 
-/// `POST /message:send` — sends a message and returns a Task.
+/// `POST /message:send` — sends a message and returns the v1
+/// `SendMessageResponse` oneof, `{"task": …}` (A2A §11.4, §6.1).
 async fn handle_message_send(
     State(handler): State<Arc<RequestHandler>>,
     caller: AuthenticatedCaller,
+    extensions: super::extensions::RequestedExtensions,
     Json(params): Json<serde_json::Value>,
 ) -> Response {
+    let configuration = match extract_configuration(&params) {
+        Ok(configuration) => configuration,
+        Err(e) => return error_response(&e),
+    };
     let msg = match extract_message(params) {
         Ok(m) => m,
         Err(e) => return error_response(&e),
     };
 
-    match handler.for_caller(caller.0).message_send(msg).await {
-        Ok(task) => a2a_json_response(&task),
+    match handler
+        .for_caller(caller.0)
+        .with_extensions(extensions)
+        .message_send_with(msg, configuration.as_ref())
+        .await
+    {
+        Ok(task) => a2a_json_response(&SendMessageResponse::Task(task)),
         Err(e) => error_response(&e),
     }
 }
@@ -104,14 +134,24 @@ async fn handle_message_send(
 async fn handle_message_stream(
     State(handler): State<Arc<RequestHandler>>,
     caller: AuthenticatedCaller,
+    extensions: super::extensions::RequestedExtensions,
     Json(params): Json<serde_json::Value>,
 ) -> Response {
+    let configuration = match extract_configuration(&params) {
+        Ok(configuration) => configuration,
+        Err(e) => return error_response(&e),
+    };
     let msg = match extract_message(params) {
         Ok(m) => m,
         Err(e) => return error_response(&e),
     };
 
-    let event_stream = match handler.for_caller(caller.0).message_stream(msg).await {
+    let event_stream = match handler
+        .for_caller(caller.0)
+        .with_extensions(extensions)
+        .message_stream_with(msg, configuration.as_ref())
+        .await
+    {
         Ok(s) => s,
         Err(e) => return error_response(&e),
     };
@@ -132,10 +172,53 @@ async fn handle_message_stream(
         }
     });
 
-    Sse::new(sse_stream).keep_alive(KeepAlive::default()).into_response()
+    super::jsonrpc_handler::sse_response(sse_stream)
 }
 
 /// `GET /tasks/{taskId}` — retrieves a task by ID.
+/// The task ID and verb of a `/tasks/{taskId}:verb` segment, for a verb A2A defines.
+fn task_verb(segment: &str) -> Option<(&str, &str)> {
+    segment
+        .rsplit_once(':')
+        .filter(|(task_id, verb)| !task_id.is_empty() && matches!(*verb, "cancel" | "subscribe"))
+}
+
+/// `GET /tasks/{taskId}` gets a task; `GET /tasks/{taskId}:subscribe` subscribes to it
+/// (A2A §11.3).
+async fn handle_task_get_or_subscribe(
+    state: State<Arc<RequestHandler>>,
+    caller: AuthenticatedCaller,
+    Path(segment): Path<String>,
+    query: Query<TaskGetQuery>,
+) -> Response {
+    match task_verb(&segment) {
+        Some((task_id, "subscribe")) => {
+            handle_tasks_subscribe(state, caller, Path(task_id.to_string())).await
+        }
+        _ => handle_tasks_get(state, caller, Path(segment), query).await,
+    }
+}
+
+/// `POST /tasks/{taskId}:cancel` cancels a task (A2A §11.3). `POST /tasks/{taskId}:subscribe`
+/// also subscribes, for clients that post it.
+async fn handle_task_verb(
+    state: State<Arc<RequestHandler>>,
+    caller: AuthenticatedCaller,
+    Path(segment): Path<String>,
+) -> Response {
+    match task_verb(&segment) {
+        Some((task_id, "cancel")) => {
+            handle_tasks_cancel(state, caller, Path(task_id.to_string())).await
+        }
+        Some((task_id, _)) => {
+            handle_tasks_subscribe(state, caller, Path(task_id.to_string())).await
+        }
+        None => {
+            error_response(&A2aError::MethodNotFound { method: format!("POST /tasks/{segment}") })
+        }
+    }
+}
+
 async fn handle_tasks_get(
     State(handler): State<Arc<RequestHandler>>,
     caller: AuthenticatedCaller,
@@ -166,7 +249,15 @@ async fn handle_tasks_list(
     caller: AuthenticatedCaller,
     Query(query): Query<TaskListQuery>,
 ) -> Response {
-    let state = query.status.and_then(|s| parse_task_state(&s));
+    let state = match query.status.as_deref().map(|s| (s, parse_task_state(s))) {
+        None => None,
+        Some((_, Some(state))) => Some(state),
+        Some((status, None)) => {
+            return error_response(&A2aError::InvalidParams {
+                message: format!("unknown task state {status:?}"),
+            });
+        }
+    };
 
     let params = ListTasksParams {
         context_id: query.context_id,
@@ -211,7 +302,7 @@ async fn handle_tasks_subscribe(
         }
     });
 
-    Sse::new(sse_stream).keep_alive(KeepAlive::default()).into_response()
+    super::jsonrpc_handler::sse_response(sse_stream)
 }
 
 /// `POST /tasks/{taskId}/pushNotificationConfigs` — creates a push config.
@@ -247,7 +338,9 @@ async fn handle_push_config_list(
     Path(task_id): Path<String>,
 ) -> Response {
     match handler.for_caller(caller.0).push_config_list(&task_id).await {
-        Ok(configs) => a2a_json_response(&configs),
+        Ok(configs) => {
+            a2a_json_response(&ListPushConfigsResponse { configs, next_page_token: None })
+        }
         Err(e) => error_response(&e),
     }
 }
@@ -265,8 +358,11 @@ async fn handle_push_config_delete(
 }
 
 /// `GET /extendedAgentCard` — returns the extended agent card.
-async fn handle_extended_agent_card(State(handler): State<Arc<RequestHandler>>) -> Response {
-    match handler.agent_card_extended().await {
+async fn handle_extended_agent_card(
+    State(handler): State<Arc<RequestHandler>>,
+    caller: AuthenticatedCaller,
+) -> Response {
+    match handler.agent_card_extended_for(caller.0).await {
         Ok(card) => a2a_json_response(&card),
         Err(e) => error_response(&e),
     }
@@ -284,6 +380,18 @@ fn extract_message(value: serde_json::Value) -> Result<a2a_protocol_types::Messa
     }
     // Fall back to direct Message shape
     serde_json::from_value(value).map_err(|e| A2aError::InvalidParams { message: e.to_string() })
+}
+
+/// Reads the `configuration` of a `SendMessageRequest` body (A2A §3.2.2), if it has one.
+fn extract_configuration(
+    value: &serde_json::Value,
+) -> Result<Option<a2a_protocol_types::params::SendMessageConfiguration>, A2aError> {
+    value
+        .get("configuration")
+        .filter(|configuration| !configuration.is_null())
+        .map(|configuration| serde_json::from_value(configuration.clone()))
+        .transpose()
+        .map_err(|e| A2aError::InvalidParams { message: format!("configuration: {e}") })
 }
 
 /// Parses a task state string (e.g., `"TASK_STATE_WORKING"`) into a `TaskState`.
@@ -348,8 +456,17 @@ mod tests {
             security_requirements: None,
             signatures: None,
         };
+        // The extended card the handler serves: the public card, for any caller.
+        let extended = card.clone();
+        let producer: super::super::request_handler::ExtendedCardProducer =
+            Arc::new(move |_caller| {
+                let card = extended.clone();
+                Box::pin(async move { Ok(card) })
+            });
         let cached = Arc::new(RwLock::new(CachedAgentCard::new(card)));
-        Arc::new(RequestHandler::new(executor, store, push_sender, cached))
+        Arc::new(
+            RequestHandler::new(executor, store, push_sender, cached).with_extended_card(producer),
+        )
     }
 
     fn make_router(handler: Arc<RequestHandler>) -> Router {
@@ -366,6 +483,50 @@ mod tests {
         serde_json::from_slice(&bytes).expect("response should be valid JSON")
     }
 
+    /// A `WORKING` task, so it can be cancelled.
+    async fn working_task(handler: &RequestHandler, task_id: &str) {
+        handler.executor().create_task(task_id, "ctx").await.unwrap();
+        handler
+            .executor()
+            .transition_state(task_id, "ctx", a2a_protocol_types::TaskState::Working, None)
+            .await
+            .unwrap();
+    }
+
+    async fn request(handler: &Arc<RequestHandler>, method: &str, uri: &str) -> Response {
+        let req = Request::builder().method(method).uri(uri).body(Body::empty()).unwrap();
+        make_router(handler.clone()).oneshot(req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_spec_s_cancel_and_subscribe_paths_and_the_old_ones_all_route() {
+        let handler = make_handler();
+
+        // A2A §11.3: `POST /tasks/{id}:cancel`.
+        working_task(&handler, "t-1").await;
+        let resp = request(&handler, "POST", "/tasks/t-1:cancel").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await["status"]["state"], "TASK_STATE_CANCELED");
+
+        // `GET /tasks/{id}:subscribe` reaches subscribe: a finished task is refused there.
+        let resp = request(&handler, "GET", "/tasks/t-1:subscribe").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(json_body(resp).await.to_string().contains("UNSUPPORTED_OPERATION"));
+
+        // `GET /tasks/{id}` still gets the task.
+        let resp = request(&handler, "GET", "/tasks/t-1").await;
+        assert_eq!(json_body(resp).await["id"], "t-1");
+
+        // The paths adk-server served before 3.0.
+        working_task(&handler, "t-2").await;
+        let resp = request(&handler, "POST", "/tasks/t-2/cancel").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // An unknown verb is not a task ID.
+        let resp = request(&handler, "POST", "/tasks/t-1:frobnicate").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
     fn send_message_body() -> String {
         serde_json::json!({
             "message": {
@@ -378,7 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_message_send_returns_task() {
+    async fn post_message_send_returns_the_send_message_response_oneof() {
         let handler = make_handler();
         let app = make_router(handler);
 
@@ -392,9 +553,15 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
+        // A2A §6.1 and §11.4: the body is a SendMessageResponse, `{"task": …}`.
         let body = json_body(resp).await;
-        assert!(body["id"].is_string());
-        assert_eq!(body["status"]["state"], "TASK_STATE_COMPLETED");
+        let keys: Vec<_> = body.as_object().expect("object body").keys().collect();
+        assert_eq!(keys, ["task"], "got: {body}");
+        assert!(body["task"]["id"].is_string());
+        assert!(body["task"]["contextId"].is_string());
+        assert_eq!(body["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+        let decoded: SendMessageResponse = serde_json::from_value(body).expect("oneof");
+        assert!(matches!(decoded, SendMessageResponse::Task(_)));
     }
 
     #[tokio::test]
@@ -448,7 +615,7 @@ mod tests {
             .unwrap();
         let create_resp = app.oneshot(create_req).await.unwrap();
         let create_body = json_body(create_resp).await;
-        let task_id = create_body["id"].as_str().unwrap();
+        let task_id = create_body["task"]["id"].as_str().unwrap();
 
         // Get the task
         let app = make_router(handler);
@@ -481,7 +648,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_tasks_list_returns_array() {
+    async fn get_tasks_list_returns_a_list_tasks_response() {
         let handler = make_handler();
 
         // Create a task
@@ -500,9 +667,11 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
+        // A2A §3.1.4: a ListTasksResponse, not a bare array.
         let body = json_body(resp).await;
-        assert!(body.is_array());
-        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(body["totalSize"], 1);
+        assert_eq!(body["nextPageToken"], "");
     }
 
     #[tokio::test]
@@ -535,7 +704,7 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let body = json_body(resp).await;
-        let task_id = body["id"].as_str().unwrap().to_string();
+        let task_id = body["task"]["id"].as_str().unwrap().to_string();
 
         // Create push config
         let app = make_router(handler.clone());
@@ -577,7 +746,7 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = json_body(resp).await;
-        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body["configs"].as_array().unwrap().len(), 1);
 
         // Delete push config
         let app = make_router(handler.clone());
@@ -598,7 +767,7 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let body = json_body(resp).await;
-        assert_eq!(body.as_array().unwrap().len(), 0);
+        assert_eq!(body["configs"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

@@ -97,6 +97,7 @@ pub struct Harness {
     app_name: String,
     run_store: Option<Arc<dyn adk_core::DurableRunStore>>,
     goal_queue: String,
+    goals_authenticated: bool,
 }
 
 impl std::fmt::Debug for Harness {
@@ -182,6 +183,7 @@ impl Harness {
             app_name,
             run_store: None,
             goal_queue: DEFAULT_GOAL_QUEUE.to_string(),
+            goals_authenticated: false,
         })
     }
 
@@ -220,6 +222,7 @@ impl Harness {
             app_name,
             run_store: None,
             goal_queue: DEFAULT_GOAL_QUEUE.to_string(),
+            goals_authenticated: false,
         })
     }
 
@@ -324,6 +327,26 @@ impl Harness {
         &self.goal_queue
     }
 
+    /// Enqueues durable goals as runs of an authenticated user (spec 3.1 §9.2 I6), so the
+    /// worker that runs them applies the session's mode and the user's standing rules. For a
+    /// host that established who the user is, such as a terminal of the machine whose kernel
+    /// runs the goal; without it, a harness that requires authenticated identity decides the
+    /// goal's calls with Auto as Ask and no standing rule.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let harness = harness
+    ///     .with_run_store(runs)
+    ///     .with_goal_queue(adk_kernel::QueueClass::BACKGROUND)
+    ///     .with_authenticated_goals();
+    /// ```
+    #[must_use]
+    pub fn with_authenticated_goals(mut self) -> Self {
+        self.goals_authenticated = true;
+        self
+    }
+
     /// Answers, from the action ledger, the calls a stopped process left without a response,
     /// so a turn after a crash never runs a completed call again (spec 3.1 §7.12, I37).
     async fn recover(&self, user: &UserId, session: &SessionId) -> Result<()> {
@@ -391,6 +414,47 @@ impl Harness {
         context: RequestContext,
     ) -> Result<EventStream> {
         self.turn(user, session, Content::new("user").with_text(text.into()), Some(context)).await
+    }
+
+    /// [`send_as`](Self::send_as) with a whole message: text and images the person sent
+    /// with it (spec 3.3 §5.1), such as a screenshot. `content` is a `user` turn; any other
+    /// role is refused.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use adk_core::{Content, RequestContext, SessionId, UserId};
+    /// use adk_harness::Harness;
+    ///
+    /// # async fn example(harness: Harness, user: UserId, session: SessionId, png: Vec<u8>) -> adk_core::Result<()> {
+    /// let context = RequestContext { user_id: user.to_string(), scopes: Vec::new(), metadata: Default::default() };
+    /// let message = Content::new("user").with_text("Why does CI fail like this?").with_inline_data("image/png", png);
+    /// let events = harness.send_content_as(&user, &session, message, context).await?;
+    /// # let _ = events;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`send_as`](Self::send_as), and an invalid-input error for a turn whose role is not
+    /// `user`.
+    pub async fn send_content_as(
+        &self,
+        user: &UserId,
+        session: &SessionId,
+        content: Content,
+        context: RequestContext,
+    ) -> Result<EventStream> {
+        if content.role != "user" {
+            return Err(AdkError::new(
+                ErrorComponent::Agent,
+                ErrorCategory::InvalidInput,
+                "harness.send.role",
+                "a person's message is a user turn",
+            ));
+        }
+        self.turn(user, session, content, Some(context)).await
     }
 
     /// Sends `call`, a call the person `context` authenticates asked for through something
@@ -1072,7 +1136,8 @@ impl Harness {
     }
 
     /// Starts a goal for the session (spec 3.1 §7.11): the harness iterates until the
-    /// goal's `until` command exits 0 or its iterations run out.
+    /// goal's checks pass — its `until` command exits 0 and its rubric's grader passes every
+    /// criterion, whichever it has — or a cap is reached.
     ///
     /// Goals run only in Ask or Auto. The goal state is written to the goal store and
     /// mirrored to `harness:goal`. With a run store ([`with_run_store`](Self::with_run_store))
@@ -1130,6 +1195,7 @@ impl Harness {
         .with_session_id(session.to_string())
         .with_idempotency_key(format!("goal:{session}:{}", record.spec.digest()))
         .with_concurrency_key(session.to_string(), adk_core::OnConflict::Enqueue);
+        let run = if self.goals_authenticated { run.with_authenticated_user() } else { run };
         let (run, note) = match runs.enqueue(run).await? {
             adk_core::Enqueued::Created(run) => (run, "enqueued"),
             adk_core::Enqueued::Existing(run) if !run.state.is_terminal() => {
@@ -1231,7 +1297,7 @@ impl Harness {
     ///     Arc::new(adk_agent::CronTrigger::new("0 0 2 * * *")?),
     ///     UserId::new("ops")?,
     ///     None,
-    ///     GoalSpec { goal: "make main green".into(), until: "cargo test".into(), max_iterations: 5, check_timeout: Duration::from_secs(900) },
+    ///     GoalSpec::new("make main green").with_until("cargo test").with_max_iterations(5).with_check_timeout(Duration::from_secs(900)),
     /// );
     /// ```
     #[cfg(feature = "ambient")]
@@ -1312,7 +1378,9 @@ impl Harness {
     ///
     /// Sessions with turns not yet distilled are distilled first (spec 3.1 §7.15.2); a
     /// distillation that fails is logged at `warn`. [`close_with_report`](Self::close_with_report)
-    /// returns those failures instead.
+    /// returns those failures instead. Last, the audit recorder is
+    /// [sealed](adk_core::audit_log::AuditRecorder::seal): a signed log signs a checkpoint
+    /// over the records not yet signed, so the log verifies after the process exits.
     pub async fn close(&self) {
         self.close_with_report().await;
     }
@@ -1344,6 +1412,11 @@ impl Harness {
         // The runner closes the root agent: the coordinator's toolsets through a compiled
         // team root, the harness toolset included.
         self.runner.close().await;
+        if let Some(trail) = self.agent.runtime().audit_trail()
+            && let Err(error) = trail.recorder().seal().await
+        {
+            tracing::warn!(error = %error, "the audit log was not sealed; its last records stay unsigned");
+        }
         report
     }
 

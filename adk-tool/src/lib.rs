@@ -12,6 +12,8 @@
 //! - [`FunctionTool`] - Create tools from async Rust functions
 //! - [`StatefulTool`] - Share `Arc<S>` state with a tool handler
 //! - [`AgentTool`] - Use agents as callable tools for composition
+//! - [`AdvisorTool`] - Let an agent consult a stronger or different model for advice
+//!   mid-task, under the run's budget, spend ledger and kill switch
 //! - [`GoogleSearchTool`] and the other [`builtin`] wrappers - Provider-hosted tools,
 //!   each declaring its [`ToolEffect`]
 //! - `McpToolset` - MCP tools, resources, prompts, completion, elicitation,
@@ -74,9 +76,20 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! ## Features
+//!
+//! No feature is on by default; function tools, agent tools and toolsets need none. MCP
+//! (`mcp`, `http-transport`, `mcp-server`, `mcp-sampling`, `mcp-apps`), memory tools
+//! (`memory-tools`, `graph-memory-tools`), code execution (`code`, `code-embedded-js`,
+//! `code-embedded-python`, `code-docker`), `slack`, `bigquery`, `spanner`, `example-store` and
+//! `vertex-agent-registry` each have a feature; the
+//! [README](https://github.com/zavora-ai/adk-rust/blob/main/adk-tool/README.md#features)
+//! says what each enables.
 
 #![deny(missing_docs)]
 
+pub mod advisor;
 mod agent_tool;
 /// Argument validation against a tool's parameters schema.
 mod arguments;
@@ -127,6 +140,7 @@ pub use adk_rust_macros::tool;
 
 // Re-export async_trait so the #[tool] macro's generated code can reference it
 // without requiring users to add async-trait as a direct dependency.
+pub use advisor::{AdvisorTool, AdvisorToolBuilder};
 pub use agent_tool::{
     AgentTool, AgentToolConfig, AgentToolFailureMode, AgentToolSessionSnapshot,
     AgentToolStateMergePolicy,
@@ -137,15 +151,15 @@ pub use arguments::{
 };
 pub use async_trait::async_trait;
 pub use builtin::{
-    AnthropicBashTool20241022, AnthropicBashTool20250124, AnthropicTextEditorTool20250124,
-    AnthropicTextEditorTool20250429, AnthropicTextEditorTool20250728, BypassBuiltinTool,
-    BypassMultiToolsLimit, DeepSeekWebSearchTool, ExitLoopTool, GeminiCodeExecutionTool,
-    GeminiComputerEnvironment, GeminiComputerUseTool, GeminiFileSearchTool, GoogleMapsContext,
-    GoogleMapsTool, GoogleSearchTool, LoadArtifactsTool, OpenAIApplyPatchTool,
-    OpenAIApproximateLocation, OpenAICodeInterpreterTool, OpenAIComputerEnvironment,
-    OpenAIComputerUseTool, OpenAIFileSearchTool, OpenAIImageGenerationTool, OpenAILocalShellTool,
-    OpenAIMcpTool, OpenAIShellTool, OpenAIWebSearchTool, UrlContextTool, WebSearchTool,
-    WebSearchUserLocation,
+    AnthropicAdvisorTool, AnthropicBashTool20241022, AnthropicBashTool20250124,
+    AnthropicTextEditorTool20250124, AnthropicTextEditorTool20250429,
+    AnthropicTextEditorTool20250728, BypassBuiltinTool, BypassMultiToolsLimit,
+    DeepSeekWebSearchTool, ExitLoopTool, GeminiCodeExecutionTool, GeminiComputerEnvironment,
+    GeminiComputerUseTool, GeminiFileSearchTool, GoogleMapsContext, GoogleMapsTool,
+    GoogleSearchTool, LoadArtifactsTool, OpenAIApplyPatchTool, OpenAIApproximateLocation,
+    OpenAICodeInterpreterTool, OpenAIComputerEnvironment, OpenAIComputerUseTool,
+    OpenAIFileSearchTool, OpenAIImageGenerationTool, OpenAILocalShellTool, OpenAIMcpTool,
+    OpenAIShellTool, OpenAIWebSearchTool, UrlContextTool, WebSearchTool, WebSearchUserLocation,
 };
 #[cfg(feature = "example-store")]
 pub use example_store::{ExampleStoreClient, ExampleStoreConfig, ExampleStoreProvider};

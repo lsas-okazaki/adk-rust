@@ -13,6 +13,8 @@
 //! - [`LoopAgent`] - Iterate until a sub-agent escalates or the iteration limit is reached
 //! - [`ConditionalAgent`] - Branch based on conditions
 //! - [`LlmConditionalAgent`] - Route to a sub-agent by a model classification
+//! - [`DecisionAgent`] - Route to a sub-agent by a typed decision with a rationale and a
+//!   confidence, made with structured output
 //! - [`TeamSpec`] - Validate and compile a portable team from existing agents
 //!
 //! `CodeActAgent` (feature `codeact`), `CodingAgent` (feature `coding`), and `AmbientAgent`
@@ -28,7 +30,7 @@
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let api_key = std::env::var("GOOGLE_API_KEY")?;
-//! let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+//! let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 //!
 //! let agent = LlmAgentBuilder::new("assistant")
 //!     .description("Helpful AI assistant")
@@ -78,6 +80,23 @@
 //!     .input_guardrails(input_guardrails)
 //!     .build()?;
 //! ```
+//!
+//! ## Features
+//!
+//! No feature is on by default.
+//!
+//! | Feature | Enables |
+//! |---------|---------|
+//! | `skills` | `with_skills`, `with_auto_skills` and the other skill methods on every agent builder |
+//! | `skills-progressive-disclosure` | `adk-skill`'s progressive-disclosure skill tools; implies `skills` |
+//! | `guardrails` | `input_guardrails`, `output_guardrails` and `tool_guardrails` through `adk-guardrail` |
+//! | `enhanced-plugins` | `enhanced_plugin` and `enhanced_plugins`: the `EnhancedPlugin` pipeline intercepting tool and model calls |
+//! | `team-tools` | `Delegate` relationships in a [`TeamSpec`], lowered to `AgentTool`s |
+//! | `codeact` | `CodeActAgent` |
+//! | `coding` | `CodingAgent` over `adk-devtools` |
+//! | `sandbox` | `LlmAgentBuilder::sandbox_config` through `adk-sandbox` |
+//! | `ambient` | `AmbientAgent` with `CronTrigger`, `WebhookTrigger` and `FileWatchTrigger` |
+//! | `record-payloads` | Trace payloads recorded in full, instead of truncated to `RunConfig::trace_payload_max_bytes`, when `RunConfig::record_payloads` is set |
 #![allow(clippy::result_large_err)]
 #![deny(missing_docs)]
 
@@ -99,6 +118,7 @@ mod invocation_hooks;
 mod llm_agent;
 mod requested_call;
 mod skill_shim;
+pub mod subagents;
 pub mod team;
 pub mod tool_call_markup;
 mod tool_ledger;
@@ -117,22 +137,24 @@ pub use llm_agent::{
 pub use team::{
     BlackboardHistoryPolicy, BlackboardPolicy, BlackboardSchedule, BlackboardSpec,
     BlackboardTransition, CircuitBreakerPolicy, CompiledBlackboardTeam, CompiledTeam,
-    RelationshipApprovalPolicy, RelationshipFailureStrategy, RelationshipKind, RelationshipPolicy,
-    ResolvedTeamMember, StaticTeamAgentRegistry, TEAM_EDGE_ID_KEY, TEAM_EXECUTION_STATE_KEY,
-    TEAM_ROOT_INVOCATION_KEY, TeamAgentDescriptor, TeamAgentHealth, TeamAgentRegistry,
-    TeamArchitectureTemplate, TeamBudget, TeamContextPolicy, TeamEdgeExecution, TeamError,
-    TeamExecutionAnalysis, TeamExecutionSnapshot, TeamExecutionStatus, TeamExecutionUsage,
-    TeamFailurePolicy, TeamHistoryPolicy, TeamLifecycleContext, TeamLifecycleDecision,
-    TeamLifecycleHook, TeamLifecycleOutcome, TeamLifecyclePhase, TeamManagerBranch, TeamMemberSpec,
-    TeamPolicy, TeamRegistryRequirement, TeamRelationship, TeamReplayError, TeamResumePlan,
-    TeamResumePolicy, TeamRuntimeError, TeamSpec, TeamStateMergePolicy, TeamTerminationPolicy,
-    WorkflowArchitectureTemplate, analyze_team_execution, validate_team_replay,
+    PERCEIVER_CAPABILITY, REASONER_CAPABILITY, RelationshipApprovalPolicy,
+    RelationshipFailureStrategy, RelationshipKind, RelationshipPolicy, ResolvedTeamMember,
+    StaticTeamAgentRegistry, TEAM_EDGE_ID_KEY, TEAM_EXECUTION_STATE_KEY, TEAM_ROOT_INVOCATION_KEY,
+    TeamAgentDescriptor, TeamAgentHealth, TeamAgentRegistry, TeamArchitectureTemplate, TeamBudget,
+    TeamContextPolicy, TeamEdgeExecution, TeamError, TeamExecutionAnalysis, TeamExecutionSnapshot,
+    TeamExecutionStatus, TeamExecutionUsage, TeamFailurePolicy, TeamHistoryPolicy,
+    TeamLifecycleContext, TeamLifecycleDecision, TeamLifecycleHook, TeamLifecycleOutcome,
+    TeamLifecyclePhase, TeamManagerBranch, TeamMemberSpec, TeamPolicy, TeamRegistryRequirement,
+    TeamRelationship, TeamReplayError, TeamResumePlan, TeamResumePolicy, TeamRuntimeError,
+    TeamSpec, TeamStateMergePolicy, TeamTerminationPolicy, VERIFIER_CAPABILITY,
+    WorkflowArchitectureTemplate, analyze_team_execution, opinion_schema, perceiver_input_schema,
+    reasoner_input_schema, validate_team_replay, verifier_input_schema,
 };
 pub use tool_call_markup::{normalize_content, normalize_option_content};
 pub use tool_ledger::held_call_ledger_key;
 pub use workflow::{
-    ConditionalAgent, DEFAULT_LOOP_MAX_ITERATIONS, LlmConditionalAgent, LlmConditionalAgentBuilder,
-    LoopAgent, ParallelAgent, SequentialAgent,
+    ConditionalAgent, DEFAULT_LOOP_MAX_ITERATIONS, DecisionAgent, DecisionAgentBuilder,
+    LlmConditionalAgent, LlmConditionalAgentBuilder, LoopAgent, ParallelAgent, SequentialAgent,
 };
 
 #[cfg(feature = "ambient")]

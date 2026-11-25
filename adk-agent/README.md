@@ -19,12 +19,13 @@ Agent implementations for ADK-Rust (LLM, Custom, Workflow agents).
 | `LoopAgent` | Repeats sub-agents until one escalates or the iteration limit is reached |
 | `ConditionalAgent` | Branches on a function of the invocation context |
 | `LlmConditionalAgent` | Routes to one of several sub-agents by a model classification |
+| `DecisionAgent` | Routes by a typed decision made with structured output: a route, a rationale and a confidence, with a confidence floor and a fallback route; the call counts against the run budget |
 | `TeamSpec` / `CompiledTeam` | A portable, validated team topology compiled from existing agents |
 | `CodeActAgent` | (feature `codeact`) Acts by writing and running code; see [CodeAct Agent](#codeact-agent-feature-codeact) |
 | `CodingAgent` | (feature `coding`) A coding harness over `LlmAgent` with the [`adk-devtools`](https://crates.io/crates/adk-devtools) toolset and a `write_todos` planning tool; see the [Coding Agent guide](../docs/official_docs/coding-agent/index.md) |
 | `AmbientAgent` | (feature `ambient`) Runs an agent from cron, webhook, or file-watch triggers |
 
-`LlmEventSummarizer` summarizes older events for context compaction.
+`LlmEventSummarizer` (re-exported from `adk-core`) summarizes older events for context compaction.
 
 ## Installation
 
@@ -44,7 +45,7 @@ adk-rust = "3.0.0"
 
 | Feature | Default | Enables |
 |---------|---------|---------|
-| `skills` | yes | `with_skills`, `with_auto_skills`, and the other skill methods on every agent builder |
+| `skills` | no | `with_skills`, `with_auto_skills`, and the other skill methods on every agent builder |
 | `skills-progressive-disclosure` | no | `adk-skill`'s progressive-disclosure skill tools (implies `skills`) |
 | `guardrails` | no | `input_guardrails`, `output_guardrails`, and `tool_guardrails` through `adk-guardrail` |
 | `enhanced-plugins` | no | `enhanced_plugin` / `enhanced_plugins`: the `EnhancedPlugin` pipeline intercepting tool and model calls |
@@ -70,7 +71,7 @@ use futures::StreamExt;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.7-flash")?);
+    let model = Arc::new(GeminiModel::new(&api_key, "gemini-3.8-flash")?);
 
     let agent = LlmAgentBuilder::new("assistant")
         .description("Helpful AI assistant")
@@ -123,8 +124,9 @@ The example needs `adk-agent`, `adk-core`, `adk-model`, `adk-runner`, `adk-sessi
 | `new(name)` | Create a builder with the agent name |
 | `description(desc)` | Set the agent description |
 | `model(llm)` | Set the model (required) |
-| `instruction(text)` | Set the static instruction, sent as `system` content |
-| `instruction_provider(fn)` | Set a dynamic instruction provider |
+| `instruction(text)` | Set the static instruction, sent as `system` content after `{var}` templating |
+| `static_instruction(text)` | Set an instruction sent as written, before the global instruction, without `{var}` templating |
+| `instruction_provider(fn)` | Set a dynamic instruction provider; its text is sent as written, without `{var}` templating |
 | `global_instruction(text)` | Set the global instruction shared across agents |
 | `global_instruction_provider(fn)` | Set a dynamic global instruction provider |
 | `generate_content_config(config)` | Set the full `GenerateContentConfig` |
@@ -174,7 +176,7 @@ The example needs `adk-agent`, `adk-core`, `adk-model`, `adk-runner`, `adk-sessi
 
 ### Governed Tool Execution
 
-`LlmAgent` and `CodeActAgent` authorize each tool call with `adk_core::authorize_tool_call` after before-tool plugins and callbacks have run, so the run's `ToolPolicy`, the agent's tool guardrails, and confirmation all see the arguments that will execute. A call held for confirmation is answered with an error result, its sibling calls in the turn still run, and the hold is surfaced as a `ToolConfirmationRequest` event. A decision recorded against `request.fingerprint()` authorizes the same agent's same call, to a tool with the same origin and declaration, when the next run resumes it or the model issues it again. A resumed call whose tool now resolves to another publisher, or was redefined, is answered as not run. A frozen `GovernanceControl` executes no further tool call — `LlmAgent` answers each one `not run`, `CodeActAgent` ends the run there — and ends the run before its next model call.
+`LlmAgent` and `CodeActAgent` authorize each tool call with `adk_core::authorize_tool_call` after before-tool plugins and callbacks have run, so the run's `ToolPolicy`, the agent's tool guardrails, and confirmation all see the arguments that will execute. A call held for confirmation is answered with `adk_core::confirmation_pending_response` (`"status": "confirmation_pending"`), its sibling calls in the turn still run, and the hold is surfaced as a `ToolConfirmationRequest` event. A decision recorded against `request.fingerprint()` authorizes the same agent's same call, to a tool with the same origin and declaration, when the next run resumes it or the model issues it again. A resumed call whose tool now resolves to another publisher, or was redefined, is answered as not run. A frozen `GovernanceControl` executes no further tool call — `LlmAgent` answers each one `not run`, `CodeActAgent` ends the run there — and ends the run before its next model call.
 
 A workflow agent stops when a sub-agent holds a call and resumes at that sub-agent on the next run, without repeating finished sub-agents, loop iterations, or routing. A call its provider sent without an ID gets a generated `adk-call-` ID, so same-name calls keep their own arguments. See [Tool Authorization](../docs/official_docs/security/tool-authorization.md).
 
@@ -215,7 +217,7 @@ fn agents(model: Arc<dyn Llm>) -> Result<(LlmAgent, LlmAgent)> {
 }
 ```
 
-Sampling controls such as `temperature`, `top_p`, and `top_k` are model-specific. `GeminiModel` refuses them for `gemini-3.6-flash` and `gemini-3.7-flash` with `model.gemini.sampling_unsupported`; a field a provider client cannot send fails with `model.unsupported_config` before the request leaves.
+Sampling controls such as `temperature`, `top_p`, and `top_k` are model-specific. `GeminiModel` refuses them for `gemini-3.6-flash` and `gemini-3.8-flash` with `model.gemini.sampling_unsupported`; a field a provider client cannot send fails with `model.unsupported_config` before the request leaves.
 
 ### Skills
 
@@ -257,7 +259,7 @@ fn workflows(a: Arc<dyn Agent>, b: Arc<dyn Agent>, c: Arc<dyn Agent>) {
 }
 ```
 
-`LoopAgent` defaults to 1000 iterations (`DEFAULT_LOOP_MAX_ITERATIONS`). Every workflow agent takes `with_description`, `before_callback`, `after_callback`, and the skills methods. A workflow sub-agent that did not receive control by transfer sees other agents' turns as quoted user-role context (`adk_core::history::OTHER_AGENT_CONTEXT_PREAMBLE`) instead of as its own model turns.
+`LoopAgent` defaults to 1000 iterations (`DEFAULT_LOOP_MAX_ITERATIONS`). Every workflow agent takes `with_description` (`description` on the `LlmConditionalAgent` builder), `before_callback`, `after_callback`, and the skills methods. A workflow sub-agent that did not receive control by transfer sees other agents' turns as quoted user-role context (`adk_core::history::OTHER_AGENT_CONTEXT_PREAMBLE`) instead of as its own model turns.
 
 ### Portable Teams
 
@@ -351,6 +353,14 @@ fn routers(
 ```
 
 `LlmConditionalAgent` lowercases route labels and the model's trimmed classification, and picks the first label the classification contains, so the model does not need to produce an exact match.
+
+### Background Sub-Agents
+
+`subagents::SubagentTools::new(host).tools()` gives a model `start_subagent`,
+`subagent_status`, `message_subagent` and `cancel_subagent` over any
+`adk_core::SubagentHost`. A start carves the sub-agent's budget from the calling run's, limits
+it to the caller's tools, and is keyed by the call's idempotency key. Each tool goes through
+the governed path. See [Background sub-agents](../docs/official_docs/agents/background-subagents.md).
 
 ### Multi-Agent Systems
 
@@ -544,6 +554,8 @@ fn processor() -> Result<CustomAgent> {
 
 It is **language-agnostic**: the `CodeRuntime` trait is the step-wise interpreter seam, so the language (Python via Monty, a shell, a DSL, ...) is the runtime's choice. A runtime that can snapshot a paused call enables HITL confirmation and long-running tool deferral, which **suspend** into session state and **resume** on the next `run()` — the same save-rebuild-continue model as `LlmAgent`.
 
+Requires the `codeact` feature, which no `adk-rust` tier enables:
+
 ```rust
 use std::sync::Arc;
 
@@ -572,7 +584,7 @@ The full agent/model/tool callback surface is supported too: `before_callback` /
 
 With `RunConfig::action_ledger` set, `CodeActAgent` records each `NonIdempotent` call like `LlmAgent` does. The idempotency key is `{app}/{user}/{session}/codeact/{run_id}/{iteration}/{call_id}`, so two identical calls in one program both execute, and a call replayed from a checkpoint (crash recovery or a confirmed resume) is answered from the ledger instead of executing again. A ledger answer, and a non-idempotent call that times out or panics, is raised into the script as the same `already_succeeded` / `already_failed` / `outcome_unknown` payload `LlmAgent` returns.
 
-A runnable, dependency-free end-to-end demo (a self-contained `CodeRuntime` and a deterministic model) lives in [`examples/codeact_agent`](../examples/codeact_agent).
+A runnable, dependency-free end-to-end demo (a self-contained `CodeRuntime` and a deterministic model) is the `codeact_agent` example in [adk-playground](https://github.com/zavora-ai/adk-playground).
 
 ## Tool Call Markup Normalization
 
@@ -614,6 +626,8 @@ fn compaction(model: Arc<dyn Llm>) -> EventsCompactionConfig {
 
 Pass the config to `Runner::builder().compaction_config(...)` to enable automatic compaction. Each summary's input includes the previous summary and the window's function calls and responses, so older turns and tool results carry forward through repeated compaction. Compaction never covers a call still held for confirmation.
 
+Within a run, `LlmAgent` and `CodeActAgent` also compact before every model call: they pass their history to the run's `HistoryCompactor` (`RunConfig::history_compactor`), which the runner installs by default and which summarizes once a request passes 80% of the model's context window, or 100,000 estimated tokens when the model reports none. A request the model rejects as too long is compacted and sent once more. `Runner::builder().intra_compaction_config(IntraCompactionConfig::at_tokens(n))` sets a fixed threshold, and `without_intra_compaction()` turns it off. See [Context Compaction](../docs/official_docs/sessions/context-compaction.md#auto-compaction-within-a-run).
+
 ## Changes in 3.0
 
 | Change | Migration |
@@ -630,6 +644,9 @@ Pass the config to `Runner::builder().compaction_config(...)` to enable automati
 | `after_agent` callbacks run after a transfer, a turn-ending tool result, and a cancellation | — |
 | Workflow sub-agents see other agents' turns as quoted context | — |
 | Team budget errors are `ResourceExhausted` | — |
+| `LlmAgent` and `CodeActAgent` compact their history before each model call, on by default | `Runner::builder().without_intra_compaction()` sends the history uncompacted |
+| `LlmEventSummarizer` moves to `adk-core`; `adk_agent::LlmEventSummarizer` still names it | — |
+| The implicit `adk-guardrail` feature is removed | Enable `guardrails` |
 
 See the [2.x to 3.0 migration guide](../docs/official_docs/migration/2.x-to-3.0.md) and the [changelog](../CHANGELOG.md) for the full list.
 

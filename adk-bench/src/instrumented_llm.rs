@@ -106,6 +106,18 @@ impl Llm for InstrumentedLlm {
         self.inner.max_cost_micro_usd(request)
     }
 
+    fn context_window(&self) -> Option<u64> {
+        self.inner.context_window()
+    }
+
+    fn native_compaction(&self) -> Option<adk_core::NativeCompaction> {
+        self.inner.native_compaction()
+    }
+
+    fn data_locality(&self) -> adk_core::DataLocality {
+        self.inner.data_locality()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }

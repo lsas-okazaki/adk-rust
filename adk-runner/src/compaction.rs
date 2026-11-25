@@ -11,10 +11,11 @@
 //!
 //! # Overview
 //!
-//! When a model rejects a request due to token limits, the runner can apply a
-//! [`CompactionStrategy`] to shrink the event history and retry. The
-//! [`ContextOverflowError`] captures the current token count and the model's
-//! maximum, enabling callers to diagnose overflow conditions.
+//! A strategy set with `RunnerConfigBuilder::context_compaction` takes the place of
+//! auto-compaction's summary: before any model call whose request passes the budget, the
+//! agent's history is shortened with it ([`crate::IntraInvocationCompactor`]). The
+//! [`ContextOverflowError`] captures the current token count and the budget when a strategy
+//! cannot get under it.
 //!
 //! # Example
 //!
@@ -296,13 +297,9 @@ impl CompactionStrategy for SummarisationCompaction {
             }
             finish_reason = response.finish_reason.or(finish_reason);
         }
-        // A summary the model cut short would replace history with part of what it said.
-        if let Some(
-            reason @ (adk_core::FinishReason::MaxTokens
-            | adk_core::FinishReason::Safety
-            | adk_core::FinishReason::Recitation
-            | adk_core::FinishReason::Other),
-        ) = finish_reason
+        // A summary the model cut short, or declined, would replace history with part of what
+        // it said or with a refusal.
+        if let Some(reason) = finish_reason.filter(|reason| *reason != adk_core::FinishReason::Stop)
         {
             return Err(AdkError::new(
                 ErrorComponent::Model,
@@ -372,10 +369,9 @@ fn build_summary_prompt(events: &[Event]) -> String {
 
 /// Configuration for automatic context compaction in the runner.
 ///
-/// When the conversation history exceeds `context_budget` tokens, the runner
-/// applies the configured [`CompactionStrategy`] to shrink the event list. If
-/// compaction still leaves the context over budget, the runner retries up to
-/// `max_retries` times before returning a [`ContextOverflowError`].
+/// Before any model call whose request passes `context_budget` estimated tokens, an
+/// agent's history is shortened with the configured [`CompactionStrategy`], applied up to
+/// `max_retries` times; a history still over budget after that is sent as it is.
 ///
 /// # Fields
 ///
@@ -447,11 +443,8 @@ impl std::fmt::Debug for CompactionConfig {
 
 /// Checks whether an [`AdkError`] represents a token/context limit error from a model.
 ///
-/// Token limit errors are typically reported by model providers as
-/// `ErrorCategory::InvalidInput` with messages containing keywords like
-/// "token", "context length", "too long", or "maximum context". This function
-/// uses heuristic message matching since different providers use different
-/// phrasing.
+/// Forwards to [`adk_core::intra_compaction::is_context_limit_error`], which agents use to
+/// compact and retry a model call the model rejected as too long.
 ///
 /// # Example
 ///
@@ -471,47 +464,13 @@ impl std::fmt::Debug for CompactionConfig {
 /// assert!(!is_token_limit_error(&other));
 /// ```
 pub fn is_token_limit_error(err: &AdkError) -> bool {
-    // Must be a model error with InvalidInput category
-    if err.component != adk_core::ErrorComponent::Model {
-        return false;
-    }
-    if err.category != adk_core::ErrorCategory::InvalidInput {
-        return false;
-    }
-
-    // Check for the specific context overflow code we emit
-    if err.code == "runner.context_overflow" {
-        return true;
-    }
-
-    // Heuristic: check the error message for token/context limit keywords.
-    // Different providers phrase this differently:
-    // - OpenAI: "maximum context length is X tokens"
-    // - Anthropic: "prompt is too long: X tokens"
-    // - Gemini: "request payload size exceeds the limit"
-    // - Generic: "token limit", "context length exceeded"
-    let msg = err.message.to_lowercase();
-    let token_limit_patterns = [
-        "token",
-        "context length",
-        "context_length",
-        "too long",
-        "too many tokens",
-        "payload size exceeds",
-        "maximum context",
-        "max_tokens",
-        "input too large",
-        "prompt is too long",
-        "exceeds the model",
-    ];
-
-    token_limit_patterns.iter().any(|pattern| msg.contains(pattern))
+    adk_core::intra_compaction::is_context_limit_error(err)
 }
 
 /// Applies compaction to the given events and returns the compacted result.
 ///
-/// This is the core retry loop used by the runner when a token limit error is
-/// detected. It applies the configured [`CompactionStrategy`] up to
+/// This is the retry loop auto-compaction runs a strategy through. It applies the
+/// configured [`CompactionStrategy`] up to
 /// `max_retries` times. If compaction cannot reduce the context below the
 /// budget after all retries, a [`ContextOverflowError`] is returned.
 ///
@@ -545,34 +504,6 @@ pub async fn apply_compaction_with_retry(
     config: &CompactionConfig,
     events: Vec<Event>,
 ) -> Result<Vec<Event>, AdkError> {
-    compact_to_budget(config, events, config.context_budget).await
-}
-
-/// Share of the rejected history's estimate that reactive compaction aims for.
-const REACTIVE_TARGET_PERCENT: usize = 75;
-
-/// Compacts a history the model has just rejected as too long.
-///
-/// Unlike [`apply_compaction_with_retry`], the target is not `context_budget`
-/// alone: a rejection means the estimate undercounts this provider's tokens,
-/// and a history whose estimate is already under budget would come back
-/// unchanged and be resent as the same oversized request. The target is the
-/// smaller of the budget and [`REACTIVE_TARGET_PERCENT`] of the rejected
-/// history's estimate, so every reactive pass removes something.
-pub async fn apply_reactive_compaction(
-    config: &CompactionConfig,
-    events: Vec<Event>,
-) -> Result<Vec<Event>, AdkError> {
-    let estimated = estimate_event_tokens(&events);
-    let target = config.context_budget.min(estimated * REACTIVE_TARGET_PERCENT / 100);
-    compact_to_budget(config, events, target).await
-}
-
-async fn compact_to_budget(
-    config: &CompactionConfig,
-    events: Vec<Event>,
-    budget: usize,
-) -> Result<Vec<Event>, AdkError> {
     let mut current_events = events;
 
     for attempt in 0..config.max_retries {
@@ -580,7 +511,7 @@ async fn compact_to_budget(
             attempt = attempt + 1,
             max_retries = config.max_retries,
             event_count = current_events.len(),
-            budget,
+            budget = config.context_budget,
             "applying context compaction"
         );
 
@@ -591,21 +522,25 @@ async fn compact_to_budget(
             adk_core::held_call_compaction_limit(&current_events, current_events.len()),
         );
         let kept = current_events.split_off(held_from);
-        current_events = config.strategy.compact(current_events, budget).await?;
+        current_events = config.strategy.compact(current_events, config.context_budget).await?;
         current_events.extend(kept);
 
         // Estimate token count after compaction using a simple heuristic:
         // ~4 chars per token (same as adk-core's estimate_tokens).
         let estimated_tokens = estimate_event_tokens(&current_events);
 
-        if estimated_tokens <= budget {
-            tracing::info!(estimated_tokens, budget, "compaction succeeded, context within budget");
+        if estimated_tokens <= config.context_budget {
+            tracing::info!(
+                estimated_tokens,
+                budget = config.context_budget,
+                "compaction succeeded, context within budget"
+            );
             return Ok(current_events);
         }
 
         tracing::warn!(
             estimated_tokens,
-            budget,
+            budget = config.context_budget,
             attempt = attempt + 1,
             "compaction did not bring context under budget, retrying"
         );
@@ -613,7 +548,7 @@ async fn compact_to_budget(
 
     // All retries exhausted — return ContextOverflowError
     let final_tokens = estimate_event_tokens(&current_events);
-    Err(ContextOverflowError { token_count: final_tokens, limit: budget }.into())
+    Err(ContextOverflowError { token_count: final_tokens, limit: config.context_budget }.into())
 }
 
 /// Estimates the total token count for a slice of events.
@@ -677,6 +612,7 @@ mod tests {
             args: serde_json::json!({ "amount": 10 }),
             acting: None,
             origin: None,
+            evidence: Vec::new(),
         });
         events.extend([call, pending, hold]);
         events.extend(make_events(after));
@@ -878,6 +814,17 @@ mod tests {
         assert_eq!(error.code, "model.summary_incomplete");
     }
 
+    #[tokio::test]
+    async fn summarisation_fails_when_the_model_declines() {
+        let model =
+            ScriptedSummary::new("I can't summarise that.", adk_core::FinishReason::Refusal);
+        let error = SummarisationCompaction { model, turns_to_summarise: 3 }
+            .compact(make_events(6), 4096)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "model.summary_incomplete");
+    }
+
     struct FailingSummary;
 
     #[async_trait]
@@ -1047,20 +994,6 @@ mod tests {
             adk_core::ErrorCategory::InvalidInput,
             "model.anthropic.bad_request",
             "prompt is too long: 200000 tokens > 100000 maximum",
-        );
-        assert!(is_token_limit_error(&err));
-    }
-
-    #[test]
-    fn test_is_token_limit_error_detects_bedrock_gpt_oss_overflow() {
-        // The shape the Bedrock adapter emits for an oversized request.
-        let err = AdkError::new(
-            adk_core::ErrorComponent::Model,
-            adk_core::ErrorCategory::InvalidInput,
-            "model.bedrock.context_overflow",
-            "Bedrock API error for region=ap-northeast-1, model=openai.gpt-oss-120b-1:0: \
-             service error: ValidationException: Input length (135735) exceeds model's \
-             maximum context length (131072).",
         );
         assert!(is_token_limit_error(&err));
     }

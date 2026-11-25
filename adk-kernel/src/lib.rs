@@ -27,7 +27,8 @@
 //! | [`inventory`]: [`KernelInventory`](inventory::KernelInventory), [`InventoryWarning`](inventory::InventoryWarning), [`Kernel::inventory`], `GET /api/kernel/inventory`; `KernelBuilder::signals` and `Kernel::signal_sink` (feature `charter`) | §7.1, §7.4 |
 //! | [`stores::KernelStores`], [`stores::StoreUse`], [`stores::StoreOrigin`]: every stateful store on one backend, [`KernelBuilder::stores`], [`KernelBuilder::require_durable`], [`Kernel::store_uses`] | §7.1, §13 Q8 |
 //! | [`ProcessStore`], [`ProcessFilter`], [`SpendScope`], [`InMemoryProcessStore`], `SqliteProcessStore`, `PostgresProcessStore`, `RedisProcessStore`, `MongoProcessStore`, `FirestoreProcessStore`, `Neo4jProcessStore` | §7.3, §13 Q8 |
-//! | [`Wake`], [`WakeSet`], [`ExpiryAction`], [`WakeSource`], [`WakeEvent`], [`keys`], [`Trigger`], [`WakeRouter`], [`WakeOutcome`], [`KernelWakeExecutor`], the wake source adapters | §7.4 |
+//! | [`Wake`], [`WakeSet`], [`ExpiryAction`], [`WakeSource`], [`WakeEvent`], [`keys`], [`Trigger`], [`WakeOverlap`], [`WakeRouter`], [`WakeOutcome`], [`KernelWakeExecutor`], the wake source adapters | §7.4 |
+//! | [`vision`]: [`VisionWakeSource`], [`VisualWake`], [`VisualFrame`], [`VisualRegion`], [`vision_payload`]; with feature `vision`, the source as an `adk-vision` `WatchSink` | spec 3.7 §7.10 |
 //! | [`CronWatermarkStore`], [`SourceWatermark`], [`InMemoryCronWatermarkStore`], `SqliteCronWatermarkStore`, `PostgresCronWatermarkStore`, `RedisCronWatermarkStore`, `MongoCronWatermarkStore`, `FirestoreCronWatermarkStore`, `Neo4jCronWatermarkStore` | §7.4, §7.13, §13 Q8 |
 //! | [`KernelEvent`], [`EventKind`], [`EventFilter`], [`EventRecord`], [`EventBus`], [`EventSubscriber`], [`EventSink`], [`AuditSink`], [`SpendDelta`]; `WebhookSink` (feature `webhooks`) | §7.6 |
 //! | [`Agenda`], [`AgendaHandle`], [`ProposalOutcome`], [`AgendaItem`], [`AgendaState`], [`AgendaStateKind`], [`AgendaOrigin`], [`AgendaAnswer`], [`ObservationAudience`], [`PlanRef`], [`AgendaStore`], [`AgendaFilter`], [`InMemoryAgendaStore`], [`ProactivityPolicy`], [`ProactiveApproval`] | §7.5 |
@@ -41,6 +42,7 @@
 //! | [`Crossing`], [`CrossingResource`], [`CrossingAccess`], [`CrossingRun`], [`CrossingRecord`], [`CrossingOutcome`], [`CrossingFilter`], [`CrossingRoute`], [`PartitionPolicy`], [`CrossingTool`] | §7.8, §13 Q3, K-I15 |
 //! | [`control`]: [`ControlPlaneConfig`](control::ControlPlaneConfig), [`router`](control::router), [`ControlPlane`](control::ControlPlane), [`ControlClient`](control::ControlClient), [`api`](control::api) | §7.11 |
 //! | [`audit`] action names | §9.3 |
+//! | [`subagents`]: background sub-agents as processes of kind [`ProcessKind::Subagent`], [`KernelBuilder::subagents`], [`Kernel::subagents`], [`SubagentHandle`], [`KernelEvent::Subagent`] | `adk_core::subagent` |
 //! | `service` (feature `service`): `ServiceDefinition`, `install`, `uninstall`, `run_as_service` (Windows) | §7.12, §10 W3 |
 //! | `conformance` (feature `conformance`) | §11 |
 //! | `managed` (feature `managed`): `KernelDef`, `TenantKernel`, `KernelResolver`, `ManagedKernels` | §7.13, §10 M1 |
@@ -66,6 +68,7 @@
 //! | `channels` | off | The chat channel contract (spec 3.3 §10 K1): the `channels` module, its binding store on every backend, and the adapter contract suite with `conformance` |
 //! | `managed` | off | The managed form: `KernelDef` in a managed definition, one kernel per tenant (`adk-managed`) |
 //! | `charter` | off | `charter` (spec 3.5 §7.10, §7.11): the charter store, the KPI tracker, autonomy records, signals and the site process kinds, on every backend of the process store |
+//! | `vision` | off | The bridge from `adk-vision` (spec 3.7 §7.10): `VisionWakeSource` as a `WatchSink` and `VisualWake` from a `WatchEvent`; the source itself needs no feature |
 //! | `conformance` | off | The `conformance` module |
 //!
 //! # Example
@@ -121,7 +124,9 @@ mod serde_util;
 #[cfg(feature = "service")]
 pub mod service;
 pub mod stores;
+pub mod subagents;
 mod supervise;
+pub mod vision;
 pub mod wake;
 pub mod watermark;
 #[cfg(windows)]
@@ -143,7 +148,10 @@ pub use consolidation::{
     TickInputs, TickMaterial, TickOutcome, TickProposal, TickRun, TickSpend, admit_tick,
 };
 pub use error::{KernelError, Result};
-pub use kernel::{Kernel, KernelBuilder, KernelConfig, KernelHealth, KernelState, WorkerHealth};
+pub use kernel::{
+    Kernel, KernelBuilder, KernelConfig, KernelHealth, KernelState, RunNow, RunNowTarget, Steering,
+    WorkerHealth,
+};
 pub use partition::{
     CROSSING_PARTITION_ARG, CrossPartition, Crossing, CrossingAccess, CrossingFilter,
     CrossingOutcome, CrossingRecord, CrossingResource, CrossingRoute, CrossingRun, CrossingTool,
@@ -208,12 +216,17 @@ pub use stores::{
     InMemoryAgendaStore, InMemoryCronWatermarkStore, InMemoryPartitionStore, InMemoryProcessStore,
     ProcessFilter, ProcessStore, SpendScope, UsageTotals,
 };
+pub use subagents::{SUBAGENT_LABEL, SUBAGENT_NAME_LABEL, SUBAGENT_NOTICE_SOURCE, SubagentHandle};
+pub use vision::{
+    VISION_PAYLOAD_KIND, VisionWakeSource, VisualFrame, VisualRegion, VisualWake, vision_payload,
+};
 #[cfg(feature = "webhooks")]
 pub use wake::webhook_wake_hook;
 pub use wake::{
-    ApprovalWakeSource, CronWakeSource, ExpiryAction, FileWakeSource, KERNEL_WAKE_TARGET,
-    KernelWakeExecutor, RunFinishedWakeSource, Trigger, Wake, WakeEvent, WakeOutcome, WakeRouter,
-    WakeSet, WakeSource, kernel_wake_run, keys, queue_wake_ingress,
+    ApprovalWakeSource, COALESCED_LABEL, CronWakeSource, ExpiryAction, FileWakeSource,
+    KERNEL_WAKE_TARGET, KernelWakeExecutor, RUN_NOW_SOURCE, RunFinishedWakeSource, SKIPPED_LABEL,
+    Trigger, WAKE_PAYLOAD_LIMIT, Wake, WakeEvent, WakeOutcome, WakeOverlap, WakeReason,
+    WakeReasonHooks, WakeRouter, WakeSet, WakeSource, kernel_wake_run, keys, queue_wake_ingress,
 };
 pub use watermark::{CronWatermarkStore, SourceWatermark};
 

@@ -10,13 +10,13 @@ repository.workspace = true
 documentation = "https://docs.rs/adk-retry-reflect"
 description = "Retry & Reflect plugin for ADK-Rust — intercepts tool failures and injects structured reflection prompts"
 readme = "README.md"
+exclude = ["tests/"]
 keywords = ["adk", "agent", "plugin", "retry", "reflection"]
 categories = ["development-tools", "asynchronous"]
 
 [dependencies]
 adk-core = { workspace = true }
 adk-plugin = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
@@ -24,5 +24,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
-proptest = "1.4"
 tracing-subscriber = { workspace = true, features = ["registry"] }

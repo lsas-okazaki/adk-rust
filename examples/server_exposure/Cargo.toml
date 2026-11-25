@@ -8,7 +8,7 @@ description = "Server and A2A exposure: loopback bind, cross-origin and DNS-rebi
 [workspace]
 
 [dependencies]
-a2a-protocol-types = "0.12.1"
+a2a-protocol-types = "0.15"
 adk-agent = { path = "../../adk-agent" }
 adk-cli = { path = "../../adk-cli", default-features = false, features = ["gemini"] }
 adk-core = { path = "../../adk-core" }
@@ -22,7 +22,7 @@ async-trait = "0.1"
 axum = "0.8"
 dotenvy = "0.15"
 futures = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 serde_json = "1.0"
 tokio = { version = "1.40", features = ["full"] }
 tracing = "0.1"

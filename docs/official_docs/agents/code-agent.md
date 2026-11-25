@@ -112,7 +112,9 @@ The builder mirrors `LlmAgentBuilder`:
   `max_output_tokens` shorthands.
 - **Instructions**: `instruction`/`instruction_provider`,
   `global_instruction`/`global_instruction_provider`, with the same `{key}`
-  templating as `LlmAgent`; plus skills (`skills` feature).
+  templating as `LlmAgent`; `static_instruction`, sent as written after any
+  selected skill and before the global instruction; plus skills (`skills`
+  feature; see [Agent Skills](../skills/agent-skills.md)).
 - **History**: `include_contents`.
 - **Tools**: static `tool`s and per-invocation `toolset`s; `tool_timeout`,
   `default_retry_budget`/`tool_retry_budget`, `circuit_breaker_threshold`, and
@@ -151,12 +153,8 @@ live invocation — so a tool behaves identically under `CodeActAgent` or `LlmAg
 ## Example
 
 A runnable, dependency-free end-to-end demo — a self-contained `CodeRuntime` plus
-a deterministic model — lives in
-[`examples/codeact_agent`](https://github.com/zavora-ai/adk-rust/tree/main/examples/codeact_agent):
-
-```bash
-cargo run --manifest-path examples/codeact_agent/Cargo.toml
-```
+a deterministic model — is the `codeact_agent` example in
+[adk-playground](https://github.com/zavora-ai/adk-playground).
 
 ## Implementing a CodeRuntime
 
@@ -197,7 +195,7 @@ pub trait CodeRuntime: Send + Sync {
 - `RuntimeCapabilities::supports_suspension` must be `true` to enable HITL and
   long-running deferral; `prompt` describes the language/environment to the model.
 
-See `examples/codeact_agent/src/runtime.rs` for a complete, minimal
+See `src/runtime.rs` of the `codeact_agent` example for a complete, minimal
 implementation that supports suspend/resume.
 
 ## Python via Monty
@@ -303,6 +301,6 @@ arguments, a non-dict argument, or a non-string key — is refused with a correc
 error rather than silently dispatched, so the model has exactly one calling form
 to learn.
 
-The runnable
-[`examples/codeact_monty_agent`](https://github.com/zavora-ai/adk-rust/tree/main/examples/codeact_monty_agent)
+The runnable `codeact_monty_agent` example in
+[adk-playground](https://github.com/zavora-ai/adk-playground)
 drives a `CodeActAgent` against real Python entirely offline.

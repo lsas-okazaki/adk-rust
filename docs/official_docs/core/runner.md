@@ -85,7 +85,7 @@ fn build(agent: Arc<dyn adk_core::Agent>) -> adk_core::Result<Runner> {
 | `plugin_manager` | `PluginManager` | Runner plugins (see [Plugin hooks](#plugin-hooks)) |
 | `run_config` | `RunConfig` | Default execution options for every run |
 | `budget` | `RunBudget` | Per-run limits (see [Run Budgets](#run-budgets)) |
-| `compaction_config`, `intra_compaction_config`, `intra_compaction_summarizer`, `context_compaction` | Compaction | Keep the model context bounded (see [Context Compaction](#context-compaction)) |
+| `compaction_config`, `intra_compaction_config`, `intra_compaction_summarizer`, `context_compaction`, `without_intra_compaction` | Compaction | Keep the model context bounded; auto-compaction is on by default (see [Context Compaction](#context-compaction)) |
 | `context_cache_config`, `cache_capable` | Gemini explicit caching | Experimental; see [Prompt caching](#prompt-caching) |
 | `request_context` | `RequestContext` | The authenticated caller, from auth middleware |
 | `cancellation_token` | `CancellationToken` | Cooperative cancellation |
@@ -180,6 +180,50 @@ fn build(agent: Arc<dyn adk_core::Agent>) -> adk_core::Result<Runner> {
         .build()
 }
 ```
+
+### Prewarming a Runner
+
+`Runner::prewarm` does before the first message what a first turn would otherwise do before its
+first token, and sends no prompt:
+
+| Part | What it readies |
+|------|-----------------|
+| `Llm::prewarm` | The model client's pooled connections. `AnthropicClient` sends one `GET /v1/models` on its request client and one on its stream client, which spends no tokens; other providers keep the default, which does nothing |
+| `Agent::prewarm` | Every agent in the tree: `LlmAgent` and `CodeActAgent` prewarm their model, a harness also starts the MCP servers its first run would start, and the default prewarms `sub_agents` |
+| `Prewarm::session(user, session)` | Reads the session, so the session store's connection is open, and refuses an archived session with `session.archived` |
+
+It is refused while the runner is frozen, and stops with `runner.prewarm.timeout` after
+`Prewarm::budget` (10 seconds by default). A warm model connection lasts while the client keeps
+it idle — 90 seconds for `adk-anthropic` — and `PrewarmReport::warm_until` says when to prewarm
+again. The `adk-rust` REPL prewarms while the person types the first message, and `adk-rust up`
+and `HarnessLauncher`'s `up` prewarm the kernel's agent at boot.
+
+```rust
+use adk_core::{SessionId, UserId};
+use adk_runner::{Prewarm, Runner};
+use std::time::Duration;
+
+async fn ready(runner: &Runner) -> adk_core::Result<()> {
+    let report = runner
+        .prewarm(
+            Prewarm::new()
+                .session(UserId::new("ana")?, SessionId::new("trip")?)
+                .budget(Duration::from_secs(5)),
+        )
+        .await?;
+    println!("ready in {:?}; warm until {}", report.elapsed, report.warm_until);
+    Ok(())
+}
+```
+
+What a prewarm saves depends on what the first turn would start:
+
+| Part | Cold cost on a first turn | Prewarmed |
+|------|---------------------------|-----------|
+| A stdio MCP server's start and handshake | Tens of milliseconds for a small binary, hundreds for a Node server, more through `npx` | Started ahead by a harness |
+| The model's TLS connection | Tens of milliseconds, against a first token of hundreds | Opened ahead |
+| Opening a session store, building the agent and runner | Milliseconds and less, paid once when the host starts | Not prewarmed |
+| An OS sandbox | A few milliseconds per command, each its own sandboxed process | Nothing to prewarm |
 
 ### Prompt caching
 
@@ -316,7 +360,9 @@ so a message never reaches another user's or another session's run.
    user-authored event. The runner saves it like any other event, so the client stream, plugins'
    `on_event`, the session, later agents of the run and later turns all see it. See
    [LlmAgent: Steering a Running Agent](../agents/llm-agent.md#steering-a-running-agent) for
-   where the agent takes it.
+   where the agent takes it. A custom agent takes the queue from
+   `InvocationContext::steering_inbox()`; see
+   [Taking steering messages in a custom agent](traits.md#taking-steering-messages-in-a-custom-agent).
 
 `SteerReceipt::outcome()` resolves once the message has a fate:
 
@@ -328,6 +374,15 @@ so a message never reaches another user's or another session's run.
 No message is dropped: one taken by an agent is saved before the next model call, and every
 other is returned. A receipt whose run was dropped without closing its queue resolves to an
 `agent.steer.outcome_lost` error instead of waiting forever.
+
+A run is steered where it runs: `steer` reaches the runs of this `Runner` in this process.
+The layers above it find that runner and send a returned message as the session's next:
+
+| Caller | Reaches `steer` through |
+|--------|-------------------------|
+| A surface (web home, terminal, tray, phone, voice) | `adk-surface`'s `send` and `steer` commands; see [Steering a running turn](../surfaces/index.md#steering-a-running-turn) |
+| A kernel's control plane | `Kernel::steer` and `POST /api/kernel/sessions/{session}/steer`; see [Control Plane](../kernel/control-plane.md#steering-a-running-turn) |
+| A chat channel | The channel gateway, for a message that arrives while its thread's turn runs; see [Chat](../surfaces/chat.md) |
 
 | Error code | Category | When |
 |------------|----------|------|
@@ -487,8 +542,8 @@ In `Auto` mode, the dispatch loop queries both `is_read_only()` and `is_concurre
 
 ## Run Budgets
 
-A `RunBudget` limits model calls, total tokens, cost, wall time and tool calls
-for one run. The runner creates a fresh `BudgetTracker` for every run and stores
+A `RunBudget` limits model calls, total tokens, cost, wall time, tool calls and
+usage per unit (images, frames, pages, …) for one run. The runner creates a fresh `BudgetTracker` for every run and stores
 it in `RunConfig::budget_tracker`; transfer targets, workflow sub-agents and
 agents behind an `AgentTool` inherit the run config, so they all count against
 the same `Arc`.
@@ -497,7 +552,7 @@ the same `Arc`.
 use std::sync::Arc;
 use std::time::Duration;
 
-use adk_core::RunBudget;
+use adk_core::{RunBudget, UsageUnit};
 use adk_runner::Runner;
 use adk_session::InMemorySessionService;
 
@@ -511,6 +566,7 @@ fn build(agent: Arc<dyn adk_core::Agent>) -> adk_core::Result<Runner> {
                 .max_cost_usd(50.0)
                 .max_model_calls(200)
                 .max_tool_calls(100)
+                .max_units(UsageUnit::Images, 20)
                 .max_wall_time(Duration::from_secs(600)),
         )
         .build()
@@ -522,6 +578,7 @@ fn build(agent: Arc<dyn adk_core::Agent>) -> adk_core::Result<Runner> {
 | Before every model call, compaction summaries and MCP sampling included | model calls, total tokens, cost, wall time; tool calls already over the limit |
 | Before every model request | built-in tools are withheld when no tool calls are left |
 | Before every tool dispatch | tool calls, total tokens, cost, wall time |
+| Before every call billed in units | total tokens, cost, wall time; the per-unit caps of the units the call declares |
 | After every event | usage from agents that call models directly |
 
 - **Reached, not exceeded**: a limit blocks new work once usage equals it. A
@@ -548,13 +605,21 @@ fn build(agent: Arc<dyn adk_core::Agent>) -> adk_core::Result<Runner> {
   (`BudgetTracker::units`) and count against the cost and token limits. A media
   call with no known price is refused before it is sent under a cost cap — see
   [Calls billed in units](../security/spend-ledger.md#calls-billed-in-units).
+- **Per-unit caps hold before the call**: `RunBudget::max_units(unit, max)` caps a
+  unit across the run. A call billed in units declares the most it can use
+  (`UsageCall::with_units`); the tracker holds that amount before the request and
+  refuses a call that would pass the cap with `budget.units`, naming the unit and
+  the cap (`adk.budget.limit` is `units.<unit>`, such as `units.images`). The call
+  commits what it used and returns the rest; a failed call returns all of it. A
+  call that declares no units is not held back, and its units count once it
+  commits. A tracker resumed from recorded usage counts units from the resume.
 
 A run that reaches a limit yields a final event explaining why — persisted with
 the session, with `llm_response.error_code` set to the `budget.*` code and the
 limit named under the `adk.budget.limit` event metadata key — followed by an
 `AdkError` with category `ResourceExhausted`.
 
-Compaction summaries (post-run, intra-invocation and token-limit compaction),
+Compaction summaries (session compaction and auto-compaction, with a summarizer or a strategy),
 `LlmConditionalAgent` routing and MCP sampling requests made during a tool call
 are model calls too: they go through `adk_core::ModelCallScope`, which checks
 the budget before the call is sent and counts its tokens and cost, and reserves
@@ -603,7 +668,43 @@ with `strict_transfer_policy` fails the run with `agent.transfer.target_forbidde
 
 ## Context Compaction
 
-For long-running sessions, enable automatic context compaction to keep the LLM context window bounded:
+**Auto-compaction is on by default.** Before every model call, `LlmAgent` and `CodeActAgent`
+pass their history to the run's compactor (`RunConfig::history_compactor`, which the runner
+installs at the start of each run). Once the request passes 80% of the model's context window
+(`Llm::context_window`), or 100,000 estimated tokens when the model reports none, all but the most
+recent history entries (at most 10, within half the threshold) are summarized by the model the agent is calling, and the
+compaction is recorded in the session. A request the model rejects as too long is compacted and
+sent once more.
+
+| Builder method | Effect |
+|----------------|--------|
+| `intra_compaction_config(IntraCompactionConfig)` | The threshold: `at_tokens(n)`, `at_window_fraction(f)`, `with_overlap_event_count(n)` |
+| `intra_compaction_summarizer(summarizer)` | A `BaseEventsSummarizer` in place of the agent's model |
+| `context_compaction(CompactionConfig)` | A `CompactionStrategy` in place of the summary (`context-compaction` feature) |
+| `without_intra_compaction()` | Turns auto-compaction off |
+
+`RunConfig::intra_compaction` overrides the runner's setting for one run, and
+`RunConfig::history_compactor` supplies a `HistoryCompactor` of your own.
+
+```rust
+use adk_core::IntraCompactionConfig;
+use adk_runner::Runner;
+use adk_session::InMemorySessionService;
+use std::sync::Arc;
+
+fn build(agent: Arc<dyn adk_core::Agent>) -> adk_core::Result<Runner> {
+    Runner::builder()
+        .app_name("my_app")
+        .agent(agent)
+        .session_service(Arc::new(InMemorySessionService::new()))
+        // A fixed threshold instead of 80% of the model's window.
+        .intra_compaction_config(IntraCompactionConfig::at_tokens(150_000))
+        .build()
+}
+```
+
+Session compaction also summarizes after every N invocations, to keep a long session's
+starting history bounded:
 
 ```rust
 use adk_agent::LlmEventSummarizer;
@@ -626,7 +727,7 @@ fn build(agent: Arc<dyn adk_core::Agent>, model: Arc<dyn Llm>) -> adk_core::Resu
 }
 ```
 
-When compaction triggers, older events are replaced by a summary event, and
+When either compaction triggers, older events are replaced by a summary event, and
 `conversation_history()` uses the summary instead of the original events. Compaction never
 covers a tool call still held for confirmation, and never cuts between a call and its
 response.

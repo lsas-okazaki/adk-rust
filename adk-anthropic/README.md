@@ -16,17 +16,24 @@ This project is an **unofficial** community-maintained library. It is not affili
 - **Messages API** — non-streaming and SSE streaming with all content block types
 - **Adaptive thinking** — `ThinkingConfig::adaptive()` for Opus 4.8 / Opus 4.7 / Opus 4.6 / Sonnet 4.6
 - **Budget-based thinking** — `ThinkingConfig::enabled(budget)` for older models (rejected on Opus 4.8 / Opus 4.7)
+- **Thinking off** — `ThinkingConfig::disabled()`, and `ThinkingConfig::between_tools()` on Claude Sonnet 5.5, which rejects `disabled`; Claude Fable 5.x, Mythos 5.x and Opus 5.5 always think
 - **Effort parameter** — `OutputConfig::with_effort()` with `low`, `medium`, `high`, `xhigh`, `max` levels
 - **Structured outputs** — JSON schema via `OutputConfig` / `OutputFormat`
 - **Tool calling** — custom function tools, server tools (web search, web fetch, bash, text editor, code execution, memory); `WebSearchTool20260209` and `WebFetchTool20260209` declare the dynamic-filtering tool versions
+- **Computer use and browser use** — `computer_toolset_20260801` and `browser_toolset_20260801` (`ComputerToolset20260801`, `BrowserToolset20260801`), the earlier `computer_20251124` and `computer_20250124` with their beta headers, `toolset_name` on member calls and results, the `browser_state` result block, and `ComputerToolVersion::for_model` to pick the version a model accepts
 - **Prompt caching** — automatic (top-level `cache_control`) and explicit (block-level)
 - **Context management** — `ContextManagement` with tool result clearing and thinking block clearing (beta)
+- **Message threads** — `MessageCreateParams::thread` (`ThreadParam::Create` / `ThreadParam::continue_from`) keeps a conversation on the API so later requests send only new messages; `required_betas()` lists the beta headers a request's features need, and `betas` adds others (beta)
+- **Mid-conversation tool changes** — `ToolAdditionBlock` (by reference or by value) and `ToolRemovalBlock` in a `MessageRole::System` message; the client adds the `inline-tools-2026-09-15` beta header (beta)
+- **On-demand compaction** — `MessageCreateParams::compaction` (`CompactionParam`) asks for a signed `CompactionBlock` in place of a reply, which later requests send first; the client adds the `compact-2026-09-04` beta header (beta)
 - **Citations** — document-level citations with char, page, and content block locations
 - **Vision** — URL and base64 image analysis
 - **PDF processing** — URL, base64, and Files API PDF analysis with citations
 - **Token counting** — `/v1/messages/count_tokens` endpoint
-- **Fast mode** — `speed: "fast"` (`SpeedMode::Fast`, research preview)
+- **Fast mode** — `speed: "fast"` (`SpeedMode::Fast`) on Claude Opus 5.5, Fable 5.2 and Mythos 5.2; research preview on Opus 5 and Opus 4.8
+- **Refusals** — `Message::stop_details` carries the category and explanation of a `refusal` stop, streamed and unary
 - **Request customization** — caller-selected beta headers, bearer auth, API-version overrides, and exact per-request headers
+- **Advisor tool** — `AdvisorTool20260301` (`ToolUnionParam::Advisor20260301`) declares `advisor_20260301` (beta); the client sends `advisor-tool-2026-03-01` while a request declares it or replays an `advisor_tool_result` block
 - **Server-side fallback** — typed default or explicit safety-refusal routing with fallback-aware responses and SSE events
 - **Batches API** — create, get, results, cancel, delete, list
 - **Files API** — upload, get, delete, list on `Anthropic`; `FilesClient` (`files` feature) adds `upload_file_from_path` and `download_file`, which returns files created by skills or the code execution tool
@@ -52,21 +59,27 @@ adk-anthropic = "3.0.0"
 
 | Model | API ID | Generation |
 |-------|--------|------------|
-| Claude Fable 5.1 | `claude-fable-5-1` | Most capable; demanding reasoning and long-horizon work |
+| Claude Fable 5.2 | `claude-fable-5-2` | Most capable; demanding reasoning and long-horizon work; fast mode supported |
+| Claude Mythos 5.2 | `claude-mythos-5-2` | Same model as Fable 5.2, verified organizations only |
 | Claude Opus 5.5 | `claude-opus-5-5` | Current Opus; fast mode supported |
-| Claude Sonnet 5.5 | `claude-sonnet-5-5` | Current Sonnet |
+| Claude Sonnet 5.5 | `claude-sonnet-5-5` | Current Sonnet; ADK default |
 | Claude Haiku 5.5 | `claude-haiku-5-5` | Current Haiku; economy |
-| Claude Opus 5 | `claude-opus-5` | Previous Opus; fast mode supported |
-| Claude Sonnet 5 | `claude-sonnet-5` | ADK default |
-| Claude Fable 5 | `claude-fable-5` | Creative and long-form |
-| Claude Opus 4.8 | `claude-opus-4-8` | Previous flagship; fast mode supported |
+| Claude Fable 5.1 | `claude-fable-5-1` | Previous Fable |
+| Claude Opus 5 | `claude-opus-5` | Previous Opus; fast mode (research preview) |
+| Claude Sonnet 5 | `claude-sonnet-5` | Previous Sonnet |
+| Claude Fable 5 | `claude-fable-5` | Earlier Fable |
+| Claude Opus 4.8 | `claude-opus-4-8` | Previous generation |
 | Claude Opus 4.7 | `claude-opus-4-7` | Previous generation |
 | Claude Sonnet 4.6 | `claude-sonnet-4-6` | Previous generation |
-| Claude Haiku 4.5 | `claude-haiku-4-5` | Economy |
+| Claude Haiku 4.5 | `claude-haiku-4-5` | Previous Haiku |
+
+`claude-sonnet-4-5` is deprecated and retires on 2026-11-30; Claude Opus 4.1, Opus 4, Sonnet 4
+and the Claude 3 models are retired.
 
 `KnownModel` covers the Claude 4 family. The Claude 5 identifiers come from factories that
-return `Model::Custom`: `Model::claude_fable_5_1()`, `claude_opus_5_5()`, `claude_sonnet_5_5()`,
-`claude_haiku_5_5()`, `claude_opus_5()`, `claude_sonnet_5()`, and `claude_fable_5()`. Any model
+return `Model::Custom`: `Model::claude_fable_5_2()`, `claude_mythos_5_2()`, `claude_fable_5_1()`,
+`claude_mythos_5_1()`, `claude_opus_5_5()`, `claude_sonnet_5_5()`, `claude_haiku_5_5()`,
+`claude_opus_5()`, `claude_sonnet_5()`, `claude_fable_5()`, and `claude_mythos_5()`. Any model
 string that matches no known variant deserializes as `Model::Custom(String)`.
 
 ### Current Model Request Contracts
@@ -258,7 +271,7 @@ not restrict them.
 
 Webhook deliveries are signed with [Standard Webhooks](https://www.standardwebhooks.com/).
 Pass the raw body and the `webhook-id`, `webhook-timestamp`, and `webhook-signature`
-headers to `WebhookVerifier`:
+headers to `WebhookVerifier`. The snippet needs the `managed-agents` feature.
 
 ```rust
 use adk_anthropic::HeaderMap;
@@ -292,7 +305,7 @@ Anthropic, Claude, and the Anthropic logo are trademarks of Anthropic, PBC. All 
 
 ## Acknowledgments
 
-This crate was forked from [claudius](https://github.com/crisogray/claudius) v0.19 by [@crisogray](https://github.com/crisogray), a comprehensive Rust SDK for the Anthropic API licensed under Apache-2.0.
+This crate was forked from [claudius](https://github.com/crisogray/claudius) v0.19 by [@crisogray](https://github.com/crisogray), a Rust SDK for the Anthropic API licensed under Apache-2.0.
 
 The following components originate from claudius and form the foundation of `adk-anthropic`:
 
@@ -300,13 +313,13 @@ The following components originate from claudius and form the foundation of `adk
 - **SSE streaming** (`sse.rs`) — Server-Sent Events parser for streaming responses
 - **Accumulating stream** (`accumulating_stream.rs`) — stream accumulator for assembling complete messages from SSE deltas
 - **Backoff** (`backoff.rs`) — exponential backoff with jitter for retryable errors
-- **Error types** (`error.rs`) — comprehensive error enum with typed variants for all API error classes
+- **Error types** (`error.rs`) — error enum with typed variants for all API error classes
 - **Core type system** (`types/`) — `Message`, `MessageCreateParams`, `MessageParam`, `ContentBlock`, `TextBlock`, `ToolUseBlock`, `ToolResultBlock`, `ImageBlock`, `DocumentBlock`, `ThinkingBlock`, `SystemPrompt`, `Usage`, `StopReason`, `ToolChoice`, `ToolParam`, `CacheControlEphemeral`, and all serde serialization/deserialization logic
 - **Client logger** (`client_logger.rs`) — `ClientLogger` trait for capturing API interactions
 - **Cache control** (`cache_control.rs`) — cache breakpoint management utilities
 - **JSON schema** (`json_schema.rs`) — schema utilities
 
-We stripped claudius's agent framework, CLI tools, chat session management, and observability modules (all handled by other ADK crates), then extended the retained code with adaptive thinking, effort parameter, structured outputs, context management, fast mode, citations, Files API, Skills API, Models API with capabilities, token pricing, and updated model definitions.
+The fork drops claudius's agent framework, CLI tools, chat session management, and observability modules (other ADK crates handle them), and extends the retained code with adaptive thinking, effort parameter, structured outputs, context management, fast mode, citations, Files API, Skills API, Models API with capabilities, token pricing, and updated model definitions.
 
 ## Tool Search
 

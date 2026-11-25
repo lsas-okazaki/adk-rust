@@ -235,7 +235,9 @@ async fn world_with(model: Arc<dyn Llm>) -> World {
                 .with_worker(
                     DurableWorkerConfig::default()
                         .with_worker_id("k1")
-                        .with_lease_ttl(Duration::from_millis(600))
+                        // A lease a starved runner keeps: a lost one drops the attempt after
+                        // a model reply, and the scripted model has no reply to give again.
+                        .with_lease_ttl(Duration::from_secs(30))
                         .with_poll_interval(Duration::from_millis(20)),
                 )
                 .with_scheduler_tick(Duration::from_millis(50))
@@ -466,6 +468,7 @@ async fn a_thread_with_an_agent_stays_with_it() {
                 agent: "finance".into(),
                 session_id: "t-finance".into(),
                 text: "hello".into(),
+                images: Vec::new(),
             },
         )
         .await
@@ -484,12 +487,22 @@ async fn a_thread_with_an_agent_stays_with_it() {
     .await;
     world
         .engine
-        .execute(&web(), Command::Send { session_id: "t-finance".into(), text: "again".into() })
+        .execute(
+            &web(),
+            Command::Send {
+                session_id: "t-finance".into(),
+                text: "again".into(),
+                images: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     world
         .engine
-        .execute(&web(), Command::Send { session_id: "t-other".into(), text: "hi".into() })
+        .execute(
+            &web(),
+            Command::Send { session_id: "t-other".into(), text: "hi".into(), images: Vec::new() },
+        )
         .await
         .unwrap();
     let finance_runs = eventually("both runs of the thread", Duration::from_secs(10), || async {
@@ -520,6 +533,7 @@ async fn the_mode_in_an_agents_thread_never_loosens_past_its_own() {
                 agent: "finance".into(),
                 session_id: "t-f".into(),
                 text: "hello".into(),
+                images: Vec::new(),
             },
         )
         .await
@@ -564,6 +578,7 @@ async fn removing_an_agent_names_what_ends() {
                 agent: "finance".into(),
                 session_id: "t-finance".into(),
                 text: "hello".into(),
+                images: Vec::new(),
             },
         )
         .await
@@ -680,7 +695,14 @@ async fn always_allow_on_an_added_agents_card_pins_the_rule_to_it() {
     add(&world, &web(), finance()).await.unwrap();
     world
         .engine
-        .execute(&web(), Command::Send { session_id: "s-hold".into(), text: "write it".into() })
+        .execute(
+            &web(),
+            Command::Send {
+                session_id: "s-hold".into(),
+                text: "write it".into(),
+                images: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     let approvals = Arc::clone(world.harness.agent().runtime().approval_store());
@@ -765,6 +787,7 @@ async fn a_suggestion_approved_in_the_home_is_added_as_the_home() {
                 edited_args: None,
                 reason: None,
                 expanded: true,
+                evidence: Vec::new(),
             },
         )
         .await

@@ -4,6 +4,12 @@
 //! [`computer-use-mcp`](https://github.com/zavora-ai/computer-use-mcp)
 //! desktop-automation server.
 //!
+//! [`ComputerUseToolset`] runs Claude's computer use toolset as governed tools over an
+//! [`adk_core::ComputerActuator`] the application supplies; every action passes through the
+//! governed tool path. [`McpComputerActuator`] is such an actuator for a desktop: it acts
+//! through the plain tools (`screenshot`, `click`, `type`, ...) of a running
+//! `computer-use-mcp` server.
+//!
 //! This crate **does not** perform desktop actuation. Desktop policy, target
 //! validation, lease ownership, physical-user interruption, and idempotent
 //! effects remain authoritative in `computer-use-mcp`. Instead, this crate
@@ -44,10 +50,13 @@
 //! # }
 //! ```
 //!
-//! To drive a real desktop, back the graph with [`ComputerUseMcpRuntime`] and a
-//! running `computer-use-mcp` server (see the cross-platform `live_clipboard`
-//! example and the macOS examples).
+//! [`ComputerUseMcpRuntime`] calls governed tools (`preview_action`, `execute_action`,
+//! control leases, target reservations, `emergency_stop`) that no released
+//! `computer-use-mcp` serves. To act on a real desktop through that server, give
+//! [`ComputerUseToolset`] an [`McpComputerActuator`].
 
+/// A [`adk_core::ComputerActuator`] over the plain tools of a `computer-use-mcp` server.
+pub mod actuator;
 mod auth;
 mod cancellation;
 pub mod contracts;
@@ -56,7 +65,10 @@ mod eval;
 mod graph;
 /// Runtime adapters and response binding.
 pub mod runtime;
+/// Claude's computer use toolset as governed tools over a [`adk_core::ComputerActuator`].
+pub mod toolset;
 
+pub use actuator::{McpComputerActuator, McpComputerActuatorBuilder};
 pub use auth::{AuthorizationError, ComputerUseAuthContext, ScopeAuthorizer};
 pub use cancellation::{AgentInterrupter, CancellationBridge, CancellationError};
 pub use error::{ComputerUseError, Result};
@@ -69,15 +81,18 @@ pub use runtime::{
     ComputerUseMcpConfig, ComputerUseMcpRuntime, ComputerUseRuntime, TraceCorrelation,
     VerificationOutcome,
 };
+pub use toolset::{
+    COMPUTER_BATCH_HALT_TEXT, COMPUTER_TOOLSET, ComputerUseMember, ComputerUseToolset,
+};
 
 // Wire contracts are re-exported at the crate root for ergonomic access.
 pub use contracts::{
     ActionClass, ActionEnvelope, ActionPostcondition, ActionPreview, ActionProvenance,
     ActionResourceContext, ApprovalGrant, ApprovalGrantScope, Bounds, ControlLease,
-    ExecutionCapability, ExecutionMode, ExecutionReceipt, LeaseBoundaries, PolicyDecision,
-    PostconditionEvidence, ReceiptStatus, RuntimeSession, SafetyCorpus, SafetyExpectation,
-    SafetyScenario, SessionCompletionEvidence, SessionDeletionResult, SessionEvent,
-    SessionFollowUp, SessionFollowUpPage, TargetEvidence, TargetReservation,
+    CoordinateSpace, ExecutionCapability, ExecutionMode, ExecutionReceipt, LeaseBoundaries,
+    PolicyDecision, PostconditionEvidence, ReceiptStatus, RuntimeSession, SafetyCorpus,
+    SafetyExpectation, SafetyScenario, SessionCompletionEvidence, SessionDeletionResult,
+    SessionEvent, SessionFollowUp, SessionFollowUpPage, TargetEvidence, TargetReservation,
     TargetReservationScope, TargetSensitivityAssessment, TargetSensitivityEvidence,
     TargetSensitivitySignal, TargetSensitivitySource,
 };

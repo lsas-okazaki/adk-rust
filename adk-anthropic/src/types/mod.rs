@@ -1,7 +1,9 @@
+mod advisor_tool_20260301;
 mod auto_cache_control;
 mod base64_image_source;
 mod base64_pdf_source;
 mod batch;
+mod browser_state;
 mod cache_control_ephemeral;
 mod citation_char_location;
 mod citation_content_block_location;
@@ -9,8 +11,10 @@ mod citation_page_location;
 mod citation_web_search_result_location;
 mod citations_config;
 mod citations_delta;
+mod client_toolset;
 mod code_execution_result_block;
 mod code_execution_tool_result_block;
+mod compaction;
 mod content;
 mod content_block;
 mod content_block_delta;
@@ -63,8 +67,10 @@ mod text_delta;
 mod thinking_block;
 mod thinking_config;
 mod thinking_delta;
+mod thread;
 mod tool_bash_20241022;
 mod tool_bash_20250124;
+mod tool_change;
 mod tool_choice;
 mod tool_param;
 mod tool_result_block;
@@ -90,12 +96,14 @@ mod web_search_tool_result_block_content;
 mod web_search_tool_result_error;
 
 // Exports
+pub use advisor_tool_20260301::{ADVISOR_TOOL_BETA, AdvisorTool20260301};
 pub use auto_cache_control::AutoCacheControl;
 pub use base64_image_source::{Base64ImageSource, ImageMediaType};
 pub use base64_pdf_source::Base64PdfSource;
 pub use batch::{
     BatchError, BatchRequest, BatchRequestCounts, BatchResult, BatchResultItem, MessageBatch,
 };
+pub use browser_state::{BrowserStateBlock, BrowserStateChange, BrowserTab};
 pub use cache_control_ephemeral::{CacheControlEphemeral, CacheTtl};
 pub use citation_char_location::CitationCharLocation;
 pub use citation_content_block_location::CitationContentBlockLocation;
@@ -103,8 +111,15 @@ pub use citation_page_location::CitationPageLocation;
 pub use citation_web_search_result_location::CitationWebSearchResultLocation;
 pub use citations_config::CitationsConfig;
 pub use citations_delta::{Citation, CitationsDelta};
+pub use client_toolset::{
+    BROWSER_BATCH_HALT_TEXT, BROWSER_TOOLSET, BrowserMember, BrowserToolset20260801,
+    COMPUTER_BATCH_HALT_TEXT, COMPUTER_TOOLSET, COMPUTER_USE_20250124_BETA,
+    COMPUTER_USE_20251124_BETA, ComputerMember, ComputerToolVersion, ComputerToolset20260801,
+    ToolComputer20250124, ToolComputer20251124, ToolsetMemberConfig, supports_browser_toolset,
+};
 pub use code_execution_result_block::CodeExecutionResultBlock;
 pub use code_execution_tool_result_block::CodeExecutionToolResultBlock;
+pub use compaction::{COMPACTION_BETA, CompactionBlock, CompactionParam};
 pub use content::Content;
 pub use content_block::ContentBlock;
 pub use content_block_delta::ContentBlockDelta;
@@ -124,7 +139,7 @@ pub use image_block::{ImageBlock, ImageSource};
 pub use input_json_delta::InputJsonDelta;
 pub use message::{ContainerInfo, Message};
 pub use message_count_tokens_params::MessageCountTokensParams;
-pub use message_create_params::MessageCreateParams;
+pub use message_create_params::{MessageCreateParams, STRUCTURED_OUTPUTS_BETA};
 pub use message_create_template::MessageCreateTemplate;
 pub use message_delta_event::{MessageDelta, MessageDeltaEvent};
 pub use message_delta_usage::MessageDeltaUsage;
@@ -165,8 +180,10 @@ pub use text_delta::TextDelta;
 pub use thinking_block::ThinkingBlock;
 pub use thinking_config::{ThinkingConfig, ThinkingDisplay};
 pub use thinking_delta::ThinkingDelta;
+pub use thread::{MESSAGE_THREADS_BETA, ThreadParam};
 pub use tool_bash_20241022::ToolBash20241022;
 pub use tool_bash_20250124::ToolBash20250124;
+pub use tool_change::{INLINE_TOOLS_BETA, ToolAdditionBlock, ToolChangeTarget, ToolRemovalBlock};
 pub use tool_choice::ToolChoice;
 pub use tool_param::ToolParam;
 pub use tool_result_block::{ToolResultBlock, ToolResultBlockContent};

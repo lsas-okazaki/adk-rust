@@ -21,11 +21,7 @@
 //! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() -> adk_core::Result<()> {
 //! let service = InMemoryMemoryService::new();
-//! let entry = MemoryEntry {
-//!     content: Content::new("user").with_text("Hometown: Nairobi."),
-//!     author: "user".to_string(),
-//!     timestamp: chrono::Utc::now(),
-//! };
+//! let entry = MemoryEntry::new(Content::new("user").with_text("Hometown: Nairobi."), "user");
 //! service.add_session("app", "user", "session", vec![entry]).await?;
 //!
 //! let found = service
@@ -81,9 +77,31 @@
 //! - Versioned schema migrations
 //! - `delete_user` and `export_user` across all projects, and [`MemorySubjectData`] for
 //!   `adk_core::subject::SubjectRights`
+//! - Expiry on every backend: a per-entry expiry or a per-service default TTL, enforced on
+//!   read, purged by [`MemoryService::purge_expired`] (see [`expiry`]), and
+//!   [`MemoryService::delete_memory`] by id
+//!
+//! ## Feature flags
+//!
+//! The in-memory backend is always compiled; no feature is on by default.
+//!
+//! | Feature | Enables |
+//! |---------|---------|
+//! | `sqlite-memory` | The SQLite backend |
+//! | `database-memory` | The PostgreSQL backend, with pgvector semantic search |
+//! | `redis-memory` | The Redis backend |
+//! | `mongodb-memory` | The MongoDB backend |
+//! | `neo4j-memory` | The Neo4j backend |
+//! | `vertex-memory` | Vertex AI Memory Bank on the Gemini Enterprise Agent Platform |
+//! | `graph-memory` | `GraphMemoryService`, the SQLite knowledge graph; implies `sqlite-memory` |
+//! | `embedding-trait` | The `EmbeddingProvider` trait without a vector backend |
+//! | `conformance` | The `conformance` module and `memory_conformance_tests!`, the id and expiry suite for a backend's tests |
 
 pub mod adapter;
+#[cfg(feature = "conformance")]
+pub mod conformance;
 pub mod consent_gate;
+pub mod expiry;
 pub mod inmemory;
 pub mod migration;
 pub mod service;

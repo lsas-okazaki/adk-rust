@@ -57,6 +57,16 @@
 //! - Run budgets, the spend ledger, tool policy, the kill switch, and audit records
 //! - Plugin hooks for every model and tool call (with the `plugins` feature)
 //! - Steering a running agent with [`Runner::steer`], screened like the run's own message
+//!
+//! ## Feature flags
+//!
+//! | Feature | Default | Enables |
+//! |---------|---------|---------|
+//! | `artifacts` | yes | `artifact_service` through `adk-artifact` |
+//! | `plugins` | yes | `plugin_manager` through `adk-plugin` |
+//! | `skills` | no | `Runner::with_skill_injector`, `Runner::with_auto_skills_mut` and skill injection through `adk-skill` |
+//! | `context-compaction` | no | The `compaction` module: `CompactionStrategy`, `TruncationCompaction`, `SummarisationCompaction`, and `RunnerConfigBuilder::context_compaction` |
+//! | `sandbox-runner` | no | The `sandbox_runner` module: `SandboxRunner` provisions an `adk-sandbox` workspace, binds its tools for the run and stops it afterwards |
 #![allow(clippy::result_large_err)]
 #![deny(missing_docs)]
 
@@ -67,8 +77,10 @@ mod cache;
 #[cfg(feature = "context-compaction")]
 pub mod compaction;
 mod context;
+pub mod history;
 pub mod intra_compaction;
 mod launcher;
+pub mod prewarm;
 mod runner;
 #[cfg(feature = "sandbox-runner")]
 pub mod sandbox_runner;
@@ -77,7 +89,9 @@ pub mod tool_concurrency;
 
 pub use builder::RunnerConfigBuilder;
 pub use context::{InvocationContext, MutableSession};
+pub use history::{ActivityGuard, HistoryControl, RewindTarget, SessionActivity};
 pub use launcher::Launcher;
+pub use prewarm::{Prewarm, PrewarmReport};
 pub use runner::{Runner, RunnerConfig, RunnerInvocation};
 pub use spend::LlmSpendEstimate;
 

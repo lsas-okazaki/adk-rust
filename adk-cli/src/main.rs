@@ -32,6 +32,8 @@ mod skills;
 #[cfg(all(feature = "harness", feature = "persist", feature = "encrypted"))]
 mod store;
 mod ultra;
+#[cfg(feature = "vision")]
+mod vision_cli;
 #[cfg(feature = "voice")]
 mod voice_cli;
 #[cfg(feature = "website")]
@@ -208,11 +210,27 @@ async fn run() -> Result<()> {
             legacy::run_code(model, options.instruction, dir, read_only, task).await
         }
         #[cfg(feature = "harness")]
-        Some(Commands::Goal { goal, until, harness, max_iters, check_timeout, state, resume }) => {
+        Some(Commands::Goal {
+            goal,
+            until,
+            rubric,
+            harness,
+            max_iters,
+            check_timeout,
+            state,
+            resume,
+        }) => {
             let model = resolve_model(&options).await?;
             let check_timeout = std::time::Duration::from_secs(check_timeout);
-            let goal =
-                harness_cli::GoalArgs { goal, until, max_iters, check_timeout, state, resume };
+            let goal = harness_cli::GoalArgs {
+                goal,
+                until,
+                rubric,
+                max_iters,
+                check_timeout,
+                state,
+                resume,
+            };
             exit_with(harness_cli::goal(model, options.instruction.clone(), harness, goal).await?)
         }
         #[cfg(not(feature = "harness"))]
@@ -306,6 +324,11 @@ async fn run() -> Result<()> {
             kernel_cli::act(&kernel, &pid, kernel_cli::Action::Resume).await
         }
         #[cfg(feature = "harness")]
+        Some(Commands::RunNow { pid, trigger, request_id, kernel }) => {
+            kernel_cli::run_now(&kernel, pid.as_deref(), trigger.as_deref(), request_id.as_deref())
+                .await
+        }
+        #[cfg(feature = "harness")]
         Some(Commands::Agents { output, yes, kernel, args }) => {
             harness_cli::agents::command(&kernel, &args, output == "json", yes).await
         }
@@ -367,9 +390,9 @@ async fn run() -> Result<()> {
         #[cfg(all(feature = "harness", feature = "persist", feature = "encrypted"))]
         Some(Commands::Store { command, store_key }) => store::run(command, store_key).await,
         #[cfg(all(feature = "harness", feature = "persist"))]
-        Some(Commands::Approvals { command, server, token }) => {
+        Some(Commands::Approvals { command, server, token, home }) => {
             let token = token.or_else(|| std::env::var("ADK_SERVE_TOKEN").ok());
-            manage::approvals(command, server, token).await
+            manage::approvals(command, server, token, home).await
         }
         Some(Commands::Skills { command }) => skills::run(command).await,
         Some(Commands::Deploy { command }) => deploy::run(command).await,
@@ -384,6 +407,8 @@ async fn run() -> Result<()> {
         Some(Commands::Awp { command }) => awp_cli::run(command).await,
         #[cfg(feature = "website")]
         Some(Commands::Website { command }) => website_cli::run(command).await,
+        #[cfg(feature = "vision")]
+        Some(Commands::Vision(args)) => vision_cli::run(args).await,
     }
 }
 

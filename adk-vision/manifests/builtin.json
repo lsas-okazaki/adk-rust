@@ -1,0 +1,1525 @@
+[
+  {
+    "id": "rf-detr-n",
+    "task": "detect",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "onnx-community/rfdetr_nano-ONNX",
+      "revision": "eae21cee0687a91bcf9fa071605c48d7705d2d91"
+    },
+    "files": [
+      {
+        "path": "onnx/model.onnx",
+        "sha256": "sha256:9cbac6b11ce34a03034e4d5a24cfac5f18632fd6761d1311dd640232088d7fee",
+        "size": 108074865
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://github.com/roboflow/rf-detr/blob/develop/LICENSE",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 17
+    },
+    "io": {
+      "input": {
+        "width": 384,
+        "height": 384,
+        "letterbox": "stretch"
+      },
+      "mean": [
+        0.485,
+        0.456,
+        0.406
+      ],
+      "std": [
+        0.229,
+        0.224,
+        0.225
+      ],
+      "labels": [
+        "",
+        "person",
+        "bicycle",
+        "car",
+        "motorcycle",
+        "airplane",
+        "bus",
+        "train",
+        "truck",
+        "boat",
+        "traffic light",
+        "fire hydrant",
+        "",
+        "stop sign",
+        "parking meter",
+        "bench",
+        "bird",
+        "cat",
+        "dog",
+        "horse",
+        "sheep",
+        "cow",
+        "elephant",
+        "bear",
+        "zebra",
+        "giraffe",
+        "",
+        "backpack",
+        "umbrella",
+        "",
+        "",
+        "handbag",
+        "tie",
+        "suitcase",
+        "frisbee",
+        "skis",
+        "snowboard",
+        "sports ball",
+        "kite",
+        "baseball bat",
+        "baseball glove",
+        "skateboard",
+        "surfboard",
+        "tennis racket",
+        "bottle",
+        "",
+        "wine glass",
+        "cup",
+        "fork",
+        "knife",
+        "spoon",
+        "bowl",
+        "banana",
+        "apple",
+        "sandwich",
+        "orange",
+        "broccoli",
+        "carrot",
+        "hot dog",
+        "pizza",
+        "donut",
+        "cake",
+        "chair",
+        "couch",
+        "potted plant",
+        "bed",
+        "",
+        "dining table",
+        "",
+        "",
+        "toilet",
+        "",
+        "tv",
+        "laptop",
+        "mouse",
+        "remote",
+        "keyboard",
+        "cell phone",
+        "microwave",
+        "oven",
+        "toaster",
+        "sink",
+        "refrigerator",
+        "",
+        "book",
+        "clock",
+        "vase",
+        "scissors",
+        "teddy bear",
+        "hair drier",
+        "toothbrush"
+      ]
+    }
+  },
+  {
+    "id": "rf-detr-n-q4f16",
+    "task": "detect",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "onnx-community/rfdetr_nano-ONNX",
+      "revision": "eae21cee0687a91bcf9fa071605c48d7705d2d91"
+    },
+    "files": [
+      {
+        "path": "onnx/model_q4f16.onnx",
+        "sha256": "sha256:42d8072bc00975405531e4e7f20dda40a6cb5ed67e345ecd764f92748463a996",
+        "size": 18996625
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://github.com/roboflow/rf-detr/blob/develop/LICENSE",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 17
+    },
+    "io": {
+      "input": {
+        "width": 384,
+        "height": 384,
+        "letterbox": "stretch"
+      },
+      "mean": [
+        0.485,
+        0.456,
+        0.406
+      ],
+      "std": [
+        0.229,
+        0.224,
+        0.225
+      ],
+      "labels": [
+        "",
+        "person",
+        "bicycle",
+        "car",
+        "motorcycle",
+        "airplane",
+        "bus",
+        "train",
+        "truck",
+        "boat",
+        "traffic light",
+        "fire hydrant",
+        "",
+        "stop sign",
+        "parking meter",
+        "bench",
+        "bird",
+        "cat",
+        "dog",
+        "horse",
+        "sheep",
+        "cow",
+        "elephant",
+        "bear",
+        "zebra",
+        "giraffe",
+        "",
+        "backpack",
+        "umbrella",
+        "",
+        "",
+        "handbag",
+        "tie",
+        "suitcase",
+        "frisbee",
+        "skis",
+        "snowboard",
+        "sports ball",
+        "kite",
+        "baseball bat",
+        "baseball glove",
+        "skateboard",
+        "surfboard",
+        "tennis racket",
+        "bottle",
+        "",
+        "wine glass",
+        "cup",
+        "fork",
+        "knife",
+        "spoon",
+        "bowl",
+        "banana",
+        "apple",
+        "sandwich",
+        "orange",
+        "broccoli",
+        "carrot",
+        "hot dog",
+        "pizza",
+        "donut",
+        "cake",
+        "chair",
+        "couch",
+        "potted plant",
+        "bed",
+        "",
+        "dining table",
+        "",
+        "",
+        "toilet",
+        "",
+        "tv",
+        "laptop",
+        "mouse",
+        "remote",
+        "keyboard",
+        "cell phone",
+        "microwave",
+        "oven",
+        "toaster",
+        "sink",
+        "refrigerator",
+        "",
+        "book",
+        "clock",
+        "vase",
+        "scissors",
+        "teddy bear",
+        "hair drier",
+        "toothbrush"
+      ]
+    }
+  },
+  {
+    "id": "rf-detr-s",
+    "task": "detect",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "onnx-community/rfdetr_small-ONNX",
+      "revision": "63463b68b200177d1fea7015f11f3cebb0ba4eeb"
+    },
+    "files": [
+      {
+        "path": "onnx/model.onnx",
+        "sha256": "sha256:121cc1476a7b69d865ca4bdc2bca59a3239020d227e4c3f35a811bef81aeb7f1",
+        "size": 114680416
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://github.com/roboflow/rf-detr/blob/develop/LICENSE",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 17
+    },
+    "io": {
+      "input": {
+        "width": 512,
+        "height": 512,
+        "letterbox": "stretch"
+      },
+      "mean": [
+        0.485,
+        0.456,
+        0.406
+      ],
+      "std": [
+        0.229,
+        0.224,
+        0.225
+      ],
+      "labels": [
+        "",
+        "person",
+        "bicycle",
+        "car",
+        "motorcycle",
+        "airplane",
+        "bus",
+        "train",
+        "truck",
+        "boat",
+        "traffic light",
+        "fire hydrant",
+        "",
+        "stop sign",
+        "parking meter",
+        "bench",
+        "bird",
+        "cat",
+        "dog",
+        "horse",
+        "sheep",
+        "cow",
+        "elephant",
+        "bear",
+        "zebra",
+        "giraffe",
+        "",
+        "backpack",
+        "umbrella",
+        "",
+        "",
+        "handbag",
+        "tie",
+        "suitcase",
+        "frisbee",
+        "skis",
+        "snowboard",
+        "sports ball",
+        "kite",
+        "baseball bat",
+        "baseball glove",
+        "skateboard",
+        "surfboard",
+        "tennis racket",
+        "bottle",
+        "",
+        "wine glass",
+        "cup",
+        "fork",
+        "knife",
+        "spoon",
+        "bowl",
+        "banana",
+        "apple",
+        "sandwich",
+        "orange",
+        "broccoli",
+        "carrot",
+        "hot dog",
+        "pizza",
+        "donut",
+        "cake",
+        "chair",
+        "couch",
+        "potted plant",
+        "bed",
+        "",
+        "dining table",
+        "",
+        "",
+        "toilet",
+        "",
+        "tv",
+        "laptop",
+        "mouse",
+        "remote",
+        "keyboard",
+        "cell phone",
+        "microwave",
+        "oven",
+        "toaster",
+        "sink",
+        "refrigerator",
+        "",
+        "book",
+        "clock",
+        "vase",
+        "scissors",
+        "teddy bear",
+        "hair drier",
+        "toothbrush"
+      ]
+    }
+  },
+  {
+    "id": "rf-detr-m",
+    "task": "detect",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "onnx-community/rfdetr_medium-ONNX",
+      "revision": "8553cefdd984bbaeb9d9ca8743d6a6a1c3e29dce"
+    },
+    "files": [
+      {
+        "path": "onnx/model.onnx",
+        "sha256": "sha256:768928acf337ac86d069c9d55a929e11e563c1e1d272a3ffc9366248d66b2654",
+        "size": 121015411
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://github.com/roboflow/rf-detr/blob/develop/LICENSE",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 17
+    },
+    "io": {
+      "input": {
+        "width": 576,
+        "height": 576,
+        "letterbox": "stretch"
+      },
+      "mean": [
+        0.485,
+        0.456,
+        0.406
+      ],
+      "std": [
+        0.229,
+        0.224,
+        0.225
+      ],
+      "labels": [
+        "",
+        "person",
+        "bicycle",
+        "car",
+        "motorcycle",
+        "airplane",
+        "bus",
+        "train",
+        "truck",
+        "boat",
+        "traffic light",
+        "fire hydrant",
+        "",
+        "stop sign",
+        "parking meter",
+        "bench",
+        "bird",
+        "cat",
+        "dog",
+        "horse",
+        "sheep",
+        "cow",
+        "elephant",
+        "bear",
+        "zebra",
+        "giraffe",
+        "",
+        "backpack",
+        "umbrella",
+        "",
+        "",
+        "handbag",
+        "tie",
+        "suitcase",
+        "frisbee",
+        "skis",
+        "snowboard",
+        "sports ball",
+        "kite",
+        "baseball bat",
+        "baseball glove",
+        "skateboard",
+        "surfboard",
+        "tennis racket",
+        "bottle",
+        "",
+        "wine glass",
+        "cup",
+        "fork",
+        "knife",
+        "spoon",
+        "bowl",
+        "banana",
+        "apple",
+        "sandwich",
+        "orange",
+        "broccoli",
+        "carrot",
+        "hot dog",
+        "pizza",
+        "donut",
+        "cake",
+        "chair",
+        "couch",
+        "potted plant",
+        "bed",
+        "",
+        "dining table",
+        "",
+        "",
+        "toilet",
+        "",
+        "tv",
+        "laptop",
+        "mouse",
+        "remote",
+        "keyboard",
+        "cell phone",
+        "microwave",
+        "oven",
+        "toaster",
+        "sink",
+        "refrigerator",
+        "",
+        "book",
+        "clock",
+        "vase",
+        "scissors",
+        "teddy bear",
+        "hair drier",
+        "toothbrush"
+      ]
+    }
+  },
+  {
+    "id": "rf-detr-seg-preview",
+    "task": "detect",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "bukuroo/RF-DETR-Seg-ONNX",
+      "revision": "627efc7f5ed9a96da1545dc7d9e3ecb99d30a65c"
+    },
+    "files": [
+      {
+        "path": "rf-detr-seg-preview.onnx",
+        "sha256": "sha256:42e3571cf64d70df6f6acf3c5dcf0fc4ecbf8bab46d819ca8e4e94d4cee4de9b",
+        "size": 134443363
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://github.com/roboflow/rf-detr/blob/develop/LICENSE",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 17
+    },
+    "io": {
+      "input": {
+        "width": 432,
+        "height": 432,
+        "letterbox": "stretch"
+      },
+      "mean": [
+        0.485,
+        0.456,
+        0.406
+      ],
+      "std": [
+        0.229,
+        0.224,
+        0.225
+      ],
+      "labels": [
+        "",
+        "person",
+        "bicycle",
+        "car",
+        "motorcycle",
+        "airplane",
+        "bus",
+        "train",
+        "truck",
+        "boat",
+        "traffic light",
+        "fire hydrant",
+        "",
+        "stop sign",
+        "parking meter",
+        "bench",
+        "bird",
+        "cat",
+        "dog",
+        "horse",
+        "sheep",
+        "cow",
+        "elephant",
+        "bear",
+        "zebra",
+        "giraffe",
+        "",
+        "backpack",
+        "umbrella",
+        "",
+        "",
+        "handbag",
+        "tie",
+        "suitcase",
+        "frisbee",
+        "skis",
+        "snowboard",
+        "sports ball",
+        "kite",
+        "baseball bat",
+        "baseball glove",
+        "skateboard",
+        "surfboard",
+        "tennis racket",
+        "bottle",
+        "",
+        "wine glass",
+        "cup",
+        "fork",
+        "knife",
+        "spoon",
+        "bowl",
+        "banana",
+        "apple",
+        "sandwich",
+        "orange",
+        "broccoli",
+        "carrot",
+        "hot dog",
+        "pizza",
+        "donut",
+        "cake",
+        "chair",
+        "couch",
+        "potted plant",
+        "bed",
+        "",
+        "dining table",
+        "",
+        "",
+        "toilet",
+        "",
+        "tv",
+        "laptop",
+        "mouse",
+        "remote",
+        "keyboard",
+        "cell phone",
+        "microwave",
+        "oven",
+        "toaster",
+        "sink",
+        "refrigerator",
+        "",
+        "book",
+        "clock",
+        "vase",
+        "scissors",
+        "teddy bear",
+        "hair drier",
+        "toothbrush"
+      ]
+    }
+  },
+  {
+    "id": "yunet-2023mar",
+    "task": "detect",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "opencv/face_detection_yunet",
+      "revision": "3cc26e7f1014a5ee5d74a42acee58bafc9d0a310"
+    },
+    "files": [
+      {
+        "path": "face_detection_yunet_2023mar.onnx",
+        "sha256": "sha256:8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+        "size": 232589
+      }
+    ],
+    "licence": {
+      "id": "MIT",
+      "url": "https://huggingface.co/opencv/face_detection_yunet/blob/3cc26e7f1014a5ee5d74a42acee58bafc9d0a310/LICENSE",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 11
+    },
+    "io": {
+      "input": {
+        "width": 640,
+        "height": 640,
+        "letterbox": "topLeft"
+      },
+      "labels": [
+        "face"
+      ]
+    }
+  },
+  {
+    "id": "efficientsam-ti",
+    "task": "segment",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "yunyangx/EfficientSAM",
+      "revision": "1cf49585c39567bfc49e991ab8eb31f491ad4877"
+    },
+    "files": [
+      {
+        "path": "efficientsam_ti_encoder.onnx",
+        "sha256": "sha256:84ed466ffcc5c1f8d08409bc34a23bb364ab2c15e402cb12d4335a42be0e0951",
+        "size": 24799761
+      },
+      {
+        "path": "efficientsam_ti_decoder.onnx",
+        "sha256": "sha256:a62f8fa5ea080447c0689418d69e58f1e83e0b7adf9c142e2bd9bcc8045c0b11",
+        "size": 16565728
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://github.com/yformer/EfficientSAM/blob/main/LICENSE",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 17
+    },
+    "io": {
+      "input": {
+        "width": 1024,
+        "height": 1024,
+        "letterbox": "stretch"
+      }
+    }
+  },
+  {
+    "id": "sam2.1-hiera-tiny",
+    "task": "segment",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "onnx-community/sam2.1-hiera-tiny-ONNX",
+      "revision": "814a066640debee5a91e70aa401fb8e17e030503"
+    },
+    "files": [
+      {
+        "path": "onnx/vision_encoder.onnx",
+        "sha256": "sha256:4f30aacd3aaefbca81a0b7fe4c1fc96345570ea0a6f80ced599493d1b3be2e8c",
+        "size": 354238
+      },
+      {
+        "path": "onnx/vision_encoder.onnx_data",
+        "sha256": "sha256:e83df9866a5afe68ea7f0f721f18f65137fc3acbf0da1c74e946d363e09c69cc",
+        "size": 134084864
+      },
+      {
+        "path": "onnx/prompt_encoder_mask_decoder.onnx",
+        "sha256": "sha256:874414704c5d686db7d206a35f6e15d26563d50c8c4468fccc6739bd7e491dcf",
+        "size": 213114
+      },
+      {
+        "path": "onnx/prompt_encoder_mask_decoder.onnx_data",
+        "sha256": "sha256:e9874d900dd4134ed60eab1e97910327c2419e0b2954485d8fd6e7f1a1470f47",
+        "size": 20958208
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://github.com/facebookresearch/sam2/blob/main/LICENSE",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 18
+    },
+    "io": {
+      "input": {
+        "width": 1024,
+        "height": 1024,
+        "letterbox": "stretch"
+      },
+      "mean": [
+        0.485,
+        0.456,
+        0.406
+      ],
+      "std": [
+        0.229,
+        0.224,
+        0.225
+      ]
+    }
+  },
+  {
+    "id": "sam2.1-hiera-tiny-q4",
+    "task": "segment",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "onnx-community/sam2.1-hiera-tiny-ONNX",
+      "revision": "814a066640debee5a91e70aa401fb8e17e030503"
+    },
+    "files": [
+      {
+        "path": "onnx/vision_encoder_q4.onnx",
+        "sha256": "sha256:c3efeef6c8e5e0cd718d9fea53b760fd09e109dc8f670c7ca592181a1eca6526",
+        "size": 366089
+      },
+      {
+        "path": "onnx/vision_encoder_q4.onnx_data",
+        "sha256": "sha256:ca3afaa983c6fe53449df092b4cf4e8d2442e44ebacf02dc5303ca5299342a9f",
+        "size": 43758848
+      },
+      {
+        "path": "onnx/prompt_encoder_mask_decoder_q4.onnx",
+        "sha256": "sha256:9d07a46ca6035cd22ec29391ed13e19a7c9f5fc3dd5bd6df92c8e2e0a23ba9c1",
+        "size": 226444
+      },
+      {
+        "path": "onnx/prompt_encoder_mask_decoder_q4.onnx_data",
+        "sha256": "sha256:5e912af5533c6ab05330886ba42712f3f9d7ac60e3f1cc39d936a85d958f2d94",
+        "size": 7130112
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://github.com/facebookresearch/sam2/blob/main/LICENSE",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 18
+    },
+    "io": {
+      "input": {
+        "width": 1024,
+        "height": 1024,
+        "letterbox": "stretch"
+      },
+      "mean": [
+        0.485,
+        0.456,
+        0.406
+      ],
+      "std": [
+        0.229,
+        0.224,
+        0.225
+      ]
+    }
+  },
+  {
+    "id": "siglip2-base-patch16-256",
+    "task": "embed",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "onnx-community/siglip2-base-patch16-256-ONNX",
+      "revision": "d1114256522a37ffa257a0a58017348ab0058db2"
+    },
+    "files": [
+      {
+        "path": "onnx/vision_model.onnx",
+        "sha256": "sha256:f5cb16728a704703f05516ded628397e11dbca4de2eb5db04b0c0bcee988aa7a",
+        "size": 371992072
+      },
+      {
+        "path": "onnx/text_model.onnx",
+        "sha256": "sha256:d3de4a6bbbfcb429b6615ac496790353cf4a4fc0f19fbbe7179e523ae60daaef",
+        "size": 1129469657
+      },
+      {
+        "path": "tokenizer.json",
+        "sha256": "sha256:cb9140fae3ac5122c972d37adf83e1248471a38147ad76f8215c8872c6fd8322",
+        "size": 34363039
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://huggingface.co/google/siglip2-base-patch16-256",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 14
+    },
+    "io": {
+      "input": {
+        "width": 256,
+        "height": 256,
+        "letterbox": "stretch"
+      },
+      "mean": [
+        0.5,
+        0.5,
+        0.5
+      ],
+      "std": [
+        0.5,
+        0.5,
+        0.5
+      ]
+    }
+  },
+  {
+    "id": "siglip2-base-patch16-256-quantized",
+    "task": "embed",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "onnx-community/siglip2-base-patch16-256-ONNX",
+      "revision": "d1114256522a37ffa257a0a58017348ab0058db2"
+    },
+    "files": [
+      {
+        "path": "onnx/vision_model_q4.onnx",
+        "sha256": "sha256:712064dae0cce3fb4c94497c7dfd65d11f4ad34eadafe09442208474068cf777",
+        "size": 63451786
+      },
+      {
+        "path": "onnx/text_model_int8.onnx",
+        "sha256": "sha256:6f59b39d880c413042314b79302b74d0dd93b273caf8fbfdb1eb2df61a7fefd4",
+        "size": 283438275
+      },
+      {
+        "path": "tokenizer.json",
+        "sha256": "sha256:cb9140fae3ac5122c972d37adf83e1248471a38147ad76f8215c8872c6fd8322",
+        "size": 34363039
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://huggingface.co/google/siglip2-base-patch16-256",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 14
+    },
+    "io": {
+      "input": {
+        "width": 256,
+        "height": 256,
+        "letterbox": "stretch"
+      },
+      "mean": [
+        0.5,
+        0.5,
+        0.5
+      ],
+      "std": [
+        0.5,
+        0.5,
+        0.5
+      ]
+    }
+  },
+  {
+    "id": "siglip2-so400m-patch16-256-quantized",
+    "task": "embed",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "onnx-community/siglip2-so400m-patch16-256-ONNX",
+      "revision": "7881d8f282cbd7cdeac1aca6bed493a36d58e713"
+    },
+    "files": [
+      {
+        "path": "onnx/vision_model_q4.onnx",
+        "sha256": "sha256:a28f8ffde39c11620e18bea40253a6ca6e38761eb9b39fc1ac49b13134bd9d4d",
+        "size": 278214740
+      },
+      {
+        "path": "onnx/text_model_int8.onnx",
+        "sha256": "sha256:189f41c153c7a914b67ee3f8aff2b90d6deacf280a504284b4004257cebf9066",
+        "size": 711126655
+      },
+      {
+        "path": "tokenizer.json",
+        "sha256": "sha256:cb9140fae3ac5122c972d37adf83e1248471a38147ad76f8215c8872c6fd8322",
+        "size": 34363039
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://huggingface.co/google/siglip2-so400m-patch16-256",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 14
+    },
+    "io": {
+      "input": {
+        "width": 256,
+        "height": 256,
+        "letterbox": "stretch"
+      },
+      "mean": [
+        0.5,
+        0.5,
+        0.5
+      ],
+      "std": [
+        0.5,
+        0.5,
+        0.5
+      ]
+    }
+  },
+  {
+    "id": "pp-ocrv6-tiny-det",
+    "task": "read",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "PaddlePaddle/PP-OCRv6_tiny_det_onnx",
+      "revision": "2ba1506c0380b8f0b03dd142459aac66d4421f6c"
+    },
+    "files": [
+      {
+        "path": "inference.onnx",
+        "sha256": "sha256:193bab7a04fca699a6c82e6abb5b81bdb28177f0abd4062552b04908dafb19f8",
+        "size": 1780590
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 14
+    }
+  },
+  {
+    "id": "pp-ocrv6-tiny-rec",
+    "task": "read",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "PaddlePaddle/PP-OCRv6_tiny_rec_onnx",
+      "revision": "2612ab37152ae0a677521bae4e1e3d4fb4cf7c30"
+    },
+    "files": [
+      {
+        "path": "inference.onnx",
+        "sha256": "sha256:9ef676d6ed3c88256a2d92c640c44f25b0c40947e111b14b8be8f594091563e6",
+        "size": 4462639
+      },
+      {
+        "path": "inference.yml",
+        "sha256": "sha256:66170210bad538e83fff3c4a3867e547d6bf20b50d64b20347c4b913f3034ea1",
+        "size": 55571
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 11
+    }
+  },
+  {
+    "id": "pp-ocrv6-small-det",
+    "task": "read",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "PaddlePaddle/PP-OCRv6_small_det_onnx",
+      "revision": "28fe5895c24fd108c19eb3e8479f4ab385fbfc62"
+    },
+    "files": [
+      {
+        "path": "inference.onnx",
+        "sha256": "sha256:d73e0058b7a8086bbd57f3d10b8bcd4ff95363f67e06e2762b5e814fe9c9410e",
+        "size": 9880512
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 14
+    }
+  },
+  {
+    "id": "pp-ocrv6-small-rec",
+    "task": "read",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "PaddlePaddle/PP-OCRv6_small_rec_onnx",
+      "revision": "b8f84f0b80c529de40b4fbb3544b84fa7233a513"
+    },
+    "files": [
+      {
+        "path": "inference.onnx",
+        "sha256": "sha256:5435fd747c9e0efe15a96d0b378d5bd157e9492ed8fd80edf08f30d02fa24634",
+        "size": 21159378
+      },
+      {
+        "path": "inference.yml",
+        "sha256": "sha256:ab078671bb49f06228eadccd34f1bb501e157f7a047095ffb943ba81512c77d1",
+        "size": 150579
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 11
+    }
+  },
+  {
+    "id": "pp-ocrv6-medium-det",
+    "task": "read",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "PaddlePaddle/PP-OCRv6_medium_det_onnx",
+      "revision": "61323801669c338b7891481ec7bac61ce31b576a"
+    },
+    "files": [
+      {
+        "path": "inference.onnx",
+        "sha256": "sha256:eb13b44b25bb36f89528b68720af8a61d9cf381176107f465db1757b65d086e1",
+        "size": 62032837
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 14
+    }
+  },
+  {
+    "id": "pp-ocrv6-medium-rec",
+    "task": "read",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "PaddlePaddle/PP-OCRv6_medium_rec_onnx",
+      "revision": "50c7eacafc52fa7bcf4194e8cd08e46f8558504b"
+    },
+    "files": [
+      {
+        "path": "inference.onnx",
+        "sha256": "sha256:9c09abf0957f7968c7586464b7397b84ad2387a0497a351af40e9acc71b673ba",
+        "size": 76554979
+      },
+      {
+        "path": "inference.yml",
+        "sha256": "sha256:991b700facf5b50a7de193468207d5f4255b538dde0d312ae3b7c7a9b6873129",
+        "size": 150580
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "ort",
+      "opset": 11
+    }
+  },
+  {
+    "id": "paddleocr-vl-1.6",
+    "task": "read",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "PaddlePaddle/PaddleOCR-VL-1.6",
+      "revision": "132c45f52c0a26ed5a6b2f6bd8e3985794cc27dd"
+    },
+    "files": [
+      {
+        "path": "config.json",
+        "sha256": "sha256:ce7f4565f8b1db78532ad5d1b9ebe55c2139d49bd4cb04778b580a08a598f171",
+        "size": 2059
+      },
+      {
+        "path": "preprocessor_config.json",
+        "sha256": "sha256:111872ab1e8bb7fd040ac5087bfced7ab8f011f02139b088cba294964c3b1d0e",
+        "size": 641
+      },
+      {
+        "path": "tokenizer.json",
+        "sha256": "sha256:c8a215a59183d0d0781adc33bacd3ce6162716f7fd568fb30234a74d69803a7d",
+        "size": 11189060
+      },
+      {
+        "path": "chat_template.jinja",
+        "sha256": "sha256:2f27812dab7f333e471884e0c803d807f11953d5453140dfb1aaba234f872bc8",
+        "size": 1474
+      },
+      {
+        "path": "model.safetensors",
+        "sha256": "sha256:85a479d506a11e724e7285d395c551be69f41dbc16b6342d3cacfb189aed71db",
+        "size": 1917255968
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "candle"
+    }
+  },
+  {
+    "id": "pp-doclayoutv3",
+    "task": "read",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "PaddlePaddle/PP-DocLayoutV3_safetensors",
+      "revision": "e4f489dc536556fc1be02b973ba06756e0d4a2ac"
+    },
+    "files": [
+      {
+        "path": "config.json",
+        "sha256": "sha256:3cf834b91d23a756b1519bce4db42c09e852f3e35c35092dd5a3e253a50c071a",
+        "size": 2460
+      },
+      {
+        "path": "preprocessor_config.json",
+        "sha256": "sha256:519fe0187a43a1ca429e3ad8317bab8700f0d5e8fb3a6e3a0a413ffac078ba42",
+        "size": 575
+      },
+      {
+        "path": "model.safetensors",
+        "sha256": "sha256:5ea422c6cc5fe759a47e1357c35639b58173508e025a3131cbe4b6ac59e2b85e",
+        "size": 133270468
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "candle"
+    }
+  },
+  {
+    "id": "qwen3-vl-2b-instruct",
+    "task": "describe",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "Qwen/Qwen3-VL-2B-Instruct",
+      "revision": "89644892e4d85e24eaac8bacfd4f463576704203"
+    },
+    "files": [
+      {
+        "path": "config.json",
+        "sha256": "sha256:bec4b3d446efa05807365c9e1cec03ac590836879d02f3a6da879971154bdd3b",
+        "size": 1505
+      },
+      {
+        "path": "generation_config.json",
+        "sha256": "sha256:1e241830b48b397cb0900101421df5450baddc7adf01e5fc86b5615865f3bae4",
+        "size": 269
+      },
+      {
+        "path": "preprocessor_config.json",
+        "sha256": "sha256:27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+        "size": 390
+      },
+      {
+        "path": "video_preprocessor_config.json",
+        "sha256": "sha256:7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+        "size": 385
+      },
+      {
+        "path": "chat_template.json",
+        "sha256": "sha256:6f8a6a55027e3da5160105556cda5dd69f6423f1c32645f6730d32de7773d0c4",
+        "size": 5502
+      },
+      {
+        "path": "tokenizer.json",
+        "sha256": "sha256:a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+        "size": 7032403
+      },
+      {
+        "path": "tokenizer_config.json",
+        "sha256": "sha256:c2da771801886ad9ae98181793ffd3dfb7f1af30f6f7c6a4e15d7dbba52e2399",
+        "size": 10868
+      },
+      {
+        "path": "vocab.json",
+        "sha256": "sha256:ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+        "size": 2776833
+      },
+      {
+        "path": "merges.txt",
+        "sha256": "sha256:599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+        "size": 1671839
+      },
+      {
+        "path": "model.safetensors",
+        "sha256": "sha256:7de1838c87a5349b016c26a1c3f7d2bc400a3d485f95ef39a7059ffd734977a0",
+        "size": 4255140312
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "mistralRs",
+      "architecture": "qwen3vl"
+    }
+  },
+  {
+    "id": "qwen3-vl-4b-instruct",
+    "task": "describe",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "Qwen/Qwen3-VL-4B-Instruct",
+      "revision": "ebb281ec70b05090aa6165b016eac8ec08e71b17"
+    },
+    "files": [
+      {
+        "path": "config.json",
+        "sha256": "sha256:edac7703329133edfc53e46ac0081835144c99d7eebf28b71c732694d435224d",
+        "size": 1505
+      },
+      {
+        "path": "generation_config.json",
+        "sha256": "sha256:8469742d1fce0de951c8909b26a2c0c0d8490837ce476efb114da9e0cefc4d44",
+        "size": 269
+      },
+      {
+        "path": "preprocessor_config.json",
+        "sha256": "sha256:27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+        "size": 390
+      },
+      {
+        "path": "video_preprocessor_config.json",
+        "sha256": "sha256:7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+        "size": 385
+      },
+      {
+        "path": "chat_template.json",
+        "sha256": "sha256:6f8a6a55027e3da5160105556cda5dd69f6423f1c32645f6730d32de7773d0c4",
+        "size": 5502
+      },
+      {
+        "path": "tokenizer.json",
+        "sha256": "sha256:a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+        "size": 7032403
+      },
+      {
+        "path": "tokenizer_config.json",
+        "sha256": "sha256:c2da771801886ad9ae98181793ffd3dfb7f1af30f6f7c6a4e15d7dbba52e2399",
+        "size": 10868
+      },
+      {
+        "path": "vocab.json",
+        "sha256": "sha256:ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+        "size": 2776833
+      },
+      {
+        "path": "merges.txt",
+        "sha256": "sha256:599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+        "size": 1671839
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "sha256": "sha256:58a7841d7bff2548dd91577d216274a83cf1b500bc6a534b809d6c1b1707cf2b",
+        "size": 64742
+      },
+      {
+        "path": "model-00001-of-00002.safetensors",
+        "sha256": "sha256:30a01a0556622645a3cce87b655bbbbbc1f170c196099f1b666c93202c3339a9",
+        "size": 4967229296
+      },
+      {
+        "path": "model-00002-of-00002.safetensors",
+        "sha256": "sha256:046296a2a387efb43b0c997d5833c789604d168834f6e0d3064bf7bb13d002a6",
+        "size": 3908490048
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "mistralRs",
+      "architecture": "qwen3vl"
+    }
+  },
+  {
+    "id": "qwen3-vl-8b-instruct",
+    "task": "describe",
+    "source": {
+      "kind": "huggingFace",
+      "repo": "Qwen/Qwen3-VL-8B-Instruct",
+      "revision": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
+    },
+    "files": [
+      {
+        "path": "config.json",
+        "sha256": "sha256:5cd452860dc1e9c29dd71cc3cef7f39b338b7a40793f7a260655c2d3568f3661",
+        "size": 1474
+      },
+      {
+        "path": "generation_config.json",
+        "sha256": "sha256:8469742d1fce0de951c8909b26a2c0c0d8490837ce476efb114da9e0cefc4d44",
+        "size": 269
+      },
+      {
+        "path": "preprocessor_config.json",
+        "sha256": "sha256:27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+        "size": 390
+      },
+      {
+        "path": "video_preprocessor_config.json",
+        "sha256": "sha256:7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+        "size": 385
+      },
+      {
+        "path": "chat_template.json",
+        "sha256": "sha256:5c72a170d2a4a1a3bc5adad2e689ae28138a9700e5b8c96c0266331e86c0acce",
+        "size": 5499
+      },
+      {
+        "path": "tokenizer.json",
+        "sha256": "sha256:a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+        "size": 7032403
+      },
+      {
+        "path": "tokenizer_config.json",
+        "sha256": "sha256:c2da771801886ad9ae98181793ffd3dfb7f1af30f6f7c6a4e15d7dbba52e2399",
+        "size": 10868
+      },
+      {
+        "path": "vocab.json",
+        "sha256": "sha256:ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+        "size": 2776833
+      },
+      {
+        "path": "merges.txt",
+        "sha256": "sha256:599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+        "size": 1671839
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "sha256": "sha256:520b2e05079402e9468a8701d03d1154d14b2599593afb6effa7fb60c1bff070",
+        "size": 67759
+      },
+      {
+        "path": "model-00001-of-00004.safetensors",
+        "sha256": "sha256:d5d0aef0eb170fc7453a296c43c0849a56f510555d3588e4fd662bb35490aefa",
+        "size": 4902275944
+      },
+      {
+        "path": "model-00002-of-00004.safetensors",
+        "sha256": "sha256:8be88fb5501e4d5719a6d4cc212e6a13480330e74f3e8c77daa1a68f199106b5",
+        "size": 4915962496
+      },
+      {
+        "path": "model-00003-of-00004.safetensors",
+        "sha256": "sha256:83de00eafe6e0d57ccd009dbcf71c9974d74df2f016c27afb7e95aafd16b2192",
+        "size": 4999831048
+      },
+      {
+        "path": "model-00004-of-00004.safetensors",
+        "sha256": "sha256:0a88b98e9f96270973f567e6a2c103ede6ccdf915ca3075e21c755604d0377a5",
+        "size": 2716270024
+      }
+    ],
+    "licence": {
+      "id": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0",
+      "class": "permissive"
+    },
+    "runtime": {
+      "kind": "mistralRs",
+      "architecture": "qwen3vl"
+    }
+  },
+  {
+    "id": "sam-mask-codec",
+    "task": "segment",
+    "source": {
+      "kind": "url",
+      "base": "https://registry.npmjs.org/@meta-sam/parser/-"
+    },
+    "files": [
+      {
+        "path": "parser-0.1.0.tgz",
+        "sha256": "sha256:14935a735fe259b06f9fe782c842a8293833fadae733b48b4e672c05ad73b387",
+        "size": 33498
+      }
+    ],
+    "licence": {
+      "id": "LicenseRef-SAM",
+      "url": "https://github.com/meta-models/meta-sam/blob/5f2e6e7f1da5b41dcd10bec971201e5910efc18a/LICENSE",
+      "class": "useRestricted"
+    },
+    "runtime": {
+      "kind": "native"
+    }
+  }
+]

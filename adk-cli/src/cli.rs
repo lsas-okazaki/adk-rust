@@ -146,7 +146,7 @@ impl std::str::FromStr for Provider {
 ///
 /// For custom agents, use [`adk_cli::Launcher`] in your own binary.
 #[derive(Parser)]
-#[command(name = "adk-rust")]
+#[command(name = "adk-rust", version)]
 #[command(
     about = "ADK-Rust CLI — governed coding harness, interactive agent, web server, and tooling"
 )]
@@ -425,16 +425,28 @@ pub enum Commands {
     /// Autonomous goal mode: work until a verifiable success condition passes.
     ///
     /// The agent loops plan → act → verify, self-correcting from the check's
-    /// output, until `--until` exits 0 or the iteration budget is reached. The goal and its
-    /// conversation are kept in the session, so `--resume` continues both.
+    /// output, until `--until` exits 0 or the iteration budget is reached. With `--rubric`, a
+    /// separate grader checks each iteration against the rubric's criteria and its feedback
+    /// drives the next one; with both, both must pass. The goal and its conversation are kept
+    /// in the session, so `--resume` continues both.
     /// Example: `adk-rust goal "make all tests pass" --until "cargo test"`
     Goal {
         /// The high-level goal.
         goal: String,
 
         /// Shell command whose exit code 0 means "goal met" (the success condition).
+        #[cfg(feature = "harness")]
+        #[arg(long)]
+        until: Option<String>,
+
+        /// Shell command whose exit code 0 means "goal met" (the success condition).
+        #[cfg(not(feature = "harness"))]
         #[arg(long)]
         until: String,
+
+        #[cfg(feature = "harness")]
+        #[command(flatten)]
+        rubric: adk_cli::harness::RubricArgs,
 
         #[cfg(feature = "harness")]
         #[command(flatten)]
@@ -596,6 +608,26 @@ pub enum Commands {
     Resume {
         /// Process id, or a unique prefix of it
         pid: String,
+        #[command(flatten)]
+        kernel: KernelTarget,
+    },
+
+    /// Run a cron sleeper or a standing cron trigger now, outside its schedule
+    ///
+    /// The run passes quiet hours, budgets and quotas like a scheduled tick, the next tick
+    /// still fires on time, and a freeze refuses it.
+    #[cfg(feature = "harness")]
+    #[command(name = "run-now")]
+    RunNow {
+        /// Process id (or a unique prefix) of a process asleep on a cron wake
+        #[arg(required_unless_present = "trigger", conflicts_with = "trigger")]
+        pid: Option<String>,
+        /// Run the standing trigger of this name instead
+        #[arg(long)]
+        trigger: Option<String>,
+        /// A retry with the same id queues nothing new
+        #[arg(long)]
+        request_id: Option<String>,
         #[command(flatten)]
         kernel: KernelTarget,
     },
@@ -819,13 +851,21 @@ pub enum Commands {
         #[command(subcommand)]
         command: ApprovalsCommands,
 
-        /// A served harness to talk to instead of this machine's harness.db
-        #[arg(long, global = true)]
+        /// A served harness or kernel to talk to instead of the kernel running here, or this
+        /// machine's harness.db when none runs
+        // Ids of their own: a global argument's value is copied to every ancestor with the
+        // same id, which would set the terminal's --server and --token.
+        #[arg(long = "server", id = "approvals_server", global = true, value_name = "URL")]
         server: Option<String>,
 
         /// Bearer token for --server (default: $ADK_SERVE_TOKEN)
-        #[arg(long, global = true)]
+        #[arg(long = "token", id = "approvals_token", global = true)]
         token: Option<String>,
+
+        /// The home of the kernel whose inbox to use, on its socket (default: the config
+        /// directory's adk-rust)
+        #[arg(long = "home", id = "approvals_home", global = true, value_name = "DIR")]
+        home: Option<std::path::PathBuf>,
     },
 
     /// Skills tooling (list/validate/match)
@@ -881,6 +921,16 @@ pub enum Commands {
         #[command(subcommand)]
         command: crate::awp_cli::AwpCommands,
     },
+
+    /// Local-first perception: model manifests and licences, one call, the egress log
+    ///
+    /// Detect, segment and read on the device; describe with a cloud model through the
+    /// egress gate of `.adk/vision.toml` (spec 3.7 §8.1).
+    ///
+    /// Example: `adk-rust vision models fetch pp-ocrv6-tiny-det pp-ocrv6-tiny-rec`, then
+    /// `adk-rust vision run read invoice.png`.
+    #[cfg(feature = "vision")]
+    Vision(crate::vision_cli::VisionArgs),
 
     /// An AWP 2.0 website: spin one up and run it
     ///
@@ -1162,8 +1212,34 @@ pub enum ServeAgent {
 #[cfg(all(feature = "harness", feature = "persist"))]
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum SessionsCommands {
-    /// List your sessions, most recent first
-    List,
+    /// List your sessions, most recent first; archived ones only with --archived
+    List {
+        /// List the archived sessions instead
+        #[arg(long)]
+        archived: bool,
+    },
+    /// Put a finished session away: kept, read-only, left out of `sessions list` and of
+    /// `--continue`
+    Archive {
+        /// Session id
+        id: String,
+        /// Why, kept with the archive mark
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Bring an archived session back, so it lists and continues again
+    Unarchive {
+        /// Session id
+        id: String,
+    },
+    /// Write a session out as one portable JSON bundle (`adk.session.bundle/v1`)
+    Export {
+        /// Session id
+        id: String,
+        /// The file to write; standard output when omitted
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+    },
     /// Show a session's conversation
     Show {
         /// Session id
@@ -1173,6 +1249,24 @@ pub enum SessionsCommands {
     Rm {
         /// Session id
         id: String,
+    },
+    /// Copy a session into a new one, up to a turn or an event, and leave the original as it is
+    ///
+    /// The fork keeps the conversation and the session state at the fork point and records
+    /// where it came from; continue it with `adk-rust --session <new id>`. Refused while a
+    /// kernel worker runs the session.
+    Fork {
+        /// Session id
+        id: String,
+        /// Keep only the first N turns
+        #[arg(long, conflicts_with = "at", value_parser = clap::value_parser!(u32).range(1..))]
+        turns: Option<u32>,
+        /// Keep the events up to and including this event id
+        #[arg(long)]
+        at: Option<String>,
+        /// The new session's id; generated when absent
+        #[arg(long = "as", value_name = "NEW_ID")]
+        new_id: Option<String>,
     },
     /// Go back to before a turn: files, transcript and plan from its snapshot
     ///
@@ -1390,6 +1484,46 @@ pub enum AuditCommands {
 
 #[derive(Subcommand, Clone)]
 pub enum GraphCommands {
+    /// Run a YAML or JSON workflow file; a pause asks for its answer on stdin, or with a
+    /// SQLite store prints the command that resumes it
+    Run {
+        /// Workflow file (`.yaml`, `.yml` or `.json`)
+        file: std::path::PathBuf,
+
+        /// The run's input, written to the `input` state key
+        #[arg(long)]
+        input: Option<String>,
+
+        /// Initial state, as a JSON object
+        #[arg(long, value_name = "JSON")]
+        state: Option<String>,
+
+        /// Thread identifier; reuse it with --resume to continue a paused run
+        #[arg(long, default_value = "workflow")]
+        thread: String,
+
+        /// Resume the paused thread with this answer, as JSON (a bare word is a string)
+        #[arg(long, value_name = "JSON")]
+        resume: Option<String>,
+
+        /// The paused node the answer is for; defaults to the thread's only pending node
+        #[arg(long, requires = "resume")]
+        node: Option<String>,
+
+        /// Path to a SQLite checkpoint database, in place of the workflow's store
+        #[arg(long)]
+        db: Option<String>,
+    },
+
+    /// Check a workflow file and print every issue with its line and column
+    Validate {
+        /// Workflow file (`.yaml`, `.yml` or `.json`)
+        file: std::path::PathBuf,
+    },
+
+    /// Print the JSON Schema of the workflow format, for editor completion
+    Schema,
+
     /// List a thread's runs, each step's node records and a fork's lineage
     Steps {
         /// Thread identifier to inspect
@@ -1874,6 +2008,17 @@ mod tests {
         assert!(parse(&["adk-rust"]).command.is_none());
     }
 
+    #[test]
+    fn version_prints_the_crate_version() {
+        for flag in ["--version", "-V"] {
+            let Err(error) = Cli::try_parse_from(["adk-rust", flag]) else {
+                panic!("{flag} parsed as a command");
+            };
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert_eq!(error.to_string(), format!("adk-rust {}\n", env!("CARGO_PKG_VERSION")));
+        }
+    }
+
     /// Spec 3.2 §8.1: `adk-rust partitions [list|add|set-mode P MODE]`.
     #[cfg(feature = "harness")]
     #[test]
@@ -1927,6 +2072,30 @@ mod tests {
             Cli::try_parse_from(["adk-rust", "partitions", "set-mode", "work", "sometimes"])
                 .is_err()
         );
+    }
+
+    /// `adk-rust run-now PID` or `adk-rust run-now --trigger NAME`, never both or neither.
+    #[cfg(feature = "harness")]
+    #[test]
+    fn run_now_takes_a_process_or_a_trigger() {
+        match parse(&["adk-rust", "run-now", "abc", "--request-id", "r-1"]).command {
+            Some(Commands::RunNow { pid, trigger, request_id, .. }) => assert_eq!(
+                (pid.as_deref(), trigger, request_id.as_deref()),
+                (Some("abc"), None, Some("r-1"))
+            ),
+            _ => panic!("not the run-now command"),
+        }
+        match parse(&["adk-rust", "run-now", "--trigger", "digest"]).command {
+            Some(Commands::RunNow { pid, trigger, .. }) => {
+                assert_eq!((pid, trigger.as_deref()), (None, Some("digest")))
+            }
+            _ => panic!("not the run-now command"),
+        }
+        for args in
+            [&["adk-rust", "run-now"][..], &["adk-rust", "run-now", "abc", "--trigger", "d"]]
+        {
+            assert!(Cli::try_parse_from(args).is_err(), "{args:?} should not parse");
+        }
     }
 
     #[test]
@@ -2051,6 +2220,69 @@ mod tests {
             Cli::try_parse_from(["adk-rust", "ultracode", "x", "--architecture", "council"])
                 .is_err()
         );
+    }
+
+    /// `harness/cli.md` and `harness/serving.md`: `--server` and `--token` after `approvals`
+    /// or after its subcommand reach the approvals command, not the terminal.
+    #[cfg(all(feature = "harness", feature = "persist"))]
+    #[test]
+    fn approvals_take_server_and_token_after_any_subcommand() {
+        let cases: [(&[&str], ApprovalsCommands); 4] = [
+            (
+                &["adk-rust", "approvals", "list", "--server", "http://k:8080", "--token", "t"],
+                ApprovalsCommands::List,
+            ),
+            (
+                &["adk-rust", "approvals", "--server", "http://k:8080", "--token", "t", "list"],
+                ApprovalsCommands::List,
+            ),
+            (
+                &[
+                    "adk-rust",
+                    "approvals",
+                    "approve",
+                    "apr_1",
+                    "--server=http://k:8080",
+                    "--token=t",
+                ],
+                ApprovalsCommands::Approve { id: "apr_1".into() },
+            ),
+            (
+                &[
+                    "adk-rust",
+                    "approvals",
+                    "deny",
+                    "apr_1",
+                    "--reason",
+                    "no",
+                    "--server",
+                    "http://k:8080",
+                    "--token",
+                    "t",
+                ],
+                ApprovalsCommands::Deny { id: "apr_1".into(), reason: Some("no".into()) },
+            ),
+        ];
+        let Some(Commands::Approvals { home, .. }) =
+            parse(&["adk-rust", "approvals", "list", "--home", "/tmp/k"]).command
+        else {
+            panic!("approvals list --home is an approvals command");
+        };
+        assert_eq!(home, Some(std::path::PathBuf::from("/tmp/k")));
+        for (args, expected) in cases {
+            let cli = parse(args);
+            #[cfg(feature = "tui")]
+            assert!(!cli.surface.given(), "{args:?} set the terminal's flags");
+            let Some(Commands::Approvals { command, server, token, home: None }) = cli.command
+            else {
+                panic!("{args:?} is not an approvals command");
+            };
+            assert_eq!(
+                (command, server.as_deref(), token.as_deref()),
+                (expected, Some("http://k:8080"), Some("t")),
+                "{args:?}"
+            );
+        }
     }
 
     #[cfg(feature = "scripted-model")]

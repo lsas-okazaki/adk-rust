@@ -1,6 +1,7 @@
 use super::ag_ui_decisions::{
-    AgUiCaller, AgUiDecisions, HeldCall, RESUME_IN_PROGRESS, ResumeOutcome, ResumesInProgress,
-    commit_resume, decision_event, plan_resume,
+    AgUiCaller, AgUiDecisions, HeldCall, INTERRUPTS_OPEN, INVALID_RESUME, RESUME_IN_PROGRESS,
+    ResumeOutcome, ResumesInProgress, commit_resume, decision_event, open_interrupt_ids,
+    plan_resume,
 };
 use super::ag_ui_extension::{AgUiAction, AgUiExtension};
 use super::error_details;
@@ -176,48 +177,54 @@ pub struct RunSseRequest {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AgUiInputMessage {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replace: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patch: Option<Vec<Value>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AgUiRunInput {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_run_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<Value>,
     #[serde(default)]
     pub messages: Vec<AgUiInputMessage>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarded_props: Option<Value>,
+    /// The AG-UI protocol version the client speaks, such as `1.0`. A client that names 1.0
+    /// gets AG-UI 1.0's run shape: a success outcome, snapshots before an interrupt, the
+    /// server-execution marker on tool calls, strict event fields, and a resume that must
+    /// answer every open interrupt (spec 3.3 §10 S2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
     /// Answers to the interrupts the previous run on the thread ended with (spec 3.3 §10
     /// S2). A run that carries them starts no new user turn unless `newMessage` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<AgUiResume>,
 }
 
-/// The `resume` of an AG-UI run input (spec 3.3 §10 S2): the AG-UI 1.1 list of
+/// The `resume` of an AG-UI run input (spec 3.3 §10 S2): the AG-UI 1.0 list of
 /// [`AgUiResumeEntry`], or the single entry of the earlier interrupt draft.
 ///
 /// # Example
@@ -235,7 +242,7 @@ pub struct AgUiRunInput {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum AgUiResume {
-    /// One entry per interrupt, as AG-UI 1.1 sends them.
+    /// One entry per interrupt, as AG-UI 1.0 sends them.
     Entries(Vec<AgUiResumeEntry>),
     /// One entry, as the earlier draft sends it.
     Entry(AgUiResumeEntry),
@@ -320,12 +327,45 @@ pub struct NewMessage {
     pub parts: Vec<MessagePart>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct MessagePart {
     #[serde(default)]
     pub text: Option<String>,
     #[serde(default, rename = "inlineData")]
     pub inline_data: Option<InlineData>,
+    /// A function call, in Gemini's shape.
+    #[serde(default, rename = "functionCall", skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<FunctionCallPart>,
+    /// A function's result, in Gemini's shape. Sent with the call's `id`, it answers a
+    /// long-running call, as adk-python and adk-go accept.
+    #[serde(default, rename = "functionResponse", skip_serializing_if = "Option::is_none")]
+    pub function_response: Option<FunctionResponsePart>,
+}
+
+/// A function call in a message part: `{id, name, args}`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FunctionCallPart {
+    /// The call id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The function's name.
+    pub name: String,
+    /// The call's arguments.
+    #[serde(default)]
+    pub args: serde_json::Value,
+}
+
+/// A function's result in a message part: `{id, name, response}`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FunctionResponsePart {
+    /// The id of the call this answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The function's name.
+    pub name: String,
+    /// The result.
+    #[serde(default)]
+    pub response: serde_json::Value,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -577,7 +617,7 @@ fn new_message_from_ag_ui_input(input: &AgUiRunInput) -> Option<NewMessage> {
     let content = selected.content.as_ref()?;
     let parts: Vec<MessagePart> = extract_text_segments(content)
         .into_iter()
-        .map(|text| MessagePart { text: Some(text), inline_data: None })
+        .map(|text| MessagePart { text: Some(text), ..MessagePart::default() })
         .collect();
     if parts.is_empty() {
         return None;
@@ -809,6 +849,26 @@ fn build_content_from_parts(parts: &[MessagePart]) -> Result<adk_core::Content, 
                 }
             }
         }
+
+        if let Some(call) = &part.function_call {
+            content.parts.push(adk_core::Part::FunctionCall {
+                name: call.name.clone(),
+                args: call.args.clone(),
+                id: call.id.clone(),
+                thought_signature: None,
+            });
+        }
+
+        if let Some(response) = &part.function_response {
+            content.parts.push(adk_core::Part::FunctionResponse {
+                function_response: adk_core::FunctionResponseData::new(
+                    response.name.clone(),
+                    response.response.clone(),
+                ),
+                id: response.id.clone(),
+                annotations: None,
+            });
+        }
     }
 
     Ok(content)
@@ -856,12 +916,33 @@ async fn apply_state_delta_to_session(
         .map_err(|error| adk_err_to_runtime(error, expose_details))
 }
 
-/// Creates the session when it does not exist and applies `state_delta` to it when it does.
+/// Whether a run creates the session it names when that session does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingSession {
+    /// The run is refused with 404, as adk-python and adk-go refuse it: an ADK client
+    /// creates its session first (`POST /apps/{app}/users/{user}/sessions`).
+    Refuse,
+    /// The session is created. A UI protocol's host (AG-UI, A2UI, MCP Apps) names its
+    /// thread and expects the run to start it.
+    Create,
+}
+
+/// The [`MissingSession`] rule for a `/run_sse` request in `profile`.
+fn missing_session_rule(profile: UiProfile) -> MissingSession {
+    match profile {
+        UiProfile::AdkUi => MissingSession::Refuse,
+        UiProfile::A2ui | UiProfile::AgUi | UiProfile::McpApps => MissingSession::Create,
+    }
+}
+
+/// Applies `state_delta` to the session when it exists. When it does not, `missing` decides:
+/// the run is refused with 404, or the session is created with `state_delta` as its initial
+/// state.
 ///
-/// Only a `session.not_found` read creates the session, with `state_delta` as its initial
-/// state. Any other read failure is returned, so a transient backend error never replaces a
-/// stored session. A create that loses a race to a concurrent request finds the session that
-/// request created and applies `state_delta` to it.
+/// Only a `session.not_found` read counts as missing. Any other read failure is returned, so
+/// a transient backend error never replaces a stored session. A create that loses a race to
+/// a concurrent request finds the session that request created and applies `state_delta`
+/// to it.
 async fn ensure_session(
     session_service: &std::sync::Arc<dyn adk_session::SessionService>,
     app_name: &str,
@@ -869,6 +950,7 @@ async fn ensure_session(
     session_id: &str,
     state_delta: HashMap<String, Value>,
     expose_details: bool,
+    missing: MissingSession,
 ) -> Result<(), RuntimeError> {
     let existing = session_service
         .get(adk_session::GetRequest {
@@ -890,6 +972,10 @@ async fn ensure_session(
                 expose_details,
             )
             .await
+        }
+        // 404 with code `session.not_found`, as the path-style run answers.
+        Err(error) if error.is_not_found() && missing == MissingSession::Refuse => {
+            Err(adk_err_to_runtime(error, expose_details))
         }
         Err(error) if error.is_not_found() => {
             let created = session_service
@@ -1356,6 +1442,176 @@ struct AgUiStream {
     held: Vec<HeldCall>,
     /// What the host adds after each event (spec 3.3 §6.1 `genui`).
     extension: Option<Arc<dyn AgUiExtension>>,
+    /// The client named AG-UI 1.0.
+    v1: bool,
+    /// The thread's state as the run left it: the input's, with every delta applied.
+    state: Map<String, Value>,
+    /// The thread's messages as the run left them: the input's, then what the run said and
+    /// the calls it made, for the snapshot an interrupting `RUN_FINISHED` follows.
+    transcript: Vec<Value>,
+    /// A `RUN_ERROR` was sent: under 1.0 nothing follows it.
+    errored: bool,
+}
+
+/// Whether a client's `protocolVersion` names AG-UI 1.0 or later.
+fn speaks_ag_ui_1(input: Option<&AgUiRunInput>) -> bool {
+    input
+        .and_then(|input| input.protocol_version.as_deref())
+        .and_then(|version| version.trim().trim_start_matches('v').split('.').next())
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major >= 1)
+}
+
+/// `payload` in AG-UI 1.0's strict shape: no `null` fields, a run error without the thread
+/// and run (its stream names them), a tool result without the tool's name, reasoning in the
+/// `reasoning` role, and every tool call marked as executed on the server.
+fn conform_ag_ui_1(payload: &mut Value) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    object.retain(|_, value| !value.is_null());
+    match object.get("type").and_then(Value::as_str).unwrap_or_default() {
+        "RUN_ERROR" => {
+            object.remove("threadId");
+            object.remove("runId");
+        }
+        "TOOL_CALL_RESULT" => {
+            object.remove("toolCallName");
+        }
+        "REASONING_MESSAGE_START" | "REASONING_MESSAGE_CHUNK" => {
+            object.insert("role".into(), Value::String("reasoning".into()));
+        }
+        "TOOL_CALL_START" => {
+            let metadata = object.entry("metadata").or_insert_with(|| json!({}));
+            if let Some(metadata) = metadata.as_object_mut() {
+                metadata.insert("ag-ui:tool-execution".into(), Value::String("server".into()));
+            }
+        }
+        _ => {}
+    }
+}
+
+impl AgUiStream {
+    /// Keeps what the snapshots need from one event the stream sends.
+    fn observe(&mut self, payload: &Value) {
+        let text =
+            |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+        match payload.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "TEXT_MESSAGE_START" | "TEXT_MESSAGE_CONTENT" | "TEXT_MESSAGE_CHUNK" => {
+                let id = text("messageId");
+                if id.is_empty() {
+                    return;
+                }
+                let index =
+                    match self.transcript.iter().position(|message| message["id"] == id.as_str()) {
+                        Some(index) => index,
+                        None => {
+                            let role =
+                                payload.get("role").and_then(Value::as_str).unwrap_or("assistant");
+                            self.transcript.push(json!({ "id": id, "role": role, "content": "" }));
+                            self.transcript.len() - 1
+                        }
+                    };
+                if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                    let content =
+                        self.transcript[index]["content"].as_str().unwrap_or_default().to_string();
+                    self.transcript[index]["content"] = Value::String(content + delta);
+                }
+            }
+            "TOOL_CALL_START" | "TOOL_CALL_ARGS" | "TOOL_CALL_CHUNK" => {
+                let id = text("toolCallId");
+                if id.is_empty() {
+                    return;
+                }
+                let found = self.transcript.iter().enumerate().find_map(|(m, message)| {
+                    message["toolCalls"]
+                        .as_array()?
+                        .iter()
+                        .position(|call| call["id"] == id.as_str())
+                        .map(|c| (m, c))
+                });
+                let (m, c) = match found {
+                    Some(found) => found,
+                    None => {
+                        let parent = payload
+                            .get("parentMessageId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("msg-{id}"));
+                        let m = match self
+                            .transcript
+                            .iter()
+                            .position(|message| message["id"] == parent.as_str())
+                        {
+                            Some(m) => m,
+                            None => {
+                                self.transcript.push(json!({ "id": parent, "role": "assistant" }));
+                                self.transcript.len() - 1
+                            }
+                        };
+                        let calls = self.transcript[m]
+                            .as_object_mut()
+                            .map(|message| message.entry("toolCalls").or_insert_with(|| json!([])));
+                        let Some(Value::Array(calls)) = calls else { return };
+                        calls.push(json!({
+                            "id": id,
+                            "type": "function",
+                            "function": { "name": text("toolCallName"), "arguments": "" },
+                        }));
+                        (m, calls.len() - 1)
+                    }
+                };
+                if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                    let call = &mut self.transcript[m]["toolCalls"][c]["function"];
+                    let arguments = call["arguments"].as_str().unwrap_or_default().to_string();
+                    call["arguments"] = Value::String(arguments + delta);
+                }
+            }
+            "TOOL_CALL_RESULT" => {
+                self.transcript.push(json!({
+                    "id": text("messageId"),
+                    "role": "tool",
+                    "toolCallId": text("toolCallId"),
+                    "content": payload.get("content").cloned().unwrap_or(Value::String(String::new())),
+                }));
+            }
+            "STATE_DELTA" => {
+                for op in payload.get("delta").and_then(Value::as_array).into_iter().flatten() {
+                    let path = op.get("path").and_then(Value::as_str).unwrap_or_default();
+                    let key = path.trim_start_matches('/').replace("~1", "/").replace("~0", "~");
+                    if key.is_empty() || key.contains('/') {
+                        continue;
+                    }
+                    match op.get("op").and_then(Value::as_str) {
+                        Some("remove") => {
+                            self.state.remove(&key);
+                        }
+                        Some(_) => {
+                            self.state.insert(key, op.get("value").cloned().unwrap_or(Value::Null));
+                        }
+                        None => {}
+                    }
+                }
+            }
+            "RUN_ERROR" => self.errored = true,
+            _ => {}
+        }
+    }
+
+    /// The events of one translated event, kept for the snapshots and, under 1.0, in its
+    /// strict shape.
+    fn finish(&mut self, payloads: Vec<Value>) -> Vec<Value> {
+        payloads
+            .into_iter()
+            .map(|mut payload| {
+                self.observe(&payload);
+                if self.v1 {
+                    conform_ag_ui_1(&mut payload);
+                }
+                payload
+            })
+            .collect()
+    }
 }
 
 impl AgUiStream {
@@ -1443,7 +1699,22 @@ where
     Box::pin(async_stream::stream! {
         let native_ag_ui = profile == UiProfile::AgUi && transport == UiTransportMode::ProtocolNative;
         let mut started = false;
-        let mut ag_ui_stream = AgUiStream { extension, ..AgUiStream::default() };
+        let v1 = speaks_ag_ui_1(ag_ui_input.as_ref());
+        let mut ag_ui_stream = AgUiStream {
+            extension,
+            v1,
+            state: selected_initial_state
+                .as_ref()
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+            transcript: selected_messages_snapshot
+                .as_ref()
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            ..AgUiStream::default()
+        };
         let mut active_run_id = ag_ui_input.as_ref().and_then(|input| input.run_id.clone());
 
         while let Some(item) = event_stream.next().await {
@@ -1470,6 +1741,10 @@ where
                             {
                                 object.insert("input".to_string(), value);
                             }
+                            // A 1.0 client hears back the version this run speaks.
+                            if v1 {
+                                started_event["protocolVersion"] = json!("1.0");
+                            }
                             yield Ok(Event::default().data(started_event.to_string()));
 
                             if let Some(snapshot) = selected_initial_state.clone() {
@@ -1493,8 +1768,13 @@ where
                             started = true;
                         }
 
-                        for payload in ag_ui_stream.translate(&event, &selected_thread_id, &run_id) {
+                        let translated = ag_ui_stream.translate(&event, &selected_thread_id, &run_id);
+                        for payload in ag_ui_stream.finish(translated) {
                             yield Ok(Event::default().data(payload.to_string()));
+                        }
+                        // Under 1.0 a run error ends the run: no RUN_FINISHED follows it.
+                        if ag_ui_stream.v1 && ag_ui_stream.errored {
+                            return;
                         }
                     } else if let Some(payload) = serialize_runtime_event(&event, profile) {
                         yield Ok(Event::default().data(payload));
@@ -1514,13 +1794,17 @@ where
                                 yield Ok(Event::default().data(update.to_string()));
                             }
                         }
-                        yield Ok(Event::default().data(json!({
+                        let mut failed = json!({
                             "type": "RUN_ERROR",
                             "threadId": selected_thread_id,
                             "runId": run_id,
                             "message": error_details::display(&error, expose_details),
                             "code": error.code,
-                        }).to_string()));
+                        });
+                        if ag_ui_stream.v1 {
+                            conform_ag_ui_1(&mut failed);
+                        }
+                        yield Ok(Event::default().data(failed.to_string()));
                     } else if let Some(payload) =
                         serialize_runtime_error(&error, profile, expose_details)
                     {
@@ -1551,23 +1835,49 @@ where
             // A run that stopped on held calls is not a success (spec 3.3 §10 S2).
             if !ag_ui_stream.held.is_empty() {
                 match decisions.interrupts(&ag_ui_stream.held).await {
-                    Ok(interrupts) => {
+                    Ok(mut interrupts) => {
+                        if ag_ui_stream.v1 {
+                            // AG-UI 1.0: the thread as it stands, then the interrupts; every
+                            // held call runs on the server once answered.
+                            yield Ok(Event::default().data(json!({
+                                "type": "STATE_SNAPSHOT",
+                                "snapshot": Value::Object(ag_ui_stream.state.clone()),
+                            }).to_string()));
+                            yield Ok(Event::default().data(json!({
+                                "type": "MESSAGES_SNAPSHOT",
+                                "messages": ag_ui_stream.transcript.clone(),
+                            }).to_string()));
+                            for interrupt in &mut interrupts {
+                                if let Some(object) = interrupt.as_object_mut() {
+                                    let metadata = object.entry("metadata").or_insert_with(|| json!({}));
+                                    if let Some(metadata) = metadata.as_object_mut() {
+                                        metadata.insert("ag-ui:tool-execution".into(), json!("server"));
+                                    }
+                                }
+                            }
+                        }
                         finished["outcome"] = json!({ "type": "interrupt", "interrupts": interrupts });
                     }
                     // An interrupt without its inbox entry would say the call cannot be
                     // decided here, so the failure is reported instead.
                     Err(error) => {
-                        yield Ok(Event::default().data(json!({
+                        let mut failed = json!({
                             "type": "RUN_ERROR",
                             "threadId": selected_thread_id,
                             "runId": run_id,
                             "message": "This run is waiting for a decision that could not be \
                                         loaded; answer it in your decisions inbox",
                             "code": error.code,
-                        }).to_string()));
+                        });
+                        if ag_ui_stream.v1 {
+                            conform_ag_ui_1(&mut failed);
+                        }
+                        yield Ok(Event::default().data(failed.to_string()));
                         return;
                     }
                 }
+            } else if ag_ui_stream.v1 {
+                finished["outcome"] = json!({ "type": "success" });
             }
             yield Ok(Event::default().data(finished.to_string()));
         }
@@ -1582,16 +1892,25 @@ fn refused_resume_stream(
     updates: Vec<Value>,
     code: &'static str,
     message: String,
+    v1: bool,
 ) -> std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> {
-    let mut events = vec![json!({ "type": "RUN_STARTED", "threadId": thread_id, "runId": run_id })];
+    let mut started = json!({ "type": "RUN_STARTED", "threadId": thread_id, "runId": run_id });
+    if v1 {
+        started["protocolVersion"] = json!("1.0");
+    }
+    let mut events = vec![started];
     events.extend(updates.into_iter().map(decision_event));
-    events.push(json!({
+    let mut failed = json!({
         "type": "RUN_ERROR",
         "threadId": thread_id,
         "runId": run_id,
         "message": message,
         "code": code,
-    }));
+    });
+    if v1 {
+        conform_ag_ui_1(&mut failed);
+    }
+    events.push(failed);
     Box::pin(futures::stream::iter(
         events.into_iter().map(|event| Ok(Event::default().data(event.to_string()))),
     ))
@@ -1700,7 +2019,8 @@ pub(crate) async fn run_sse_for_request(
             .app_name(app_name.clone())
             .agent(agent)
             .session_service(controller.config.session_service.clone())
-            .governance(controller.config.governance.clone());
+            .governance(controller.config.governance.clone())
+            .session_activity(controller.config.session_activity.clone());
         if let Some(ref artifact_service) = controller.config.artifact_service {
             runner_builder = runner_builder.artifact_service(artifact_service.clone());
         }
@@ -1859,7 +2179,14 @@ pub(crate) async fn run_sse_compat_for_request(
             let run_id = input
                 .and_then(|input| input.run_id.clone())
                 .unwrap_or_else(|| format!("run-{}", Uuid::new_v4()));
-            let stream = refused_resume_stream(thread_id, run_id, updates, code, message);
+            let stream = refused_resume_stream(
+                thread_id,
+                run_id,
+                updates,
+                code,
+                message,
+                speaks_ag_ui_1(input),
+            );
             Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
         };
         // One resume of a session at a time, until its run ends: a second one would start a
@@ -1874,6 +2201,29 @@ pub(crate) async fn run_sse_compat_for_request(
             );
         };
         resume_in_progress = Some(in_progress);
+        // AG-UI 1.0: a resume answers every interrupt still open on the thread, and names no
+        // other.
+        if speaks_ag_ui_1(ag_ui_input.as_ref()) {
+            let open = match open_interrupt_ids(service.as_ref(), &scope).await {
+                Ok(open) => open,
+                Err(error) => return Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string())),
+            };
+            let answered: std::collections::BTreeSet<&str> =
+                resume.entries().iter().map(|entry| entry.interrupt_id.as_str()).collect();
+            let open_set: std::collections::BTreeSet<&str> =
+                open.iter().map(String::as_str).collect();
+            if answered != open_set {
+                return refused(
+                    Vec::new(),
+                    INVALID_RESUME,
+                    format!(
+                        "A resume answers every open interrupt on this thread at once: {} open, {} answered",
+                        open_set.len(),
+                        answered.len()
+                    ),
+                );
+            }
+        }
         // The session's owner decides: the extractor authenticated the user it runs for.
         let approver = adk_core::principal::SubjectRef::human(effective_user_id.clone());
         match plan_resume(
@@ -1891,6 +2241,38 @@ pub(crate) async fn run_sse_compat_for_request(
             ResumeOutcome::Refused { updates, code, message } => {
                 return refused(updates, code, message);
             }
+        }
+    }
+
+    // AG-UI 1.0: new input waits until the thread's open interrupts are answered.
+    if resume_plan.is_none()
+        && speaks_ag_ui_1(ag_ui_input.as_ref())
+        && let Some(service) = decisions.service.clone()
+    {
+        let scope = adk_core::ApprovalScope::new(&app_name, &effective_user_id, &session_id);
+        let open = open_interrupt_ids(service.as_ref(), &scope)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        if !open.is_empty() {
+            let input = ag_ui_input.as_ref();
+            let thread_id = input
+                .and_then(|input| input.thread_id.clone())
+                .unwrap_or_else(|| session_id.clone());
+            let run_id = input
+                .and_then(|input| input.run_id.clone())
+                .unwrap_or_else(|| format!("run-{}", Uuid::new_v4()));
+            let stream = refused_resume_stream(
+                thread_id,
+                run_id,
+                Vec::new(),
+                INTERRUPTS_OPEN,
+                format!(
+                    "This thread waits for {} decision(s); resume with an answer for each first",
+                    open.len()
+                ),
+                true,
+            );
+            return Ok(Sse::new(stream).keep_alive(KeepAlive::default()));
         }
     }
 
@@ -1995,6 +2377,12 @@ pub(crate) async fn run_sse_compat_for_request(
         ag_ui_input.as_ref().map(ag_ui_state_delta).unwrap_or_default(),
     );
 
+    // The agent loads first, so an unknown app reports itself rather than a missing session.
+    let agent = match action_agent {
+        Some(agent) => agent,
+        None => controller.config.agent_loader.load_agent(&app_name).await.map_err(problem)?,
+    };
+
     ensure_session(
         &controller.config.session_service,
         &app_name,
@@ -2002,6 +2390,7 @@ pub(crate) async fn run_sse_compat_for_request(
         &session_id,
         merged_state_delta.clone(),
         expose_details,
+        missing_session_rule(ui_profile),
     )
     .await?;
 
@@ -2025,12 +2414,6 @@ pub(crate) async fn run_sse_compat_for_request(
         )?;
     }
 
-    // Load agent
-    let agent = match action_agent {
-        Some(agent) => agent,
-        None => controller.config.agent_loader.load_agent(&app_name).await.map_err(problem)?,
-    };
-
     // Create runner with streaming config from request
     let streaming_mode =
         if req.streaming { adk_core::StreamingMode::SSE } else { adk_core::StreamingMode::None };
@@ -2047,6 +2430,7 @@ pub(crate) async fn run_sse_compat_for_request(
         .agent(agent)
         .session_service(controller.config.session_service.clone())
         .governance(controller.config.governance.clone())
+        .session_activity(controller.config.session_activity.clone())
         .run_config(run_config.build());
     if let Some(ref artifact_service) = controller.config.artifact_service {
         runner_builder = runner_builder.artifact_service(artifact_service.clone());
@@ -2161,7 +2545,10 @@ pub(crate) async fn run_collect_for_request(
 
     let state_delta = body_state_delta(req.state_delta.as_ref())?;
 
-    // Same behavior as /run_sse.
+    // The agent loads first, so an unknown app reports itself rather than a missing session.
+    let agent = controller.config.agent_loader.load_agent(&app_name).await.map_err(problem)?;
+
+    // An ADK run, as /run_sse without a UI protocol: the session must exist.
     ensure_session(
         &controller.config.session_service,
         &app_name,
@@ -2169,11 +2556,9 @@ pub(crate) async fn run_collect_for_request(
         &session_id,
         state_delta,
         expose_details,
+        MissingSession::Refuse,
     )
     .await?;
-
-    // Load agent
-    let agent = controller.config.agent_loader.load_agent(&app_name).await.map_err(problem)?;
 
     // Create runner — always non-streaming for the plain-JSON endpoint
     let mut runner_builder = adk_runner::Runner::builder()
@@ -2181,6 +2566,7 @@ pub(crate) async fn run_collect_for_request(
         .agent(agent)
         .session_service(controller.config.session_service.clone())
         .governance(controller.config.governance.clone())
+        .session_activity(controller.config.session_activity.clone())
         .run_config(
             adk_core::RunConfig::builder().streaming_mode(adk_core::StreamingMode::None).build(),
         );
@@ -2242,5 +2628,33 @@ mod error_status_tests {
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body["error"]["category"], "conflict");
         assert_eq!(body["error"]["code"], "run_store.stale_epoch");
+    }
+}
+
+#[cfg(test)]
+mod message_part_tests {
+    use super::*;
+
+    #[test]
+    fn a_function_response_part_answers_its_call_by_id() {
+        // The shape adk-python and adk-go clients send to resume a long-running call.
+        let message: NewMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "parts": [{"functionResponse": {
+                "id": "call-approve",
+                "name": "request_approval",
+                "response": {"status": "approved"}
+            }}]
+        }))
+        .unwrap();
+        let content = build_content_from_parts(&message.parts).unwrap();
+        match content.parts.as_slice() {
+            [adk_core::Part::FunctionResponse { function_response, id, .. }] => {
+                assert_eq!(id.as_deref(), Some("call-approve"));
+                assert_eq!(function_response.name, "request_approval");
+                assert_eq!(function_response.response, serde_json::json!({"status": "approved"}));
+            }
+            other => panic!("expected one function response, got {other:?}"),
+        }
     }
 }

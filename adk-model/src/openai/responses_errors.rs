@@ -37,9 +37,9 @@ impl std::error::Error for HttpError {}
 /// body-deserialization error. `Retry-After` and `x-request-id` are captured
 /// before consuming the body.
 pub(super) async fn normalize_response(
-    response: reqwest_openai::Response,
+    response: reqwest::Response,
     open_responses_mode: bool,
-) -> Result<reqwest_openai::Response, OpenAIError> {
+) -> Result<reqwest::Response, OpenAIError> {
     let status = response.status();
     let header = |name| response.headers().get(name).and_then(|value| value.to_str().ok());
     let retry_after = header(http::header::RETRY_AFTER).and_then(parse_retry_after);
@@ -70,11 +70,7 @@ pub(super) async fn normalize_response(
     })))
 }
 
-fn api_error(
-    status: reqwest_openai::StatusCode,
-    bytes: &[u8],
-    open_responses_mode: bool,
-) -> ApiError {
+fn api_error(status: reqwest::StatusCode, bytes: &[u8], open_responses_mode: bool) -> ApiError {
     if let Ok(wrapped) = serde_json::from_slice::<WrappedError>(bytes) {
         return wrapped.error;
     }
@@ -127,7 +123,16 @@ pub(super) fn mapped_http_error(error: &OpenAIError) -> Option<AdkError> {
 
 pub(super) fn map_api_error(api_err: &ApiErrorResponse) -> AdkError {
     let status_code = api_err.status_code.as_u16();
+    // OpenAI answers HTTP 429 both for a rate limit and for an account with no credit.
+    let quota_exhausted = status_code == 402
+        || [api_err.api_error.code.as_deref(), api_err.api_error.r#type.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(crate::error_metadata::is_quota_exhausted);
     let (category, code) = match status_code {
+        _ if quota_exhausted => {
+            (ErrorCategory::ResourceExhausted, "model.openai_responses.quota_exhausted")
+        }
         401 => (ErrorCategory::Unauthorized, "model.openai_responses.unauthorized"),
         403 => (ErrorCategory::Forbidden, "model.openai_responses.forbidden"),
         404 => (ErrorCategory::NotFound, "model.openai_responses.not_found"),
@@ -148,6 +153,7 @@ pub(super) fn map_api_error(api_err: &ApiErrorResponse) -> AdkError {
     )
     .with_provider("openai-responses")
     .with_upstream_status(status_code);
+    let mapped = crate::error_metadata::classify_quota(mapped, quota_exhausted);
     crate::error_metadata::with_first_code(
         mapped,
         [api_err.api_error.code.as_deref(), api_err.api_error.r#type.as_deref()],
@@ -160,7 +166,7 @@ mod tests {
 
     #[test]
     fn quotes_a_bounded_excerpt_of_unrecognized_bodies() {
-        let status = reqwest_openai::StatusCode::BAD_GATEWAY;
+        let status = reqwest::StatusCode::BAD_GATEWAY;
         assert_eq!(
             api_error(status, b"  upstream timed out \n", false).message,
             "HTTP 502 Bad Gateway: upstream timed out"
@@ -177,7 +183,7 @@ mod tests {
     #[test]
     fn bounds_an_echoed_api_message() {
         let error = ApiErrorResponse {
-            status_code: reqwest_openai::StatusCode::BAD_REQUEST,
+            status_code: reqwest::StatusCode::BAD_REQUEST,
             api_error: ApiError {
                 message: format!("Invalid value: '{}'", "x".repeat(4096)),
                 r#type: Some("invalid_request_error".into()),
@@ -203,7 +209,7 @@ mod tests {
     #[test]
     fn preserves_safe_provider_codes() {
         let error = ApiErrorResponse {
-            status_code: reqwest_openai::StatusCode::BAD_REQUEST,
+            status_code: reqwest::StatusCode::BAD_REQUEST,
             api_error: ApiError {
                 message: "invalid".into(),
                 r#type: None,
@@ -219,7 +225,7 @@ mod tests {
     #[test]
     fn falls_back_to_the_error_type() {
         let error = ApiErrorResponse {
-            status_code: reqwest_openai::StatusCode::BAD_REQUEST,
+            status_code: reqwest::StatusCode::BAD_REQUEST,
             api_error: ApiError {
                 message: "invalid".into(),
                 r#type: Some("invalid_request_error".into()),
@@ -233,7 +239,7 @@ mod tests {
 
     async fn http_error_code(body: serde_json::Value) -> Option<serde_json::Value> {
         let response = http::Response::builder().status(400).body(body.to_string()).unwrap();
-        let error = normalize_response(reqwest_openai::Response::from(response), false)
+        let error = normalize_response(reqwest::Response::from(response), false)
             .await
             .expect_err("a 400 is an error");
         let mapped = mapped_http_error(&error).expect("an HTTP error");
@@ -267,10 +273,57 @@ mod tests {
         assert_eq!(http_error_code(serde_json::json!({"error": {"message": "m"}})).await, None);
     }
 
+    #[tokio::test]
+    async fn an_exhausted_quota_is_not_a_rate_limit() {
+        // OpenAI's body for an account with no credit, live on 2026-11-16.
+        let body = serde_json::json!({"error": {
+            "message": "You have no credits remaining.",
+            "type": "insufficient_quota",
+            "param": null,
+            "code": "credit_balance_exhausted"
+        }});
+        let response = http::Response::builder()
+            .status(429)
+            .header("retry-after", "7")
+            .body(body.to_string())
+            .unwrap();
+        let error = normalize_response(reqwest::Response::from(response), false)
+            .await
+            .expect_err("a 429 is an error");
+        let mapped = mapped_http_error(&error).expect("an HTTP error");
+        assert_eq!(
+            (mapped.category, mapped.code, mapped.is_retryable(), mapped.retry.retry_after()),
+            (
+                ErrorCategory::ResourceExhausted,
+                "model.openai_responses.quota_exhausted",
+                false,
+                None
+            )
+        );
+        assert_eq!(mapped.details.upstream_status_code, Some(429));
+        assert_eq!(mapped.details.metadata["provider_error_code"], "credit_balance_exhausted");
+        assert!(mapped.message.contains("add credit or raise the limit"), "{}", mapped.message);
+
+        let rate_limited = ApiErrorResponse {
+            status_code: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            api_error: ApiError {
+                message: "slow down".into(),
+                r#type: Some("requests".into()),
+                param: None,
+                code: Some("rate_limit_exceeded".into()),
+            },
+        };
+        let mapped = map_api_error(&rate_limited);
+        assert_eq!(
+            (mapped.category, mapped.code, mapped.is_retryable()),
+            (ErrorCategory::RateLimited, "model.openai_responses.rate_limited", true)
+        );
+    }
+
     #[test]
     fn drops_unsafe_provider_codes() {
         let error = ApiErrorResponse {
-            status_code: reqwest_openai::StatusCode::BAD_REQUEST,
+            status_code: reqwest::StatusCode::BAD_REQUEST,
             api_error: ApiError {
                 message: "invalid".into(),
                 r#type: None,

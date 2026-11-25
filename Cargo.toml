@@ -85,15 +85,16 @@ members = [
 
     # The prebuilt AWP website: kinds, team, onboarding, jobs (spec 3.5 Part C)
     "adk-website",
+
+    # Local-first perception: media, regions, manifests, traits, runtime (spec 3.7)
+    "adk-vision",
+
+    # The sam-3.1 mask codec, ported from Meta's @meta-sam/parser: SAM License, not Apache-2.0
+    "adk-vision-sam-codec",
 ]
 exclude = [
     # Extracted to standalone repo: https://github.com/zavora-ai/adk-studio
     "adk-studio",
-
-    # Standalone example crates (have their own [workspace] key)
-    "examples/enterprise_custom_tool",
-    "examples/enterprise_hello",
-    "examples/eval_showcase",
 
     # Local-only directories (gitignored, not part of CI)
     "learning",
@@ -148,13 +149,16 @@ repository = "https://github.com/zavora-ai/adk-rust"
 
 [workspace.dependencies]
 # External dependencies
-tokio = { version = "1.40", default-features = false }
+tokio = { version = "1.53.3", default-features = false }
 tokio-stream = "0.1"
 async-trait = "0.1"
 futures = "0.3"
 async-stream = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# YAML in skill frontmatter, site front matter and YAML agent definitions: pure Rust and
+# maintained, where serde_yaml is deprecated and its unsafe-libyaml unmaintained.
+serde-saphyr = { version = "2.1", default-features = false, features = ["serialize", "deserialize"] }
 jsonschema = { version = "0.47", default-features = false }
 thiserror = "2.0"
 anyhow = "1.0"
@@ -166,14 +170,16 @@ tracing-subscriber = "0.3"
 opentelemetry = "0.32"
 # Unify rustls crypto provider to 'aws-lc-rs' across the workspace.
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots", "connect"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots", "multipart"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots", "connect"] }
+# `rustls` is rustls on aws-lc-rs with the platform verifier (the OS trust store), the one
+# crypto provider the workspace uses.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "multipart", "query", "form"] }
 toml = "0.8"
 sha2 = "0.10"
 hex = "0.4"
 flate2 = "1.0"
 tar = "0.4"
-zip = { version = "9.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 livekit = { version = "=0.8.1", default-features = false, features = ["tokio", "native-tls"] }
 # livekit 0.8.1 declares `livekit-data-stream = "0.1"`, and 0.1.2 changed
 # `incoming::Manager::new`'s arity and added a `topic` field, so livekit's own
@@ -183,10 +189,29 @@ livekit-api = { version = "=0.6.1", default-features = false, features = ["servi
 livekit-datatrack = { version = "=0.1.13", default-features = false }
 libwebrtc = { version = "=0.3.43", default-features = false }
 webrtc-sys = { version = "=0.3.40", default-features = false }
+# webrtc-sys 0.3.40 asks for `webrtc-sys-build = "0.3.18"`, whose build script downloads the
+# prebuilt libwebrtc it names. 0.3.21 names webrtc-a545de4, whose headers lack
+# `webrtc::ArrayView`, so webrtc-sys 0.3.40 stops compiling; a consumer's fresh resolve picks
+# 0.3.21 unless a dependency pins it. Pinned with webrtc-sys until the livekit 0.8.4 stack lands.
+webrtc-sys-build = "=0.3.18"
+# The livekit 0.8.1 stack asks for `livekit-protocol = "0.7.12"` and `livekit-common = "0.1.0"`.
+# livekit-protocol 0.7.13 adds `SyncState::data_subscription`, which livekit 0.8.1's struct
+# literal lacks, and livekit-common 0.1.7 moves to livekit-protocol 0.8, so `EncryptionType` no
+# longer converts; either release stops livekit compiling. Pinned until the livekit 0.8.4 stack.
+livekit-protocol = "=0.7.12"
+livekit-common = "=0.1.1"
 
 # Shared database API types; all public pool constructors use this SQLx line.
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
 pgvector = "0.4.2"
+
+# ONNX Runtime for every crate that runs ONNX models. One exact pin: every 2.0.0 pre-release is
+# one Cargo compatibility range, so two exact pins cannot resolve together. It is the version
+# `oar-ocr` 0.11 pins (spec 3.7 Q7). Default features are off so each crate states how it links.
+# `ort` allows one environment per process: crates take it from `adk_core::onnx`. No crate turns
+# on an `api-*` level of 22 or more: from 22 `ort` lets onnxruntime pick each session's device,
+# which on Apple silicon is CoreML, and `oar-ocr` sessions offer no way to opt out.
+ort = { version = "=2.0.0-rc.15", default-features = false }
 
 # ADK internal crates (use { workspace = true } in member crates)
 adk-core = { path = "adk-core", version = "3.0.0" }
@@ -235,3 +260,5 @@ adk-awp = { path = "adk-awp", version = "3.0.0" }
 adk-acp = { path = "adk-acp", version = "3.0.0" }
 adk-site = { path = "adk-site", version = "3.0.0" }
 adk-website = { path = "adk-website", version = "3.0.0" }
+adk-vision = { path = "adk-vision", version = "3.0.0" }
+adk-vision-sam-codec = { path = "adk-vision-sam-codec", version = "3.0.0" }

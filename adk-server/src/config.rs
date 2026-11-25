@@ -323,6 +323,10 @@ pub struct ServerConfig {
     /// [`ServerBuilder::enable_governance_endpoints`](crate::ServerBuilder::enable_governance_endpoints)
     /// is set — fails new runs and stops running ones before their next model or tool call.
     pub governance: adk_core::GovernanceControl,
+    /// The sessions with a turn in flight, shared by every runner the server builds and by the
+    /// session history routes, which refuse to fork, rewind, or edit a session while a turn
+    /// runs on it.
+    pub session_activity: adk_runner::SessionActivity,
 }
 
 impl ServerConfig {
@@ -347,7 +351,28 @@ impl ServerConfig {
             #[cfg(feature = "yaml-agent")]
             yaml_agent_dirs: Vec::new(),
             governance: adk_core::GovernanceControl::new(),
+            session_activity: adk_runner::SessionActivity::new(),
         }
+    }
+
+    /// Shares `activity` with every runner the server builds, so the session history routes
+    /// also see the runs of runners built outside the server, such as a background worker's.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let activity = adk_runner::SessionActivity::new();
+    /// let config = ServerConfig::new(loader, sessions).with_session_activity(activity.clone());
+    /// let worker_runner = Runner::builder()
+    ///     .app_name("ops")
+    ///     .agent(agent)
+    ///     .session_service(sessions)
+    ///     .session_activity(activity)
+    ///     .build()?;
+    /// ```
+    pub fn with_session_activity(mut self, activity: adk_runner::SessionActivity) -> Self {
+        self.session_activity = activity;
+        self
     }
 
     /// Shares `control` with every runner the server builds.
@@ -595,7 +620,7 @@ mod tests {
         async fn create_cache(
             &self,
             _system_instruction: &str,
-            _tools: &std::collections::HashMap<String, serde_json::Value>,
+            _tools: &adk_core::ToolDeclarations,
             _ttl_seconds: u32,
         ) -> adk_core::Result<String> {
             Ok("cache".to_string())

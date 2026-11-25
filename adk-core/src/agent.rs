@@ -8,6 +8,48 @@ use std::sync::Arc;
 /// A pinned, boxed stream of [`Event`] results emitted by an agent during execution.
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<Event>> + Send>>;
 
+/// What kind of agent an agent is, as [`Agent::profile`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentKind {
+    /// An agent that calls a model (`LlmAgent`).
+    Llm,
+    /// Runs its sub-agents one after another (`SequentialAgent`).
+    Sequential,
+    /// Runs its sub-agents at the same time (`ParallelAgent`).
+    Parallel,
+    /// Runs its sub-agents in a loop (`LoopAgent`), at most `max_iterations` times when set.
+    Loop {
+        /// The most iterations the loop runs; `None` for no limit.
+        max_iterations: Option<u32>,
+    },
+    /// Any other agent.
+    #[default]
+    Custom,
+}
+
+/// A tool an agent offers, as [`Agent::profile`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ToolProfile {
+    /// The tool's name.
+    pub name: String,
+    /// What the tool does.
+    pub description: String,
+}
+
+/// What an agent tells callers about itself when they list its skills, such as an A2A
+/// agent card ([`Agent::profile`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentProfile {
+    /// The kind of agent.
+    pub kind: AgentKind,
+    /// The agent's fixed instruction, when it has one.
+    pub instruction: Option<String>,
+    /// The agent's fixed global instruction, when it has one.
+    pub global_instruction: Option<String>,
+    /// The tools the agent always offers, in declaration order.
+    pub tools: Vec<ToolProfile>,
+}
+
 /// Runtime composition features an [`Agent`] can consume or enforce.
 ///
 /// The declaration is intentionally separate from an agent's domain-specific
@@ -189,6 +231,32 @@ pub trait Agent: Send + Sync {
         }
     }
 
+    /// Cancels `task_id`, a task this agent started on another agent, for `acting`: the
+    /// task that waited on it was cancelled, so the input it waits for will never come.
+    ///
+    /// The default does nothing: only an agent that starts tasks elsewhere, such as an A2A
+    /// remote agent, has any to cancel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the other agent cannot be reached or refuses the cancel.
+    async fn cancel_remote_task(
+        &self,
+        _task_id: &str,
+        _acting: &crate::ActingContext,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// What the agent tells callers about itself when they list its skills, such as an A2A
+    /// agent card: its kind, its fixed instructions and its tools.
+    ///
+    /// The default is a [`AgentKind::Custom`] agent with nothing more to say. `LlmAgent`
+    /// and the workflow agents describe themselves.
+    fn profile(&self) -> AgentProfile {
+        AgentProfile::default()
+    }
+
     /// Returns portable composition metadata when this agent owns an explicit topology.
     ///
     /// Leaf agents and legacy composites return `None`. The default keeps this
@@ -300,6 +368,54 @@ pub trait Agent: Send + Sync {
         for agent in self.sub_agents() {
             agent.close().await;
         }
+    }
+
+    /// Readies what this agent's first turn would otherwise start, such as its model's
+    /// connection and its toolsets' servers, so the turn starts without that wait.
+    ///
+    /// `adk_runner::Runner::prewarm` calls this on its root agent. It sends no prompt and
+    /// runs no tool. The default prewarms each of [`sub_agents`](Self::sub_agents); an agent
+    /// that owns a model or toolsets readies them, then its sub-agents.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error a model or toolset gave; a turn would meet the same error.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_core::{Agent, EventStream, InvocationContext, Result};
+    /// use async_trait::async_trait;
+    /// use std::sync::Arc;
+    ///
+    /// struct Leaf;
+    ///
+    /// #[async_trait]
+    /// impl Agent for Leaf {
+    ///     fn name(&self) -> &str {
+    ///         "leaf"
+    ///     }
+    ///     fn description(&self) -> &str {
+    ///         "does nothing"
+    ///     }
+    ///     fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+    ///         &[]
+    ///     }
+    ///     async fn run(&self, _ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
+    ///         Ok(Box::pin(futures::stream::empty()))
+    ///     }
+    /// }
+    ///
+    /// # futures::executor::block_on(async {
+    /// Leaf.prewarm().await?;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// # }).unwrap();
+    /// ```
+    async fn prewarm(&self) -> Result<()> {
+        for agent in self.sub_agents() {
+            agent.prewarm().await?;
+        }
+        Ok(())
     }
 
     /// Screens a user message with the input guardrails of this agent and of every agent

@@ -7,10 +7,12 @@ license.workspace = true
 authors.workspace = true
 description = "Tool system for Rust Agent Development Kit (ADK-Rust) agents (FunctionTool, MCP, Google Search)"
 repository = "https://github.com/zavora-ai/adk-rust"
+homepage.workspace = true
 documentation = "https://docs.rs/adk-tool"
 keywords = ["ai", "agent", "adk", "tools", "mcp"]
 categories = ["api-bindings", "asynchronous"]
 readme = "README.md"
+exclude = ["tests/"]
 
 [features]
 default = []
@@ -24,8 +26,7 @@ mcp = ["dep:rmcp"]
 http-transport = [
     "mcp",
     "rmcp/transport-streamable-http-client-reqwest",
-    "reqwest",
-    "dep:reqwest-mcp",
+    "dep:reqwest",
 ]
 # Enable code execution tools (CodeTool, etc.)
 code = ["dep:adk-code", "dep:adk-sandbox"]
@@ -36,7 +37,7 @@ code-embedded-python = ["code", "adk-code/embedded-python"]
 # Enable Docker SDK-based persistent container execution
 code-docker = ["code", "adk-code/docker"]
 # Enable native Slack toolset (send messages, read channels, reactions, threads)
-slack = ["reqwest"]
+slack = ["dep:reqwest"]
 # Enable native BigQuery toolset (execute SQL, schemas, datasets)
 bigquery = ["dep:gcp-bigquery-client"]
 # Enable native Spanner toolset (execute SQL, schemas, tables)
@@ -47,19 +48,20 @@ mcp-sampling = ["mcp"]
 # extension, keep each tool's `_meta.ui`, leave app-only tools out of the model's tools, and
 # read `ui://` resources back for a host to show sandboxed.
 mcp-apps = ["mcp"]
-# Publish a set of adk_core::Tool as a Streamable HTTP MCP server with a Server Card
-# (spec 3.5 §7.9).
+# Publish a set of adk_core::Tool as an MCP server over Streamable HTTP, with a Server Card
+# (spec 3.5 §7.9), or over stdio.
 mcp-server = [
     "mcp",
     "rmcp/server",
+    "rmcp/transport-io",
     "rmcp/transport-streamable-http-server",
     "dep:axum",
     "dep:sha2",
 ]
 # Enable the Vertex AI Example Store client and few-shot retrieval provider
-example-store = ["adk-gcp", "google-cloud-auth", "reqwest"]
+example-store = ["dep:adk-gcp", "dep:google-cloud-auth", "dep:reqwest"]
 # Enable the Google Agent Registry client and the agent discovery tool
-vertex-agent-registry = ["adk-gcp", "google-cloud-auth", "reqwest"]
+vertex-agent-registry = ["dep:adk-gcp", "dep:google-cloud-auth", "dep:reqwest"]
 
 [dependencies]
 adk-core.workspace = true
@@ -71,7 +73,7 @@ serde.workspace = true
 serde_json.workspace = true
 schemars = "1.0"
 jsonschema = { workspace = true }
-rmcp = { version = "3.1", features = ["client", "transport-child-process", "elicitation"], optional = true }
+rmcp = { version = "3.9", features = ["client", "transport-child-process", "elicitation"], optional = true }
 tracing.workspace = true
 base64 = "0.22"
 uuid.workspace = true
@@ -85,10 +87,6 @@ adk-code = { workspace = true, optional = true }
 adk-sandbox = { workspace = true, optional = true }
 # Optional: HTTP client for remote MCP servers and Slack toolset
 reqwest = { workspace = true, optional = true }
-# rmcp 2.x uses reqwest 0.13 for its Streamable HTTP transport. Keep this
-# transport-specific client separate from the workspace's provider-facing
-# reqwest version until the wider workspace migration is complete.
-reqwest-mcp = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls", "json"], optional = true }
 # Optional: BigQuery toolset
 gcp-bigquery-client = { version = "0.28", optional = true }
 # Optional: Spanner toolset
@@ -125,7 +123,7 @@ adk-code = { path = "../adk-code" }
 adk-sandbox = { path = "../adk-sandbox" }
 # Server side of rmcp, used only to drive an in-process peer in the protocol
 # negotiation tests. Not a runtime dependency: adk-tool is an MCP client.
-rmcp = { version = "3.1", features = ["client", "server", "elicitation"] }
+rmcp = { version = "3.9", features = ["client", "server", "elicitation"] }
 # Mock upstream for the Example Store contract tests.
 axum = "0.8"
 # `Runner::close` reaching an agent's MCP toolset, in the MCP close tests.
@@ -172,6 +170,10 @@ required-features = ["mcp-server", "http-transport"]
 
 [[test]]
 name = "preload_memory_tests"
+required-features = ["memory-tools"]
+
+[[test]]
+name = "memory_expiry_tests"
 required-features = ["memory-tools"]
 
 [[test]]

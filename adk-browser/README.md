@@ -10,21 +10,25 @@ Browser automation tools for ADK-Rust agents using WebDriver (via [thirtyfour](h
 
 ```toml
 [dependencies]
-adk-browser = "3.0"
+adk-browser = "3.0.0"
 ```
 
 Or via the umbrella crate:
 
 ```toml
 [dependencies]
-adk-rust = { version = "3.0", features = ["browser"] }
+adk-rust = { version = "3.0.0", features = ["browser"] }
 ```
 
 ## Overview
 
-This crate provides 46 browser automation tools (44 enabled by default) as ADK `Tool` implementations, allowing LLM agents to interact with web pages. Tools are organized into categories and can be selectively enabled via profiles or builder toggles.
+This crate provides 47 browser automation tools (45 enabled by default) as ADK `Tool` implementations, allowing LLM agents to interact with web pages. Tools are organized into categories and can be selectively enabled via profiles or builder toggles.
 
 `BrowserToolset` implements the `adk_core::Toolset` trait, so it integrates directly with `LlmAgentBuilder::toolset()`.
+
+### Claude's browser use and computer use toolsets
+
+`BrowserUseToolset` offers the members of Claude's `browser_toolset_20260801` (`browser.navigate`, `browser.read_page`, `browser.left_click`, tab management with `browser_state`) over the same `BrowserSession` and navigation policy. `WebDriverComputer` implements `adk_core::ComputerActuator` over the viewport, so `adk_computer_use::ComputerUseToolset` can drive it. Every action runs on the governed tool path; see [Governed Computer Use and Browser Use](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/computer-use/toolsets.md).
 
 ## Security Defaults
 
@@ -32,8 +36,9 @@ This crate provides 46 browser automation tools (44 enabled by default) as ADK `
 |---------|---------|
 | `browser_evaluate_js`, which runs model-written JavaScript in the page, is not included in any toolset or profile | `.with_evaluate_js(true)` (or `.with_js(true)`) |
 | `browser_navigate`, `browser_new_tab`, and `browser_new_window` accept only `http` and `https` URLs, so `file:`, `javascript:`, `data:`, and `chrome:` URLs are refused | `.with_allowed_schemes(["https", "file"])` |
-| The same tools refuse loopback, private, link-local, and cloud metadata addresses (`localhost`, `10.0.0.0/8`, `169.254.169.254`, and host names that resolve to them), and check the page they and `browser_back`, `browser_forward`, and `browser_refresh` end on after redirects, replacing a refused page with `about:blank` | `.with_private_network_access(true)` |
+| The same tools refuse non-public addresses — loopback, private, link-local, shared-address and cloud metadata (`localhost`, `10.0.0.0/8`, `100.64.0.0/10`, `169.254.169.254`, and host names that resolve to them), and check the page they and `browser_back`, `browser_forward`, and `browser_refresh` end on after redirects, replacing a refused page with `about:blank` | `.with_private_network_access(true)` |
 | The same tools refuse host names that do not resolve on the agent host | `.with_unresolved_hosts(true)` |
+| Opt-in: the same tools open only a URL that already appeared in the conversation, in a user message or a tool result, so a model cannot carry data out in a URL it composed; a refused URL fails with `browser.url_not_in_context` before the browser moves | `.with_url_provenance(UrlSources::default())` turns it on |
 | `browser_file_upload` is not included in any toolset or profile; once enabled, it uploads only existing files inside the configured directories, after resolving symlinks | `.with_file_upload(["/srv/agent/uploads"])` |
 | Chrome runs with its sandbox on; `--no-sandbox` is never added, and `chrome_options` cannot replace the argument list | `BrowserConfig::new().add_arg("--no-sandbox")` for containers that run Chrome as root |
 
@@ -93,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Use a profile to limit tools (recommended)
     let toolset = BrowserToolset::with_profile(browser.clone(), BrowserProfile::Scraping);
 
-    let model = GeminiModel::new(std::env::var("GOOGLE_API_KEY")?, "gemini-3.7-flash")?;
+    let model = GeminiModel::new(std::env::var("GOOGLE_API_KEY")?, "gemini-3.8-flash")?;
     let agent = LlmAgentBuilder::new("browser_agent")
         .instruction("Use the browser tools to answer. Reply with the answer only.")
         .model(Arc::new(model))
@@ -136,14 +141,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Tool Profiles
 
-Instead of using all 44 default tools (which can overwhelm LLM context windows), use a profile:
+Instead of using all 45 default tools (which can overwhelm LLM context windows), use a profile:
 
 | Profile | Tools | Use Case |
 |---------|-------|----------|
-| `Minimal` | 19 | Navigation + interaction + extraction + wait + screenshot |
-| `FormFilling` | 19 | Same as Minimal — optimized for form-filling agents |
-| `Scraping` | 13 | Navigation + extraction + screenshot + scroll/hover/alert (no interaction) |
-| `Full` | 44 | Every tool except `browser_evaluate_js` and `browser_file_upload` — use only when full browser control is needed |
+| `Minimal` | 20 | Navigation + interaction + extraction + wait + screenshot |
+| `FormFilling` | 20 | Same as Minimal — optimized for form-filling agents |
+| `Scraping` | 14 | Navigation + extraction + screenshot + scroll/hover/alert (no interaction) |
+| `Full` | 45 | Every tool except `browser_evaluate_js` and `browser_file_upload` — use only when full browser control is needed |
 
 `BrowserToolset::new` is the `Full` profile. For even fewer tools, use the helper functions,
 which apply the default URL policy:
@@ -159,7 +164,7 @@ fn main() {
     let browser = Arc::new(BrowserSession::new(BrowserConfig::new()));
 
     let form_filling = BrowserToolset::with_profile(browser.clone(), BrowserProfile::FormFilling);
-    assert_eq!(form_filling.all_tools().len(), 19);
+    assert_eq!(form_filling.all_tools().len(), 20);
 
     // 6 tools: navigate, click, type, extract_text, wait_for_element, screenshot
     assert_eq!(minimal_browser_tools(browser.clone()).len(), 6);
@@ -179,7 +184,7 @@ fn main() {
         .with_windows(false)
         .with_frames(false)
         .with_actions(false);
-    assert_eq!(custom.all_tools().len(), 19);
+    assert_eq!(custom.all_tools().len(), 20);
 }
 ```
 
@@ -287,7 +292,35 @@ fn config() -> BrowserConfig {
 
 Then open `http://localhost:7900` to watch the browser in real-time.
 
-### Category Filtering
+## Live Frames
+
+To show a person what the agent sees without a remote desktop, start a frame feed. It takes a
+WebDriver screenshot on an interval, only while the session runs, and keeps the latest frame
+that differs from the one before:
+
+```rust,no_run
+use std::sync::Arc;
+use std::time::Duration;
+
+use adk_browser::{BrowserConfig, BrowserSession};
+
+async fn watch() -> adk_core::Result<()> {
+    let session = Arc::new(BrowserSession::new(BrowserConfig::new()));
+    session.start().await?;
+    let mut feed = session.frames(Duration::from_secs(1));
+    while let Some(frame) = feed.next().await {
+        // Relay frame.png_base64 to the viewer, e.g. as a server-sent event.
+        let _ = (frame.seq, &frame.png_base64);
+    }
+    Ok(())
+}
+```
+
+It needs no port beyond WebDriver's and nothing the page can reach, so it suits a browser in a
+sealed sandbox, where `observable()` and noVNC should not be exposed. The feed ends when its
+session is dropped or its last handle is.
+
+## Category Filtering
 
 Fine-tune which tool categories are included:
 
@@ -310,7 +343,7 @@ fn toolset(session: Arc<BrowserSession>) -> BrowserToolset {
 }
 ```
 
-## Available Tools (46, 44 by default)
+## Available Tools (47, 45 by default)
 
 ### Navigation (4 tools)
 | Tool | Description |
@@ -329,7 +362,7 @@ fn toolset(session: Arc<BrowserSession>) -> BrowserToolset {
 | `browser_clear` | Clear an input field |
 | `browser_select` | Select from dropdown by value, text, or index |
 
-### Extraction (5 tools)
+### Extraction (6 tools)
 | Tool | Description |
 |------|-------------|
 | `browser_extract_text` | Extract text from one or all matching elements |
@@ -337,6 +370,7 @@ fn toolset(session: Arc<BrowserSession>) -> BrowserToolset {
 | `browser_extract_links` | Extract all links from page or container |
 | `browser_page_info` | Get current URL and title |
 | `browser_page_source` | Get HTML source (with max_length truncation) |
+| `browser_elements` | Visible interactive elements with rectangles in CSS pixels, the device pixel ratio and a unique selector each, for set-of-marks grounding: draw them with `vision_annotate`, click the chosen one with `browser_click` by selector |
 
 ### Screenshots (1 tool)
 | Tool | Description |

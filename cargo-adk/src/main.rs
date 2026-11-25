@@ -17,6 +17,10 @@
 //! cargo adk validate --yaml agent.yaml      # validate agent definition
 //! cargo adk deploy                          # deploy to platform
 //! cargo adk deploy --stream-output          # deploy with JSON event streaming
+//! cargo adk deploy --target container --plan  # render the Dockerfile, Compose and Kubernetes files
+//! cargo adk deploy --target agent-engine --image IMAGE  # deploy to Agent Engine (feature gcp)
+//! cargo adk deploy --target ecs-express --image IMAGE   # deploy to Amazon ECS Express Mode (feature aws)
+//! cargo adk deploy --target azure-container-apps --image IMAGE  # deploy to Azure Container Apps (feature azure)
 //! cargo adk eval tests/ --agent-cmd "target/release/my-agent --eval"  # run eval sets
 //! cargo adk eval --ledger ledger.jsonl      # gate on drift in an exported activity ledger
 //! ```
@@ -26,7 +30,9 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use cargo_adk::codegen::generate_project_with_registry;
+use cargo_adk::codegen::{
+    generate_pattern_readme, generate_project_with_registry, generate_readme,
+};
 use cargo_adk::composition::{DryRunFile, DryRunOutput, resolve_composition};
 use cargo_adk::registry::TemplateRegistry;
 
@@ -143,8 +149,36 @@ enum AdkCommand {
         rust: Option<PathBuf>,
     },
 
-    /// Deploy the agent to the ADK platform
+    /// Deploy the agent to the ADK platform, or to a deploy target with --target
     Deploy {
+        /// Where to deploy: the ADK platform control plane, or a deploy target
+        #[arg(long, value_enum, default_value_t = TargetName::Platform)]
+        target: TargetName,
+
+        /// Container image to deploy with --target (default: `[targets.<name>] image`)
+        #[arg(long)]
+        image: Option<String>,
+
+        /// Deployment manifest
+        #[arg(long, default_value = "adk-deploy.toml")]
+        manifest: PathBuf,
+
+        /// Write and print what --target would create, without deploying
+        #[arg(long, conflicts_with_all = ["status", "destroy"])]
+        plan: bool,
+
+        /// Report the state of a deployment on --target
+        #[arg(long, value_name = "DEPLOYMENT_ID", conflicts_with = "destroy")]
+        status: Option<String>,
+
+        /// Remove a deployment from --target
+        #[arg(long, value_name = "DEPLOYMENT_ID")]
+        destroy: Option<String>,
+
+        /// Skip the health and authentication check of the deployed endpoint
+        #[arg(long)]
+        no_verify: bool,
+
         /// Target environment
         #[arg(long, default_value = "production")]
         environment: String,
@@ -184,7 +218,9 @@ enum AdkCommand {
     /// stdin and writes one JSON response per line on stdout:
     /// request `{"case_id","turn","user_text","session_id"}`, response
     /// `{"text","tool_calls":[{"name","args"}]}` or `{"error"}`. Every turn of a case shares
-    /// a session_id. Logs go to stderr.
+    /// a session_id. Logs go to stderr. A turn that shows image fixtures adds
+    /// `"images":[{"path","digest","mime_type"}]`, verified before the run; a tool call may
+    /// add its `"response"`, which the vision criteria score.
     ///
     /// `--ledger <export.jsonl>` instead runs the ledger statistics over an exported activity
     /// ledger and exits non-zero on a meaningful deviation of its last day from the baseline.
@@ -205,7 +241,8 @@ enum AdkCommand {
             value_name = "EXPORT.JSONL",
             conflicts_with_all = [
                 "path", "agent_cmd", "criteria", "judge_model", "save_baseline",
-                "check_regression", "baseline", "tolerance", "turn_timeout",
+                "check_regression", "baseline", "tolerance", "turn_timeout", "num_runs",
+                "min_pass_rate", "judge_max_calls", "judge_max_cost_usd",
             ]
         )]
         ledger: Option<PathBuf>,
@@ -252,12 +289,30 @@ enum AdkCommand {
         /// Seconds to wait for each agent response before failing the case
         #[arg(long, default_value = "300")]
         turn_timeout: u64,
+
+        /// Run the eval set this many times and report each case's pass rate, score mean
+        /// and variance, and flakiness
+        #[arg(long, default_value = "1")]
+        num_runs: usize,
+
+        /// Fraction of runs, from 0.0 to 1.0, a case must pass (default: every run)
+        #[arg(long, default_value = "1.0")]
+        min_pass_rate: f64,
+
+        /// Most --judge-model calls across every run; the evaluation stops when they are spent
+        #[arg(long)]
+        judge_max_calls: Option<u64>,
+
+        /// Most --judge-model spend in US dollars across every run; the evaluation stops when
+        /// it is spent
+        #[arg(long)]
+        judge_max_cost_usd: Option<f64>,
     },
 
     /// Run performance benchmarks against real LLM APIs
     Bench {
-        /// LLM model identifier (e.g., "gemini-3.7-flash")
-        #[arg(long, default_value = "gemini-3.7-flash")]
+        /// LLM model identifier (e.g., "gemini-3.8-flash")
+        #[arg(long, default_value = "gemini-3.8-flash")]
         model: String,
 
         /// Number of measurement iterations per workload
@@ -462,6 +517,13 @@ fn main() {
             }
         }
         AdkCommand::Deploy {
+            target,
+            image,
+            manifest,
+            plan,
+            status,
+            destroy,
+            no_verify,
             environment,
             token,
             server,
@@ -476,7 +538,28 @@ fn main() {
                 .build()
                 .expect("failed to create tokio runtime");
 
+            if target != TargetName::Platform {
+                let action = match (plan, status, destroy) {
+                    (true, _, _) => TargetAction::Plan,
+                    (false, Some(id), _) => TargetAction::Status(id),
+                    (false, None, Some(id)) => TargetAction::Destroy(id),
+                    (false, None, None) => TargetAction::Deploy { verify: !no_verify },
+                };
+                if let Err(e) = rt.block_on(run_target(target, &manifest, image, action)) {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+            if plan || status.is_some() || destroy.is_some() || image.is_some() {
+                eprintln!(
+                    "Error: --plan, --status, --destroy and --image apply to a deploy target; pass --target"
+                );
+                std::process::exit(2);
+            }
+
             if let Err(e) = rt.block_on(run_deploy(
+                manifest,
                 environment,
                 token,
                 server,
@@ -517,6 +600,10 @@ fn main() {
             format,
             output,
             turn_timeout,
+            num_runs,
+            min_pass_rate,
+            judge_max_calls,
+            judge_max_cost_usd,
             ledger: None,
             floors: _,
         } => {
@@ -532,6 +619,10 @@ fn main() {
                 format,
                 output,
                 turn_timeout: std::time::Duration::from_secs(turn_timeout),
+                num_runs,
+                min_pass_rate,
+                judge_max_calls,
+                judge_max_cost_usd,
             };
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -551,6 +642,14 @@ fn main() {
             eprintln!("Error: cargo adk eval needs a path and --agent-cmd, or --ledger");
             std::process::exit(2);
         }
+        #[cfg(not(feature = "bench"))]
+        AdkCommand::Bench { .. } => {
+            eprintln!(
+                "Error: cargo adk bench is not in this build; install it with `cargo install cargo-adk --features bench`"
+            );
+            std::process::exit(2);
+        }
+        #[cfg(feature = "bench")]
         AdkCommand::Bench {
             model,
             runs,
@@ -782,7 +881,7 @@ fn validate_yaml(
         fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
 
     // Parse as YAML and validate structure
-    let value: Result<serde_json::Value, _> = serde_yaml_ng::from_str(&content);
+    let value: Result<serde_json::Value, _> = serde_saphyr::from_str(&content);
     match value {
         Err(e) => {
             errors.push(format!("YAML parse error: {e}"));
@@ -885,6 +984,7 @@ fn validate_rust(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_deploy(
+    manifest_path: PathBuf,
     environment: String,
     token: Option<String>,
     server: String,
@@ -900,7 +1000,7 @@ async fn run_deploy(
     };
     use sha2::{Digest, Sha256};
 
-    let manifest_path = Path::new("adk-deploy.toml");
+    let manifest_path = manifest_path.as_path();
     let manifest = DeploymentManifest::from_path(manifest_path)
         .map_err(|e| format!("failed to load manifest: {e}"))?;
 
@@ -1149,8 +1249,253 @@ async fn run_deploy(
     Ok(())
 }
 
+// ── Deploy targets ──────────────────────────────────────────────
+
+/// `cargo adk deploy --target`: the ADK platform, or a provider-neutral deploy target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum TargetName {
+    /// The ADK platform control plane (`--server`)
+    Platform,
+    /// Dockerfile, Docker Compose and Kubernetes manifests; no cloud account needed
+    Container,
+    /// Agent Engine on Google Cloud (cargo-adk feature `gcp`)
+    AgentEngine,
+    /// Amazon ECS Express Mode (cargo-adk feature `aws`)
+    EcsExpress,
+    /// Azure Container Apps (cargo-adk feature `azure`)
+    AzureContainerApps,
+}
+
+impl TargetName {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Platform => "platform",
+            Self::Container => "container",
+            Self::AgentEngine => "agent-engine",
+            Self::EcsExpress => "ecs-express",
+            Self::AzureContainerApps => "azure-container-apps",
+        }
+    }
+}
+
+/// How long `cargo adk deploy --target` waits for a new endpoint to pass its health check; a
+/// cloud load balancer takes minutes to register its first target.
+const VERIFY_TIMEOUT_SECS: u64 = 300;
+
+/// What `cargo adk deploy --target` does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetAction {
+    Plan,
+    Deploy { verify: bool },
+    Status(String),
+    Destroy(String),
+}
+
+async fn build_target(
+    name: TargetName,
+    project_dir: &Path,
+    manifest: &adk_deploy::DeploymentManifest,
+) -> Result<Box<dyn adk_deploy::targets::DeployTarget>, String> {
+    match name {
+        TargetName::Platform => Err("the platform is not a deploy target".to_string()),
+        TargetName::Container => {
+            adk_deploy::targets::container::ContainerTarget::from_manifest(project_dir, manifest)
+                .map(|target| Box::new(target) as Box<dyn adk_deploy::targets::DeployTarget>)
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(feature = "gcp")]
+        TargetName::AgentEngine => adk_deploy::gcp::AgentEngineTarget::from_manifest(manifest)
+            .map(|target| Box::new(target) as Box<dyn adk_deploy::targets::DeployTarget>)
+            .map_err(|e| e.to_string()),
+        #[cfg(not(feature = "gcp"))]
+        TargetName::AgentEngine => Err(missing_target_feature(name, "gcp")),
+        #[cfg(feature = "aws")]
+        TargetName::EcsExpress => adk_deploy::aws::EcsExpressTarget::from_manifest(manifest)
+            .await
+            .map(|target| Box::new(target) as Box<dyn adk_deploy::targets::DeployTarget>)
+            .map_err(|e| e.to_string()),
+        #[cfg(not(feature = "aws"))]
+        TargetName::EcsExpress => Err(missing_target_feature(name, "aws")),
+        #[cfg(feature = "azure")]
+        TargetName::AzureContainerApps => {
+            adk_deploy::azure::ContainerAppsTarget::from_manifest(manifest)
+                .map(|target| Box::new(target) as Box<dyn adk_deploy::targets::DeployTarget>)
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(feature = "azure"))]
+        TargetName::AzureContainerApps => Err(missing_target_feature(name, "azure")),
+    }
+}
+
+#[cfg(any(not(feature = "gcp"), not(feature = "aws"), not(feature = "azure")))]
+fn missing_target_feature(name: TargetName, feature: &str) -> String {
+    format!(
+        "--target {} needs cargo-adk built with the `{feature}` feature: cargo install cargo-adk --features {feature}",
+        name.as_str()
+    )
+}
+
+/// The image `--target` deploys: `--image`, then `[targets.<name>] image`, then the container
+/// target's `<agent name>:<version>`.
+fn resolve_image(
+    name: TargetName,
+    image: Option<String>,
+    project_dir: &Path,
+    manifest: &adk_deploy::DeploymentManifest,
+) -> Result<String, String> {
+    if let Some(image) = image {
+        return Ok(image);
+    }
+    let configured = manifest
+        .targets
+        .get(name.as_str())
+        .and_then(|table| table.get("image"))
+        .and_then(serde_json::Value::as_str);
+    if let Some(image) = configured {
+        return Ok(image.to_string());
+    }
+    if name == TargetName::Container {
+        let target =
+            adk_deploy::targets::container::ContainerTarget::from_manifest(project_dir, manifest)
+                .map_err(|e| e.to_string())?;
+        return Ok(target.default_image(manifest));
+    }
+    Err(format!(
+        "--target {} needs a container image: pass --image or set image in [targets.{}]",
+        name.as_str(),
+        name.as_str()
+    ))
+}
+
+async fn run_target(
+    name: TargetName,
+    manifest_path: &Path,
+    image: Option<String>,
+    action: TargetAction,
+) -> Result<(), String> {
+    use adk_deploy::DeploymentManifest;
+    use adk_deploy::targets::{DeployRequest, verify_endpoint_within};
+
+    let manifest = DeploymentManifest::from_path(manifest_path)
+        .map_err(|e| format!("failed to load manifest: {e}"))?;
+    let project_dir = match manifest_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let target = build_target(name, &project_dir, &manifest).await?;
+
+    match action {
+        TargetAction::Status(id) => {
+            let status = target.status(&id).await.map_err(|e| e.to_string())?;
+            println!("{}", serde_json::to_string_pretty(&status).unwrap_or_default());
+            return Ok(());
+        }
+        TargetAction::Destroy(id) => {
+            target.destroy(&id).await.map_err(|e| e.to_string())?;
+            println!("Removed {id} from target {}", name.as_str());
+            return Ok(());
+        }
+        TargetAction::Plan | TargetAction::Deploy { .. } => {}
+    }
+
+    let image = resolve_image(name, image, &project_dir, &manifest)?;
+    let request = DeployRequest::new(manifest, image);
+    let plan = target.plan(&request).map_err(|e| e.to_string())?;
+    print_plan(&plan);
+
+    match action {
+        TargetAction::Plan => {
+            let written = write_plan(name, &project_dir, &request.manifest, &plan).await?;
+            println!("\nWrote {} file(s) to {}", plan.resources.len(), written.display());
+            Ok(())
+        }
+        TargetAction::Deploy { verify } => {
+            println!("\nDeploying to target {}...", name.as_str());
+            let outcome = target.deploy(&request).await.map_err(|e| e.to_string())?;
+            println!("{}", serde_json::to_string_pretty(&outcome).unwrap_or_default());
+            if let (true, Some(endpoint)) = (verify, outcome.endpoint.as_deref()) {
+                println!(
+                    "Checking {endpoint} (up to {VERIFY_TIMEOUT_SECS}s for it to pass its health check)..."
+                );
+                let report = verify_endpoint_within(
+                    endpoint,
+                    &plan.runtime,
+                    std::time::Duration::from_secs(VERIFY_TIMEOUT_SECS),
+                    std::time::Duration::from_secs(10),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                println!(
+                    "Verified {endpoint}: health {}, unauthenticated API {}",
+                    report.health_status, report.unauthenticated_status
+                );
+                for warning in &report.warnings {
+                    println!("  warning: {warning}");
+                }
+            }
+            Ok(())
+        }
+        TargetAction::Status(_) | TargetAction::Destroy(_) => Ok(()),
+    }
+}
+
+fn print_plan(plan: &adk_deploy::targets::DeployPlan) {
+    let runtime = &plan.runtime;
+    println!(
+        "Plan for target {}: {} {} from image {}",
+        plan.target, runtime.name, runtime.version, runtime.image
+    );
+    for resource in &plan.resources {
+        println!("  {:<40} {}", resource.kind, resource.name);
+    }
+    let secrets: Vec<&str> = runtime.secret_keys().into_iter().collect();
+    if secrets.is_empty() {
+        println!("Secrets: none");
+    } else {
+        println!("Secrets from the provider's secret store: {}", secrets.join(", "));
+    }
+    println!(
+        "Ingress: {}; callers authenticate: {}",
+        if runtime.public { "public" } else { "internal" },
+        if runtime.auth_required { "yes" } else { "no" }
+    );
+    for warning in &runtime.warnings {
+        println!("  warning: {warning}");
+    }
+}
+
+/// Writes the plan's resources: the container target's files into its output directory, and
+/// every other target's provider requests into `.adk-deploy/<target>/`.
+async fn write_plan(
+    name: TargetName,
+    project_dir: &Path,
+    manifest: &adk_deploy::DeploymentManifest,
+    plan: &adk_deploy::targets::DeployPlan,
+) -> Result<PathBuf, String> {
+    if name == TargetName::Container {
+        let target =
+            adk_deploy::targets::container::ContainerTarget::from_manifest(project_dir, manifest)
+                .map_err(|e| e.to_string())?;
+        return target.write_files(plan).await.map_err(|e| e.to_string());
+    }
+    let dir = project_dir.join(".adk-deploy").join(name.as_str());
+    fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+    for resource in &plan.resources {
+        let file: String = resource
+            .kind
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+            .collect();
+        let path = dir.join(format!("{file}.json"));
+        fs::write(&path, &resource.body)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    }
+    Ok(dir)
+}
+
 // ── Bench command ───────────────────────────────────────────────
 
+#[cfg(feature = "bench")]
 #[allow(clippy::too_many_arguments)]
 async fn run_bench(
     model: String,
@@ -1413,13 +1758,13 @@ fn get_builtin_templates() -> Vec<TemplateInfo> {
         },
         TemplateInfo {
             name: "api",
-            description: "REST API server with /chat and /health endpoints",
+            description: "REST API server exposing the agent over HTTP",
             default_provider: "gemini",
             features: vec!["minimal", "server"],
         },
         TemplateInfo {
             name: "openai",
-            description: "OpenAI-powered agent (gpt-5.6-terra)",
+            description: "OpenAI-powered agent (gpt-6.1-sol)",
             default_provider: "openai",
             features: vec!["agents", "models", "openai", "runner", "sessions"],
         },
@@ -1739,6 +2084,16 @@ fn create_project_composable(
     // Generate project files
     let mut files = generate_project_with_registry(&registry, &manifest, name);
 
+    // A pattern's README names the pattern, unless its template ships its own README.
+    if let Some(pattern) = registry.resolve_pattern(template) {
+        let generic = generate_readme(&manifest, name);
+        if let Some(readme) =
+            files.iter_mut().find(|f| f.path == "README.md" && f.content == generic)
+        {
+            readme.content = generate_pattern_readme(&manifest, name, pattern);
+        }
+    }
+
     // Optionally include a YAML agent definition
     if with_yaml {
         files.push(cargo_adk::composition::GeneratedFile {
@@ -1857,24 +2212,24 @@ fn generate_yaml_definition(
     let model_id = model_override.unwrap_or(match provider {
         "openai" => adk_model::catalog::OPENAI_DEFAULT,
         "anthropic" => adk_model::catalog::ANTHROPIC_DEFAULT,
-        "deepseek" => "deepseek-v4-flash",
+        "deepseek" => adk_model::catalog::DEEPSEEK_DEFAULT,
         "ollama" => adk_model::catalog::OLLAMA_DEFAULT,
         "groq" => adk_model::catalog::GROQ_DEFAULT,
-        "openrouter" => "qwen/qwen3.7-max",
+        "openrouter" => adk_model::catalog::OPENROUTER_DEFAULT,
         "fireworks" => adk_model::catalog::FIREWORKS_DEFAULT,
         "together" => adk_model::catalog::TOGETHER_DEFAULT,
         "cerebras" => adk_model::catalog::CEREBRAS_DEFAULT,
         "sambanova" => adk_model::catalog::SAMBANOVA_DEFAULT,
-        "bedrock" => "anthropic.claude-opus-4-6-v1",
+        "bedrock" => "global.anthropic.claude-sonnet-5-5",
         "azure-ai" => "gpt-5.5",
         "xai" => adk_model::catalog::XAI_DEFAULT,
         "mistral" => adk_model::catalog::MISTRAL_DEFAULT,
-        "perplexity" => "sonar-pro",
+        "perplexity" => adk_model::catalog::PERPLEXITY_DEFAULT,
         "minimax" => adk_model::catalog::MINIMAX_DEFAULT,
         "bytedance" => "doubao-1-5-pro-256k",
         "zhipu" => adk_model::catalog::ZHIPU_DEFAULT,
         "baidu" => adk_model::catalog::BAIDU_DEFAULT,
-        "cohere" => "command-a-plus-05-2026",
+        "cohere" => adk_model::catalog::COHERE_DEFAULT,
         _ => adk_model::catalog::GEMINI_DEFAULT,
     });
 
@@ -1927,20 +2282,20 @@ fn provider_dep(provider: &str) -> (String, &str, &str) {
         "openai" => (
             adk_rust_dep(&provider_features(provider)),
             r#"let model = adk_rust::model::openai::OpenAIClient::new(
-        adk_rust::model::openai::OpenAIConfig::new(&api_key, "gpt-5.6-terra"),
+        adk_rust::model::openai::OpenAIConfig::new(&api_key, "gpt-6.1-sol"),
     )?;"#,
             "OPENAI_API_KEY",
         ),
         "anthropic" => (
             adk_rust_dep(&provider_features(provider)),
             r#"let model = adk_rust::model::anthropic::AnthropicClient::new(
-        adk_rust::model::anthropic::AnthropicConfig::new(&api_key, "claude-sonnet-5"),
+        adk_rust::model::anthropic::AnthropicConfig::new(&api_key, "claude-sonnet-5-5"),
     )?;"#,
             "ANTHROPIC_API_KEY",
         ),
         _ => (
             adk_rust_dep(&provider_features("gemini")),
-            r#"let model = adk_rust::model::GeminiModel::new(&api_key, "gemini-3.7-flash")?;"#,
+            r#"let model = adk_rust::model::GeminiModel::new(&api_key, "gemini-3.8-flash")?;"#,
             "GOOGLE_API_KEY",
         ),
     }
@@ -2195,13 +2550,14 @@ async fn main() -> anyhow::Result<()> {{
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     // Loopback by default. Set BIND_HOST=0.0.0.0 to expose this agent, and configure
-    // authentication before you do: the A2A JSON-RPC routes run agent and tool work — and
-    // incur its cost — on behalf of whoever calls them.
+    // authentication before you do: the run routes run agent and tool work — and incur its
+    // cost — on behalf of whoever calls them.
     let host = std::env::var("BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let addr = format!("{{host}}:{{port}}");
     println!("ADK agent server running on http://{{addr}}");
-    println!("  POST /chat          — send messages");
-    println!("  GET  /health        — health check");
+    println!("  GET  /api/health                              — health check");
+    println!("  POST /api/sessions                            — create a session (appName, userId)");
+    println!("  POST /api/run/{name}/<user_id>/<session_id>   — send a message, SSE response");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
@@ -2294,8 +2650,10 @@ async fn main() -> anyhow::Result<()> {{
         .build()?;
 
     println!("A2A agent server running on http://{{addr}}");
-    println!("  GET  /.well-known/agent-card.json — agent card");
-    println!("  POST /jsonrpc                     — JSON-RPC endpoint");
+    println!("  GET  /.well-known/agent-card.json — A2A v1 agent card");
+    println!("  GET  /.well-known/agent.json      — A2A 0.3 agent card");
+    println!("  POST /a2a/v1                      — A2A v1 JSON-RPC (header A2A-Version: 1.0)");
+    println!("  POST /a2a, POST /a2a/stream       — A2A 0.3 JSON-RPC");
 
     server.serve().await?;
     Ok(())
@@ -2358,7 +2716,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {{
     let agent = client
         .create_agent(CreateAgentParams {{
             name: "{name}".to_string(),
-            model: serde_json::json!("claude-sonnet-5"),
+            model: serde_json::json!("claude-sonnet-5-5"),
             system: Some("You are a helpful assistant. Be concise.".to_string()),
             description: None,
             tools: vec![ToolConfig::agent_toolset()],
@@ -2428,6 +2786,117 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {{
 mod tests {
     use super::*;
 
+    fn deploy_args(argv: &[&str]) -> AdkCommand {
+        let mut full = vec!["cargo", "adk", "deploy"];
+        full.extend_from_slice(argv);
+        match Cargo::try_parse_from(full).expect("argv parses").command {
+            CargoSubcommand::Adk(cli) => cli.command,
+        }
+    }
+
+    #[test]
+    fn deploy_defaults_to_the_platform_and_takes_a_target() {
+        let AdkCommand::Deploy { target, plan, manifest, .. } = deploy_args(&[]) else {
+            panic!("not deploy");
+        };
+        assert_eq!(
+            (target, plan, manifest),
+            (TargetName::Platform, false, PathBuf::from("adk-deploy.toml"))
+        );
+        let AdkCommand::Deploy { target, plan, image, .. } =
+            deploy_args(&["--target", "container", "--plan", "--image", "demo:1"])
+        else {
+            panic!("not deploy");
+        };
+        assert_eq!((target, plan, image.as_deref()), (TargetName::Container, true, Some("demo:1")));
+        assert!(
+            Cargo::try_parse_from([
+                "cargo",
+                "adk",
+                "deploy",
+                "--target",
+                "container",
+                "--plan",
+                "--status",
+                "x"
+            ])
+            .is_err(),
+            "--plan and --status are exclusive"
+        );
+        assert!(Cargo::try_parse_from(["cargo", "adk", "deploy", "--target", "nowhere"]).is_err());
+    }
+
+    fn target_manifest(extra: &str) -> adk_deploy::DeploymentManifest {
+        toml::from_str(&format!(
+            "[agent]\nname = \"demo\"\nbinary = \"demo\"\nversion = \"0.2.0\"\n\n[[services]]\nname = \"sessions\"\nkind = \"in-memory\"\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_image_comes_from_the_flag_then_the_target_table_then_the_default() {
+        let dir = Path::new(".");
+        let plain = target_manifest("");
+        assert_eq!(
+            resolve_image(TargetName::Container, Some("flag:1".into()), dir, &plain).unwrap(),
+            "flag:1"
+        );
+        assert_eq!(resolve_image(TargetName::Container, None, dir, &plain).unwrap(), "demo:0.2.0");
+        let configured = target_manifest("[targets.agent-engine]\nimage = \"gcr.io/p/demo:7\"\n");
+        assert_eq!(
+            resolve_image(TargetName::AgentEngine, None, dir, &configured).unwrap(),
+            "gcr.io/p/demo:7"
+        );
+        assert!(
+            resolve_image(TargetName::AgentEngine, None, dir, &plain)
+                .unwrap_err()
+                .contains("--target agent-engine needs a container image")
+        );
+    }
+
+    #[tokio::test]
+    async fn target_plan_writes_the_container_files() {
+        let project = tempfile::tempdir().unwrap();
+        let manifest_path = project.path().join("adk-deploy.toml");
+        fs::write(
+            &manifest_path,
+            "[agent]\nname = \"demo\"\nbinary = \"demo\"\n\n[[services]]\nname = \"sessions\"\nkind = \"in-memory\"\n",
+        )
+        .unwrap();
+        run_target(TargetName::Container, &manifest_path, None, TargetAction::Plan).await.unwrap();
+        let out = project.path().join(".adk-deploy/container");
+        for file in ["Dockerfile", "Dockerfile.dockerignore", "compose.yaml", "kubernetes.yaml"] {
+            assert!(out.join(file).is_file(), "{file}");
+        }
+        let compose = fs::read_to_string(out.join("compose.yaml")).unwrap();
+        assert!(compose.contains("image: \"demo:0.1.0\""), "{compose}");
+    }
+
+    #[cfg(not(feature = "aws"))]
+    #[tokio::test]
+    async fn a_target_compiled_out_names_the_feature_to_enable() {
+        let error = build_target(TargetName::EcsExpress, Path::new("."), &target_manifest(""))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            "--target ecs-express needs cargo-adk built with the `aws` feature: cargo install cargo-adk --features aws"
+        );
+    }
+
+    #[tokio::test]
+    async fn target_plan_refuses_a_manifest_that_breaks_a_guarantee() {
+        let project = tempfile::tempdir().unwrap();
+        let manifest_path = project.path().join("adk-deploy.toml");
+        fs::write(&manifest_path, "[agent]\nname = \"demo\"\nbinary = \"demo\"\n").unwrap();
+        let error = run_target(TargetName::Container, &manifest_path, None, TargetAction::Plan)
+            .await
+            .unwrap_err();
+        assert!(error.contains("declare the session store"), "{error}");
+        assert!(!project.path().join(".adk-deploy").exists());
+    }
+
     #[test]
     fn bench_accepts_no_task_quality_suite() {
         // The τ²-bench and BFCL adapters do not run a model, so no flag selects them.
@@ -2482,6 +2951,31 @@ mod tests {
     }
 
     #[test]
+    fn server_banners_name_only_routes_the_server_serves() {
+        // `create_app` serves the REST API under `/api`; A2aServer adds the A2A v1 and 0.3 routes.
+        let (_, api_main, _) = generate_api("assistant", "anthropic");
+        for route in ["GET  /api/health", "POST /api/sessions", "POST /api/run/assistant/"] {
+            assert!(api_main.contains(route), "api banner misses `{route}`:\n{api_main}");
+        }
+        let (_, a2a_main, _) = generate_a2a("assistant", "anthropic", false);
+        for route in [
+            "GET  /.well-known/agent-card.json",
+            "GET  /.well-known/agent.json",
+            "POST /a2a/v1",
+            "POST /a2a, POST /a2a/stream",
+        ] {
+            assert!(a2a_main.contains(route), "a2a banner misses `{route}`:\n{a2a_main}");
+        }
+        for main_rs in [&api_main, &a2a_main] {
+            for absent in ["/chat", "GET  /health", "/jsonrpc"] {
+                assert!(!main_rs.contains(absent), "banner names `{absent}`, which 404s");
+            }
+        }
+        let api = get_builtin_templates().into_iter().find(|t| t.name == "api").unwrap();
+        assert!(!api.description.contains("/chat"), "{}", api.description);
+    }
+
+    #[test]
     fn create_project_with_output_dir() {
         let tmp = std::env::temp_dir().join("cargo-adk-test-output-dir");
         let _ = fs::remove_dir_all(&tmp);
@@ -2531,7 +3025,7 @@ mod tests {
             fs::read_to_string(tmp.join("yaml-agent/agents/yaml-agent.yaml")).unwrap();
         assert!(yaml_content.contains("name: yaml-agent"));
         assert!(yaml_content.contains("provider: gemini"));
-        assert!(yaml_content.contains("model_id: gemini-3.7-flash"));
+        assert!(yaml_content.contains("model_id: gemini-3.8-flash"));
         assert!(yaml_content.contains("- name: greet"));
 
         let _ = fs::remove_dir_all(&tmp);
@@ -2578,13 +3072,13 @@ mod tests {
     #[test]
     fn yaml_generation_providers() {
         let gemini_yaml = generate_yaml_definition("test", "gemini", "basic", None);
-        assert!(gemini_yaml.contains("model_id: gemini-3.7-flash"));
+        assert!(gemini_yaml.contains("model_id: gemini-3.8-flash"));
 
         let openai_yaml = generate_yaml_definition("test", "openai", "basic", None);
-        assert!(openai_yaml.contains("model_id: gpt-5.6-terra"));
+        assert!(openai_yaml.contains("model_id: gpt-6.1-sol"));
 
         let anthropic_yaml = generate_yaml_definition("test", "anthropic", "basic", None);
-        assert!(anthropic_yaml.contains("model_id: claude-sonnet-5"));
+        assert!(anthropic_yaml.contains("model_id: claude-sonnet-5-5"));
     }
 
     #[test]
@@ -2741,6 +3235,14 @@ mod tests {
                 prop_assert!(
                     project_path.join(".gitignore").exists(),
                     ".gitignore missing for name={name}"
+                );
+
+                // The README names the pattern, not only the `llm` template it builds on
+                let readme = fs::read_to_string(project_path.join("README.md")).unwrap();
+                prop_assert!(
+                    readme.contains("- **Template**: `a2a-server` (")
+                        && readme.contains("built on the `llm` template"),
+                    "README does not name the a2a-server pattern for name={name}:\n{readme}"
                 );
 
                 // Cargo.toml must enable the server + sessions features

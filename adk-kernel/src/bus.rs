@@ -174,6 +174,22 @@ pub enum KernelEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// A background sub-agent's status changed: it started, ran, waits for a person's
+    /// decision, finished, failed or was cancelled. Subscribe a `WebhookSink` to
+    /// [`EventKind::Subagent`] for a signed webhook per change.
+    Subagent {
+        /// The run the change concerns: the sub-agent's latest.
+        pid: String,
+        /// The sub-agent's id.
+        id: String,
+        /// The name its parent knows it by.
+        name: String,
+        /// The run of the parent that started it, when the parent's turn was a process.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
+        /// Its status.
+        status: adk_core::SubagentStatus,
+    },
     /// The kill switch changed.
     Governance {
         /// Whether execution is frozen.
@@ -215,6 +231,7 @@ impl KernelEvent {
             Self::Driver { .. } => EventKind::Driver,
             Self::Observation { .. } => EventKind::Observation,
             Self::Agent { .. } => EventKind::Agent,
+            Self::Subagent { .. } => EventKind::Subagent,
             Self::Governance { .. } => EventKind::Governance,
             Self::Health(_) => EventKind::Health,
         }
@@ -259,6 +276,8 @@ pub enum EventKind {
     Observation,
     /// [`KernelEvent::Agent`].
     Agent,
+    /// [`KernelEvent::Subagent`].
+    Subagent,
     /// [`KernelEvent::Governance`].
     Governance,
     /// [`KernelEvent::Health`].
@@ -267,7 +286,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 13] = [
+    pub const ALL: [EventKind; 14] = [
         Self::Process,
         Self::Wake,
         Self::Held,
@@ -279,6 +298,7 @@ impl EventKind {
         Self::Driver,
         Self::Observation,
         Self::Agent,
+        Self::Subagent,
         Self::Governance,
         Self::Health,
     ];
@@ -297,6 +317,7 @@ impl EventKind {
             Self::Driver => "driver",
             Self::Observation => "observation",
             Self::Agent => "agent",
+            Self::Subagent => "subagent",
             Self::Governance => "governance",
             Self::Health => "health",
         }
@@ -879,8 +900,75 @@ impl EventSink for AuditSink {
             WakeOutcome::Woke { pid } | WakeOutcome::Deduplicated { pid } => {
                 draft.ext("matchedPid", json!(pid))
             }
+            WakeOutcome::Skipped { pid, trigger } => draft
+                .ext("matchedPid", json!(pid))
+                .ext("trigger", json!(trigger))
+                .ext("overlap", json!("skipped")),
+            WakeOutcome::Coalesced { pid, trigger } => draft
+                .ext("matchedPid", json!(pid))
+                .ext("trigger", json!(trigger))
+                .ext("overlap", json!("coalesced")),
+            WakeOutcome::Missed { trigger } => {
+                draft.ext("trigger", json!(trigger)).ext("missed", json!(true))
+            }
         };
         self.trail.record(draft).await?;
+        Ok(())
+    }
+}
+
+/// Publishes the approvals inbox's changes on a kernel's bus (`KernelBuilder::approval_service`):
+/// [`KernelEvent::Held`] when a call is filed, [`KernelEvent::Decided`] when a decision
+/// resolves it. Both carry the call's redacted arguments only, and the fingerprint of the
+/// redacted call, so a `held` and its `decided` share it.
+#[derive(Clone)]
+pub(crate) struct ApprovalEvents(EventBus);
+
+impl ApprovalEvents {
+    pub(crate) fn new(bus: EventBus) -> Self {
+        Self(bus)
+    }
+}
+
+impl fmt::Debug for ApprovalEvents {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApprovalEvents").finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl adk_core::ApprovalNotifier for ApprovalEvents {
+    async fn notify(&self, notification: &adk_core::ApprovalNotification) -> adk_core::Result<()> {
+        use adk_core::{ApprovalEventKind, ApprovalState};
+
+        let request = &notification.request;
+        let mut call =
+            ToolConfirmationRequest::new(request.tool_name.clone(), request.args_redacted.clone());
+        call.origin = request.origin.clone();
+        call.acting = request.acting.clone().map(Box::new);
+        let pid = request.run_id.clone().unwrap_or_default();
+        match (notification.kind, &notification.decision) {
+            (ApprovalEventKind::Submitted, _) => {
+                self.0.publish(KernelEvent::Held { pid, request: call });
+            }
+            (ApprovalEventKind::Decided, Some(decision)) if request.state.is_terminal() => {
+                let decision_kind = match request.state {
+                    ApprovalState::Approved => ToolConfirmationDecision::Approve,
+                    ApprovalState::Pending
+                    | ApprovalState::Rejected
+                    | ApprovalState::Responded
+                    | ApprovalState::Expired
+                    | ApprovalState::Cancelled => ToolConfirmationDecision::Deny,
+                };
+                self.0.publish(KernelEvent::Decided {
+                    pid,
+                    fingerprint: call.fingerprint(),
+                    decision: decision_kind,
+                    by: decision.authority().clone(),
+                });
+            }
+            _ => {}
+        }
         Ok(())
     }
 }
@@ -905,7 +993,7 @@ mod tests {
 
     fn wake(outcome: Option<WakeOutcome>) -> KernelEvent {
         KernelEvent::Wake {
-            pid: outcome.as_ref().map(|outcome| outcome.pid().to_string()),
+            pid: outcome.as_ref().and_then(WakeOutcome::pid).map(str::to_string),
             source: "hook:github".into(),
             key: "hook:github:msg_1".into(),
             outcome,

@@ -7,6 +7,7 @@
 //! and follows ADK-Rust best practices.
 
 use crate::composition::{CompositionManifest, GeneratedFile};
+use crate::pattern::EnterprisePattern;
 use crate::provider::get_provider_config;
 use crate::registry::{OWN_MODEL_TEMPLATES, TemplateRegistry};
 
@@ -130,6 +131,12 @@ pub fn generate_cargo_toml(manifest: &CompositionManifest, project_name: &str) -
     } else {
         ""
     };
+    // A project on the `cli` launcher logs through ADK telemetry (see `generate_main_rs`).
+    let subscriber = if launcher_owns_telemetry(manifest) {
+        ""
+    } else {
+        "tracing-subscriber = { version = \"0.3\", features = [\"env-filter\"] }\n"
+    };
 
     let mut output = format!(
         r#"{header}[package]
@@ -142,8 +149,7 @@ adk-rust = {{ version = "{ADK_VERSION}", default-features = false, features = [{
 tokio = {{ version = "1", features = ["full"] }}
 dotenvy = "0.15"
 tracing = "0.1"
-tracing-subscriber = {{ version = "0.3", features = ["env-filter"] }}
-anyhow = "1"
+{subscriber}anyhow = "1"
 "#
     );
 
@@ -162,6 +168,16 @@ anyhow = "1"
     }
 
     output
+}
+
+/// Whether the project runs on the `cli` launcher, whose serve mode records runtime spans
+/// for the web home's developer panel through the ADK span exporter.
+///
+/// The exporter needs to be the process's global subscriber, so such a project initializes
+/// ADK telemetry first instead of installing a `tracing_subscriber`; the launcher then
+/// reuses the exporter instead of failing to install it next to the project's subscriber.
+fn launcher_owns_telemetry(manifest: &CompositionManifest) -> bool {
+    manifest.feature_set.contains("cli")
 }
 
 /// Fallback agent construction used when a template has no (or placeholder)
@@ -239,7 +255,8 @@ pub fn generate_main_rs_with_registry(
     // When nothing serves (no server addon, template doesn't start its own
     // server), run the agent in the interactive console so `cargo run` does
     // something useful out of the box.
-    const SELF_SERVING_TEMPLATES: &[&str] = &["api", "agent-engine", "realtime", "harness"];
+    const SELF_SERVING_TEMPLATES: &[&str] =
+        &["api", "agent-engine", "realtime", "harness", "autonomous", "vision"];
     let has_server_addon = manifest.addons.iter().any(|a| a == "server");
     let interactive =
         !has_server_addon && !SELF_SERVING_TEMPLATES.contains(&manifest.template_name.as_str());
@@ -323,7 +340,13 @@ pub fn generate_main_rs_with_registry(
     let has_telemetry = manifest.addons.iter().any(|a| a == "telemetry");
 
     // Build tracing subscriber init
-    let tracing_init = if has_telemetry {
+    let tracing_init = if launcher_owns_telemetry(manifest) {
+        format!(
+            r#"    // RUST_LOG filters the log. The exporter also keeps runtime spans for the web home's
+    // developer panel, which `cargo run -- up` serves; the launcher reuses it.
+    adk_rust::telemetry::init_with_adk_exporter("{project_name}")?;"#
+        )
+    } else if has_telemetry {
         r#"    tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(true)
@@ -416,8 +439,54 @@ pub fn generate_env_example(manifest: &CompositionManifest) -> String {
 pub fn generate_readme(manifest: &CompositionManifest, project_name: &str) -> String {
     let registry = TemplateRegistry::builtin();
     let template = registry.resolve_template(&manifest.template_name);
-
     let template_description = template.map(|t| t.description).unwrap_or("ADK-Rust agent project");
+    let template_line = format!("`{}` ({template_description})", manifest.template_name);
+    readme(manifest, project_name, template_description, &template_line)
+}
+
+/// Generate `README.md` for a project made from an enterprise pattern: the README names
+/// the pattern and the template it builds on, rather than the template alone.
+///
+/// # Example
+///
+/// ```
+/// use cargo_adk::codegen::generate_pattern_readme;
+/// use cargo_adk::composition::resolve_composition;
+/// use cargo_adk::registry::TemplateRegistry;
+///
+/// let registry = TemplateRegistry::builtin();
+/// let pattern = registry.resolve_pattern("a2a").unwrap();
+/// let manifest = resolve_composition(
+///     &registry,
+///     pattern.base_template,
+///     &pattern.included_addons,
+///     "anthropic",
+/// )
+/// .unwrap();
+/// let readme = generate_pattern_readme(&manifest, "peer", pattern);
+/// assert!(readme.contains("- **Template**: `a2a-server`"));
+/// ```
+pub fn generate_pattern_readme(
+    manifest: &CompositionManifest,
+    project_name: &str,
+    pattern: &EnterprisePattern,
+) -> String {
+    let template_line = format!(
+        "`{}` ({}), built on the `{}` template",
+        pattern.name, pattern.description, manifest.template_name
+    );
+    readme(manifest, project_name, pattern.description, &template_line)
+}
+
+/// The README of `project_name`, headed by `description`, with `template_line` as its
+/// template entry.
+fn readme(
+    manifest: &CompositionManifest,
+    project_name: &str,
+    description: &str,
+    template_line: &str,
+) -> String {
+    let registry = TemplateRegistry::builtin();
 
     let addons_section = if manifest.addons.is_empty() {
         String::new()
@@ -452,7 +521,7 @@ pub fn generate_readme(manifest: &CompositionManifest, project_name: &str) -> St
     format!(
         r#"# {project_name}
 
-{template_description}
+{description}
 
 ## Quick Start
 
@@ -470,7 +539,7 @@ cargo run
 
 ## Architecture
 
-- **Template**: `{template_name}` ({template_description})
+- **Template**: {template_line}
 - **Provider**: `{provider}`
 - **Features**: `[{features}]`
 {addons_section}{env_vars_section}
@@ -498,7 +567,6 @@ cargo fmt
 - [ADK-Rust Documentation](https://docs.rs/adk-rust)
 - [ADK-Rust GitHub](https://github.com/zavora-ai/adk-rust)
 "#,
-        template_name = manifest.template_name,
         provider = manifest.provider,
         features = features_list.join(", "),
     )
@@ -557,7 +625,7 @@ mod tests {
         assert!(toml.contains("\"gemini\""));
         assert!(toml.contains("tokio"));
         assert!(toml.contains("dotenvy"));
-        assert!(toml.contains("tracing"));
+        assert!(toml.contains("tracing-subscriber"));
         assert!(toml.contains("anyhow"));
     }
 
@@ -584,7 +652,7 @@ mod tests {
         assert!(main_rs.contains("#[tokio::main]"));
         assert!(main_rs.contains("dotenvy::dotenv().ok();"));
         assert!(main_rs.contains("tracing_subscriber::fmt()"));
-        assert!(main_rs.contains("GeminiModel::new(&api_key, \"gemini-3.7-flash\")?"));
+        assert!(main_rs.contains("GeminiModel::new(&api_key, \"gemini-3.8-flash\")?"));
         assert!(main_rs.contains("anyhow::Result<()>"));
     }
 
@@ -599,6 +667,35 @@ mod tests {
             main_rs.contains(r#"std::env::var("PORT").unwrap_or_else(|_| "8080".to_string())"#),
             "Server addon MUST use std::env::var(\"PORT\").unwrap_or_else(|_| \"8080\".to_string())"
         );
+    }
+
+    #[test]
+    fn server_scaffolds_log_the_routes_they_serve() {
+        let api = generate_main_rs(
+            &resolve_composition(&registry(), "api", &[], "anthropic").unwrap(),
+            "qs",
+        );
+        for route in ["GET  /api/health", "POST /api/sessions", "POST /api/run/qs/"] {
+            assert!(api.contains(route), "api banner misses `{route}`:\n{api}");
+        }
+        // `--template a2a` is the `a2a-server` pattern: `llm` with the `server` and `sessions` addons.
+        let a2a = generate_main_rs(
+            &resolve_composition(&registry(), "llm", &["server", "sessions"], "anthropic").unwrap(),
+            "peer",
+        );
+        for route in [
+            "GET  /.well-known/agent-card.json",
+            "GET  /.well-known/agent.json",
+            "POST /a2a/v1",
+            "POST /a2a, POST /a2a/stream",
+        ] {
+            assert!(a2a.contains(route), "a2a banner misses `{route}`:\n{a2a}");
+        }
+        for main_rs in [&api, &a2a] {
+            for absent in ["/chat", "GET  /health", "/jsonrpc"] {
+                assert!(!main_rs.contains(absent), "banner names `{absent}`, which 404s");
+            }
+        }
     }
 
     #[test]
@@ -776,8 +873,8 @@ mod tests {
         assert!(static_dockerfile.contains("rustup target add x86_64-unknown-linux-musl"));
         assert!(static_dockerfile.contains("musl-tools cmake ca-certificates"));
         assert!(static_dockerfile.contains("FROM scratch"));
-        // rustls-tls-native-roots reads /etc/ssl/certs at runtime, so the CA
-        // bundle copy is load-bearing, not cosmetic.
+        // reqwest's rustls verifier reads the system trust store in /etc/ssl/certs at
+        // runtime, so the CA bundle copy is load-bearing, not cosmetic.
         assert!(static_dockerfile.contains(
             "COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt"
         ));
@@ -906,31 +1003,38 @@ mod tests {
         let main_rs = file("src/main.rs");
         for expected in [
             "use adk_rust::prelude::*;",
-            "use adk_rust::harness::{ConsoleIo, ConsolePrompter, HarnessConfig, HarnessLauncher};",
+            "use adk_rust::harness::{",
+            "use adk_rust::kernel::stores::KernelStores;",
             "SqliteSessionService::new(\"sqlite://.adk/state.db?mode=rwc\").await?",
             "sessions.migrate().await?;",
+            "KernelStores::from_sqlite_pool(sessions.pool().clone()).await?",
             "HarnessAgent::builder(\"demo\")",
-            ".workspace(adk_devtools::Workspace::new(\".\").allow_bash(true))",
+            ".workspace(Workspace::new(\".\").allow_bash(true))",
+            ".action_ledger(stores.actions.clone())",
+            ".with_kernel_stores(stores)",
             ".prompter(Arc::new(ConsolePrompter::new(console.clone())))",
             ".config(HarnessConfig::discover(\".\")?)",
             "HarnessLauncher::new(harness)",
             ".with_session_service(sessions)",
             "`cargo run -- up` runs it as the agent kernel",
-            "GeminiModel::new(&api_key, \"gemini-3.7-flash\")?",
+            "GeminiModel::new(&api_key, \"gemini-3.8-flash\")?",
+            "adk_rust::telemetry::init_with_adk_exporter(\"demo\")?;",
         ] {
             assert!(main_rs.contains(expected), "missing `{expected}` in:\n{main_rs}");
         }
         // The launcher is the console and the server; nothing else runs the agent.
         assert!(!main_rs.contains("Launcher::new(agent)"), "{main_rs}");
+        // A subscriber of the project's own would keep the launcher's span exporter out.
+        assert!(!main_rs.contains("tracing_subscriber"), "{main_rs}");
 
         let cargo_toml = file("Cargo.toml");
-        for feature in ["\"minimal\"", "\"harness\"", "\"cli\"", "\"gemini\""] {
+        for feature in ["\"minimal\"", "\"autonomy\"", "\"cli\"", "\"gemini\""] {
             assert!(cargo_toml.contains(feature), "missing {feature} in:\n{cargo_toml}");
         }
-        assert!(cargo_toml.contains(&format!(
-            "adk-session = {{ version = \"{ADK_VERSION}\", features = [\"sqlite\"] }}"
-        )));
-        assert!(cargo_toml.contains(&format!("adk-devtools = \"{ADK_VERSION}\"")));
+        assert!(!cargo_toml.contains("tracing-subscriber"), "{cargo_toml}");
+        // `autonomy` brings the SQLite stores and `Workspace` through `adk-rust`.
+        assert!(!cargo_toml.contains("adk-session ="), "{cargo_toml}");
+        assert!(!cargo_toml.contains("adk-devtools ="), "{cargo_toml}");
 
         assert!(file(".gitignore").contains(".adk/state.db*"));
         assert!(file(".gitignore").contains(".env"));
@@ -941,6 +1045,53 @@ mod tests {
         assert!(file("AGENTS.md").starts_with("# demo\n"));
         assert!(file(".adk/harness.toml").contains("[deploy]"));
         assert!(file(".skills/example/SKILL.md").contains("name: example"));
+    }
+
+    #[test]
+    fn autonomous_template_generates_a_self_serving_project_on_one_dependency() {
+        let manifest = resolve_composition(&registry(), "autonomous", &[], "anthropic").unwrap();
+        let files = generate_project(&manifest, "ops-agent");
+        let file = |path: &str| {
+            let matching: Vec<_> = files.iter().filter(|f| f.path == path).collect();
+            assert_eq!(matching.len(), 1, "expected exactly one '{path}'");
+            matching[0].content.as_str()
+        };
+
+        let main_rs = file("src/main.rs");
+        for expected in [
+            "mod audit;",
+            "mod publish;",
+            "HarnessAgent::builder(\"ops-agent\")",
+            ".mode(HarnessMode::Auto)",
+            ".tool(publish::tool(\"outbox\"))",
+            "audit::open(&sessions, \"ops-agent\")",
+            "NewRun::new(",
+            "\"ops-agent\",",
+            ".with_home(\".adk\")",
+            "AnthropicClient::new(",
+            "adk_rust::telemetry::init_with_adk_exporter(\"ops-agent\")?;",
+        ] {
+            assert!(main_rs.contains(expected), "missing `{expected}` in:\n{main_rs}");
+        }
+        // The launcher runs the agent; no generic console or server is added.
+        assert!(!main_rs.contains("Launcher::new(agent)"), "{main_rs}");
+        assert!(!main_rs.contains("{name}"), "{main_rs}");
+        assert!(!main_rs.contains("tracing_subscriber"), "{main_rs}");
+
+        let cargo_toml = file("Cargo.toml");
+        for feature in ["\"minimal\"", "\"autonomy\"", "\"cli\"", "\"anthropic\""] {
+            assert!(cargo_toml.contains(feature), "missing {feature} in:\n{cargo_toml}");
+        }
+        assert!(!cargo_toml.contains("tracing-subscriber"), "{cargo_toml}");
+        assert_eq!(cargo_toml.matches("adk-").count(), 1, "one ADK dependency:\n{cargo_toml}");
+        assert!(file("src/publish.rs").contains("\"ops-agent-publish-{}\""));
+        assert!(file("src/audit.rs").contains("--log-id ops-agent"));
+        assert!(file(".gitignore").contains(".adk/audit.key"));
+        assert!(file("README.md").starts_with("# ops-agent\n"));
+        // Goals are graded against rubric.md, which the project file names.
+        let harness_toml = file(".adk/harness.toml");
+        assert!(harness_toml.contains("[goal]\nrubric = \"rubric.md\""), "{harness_toml}");
+        assert!(file("rubric.md").lines().filter(|line| line.starts_with("- ")).count() >= 3);
     }
 
     #[test]

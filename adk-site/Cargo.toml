@@ -12,7 +12,10 @@ documentation = "https://docs.rs/adk-site"
 readme = "README.md"
 keywords = ["adk", "awp", "static-site", "release", "agent"]
 categories = ["web-programming", "asynchronous"]
-include = ["src/**/*", "tests/**/*", "Cargo.toml", "README.md"]
+include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 # Spec 3.5 §7.1: the default build carries the content model, the built-in generator, the
 # launch gate, releases, the site log and `DirectoryHost`. External generators and host
@@ -75,14 +78,14 @@ hex.workspace = true
 # included (spec 3.5 §7.8.2 "Media").
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 minijinja = "2"
-pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+pulldown-cmark = { version = "0.13.6", default-features = false, features = ["html"] }
 # CSS references in the third-party resource check.
 regex.workspace = true
 # The launch gate parses generated HTML with an HTML5 parser, not patterns.
 scraper = "0.25"
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml = "0.9"
+serde-saphyr.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "sync", "rt", "time"] }

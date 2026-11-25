@@ -25,6 +25,11 @@ Or through the umbrella crate:
 adk-rust = { version = "3.0.0", features = ["audio"] }
 ```
 
+`audio` enables the default `tts` and `stt` features. The umbrella's `audio-tts`, `audio-stt`,
+`audio-fx`, `audio-mlx`, and `audio-all` enable `tts`, `stt`, `fx`, `mlx`, and `all`; `kokoro`,
+`qwen3-tts`, and `all-onnx` keep their names; and `audio-onnx` enables `onnx` with the
+`whisper-onnx`, `distil-whisper`, `moonshine`, and `chatterbox` models.
+
 ## Feature flags
 
 | Feature | Enables | Key dependencies |
@@ -34,17 +39,18 @@ adk-rust = { version = "3.0.0", features = ["audio"] }
 | `muse` | `MuseStt`: Meta Muse file and realtime transcription | `adk-model` (`muse-realtime`) |
 | `fx` | DSP processors: normalizer, resampler, noise suppressor, compressor, trimmer, pitch shifter | none |
 | `mlx` | Local TTS and STT model loading with tokenizers and Hugging Face Hub | `tokenizers`, `hf-hub` |
-| `onnx` | ONNX Runtime local inference | `ort`, `tokenizers`, `hf-hub` |
+| `onnx` | ONNX Runtime local inference; `ort` downloads the onnxruntime binary at build time | `ort`, `tokenizers`, `hf-hub` |
+| `onnx-cuda` | `OnnxExecutionProvider::Cuda` (implies `onnx`); downloads the CUDA build of onnxruntime | `ort` (`cuda`) |
+| `onnx-coreml` | `OnnxExecutionProvider::CoreMl` (implies `onnx`); links only on Apple targets | `ort` (`coreml`) |
 | `kokoro` | Kokoro-82M ONNX TTS with the espeak-ng phonemizer (implies `onnx`) | `espeak-rs`, `ndarray`; needs a system espeak-ng |
 | `chatterbox` | Chatterbox ONNX TTS (implies `onnx`) | |
 | `whisper-onnx`, `distil-whisper`, `moonshine` | ONNX STT backends (imply `onnx`) | |
 | `qwen3-tts` | Qwen3-TTS on Candle (0.6B and 1.7B) | `qwen_tts`, `candle-core`, `hf-hub` |
 | `all-onnx` | `onnx`, `kokoro`, `chatterbox`, `whisper-onnx`, `distil-whisper`, `moonshine`, `qwen3-tts` | |
-| `livekit` | `RealtimeBridge` between `adk-realtime` audio and pipelines | `livekit-api`, `adk-realtime` |
-| `desktop-audio` | Microphone capture, speaker playback, and VAD turn-taking (implies `vad`) | `cpal` |
+| `livekit` | `RealtimeBridge` between `adk-realtime` audio and pipelines | `base64` |
+| `desktop-audio` | Microphone capture, speaker playback, and VAD turn-taking | `cpal` |
 | `music` | Adds `reqwest` for `MusicProvider` implementations | `reqwest` |
-| `vad`, `streaming` | Markers; the `VadProcessor` trait and streaming methods are always available | none |
-| `all` | Every feature except `desktop-audio` | |
+| `all` | Every feature except `desktop-audio`, `onnx-cuda`, and `onnx-coreml` | |
 
 ## Core types
 
@@ -133,7 +139,7 @@ work for it.
 | `DeepgramStt` | `nova-3`, with diarization | WebSocket streaming: `Partial` for interim results, `Final` per finalized segment, `SpeechStarted`/`SpeechEnded` from voice activity, `Usage` from the closing metadata; dropping the stream closes the socket | `DEEPGRAM_API_KEY` |
 | `AssemblyAiStt` | asynchronous jobs | `AudioError::Stt` (not yet implemented) | `ASSEMBLYAI_API_KEY` |
 | `MuseStt` (`muse`) | `muse-voice-transcribe-1.0` | Realtime WebSocket: `Partial` per cumulative transcript, one `Final` per turn, `SpeechStarted`/`SpeechEnded`, `Speaker` with diarization, `Progress`, `Usage`; the 60-minute session limit ends the stream with `model.muse.session_limit` | `META_API_KEY` or `MODEL_API_KEY` |
-| `GeminiStt` | `gemini-3.7-flash` | `AudioError::Stt`; use the Gemini Live API through `adk-realtime` for live audio | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
+| `GeminiStt` | `gemini-3.8-flash` | `AudioError::Stt`; use the Gemini Live API through `adk-realtime` for live audio | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
 
 ```rust
 use adk_audio::{AudioFrame, SttOptions, SttProvider, WhisperApiStt};
@@ -176,7 +182,9 @@ Models download from Hugging Face Hub into `LocalModelRegistry`'s cache
 
 ### ONNX TTS
 
-```rust
+Needs the `onnx` feature.
+
+```rust,ignore
 use adk_audio::{OnnxTtsProvider, TtsProvider};
 
 #[tokio::main]
@@ -190,7 +198,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 `OnnxTtsProvider::new(OnnxModelConfig, &registry)` loads another model. The provider is generic
 over a `Preprocessor`: `TokenizerPreprocessor` uses a Hugging Face `tokenizer.json`, and
 `KokoroPreprocessor` (`kokoro` feature) runs the espeak-ng phonemizer. Execution providers are
-`OnnxExecutionProvider::Cpu`, `Cuda`, `CoreMl`, and `DirectMl`.
+`OnnxExecutionProvider::Cpu`, `Cuda`, `CoreMl`, and `DirectMl`; `auto_detect()` picks `CoreMl` on
+macOS and `Cpu` elsewhere. `Cuda` needs the `onnx-cuda` feature and `CoreMl` needs `onnx-coreml`.
+A provider whose feature is off, and `DirectMl`, logs a warning and the session runs on the CPU.
 
 ### ONNX STT
 
@@ -200,7 +210,9 @@ over a `Preprocessor`: `TokenizerPreprocessor` uses a Hugging Face `tokenizer.js
 | `SttBackend::DistilWhisper` | `distil-whisper` | `DistilWhisperVariant::{DistilSmallEn, DistilMediumEn, DistilLargeV3}` |
 | `SttBackend::Moonshine` | `moonshine` | `MoonshineVariant::{Tiny, Base}` |
 
-```rust
+The example needs the `whisper-onnx` feature.
+
+```rust,ignore
 use adk_audio::{LocalModelRegistry, OnnxSttConfig, OnnxSttProvider, SttBackend, WhisperModelSize};
 
 #[tokio::main]
@@ -221,9 +233,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `MlxTtsProvider` and `MlxSttProvider` load models with tokenizers and Hugging Face Hub, configured
 by `MlxTtsConfig`, `MlxSttConfig`, and `MlxQuantization`. Metal GPU inference through `mlx-rs` is
-not implemented.
+not implemented. The example needs the `mlx` feature.
 
-```rust
+```rust,ignore
 use adk_audio::MlxTtsProvider;
 
 #[tokio::main]
@@ -236,9 +248,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Qwen3-TTS
 
-Candle-based TTS for 10 languages with predefined speakers, on CPU, Metal, or CUDA.
+Candle-based TTS for 10 languages with predefined speakers. On macOS it runs on Metal when the
+build's `candle-core` has Metal support, and on the CPU otherwise; elsewhere on the CPU. Needs the
+`qwen3-tts` feature.
 
-```rust
+```rust,ignore
 use adk_audio::{Qwen3TtsNativeProvider, Qwen3TtsVariant, TtsProvider, TtsRequest};
 
 #[tokio::main]
@@ -419,7 +433,7 @@ on an output device, and `VadTurnManager` turns a `VadProcessor`'s decisions int
 Behind `livekit`, `RealtimeBridge` converts between `adk-realtime` base64 PCM16 audio streams and
 pipeline inputs and outputs:
 
-```rust
+```rust,ignore
 use std::pin::Pin;
 
 use adk_audio::{AudioResult, PipelineInput, PipelineOutput, RealtimeBridge};

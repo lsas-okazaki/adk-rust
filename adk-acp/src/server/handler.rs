@@ -12,27 +12,32 @@ use adk_core::{
 use adk_runner::Runner;
 use adk_session::{CreateRequest, DeleteRequest, GetRequest, ListRequest, SessionService};
 use adk_tool::McpToolset;
-use agent_client_protocol::RequestCancellation;
-use agent_client_protocol::schema::v1::{
-    ContentBlock, ListSessionsRequest, ListSessionsResponse, McpServer, NewSessionRequest,
-    PromptRequest, SessionId, SessionInfo, SessionNotification, StopReason,
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::v1::schema::{
+    ContentBlock, ForkSessionRequest, InitialSessionConfigOption, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, McpServer, NewSessionRequest, PromptRequest,
+    PromptResponse, ResumeSessionRequest, SessionArchiveFilter, SessionId, SessionInfo,
+    SessionNotification, SessionOptionsRequest, SessionOptionsResponse, SessionStatus, StopReason,
+    Usage,
 };
-use agent_client_protocol::{Client, ConnectionTo};
+use agent_client_protocol::{Client, RequestCancellation};
 use futures::StreamExt;
 use rmcp::{ServiceExt, transport::TokioChildProcess};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::config::AcpServerConfig;
+use super::config::{AcpServerConfig, SystemPromptSupport};
 use super::error::AcpServerError;
+use super::mcp_acp::AcpMcpToolset;
 use super::modes::{
     self, SessionControls, config_state_key, config_value_is_valid, mode_is_advertised,
     option_with_current_value,
 };
-use super::permission::{PermissionBridge, StandingPermissions};
+use super::permission::{PermissionAnswer, PermissionBridge, StandingOffer, StandingPermissions};
 use super::streamer::ResponseStreamer;
-use agent_client_protocol::schema::v1::{
+use super::system_prompt::SystemPromptHook;
+use agent_client_protocol::v1::schema::{
     AvailableCommandsUpdate, ConfigOptionUpdate, CurrentModeUpdate, SessionConfigId,
     SessionConfigOption, SessionConfigOptionValue, SessionInfoUpdate, SessionModeId,
     SessionModeState, SessionUpdate,
@@ -46,11 +51,22 @@ const ADDITIONAL_DIRS_STATE_KEY: &str = "acp:additional_directories";
 /// present) and whenever [`set_session_title`](AcpSessionHandler::set_session_title)
 /// changes it, so a title survives load / resume / fork like other ACP state.
 const TITLE_STATE_KEY: &str = "acp:title";
+/// Session-state key recording that a session is archived (`session/archive`).
+const ARCHIVED_STATE_KEY: &str = "acp:archived";
 const MCP_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct SessionState {
     execution_token: Option<CancellationToken>,
     mcp: McpSessionResources,
+    /// The client system prompt the session was set up with, applied to every
+    /// model request of its turns.
+    system_prompt: Option<Arc<SystemPromptHook>>,
+}
+
+impl SessionState {
+    fn new(system_prompt: Option<Arc<SystemPromptHook>>) -> Self {
+        Self { execution_token: None, mcp: McpSessionResources::default(), system_prompt }
+    }
 }
 
 #[derive(Default)]
@@ -84,6 +100,8 @@ pub struct AcpSessionHandler {
     standing_permissions: Option<Arc<dyn StandingPermissions>>,
     /// Prompts running now, which shutdown waits for.
     running_prompts: tokio::sync::watch::Sender<usize>,
+    /// Which client system prompts sessions may carry.
+    system_prompts: SystemPromptSupport,
 }
 
 /// Counts one prompt as running until it is dropped, however the prompt ends.
@@ -100,6 +118,64 @@ impl Drop for RunningPrompt<'_> {
     fn drop(&mut self) {
         self.0.send_modify(|count| *count = count.saturating_sub(1));
     }
+}
+
+/// Where a prompt turn reports its progress: the protocol adapter serving the
+/// turn's connection.
+///
+/// The turn itself is protocol-neutral: it streams the updates the
+/// [`ResponseStreamer`] maps from the agent's events and asks for permissions,
+/// and each protocol version delivers them in its own wire form.
+#[async_trait::async_trait]
+pub(crate) trait TurnSink: Send + Sync {
+    /// The runner accepted the turn's prompt as invocation `invocation_id`,
+    /// before the turn's first event. Protocol v2 inserts the user message
+    /// here; v1 has nothing to do.
+    fn started(&self, _invocation_id: &str) -> Result<(), AcpServerError> {
+        Ok(())
+    }
+
+    /// Report one update of the turn.
+    fn update(&self, update: SessionUpdate) -> Result<(), AcpServerError>;
+
+    /// Ask the client to approve a tool call the agent paused on.
+    async fn request_permission(
+        &self,
+        confirmation: &ToolConfirmationRequest,
+        offer: Option<&StandingOffer>,
+    ) -> Result<PermissionAnswer, AcpServerError>;
+}
+
+/// A protocol v1 turn: `session/update` notifications and
+/// `session/request_permission` requests on the v1 connection.
+struct V1Turn<'a> {
+    connection: &'a ConnectionTo<Client>,
+    session_id: &'a SessionId,
+}
+
+#[async_trait::async_trait]
+impl TurnSink for V1Turn<'_> {
+    fn update(&self, update: SessionUpdate) -> Result<(), AcpServerError> {
+        self.connection
+            .send_notification(SessionNotification::new(self.session_id.clone(), update))
+            .map_err(|e| AcpServerError::Transport(e.to_string()))
+    }
+
+    async fn request_permission(
+        &self,
+        confirmation: &ToolConfirmationRequest,
+        offer: Option<&StandingOffer>,
+    ) -> Result<PermissionAnswer, AcpServerError> {
+        PermissionBridge::request(self.connection, self.session_id, confirmation, offer).await
+    }
+}
+
+/// Which sessions `session/list` reports, by archived flag.
+#[derive(Clone, Copy)]
+enum ArchivedFilter {
+    Exclude,
+    Include,
+    Only,
 }
 
 impl AcpSessionHandler {
@@ -119,22 +195,44 @@ impl AcpSessionHandler {
             session_controls: config.session_controls.clone(),
             standing_permissions: config.standing_permissions.clone(),
             running_prompts: tokio::sync::watch::channel(0).0,
+            system_prompts: config.system_prompts,
         })
     }
 
     /// Create an ACP session and its persistent ADK-Rust session.
+    ///
+    /// Applies the request's `systemPrompt` to the session's turns and stores
+    /// its initial `configOptions` values, rejecting the request when either
+    /// cannot be applied. The session's `acp` MCP servers are reached through
+    /// `connection`.
     pub async fn create_session(
         &self,
         request: NewSessionRequest,
         request_cancellation: RequestCancellation,
+        connection: ConnectionTo<Client>,
+    ) -> Result<SessionId, AcpServerError> {
+        self.create_session_on(request, request_cancellation, Some(&connection)).await
+    }
+
+    /// [`create_session`](Self::create_session) on a connection that may not reach the
+    /// client's tool servers, as on protocol v2: without `connection`, the session's
+    /// `acp` MCP servers are refused.
+    pub(crate) async fn create_session_on(
+        &self,
+        request: NewSessionRequest,
+        request_cancellation: RequestCancellation,
+        connection: Option<&ConnectionTo<Client>>,
     ) -> Result<SessionId, AcpServerError> {
         self.ensure_running()?;
         validate_absolute(&request.cwd, "cwd")?;
         for directory in &request.additional_directories {
             validate_absolute(directory, "additionalDirectories")?;
         }
+        let system_prompt =
+            SystemPromptHook::resolve(request.system_prompt.as_ref(), self.system_prompts)?;
+        let initial_config = self.initial_config_state(&request.config_options)?;
         let session_id = uuid::Uuid::new_v4().to_string();
-        let mut state = HashMap::new();
+        let mut state: HashMap<String, serde_json::Value> = initial_config.into_iter().collect();
         state.insert(
             CWD_STATE_KEY.to_string(),
             serde_json::Value::String(request.cwd.display().to_string()),
@@ -145,19 +243,14 @@ impl AcpSessionHandler {
                 .map_err(|e| AcpServerError::Internal(e.to_string()))?,
         );
 
-        {
-            let mut sessions = self.sessions.lock().await;
-            if sessions.len() >= self.max_sessions {
-                return Err(AcpServerError::MaxSessionsReached(self.max_sessions));
-            }
-            sessions.insert(
-                session_id.clone(),
-                SessionState { execution_token: None, mcp: McpSessionResources::default() },
-            );
-        }
-
-        let mcp = match start_mcp_servers(&request.mcp_servers, &request.cwd, &request_cancellation)
-            .await
+        self.reserve(&session_id, system_prompt).await?;
+        let mcp = match start_mcp_servers(
+            &request.mcp_servers,
+            &request.cwd,
+            &request_cancellation,
+            connection,
+        )
+        .await
         {
             Ok(resources) => resources,
             Err(error) => {
@@ -180,76 +273,54 @@ impl AcpSessionHandler {
             return Err(AcpServerError::Internal(format!("failed to create session: {error}")));
         }
 
-        if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
-            session.mcp = mcp;
-        }
+        self.attach_mcp(&session_id, mcp).await;
         info!(session_id, "created ACP session");
         Ok(SessionId::new(session_id))
     }
 
     /// Resume a persisted session and make it active on this ACP connection.
+    ///
+    /// The request's `systemPrompt` applies to the resumed session's turns and
+    /// its initial `configOptions` values are stored before it becomes active.
     pub async fn resume_session(
         &self,
-        session_id: &SessionId,
-        cwd: PathBuf,
-        additional_directories: Vec<PathBuf>,
-        mcp_servers: Vec<McpServer>,
+        request: ResumeSessionRequest,
         request_cancellation: RequestCancellation,
+        connection: ConnectionTo<Client>,
     ) -> Result<(), AcpServerError> {
-        self.ensure_running()?;
-        validate_absolute(&cwd, "cwd")?;
-        for directory in &additional_directories {
-            validate_absolute(directory, "additionalDirectories")?;
-        }
+        self.resume_session_on(request, request_cancellation, Some(&connection)).await
+    }
 
-        let id = session_id.to_string();
-        let persisted = self
-            .session_service
-            .get(GetRequest {
-                app_name: self.app_name.clone(),
-                user_id: self.user_id.clone(),
-                session_id: id.clone(),
-                num_recent_events: None,
-                after: None,
-            })
-            .await
-            .map_err(|_| AcpServerError::SessionNotFound(id.clone()))?;
-
-        let stored_cwd = persisted
-            .state()
-            .get(CWD_STATE_KEY)
-            .and_then(|value| value.as_str().map(PathBuf::from))
-            .unwrap_or_else(|| cwd.clone());
-        if stored_cwd != cwd {
-            return Err(AcpServerError::MalformedMessage(
-                "resumed session cwd does not match its original cwd".into(),
-            ));
-        }
-        {
-            let mut sessions = self.sessions.lock().await;
-            if sessions.contains_key(&id) {
-                return Err(AcpServerError::Execution(
-                    "the session is already active on this ACP connection".into(),
-                ));
-            }
-            if sessions.len() >= self.max_sessions {
-                return Err(AcpServerError::MaxSessionsReached(self.max_sessions));
-            }
-            sessions.insert(
-                id.clone(),
-                SessionState { execution_token: None, mcp: McpSessionResources::default() },
-            );
-        }
-        let mcp = match start_mcp_servers(&mcp_servers, &cwd, &request_cancellation).await {
-            Ok(resources) => resources,
-            Err(error) => {
-                self.sessions.lock().await.remove(&id);
-                return Err(error);
-            }
-        };
-        if let Some(session) = self.sessions.lock().await.get_mut(&id) {
-            session.mcp = mcp;
-        }
+    /// [`resume_session`](Self::resume_session) on a connection that may not reach the
+    /// client's tool servers, as on protocol v2: without `connection`, the session's
+    /// `acp` MCP servers are refused.
+    pub(crate) async fn resume_session_on(
+        &self,
+        request: ResumeSessionRequest,
+        request_cancellation: RequestCancellation,
+        connection: Option<&ConnectionTo<Client>>,
+    ) -> Result<(), AcpServerError> {
+        let ResumeSessionRequest {
+            session_id,
+            cwd,
+            additional_directories,
+            mcp_servers,
+            system_prompt,
+            config_options,
+            ..
+        } = request;
+        self.reactivate(
+            &session_id,
+            &cwd,
+            &additional_directories,
+            &mcp_servers,
+            system_prompt.as_ref(),
+            &config_options,
+            &request_cancellation,
+            connection,
+            "resumed",
+        )
+        .await?;
         Ok(())
     }
 
@@ -264,70 +335,34 @@ impl AcpSessionHandler {
     /// already-active checks) with its MCP servers started. After reactivation,
     /// every stored event is mapped to its `SessionUpdate` variant through the
     /// shared [`ResponseStreamer`] and sent in chronological order.
-    #[allow(clippy::too_many_arguments)]
     pub async fn load_session(
         &self,
-        session_id: &SessionId,
-        cwd: PathBuf,
-        additional_directories: Vec<PathBuf>,
-        mcp_servers: Vec<McpServer>,
+        request: LoadSessionRequest,
         request_cancellation: RequestCancellation,
         connection: ConnectionTo<Client>,
     ) -> Result<(), AcpServerError> {
-        self.ensure_running()?;
-        validate_absolute(&cwd, "cwd")?;
-        for directory in &additional_directories {
-            validate_absolute(directory, "additionalDirectories")?;
-        }
-
-        let id = session_id.to_string();
+        let LoadSessionRequest {
+            session_id,
+            cwd,
+            additional_directories,
+            mcp_servers,
+            system_prompt,
+            config_options,
+            ..
+        } = request;
         let persisted = self
-            .session_service
-            .get(GetRequest {
-                app_name: self.app_name.clone(),
-                user_id: self.user_id.clone(),
-                session_id: id.clone(),
-                num_recent_events: None,
-                after: None,
-            })
-            .await
-            .map_err(|_| AcpServerError::SessionNotFound(id.clone()))?;
-
-        let stored_cwd = persisted
-            .state()
-            .get(CWD_STATE_KEY)
-            .and_then(|value| value.as_str().map(PathBuf::from))
-            .unwrap_or_else(|| cwd.clone());
-        if stored_cwd != cwd {
-            return Err(AcpServerError::MalformedMessage(
-                "loaded session cwd does not match its original cwd".into(),
-            ));
-        }
-        {
-            let mut sessions = self.sessions.lock().await;
-            if sessions.contains_key(&id) {
-                return Err(AcpServerError::Execution(
-                    "the session is already active on this ACP connection".into(),
-                ));
-            }
-            if sessions.len() >= self.max_sessions {
-                return Err(AcpServerError::MaxSessionsReached(self.max_sessions));
-            }
-            sessions.insert(
-                id.clone(),
-                SessionState { execution_token: None, mcp: McpSessionResources::default() },
-            );
-        }
-        let mcp = match start_mcp_servers(&mcp_servers, &cwd, &request_cancellation).await {
-            Ok(resources) => resources,
-            Err(error) => {
-                self.sessions.lock().await.remove(&id);
-                return Err(error);
-            }
-        };
-        if let Some(session) = self.sessions.lock().await.get_mut(&id) {
-            session.mcp = mcp;
-        }
+            .reactivate(
+                &session_id,
+                &cwd,
+                &additional_directories,
+                &mcp_servers,
+                system_prompt.as_ref(),
+                &config_options,
+                &request_cancellation,
+                Some(&connection),
+                "loaded",
+            )
+            .await?;
 
         // Replay the stored conversation in chronological order. `events().all()`
         // returns events oldest-first, matching the order in which they were
@@ -339,7 +374,7 @@ impl AcpSessionHandler {
                     .map_err(|e| AcpServerError::Transport(e.to_string()))?;
             }
         }
-        info!(session_id = %id, "loaded ACP session and replayed history");
+        info!(session_id = %session_id, "loaded ACP session and replayed history");
         Ok(())
     }
 
@@ -354,34 +389,32 @@ impl AcpSessionHandler {
     ///
     /// The forked session is registered on this ACP connection (subject to the
     /// max-session limit) and its MCP servers are started, mirroring
-    /// [`create_session`](Self::create_session). The returned identifier is a
-    /// new UUID distinct from the source.
+    /// [`create_session`](Self::create_session). The request's `systemPrompt`
+    /// applies to the fork's turns. The returned identifier is a new UUID
+    /// distinct from the source.
     pub async fn fork_session(
         &self,
-        source_session_id: &SessionId,
-        cwd: PathBuf,
-        additional_directories: Vec<PathBuf>,
-        mcp_servers: Vec<McpServer>,
+        request: ForkSessionRequest,
         request_cancellation: RequestCancellation,
+        connection: ConnectionTo<Client>,
     ) -> Result<SessionId, AcpServerError> {
         self.ensure_running()?;
+        let ForkSessionRequest {
+            session_id: source_session_id,
+            cwd,
+            additional_directories,
+            mcp_servers,
+            system_prompt,
+            ..
+        } = request;
         validate_absolute(&cwd, "cwd")?;
         for directory in &additional_directories {
             validate_absolute(directory, "additionalDirectories")?;
         }
+        let system_prompt = SystemPromptHook::resolve(system_prompt.as_ref(), self.system_prompts)?;
 
         let source_id = source_session_id.to_string();
-        let source = self
-            .session_service
-            .get(GetRequest {
-                app_name: self.app_name.clone(),
-                user_id: self.user_id.clone(),
-                session_id: source_id.clone(),
-                num_recent_events: None,
-                after: None,
-            })
-            .await
-            .map_err(|_| AcpServerError::SessionNotFound(source_id.clone()))?;
+        let source = self.persisted(&source_id).await?;
 
         // Copy the relevant ACP state into the fork. `acp:cwd` and
         // `acp:additional_directories` live only in the initial create-state, so
@@ -407,25 +440,18 @@ impl AcpSessionHandler {
         drop(source);
 
         let new_session_id = uuid::Uuid::new_v4().to_string();
+        self.reserve(&new_session_id, system_prompt).await?;
 
-        {
-            let mut sessions = self.sessions.lock().await;
-            if sessions.len() >= self.max_sessions {
-                return Err(AcpServerError::MaxSessionsReached(self.max_sessions));
-            }
-            sessions.insert(
-                new_session_id.clone(),
-                SessionState { execution_token: None, mcp: McpSessionResources::default() },
-            );
-        }
-
-        let mcp = match start_mcp_servers(&mcp_servers, &cwd, &request_cancellation).await {
-            Ok(resources) => resources,
-            Err(error) => {
-                self.sessions.lock().await.remove(&new_session_id);
-                return Err(error);
-            }
-        };
+        let mcp =
+            match start_mcp_servers(&mcp_servers, &cwd, &request_cancellation, Some(&connection))
+                .await
+            {
+                Ok(resources) => resources,
+                Err(error) => {
+                    self.sessions.lock().await.remove(&new_session_id);
+                    return Err(error);
+                }
+            };
 
         if let Err(error) = self
             .session_service
@@ -444,7 +470,9 @@ impl AcpSessionHandler {
         }
 
         // Copy the source history into the fork, preserving chronological order.
-        for event in source_events {
+        // The fork starts unarchived even when the source is archived.
+        for mut event in source_events {
+            event.actions.state_delta.remove(ARCHIVED_STATE_KEY);
             if let Err(error) = self.session_service.append_event(&new_session_id, event).await {
                 // Best-effort cleanup so a partial fork is not left behind.
                 let _ = self
@@ -462,9 +490,7 @@ impl AcpSessionHandler {
             }
         }
 
-        if let Some(session) = self.sessions.lock().await.get_mut(&new_session_id) {
-            session.mcp = mcp;
-        }
+        self.attach_mcp(&new_session_id, mcp).await;
         info!(
             source_session_id = %source_id,
             forked_session_id = %new_session_id,
@@ -474,6 +500,10 @@ impl AcpSessionHandler {
     }
 
     /// List persisted ACP sessions for the configured ADK application and user.
+    ///
+    /// Archived sessions are left out unless the request's `archived` filter
+    /// includes them (`include`) or asks only for them (`only`). Each entry
+    /// carries the session's title and archived flag.
     pub async fn list_sessions(
         &self,
         request: ListSessionsRequest,
@@ -485,6 +515,16 @@ impl AcpSessionHandler {
             .transpose()
             .map_err(|_| AcpServerError::MalformedMessage("invalid session cursor".into()))?
             .unwrap_or(0);
+        let archived_filter = match request.archived {
+            None | Some(SessionArchiveFilter::Exclude) => ArchivedFilter::Exclude,
+            Some(SessionArchiveFilter::Include) => ArchivedFilter::Include,
+            Some(SessionArchiveFilter::Only) => ArchivedFilter::Only,
+            Some(other) => {
+                return Err(AcpServerError::MalformedMessage(format!(
+                    "unsupported archived filter: {other:?}"
+                )));
+            }
+        };
         let page_size = 50;
         let sessions = self
             .session_service
@@ -508,19 +548,238 @@ impl AcpSessionHandler {
             if request.cwd.as_ref().is_some_and(|filter| filter != &cwd) {
                 continue;
             }
+            let archived = session
+                .state()
+                .get(ARCHIVED_STATE_KEY)
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let listed = match archived_filter {
+                ArchivedFilter::Exclude => !archived,
+                ArchivedFilter::Include => true,
+                ArchivedFilter::Only => archived,
+            };
+            if !listed {
+                continue;
+            }
             let additional_directories = session
                 .state()
                 .get(ADDITIONAL_DIRS_STATE_KEY)
                 .and_then(|value| serde_json::from_value(value).ok())
                 .unwrap_or_default();
+            let title = session
+                .state()
+                .get(TITLE_STATE_KEY)
+                .and_then(|value| value.as_str().map(str::to_string));
             result.push(
                 SessionInfo::new(session.id().to_string(), cwd)
                     .additional_directories(additional_directories)
-                    .updated_at(session.last_update_time().to_rfc3339()),
+                    .title(title)
+                    .updated_at(session.last_update_time().to_rfc3339())
+                    .archived(archived),
             );
         }
         Ok(ListSessionsResponse::new(result)
             .next_cursor(has_more.then(|| (offset + page_size).to_string())))
+    }
+
+    /// The status of a session (`session/status`): `open` while it is active
+    /// on this connection, `saved` while it is only persisted.
+    pub async fn session_status(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionStatus, AcpServerError> {
+        if self.sessions.lock().await.contains_key(&session_id.to_string()) {
+            return Ok(SessionStatus::Open);
+        }
+        self.persisted(&session_id.to_string()).await?;
+        Ok(SessionStatus::Saved)
+    }
+
+    /// Archive a persisted session (`session/archive`), hiding it from
+    /// `session/list` unless the client asks for archived sessions.
+    ///
+    /// Archiving keeps the session's history and does not close it.
+    pub async fn archive_session(&self, session_id: &SessionId) -> Result<(), AcpServerError> {
+        self.set_archived(session_id, true).await
+    }
+
+    /// Restore an archived session to the default `session/list` results
+    /// (`session/unarchive`).
+    pub async fn unarchive_session(&self, session_id: &SessionId) -> Result<(), AcpServerError> {
+        self.set_archived(session_id, false).await
+    }
+
+    async fn set_archived(
+        &self,
+        session_id: &SessionId,
+        archived: bool,
+    ) -> Result<(), AcpServerError> {
+        self.ensure_running()?;
+        let id = session_id.to_string();
+        self.persisted(&id).await?;
+        self.write_session_state(&id, ARCHIVED_STATE_KEY, serde_json::Value::Bool(archived))
+            .await?;
+        info!(session_id = %id, archived, "set ACP session archived flag");
+        Ok(())
+    }
+
+    /// The modes and configuration options a session would start with
+    /// (`session/options`), before the client creates or reactivates it.
+    ///
+    /// With a `sessionId`, the options reflect that persisted session's current
+    /// selections; without one, the agent's defaults.
+    pub async fn session_options(
+        &self,
+        request: SessionOptionsRequest,
+    ) -> Result<SessionOptionsResponse, AcpServerError> {
+        validate_absolute(&request.cwd, "cwd")?;
+        for directory in &request.additional_directories {
+            validate_absolute(directory, "additionalDirectories")?;
+        }
+        let (modes, config_options) = match &request.session_id {
+            Some(session_id) => {
+                self.persisted(&session_id.to_string()).await?;
+                self.session_controls_snapshot(session_id).await
+            }
+            None => match &self.session_controls {
+                None => (None, None),
+                Some(controls) => {
+                    let options = controls.config_options();
+                    (controls.modes(), (!options.is_empty()).then_some(options))
+                }
+            },
+        };
+        Ok(SessionOptionsResponse::new().modes(modes).config_options(config_options))
+    }
+
+    /// Reserve a session slot on this connection, subject to the max-session
+    /// and already-active checks.
+    async fn reserve(
+        &self,
+        id: &str,
+        system_prompt: Option<Arc<SystemPromptHook>>,
+    ) -> Result<(), AcpServerError> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(id) {
+            return Err(AcpServerError::Execution(
+                "the session is already active on this ACP connection".into(),
+            ));
+        }
+        if sessions.len() >= self.max_sessions {
+            return Err(AcpServerError::MaxSessionsReached(self.max_sessions));
+        }
+        sessions.insert(id.to_string(), SessionState::new(system_prompt));
+        Ok(())
+    }
+
+    async fn attach_mcp(&self, id: &str, mcp: McpSessionResources) {
+        if let Some(session) = self.sessions.lock().await.get_mut(id) {
+            session.mcp = mcp;
+        }
+    }
+
+    /// Read a persisted session of the configured application and user.
+    async fn persisted(&self, id: &str) -> Result<Box<dyn adk_session::Session>, AcpServerError> {
+        self.session_service
+            .get(GetRequest {
+                app_name: self.app_name.clone(),
+                user_id: self.user_id.clone(),
+                session_id: id.to_string(),
+                num_recent_events: None,
+                after: None,
+            })
+            .await
+            .map_err(|_| AcpServerError::SessionNotFound(id.to_string()))
+    }
+
+    /// Validate initial `configOptions` values against the advertised options
+    /// and return the session-state entries that store them.
+    fn initial_config_state(
+        &self,
+        initial: &[InitialSessionConfigOption],
+    ) -> Result<Vec<(String, serde_json::Value)>, AcpServerError> {
+        if initial.is_empty() {
+            return Ok(Vec::new());
+        }
+        let options = self
+            .session_controls
+            .as_ref()
+            .map(|controls| controls.config_options())
+            .unwrap_or_default();
+        let mut entries = Vec::with_capacity(initial.len());
+        for value in initial {
+            let option =
+                options.iter().find(|option| option.id == value.config_id).ok_or_else(|| {
+                    AcpServerError::MalformedMessage(format!(
+                        "unknown configuration option: {}",
+                        value.config_id
+                    ))
+                })?;
+            if !config_value_is_valid(option, &value.value) {
+                return Err(AcpServerError::MalformedMessage(format!(
+                    "invalid value for configuration option: {}",
+                    value.config_id
+                )));
+            }
+            let encoded = serde_json::to_value(&value.value)
+                .map_err(|e| AcpServerError::Internal(e.to_string()))?;
+            entries.push((config_state_key(&value.config_id), encoded));
+        }
+        Ok(entries)
+    }
+
+    /// Reactivate a persisted session for `session/load` or `session/resume`
+    /// and return its persisted record.
+    #[allow(clippy::too_many_arguments)]
+    async fn reactivate(
+        &self,
+        session_id: &SessionId,
+        cwd: &Path,
+        additional_directories: &[PathBuf],
+        mcp_servers: &[McpServer],
+        system_prompt: Option<&agent_client_protocol::v1::schema::SystemPrompt>,
+        config_options: &[InitialSessionConfigOption],
+        request_cancellation: &RequestCancellation,
+        connection: Option<&ConnectionTo<Client>>,
+        verb: &str,
+    ) -> Result<Box<dyn adk_session::Session>, AcpServerError> {
+        self.ensure_running()?;
+        validate_absolute(cwd, "cwd")?;
+        for directory in additional_directories {
+            validate_absolute(directory, "additionalDirectories")?;
+        }
+        let system_prompt = SystemPromptHook::resolve(system_prompt, self.system_prompts)?;
+        let initial_config = self.initial_config_state(config_options)?;
+
+        let id = session_id.to_string();
+        let persisted = self.persisted(&id).await?;
+        let stored_cwd = persisted
+            .state()
+            .get(CWD_STATE_KEY)
+            .and_then(|value| value.as_str().map(PathBuf::from))
+            .unwrap_or_else(|| cwd.to_path_buf());
+        if stored_cwd != cwd {
+            return Err(AcpServerError::MalformedMessage(format!(
+                "{verb} session cwd does not match its original cwd"
+            )));
+        }
+        self.reserve(&id, system_prompt).await?;
+        let mcp = match start_mcp_servers(mcp_servers, cwd, request_cancellation, connection).await
+        {
+            Ok(resources) => resources,
+            Err(error) => {
+                self.sessions.lock().await.remove(&id);
+                return Err(error);
+            }
+        };
+        for (key, value) in initial_config {
+            if let Err(error) = self.write_session_state(&id, &key, value).await {
+                self.sessions.lock().await.remove(&id);
+                return Err(error);
+            }
+        }
+        self.attach_mcp(&id, mcp).await;
+        Ok(persisted)
     }
 
     /// Delete persisted session history and release any active execution.
@@ -541,15 +800,31 @@ impl AcpSessionHandler {
     }
 
     /// Execute one prompt and stream official `session/update` notifications
-    /// through the SDK connection before returning the turn stop reason.
+    /// through the SDK connection before returning the turn's response: its
+    /// stop reason and the tokens the turn's model calls used.
     pub async fn handle_prompt(
         &self,
         request: PromptRequest,
         connection: ConnectionTo<Client>,
-    ) -> Result<StopReason, AcpServerError> {
+    ) -> Result<PromptResponse, AcpServerError> {
+        let sink = V1Turn { connection: &connection, session_id: &request.session_id };
+        let (stop_reason, usage) =
+            self.run_turn(&request.session_id, &request.prompt, &sink).await?;
+        Ok(PromptResponse::new(stop_reason).usage(usage))
+    }
+
+    /// Run one prompt turn of an active session, reporting its updates and
+    /// permission requests through `sink`, and return how it ended with the
+    /// tokens its model calls used.
+    pub(crate) async fn run_turn(
+        &self,
+        session_id: &SessionId,
+        prompt: &[ContentBlock],
+        sink: &dyn TurnSink,
+    ) -> Result<(StopReason, Option<Usage>), AcpServerError> {
         self.ensure_running()?;
-        let id = request.session_id.to_string();
-        let (cancellation_token, runtime_toolsets) = {
+        let id = session_id.to_string();
+        let (cancellation_token, runtime_toolsets, system_prompt) = {
             let mut sessions = self.sessions.lock().await;
             let state =
                 sessions.get_mut(&id).ok_or_else(|| AcpServerError::SessionNotFound(id.clone()))?;
@@ -560,12 +835,21 @@ impl AcpSessionHandler {
             }
             let token = CancellationToken::new();
             state.execution_token = Some(token.clone());
-            (token, state.mcp.toolsets.clone())
+            (token, state.mcp.toolsets.clone(), state.system_prompt.clone())
         };
         let _running = RunningPrompt::start(&self.running_prompts);
 
+        let mut usage = TurnUsage::default();
         let result = self
-            .execute_prompt(&request, connection, cancellation_token.clone(), runtime_toolsets)
+            .execute_prompt(
+                session_id,
+                prompt,
+                sink,
+                cancellation_token.clone(),
+                runtime_toolsets,
+                system_prompt,
+                &mut usage,
+            )
             .await;
 
         let mut sessions = self.sessions.lock().await;
@@ -574,23 +858,26 @@ impl AcpSessionHandler {
         }
         drop(sessions);
 
-        if cancellation_token.is_cancelled() {
-            return Ok(StopReason::Cancelled);
-        }
-        result
+        let stop_reason =
+            if cancellation_token.is_cancelled() { StopReason::Cancelled } else { result? };
+        Ok((stop_reason, usage.into_acp()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_prompt(
         &self,
-        request: &PromptRequest,
-        connection: ConnectionTo<Client>,
+        acp_session_id: &SessionId,
+        prompt: &[ContentBlock],
+        sink: &dyn TurnSink,
         cancellation_token: CancellationToken,
         runtime_toolsets: Vec<Arc<dyn Toolset>>,
+        system_prompt: Option<Arc<SystemPromptHook>>,
+        usage: &mut TurnUsage,
     ) -> Result<StopReason, AcpServerError> {
-        let content = prompt_content(&request.prompt)?;
+        let content = prompt_content(prompt)?;
         let user_id = UserId::new(self.user_id.clone())
             .map_err(|e| AcpServerError::Execution(e.to_string()))?;
-        let session_id = AdkSessionId::new(request.session_id.to_string())
+        let session_id = AdkSessionId::new(acp_session_id.to_string())
             .map_err(|e| AcpServerError::Execution(e.to_string()))?;
 
         // Accumulated tool-confirmation decisions, keyed by function-call ID (the
@@ -618,17 +905,17 @@ impl AcpSessionHandler {
         // call that already has a decision.
         const MAX_CONFIRMATION_ROUNDS: usize = 64;
 
-        let scope = adk_core::ApprovalScope::new(
-            &self.app_name,
-            &self.user_id,
-            request.session_id.to_string(),
-        );
+        let scope =
+            adk_core::ApprovalScope::new(&self.app_name, &self.user_id, acp_session_id.to_string());
         for _round in 0..MAX_CONFIRMATION_ROUNDS {
-            let run_config = RunConfig::builder()
+            let mut run_config = RunConfig::builder()
                 .runtime_toolsets(runtime_toolsets.clone())
                 .tool_confirmation_decisions(decisions.clone())
-                .tool_confirmation_fingerprints(fingerprints.clone())
-                .build();
+                .tool_confirmation_fingerprints(fingerprints.clone());
+            if let Some(hook) = &system_prompt {
+                run_config = run_config.invocation_hook(hook.clone());
+            }
+            let run_config = run_config.build();
             let runner = Runner::builder()
                 .app_name(&self.app_name)
                 .agent(self.agent.clone())
@@ -640,10 +927,16 @@ impl AcpSessionHandler {
 
             let run_content =
                 if is_resume { Content::new("user").with_text("") } else { content.clone() };
-            let mut stream = runner
-                .run(user_id.clone(), session_id.clone(), run_content)
+            // `start_with_config` with no override runs with the runner's config, as
+            // `run` does, and names the invocation before its first event.
+            let invocation = runner
+                .start_with_config(user_id.clone(), session_id.clone(), run_content, None)
                 .await
                 .map_err(|e| AcpServerError::Execution(format!("runner.run failed: {e}")))?;
+            if !is_resume {
+                sink.started(invocation.invocation_id().as_ref())?;
+            }
+            let mut stream = invocation.into_events();
 
             // Confirmations surfaced during this run, awaiting a client decision.
             let mut pending: Vec<ToolConfirmationRequest> = Vec::new();
@@ -667,21 +960,19 @@ impl AcpSessionHandler {
                             pending.push(confirmation.clone());
                             continue;
                         }
+                        if let Some(metadata) = &event.llm_response.usage_metadata {
+                            usage.add(metadata);
+                        }
                         let event = text_deltas.push(&event);
                         for update in ResponseStreamer::map_event(&event) {
-                            connection
-                                .send_notification(SessionNotification::new(
-                                    request.session_id.clone(),
-                                    update,
-                                ))
-                                .map_err(|e| AcpServerError::Transport(e.to_string()))?;
+                            sink.update(update)?;
                         }
                     }
                     Err(error) => {
                         if cancellation_token.is_cancelled() {
                             return Ok(StopReason::Cancelled);
                         }
-                        warn!(%error, session_id = %request.session_id, "ACP Runner event failed");
+                        warn!(%error, session_id = %acp_session_id, "ACP Runner event failed");
                         return Err(AcpServerError::Execution(error.to_string()));
                     }
                 }
@@ -729,13 +1020,7 @@ impl AcpSessionHandler {
                     Some(standing) => standing.offer(&scope, confirmation).await,
                     None => None,
                 };
-                let answer = PermissionBridge::request(
-                    &connection,
-                    &request.session_id,
-                    confirmation,
-                    offer.as_ref(),
-                )
-                .await?;
+                let answer = sink.request_permission(confirmation, offer.as_ref()).await?;
                 // A confirmation without a call ID cannot be bound to one call, so
                 // there is nothing safe to authorize.
                 let Some(call_id) = confirmation.function_call_id.clone() else {
@@ -940,7 +1225,7 @@ impl AcpSessionHandler {
     ///
     /// Best-effort: an absent or unreadable session yields `None` rather than
     /// failing the surrounding request.
-    async fn session_title(&self, session_id: &SessionId) -> Option<String> {
+    pub(crate) async fn session_title(&self, session_id: &SessionId) -> Option<String> {
         let persisted = self
             .session_service
             .get(GetRequest {
@@ -969,6 +1254,7 @@ impl AcpSessionHandler {
     ) -> Result<(), AcpServerError> {
         self.ensure_running()?;
         let title = title.into();
+        self.persisted(&session_id.to_string()).await?;
         self.write_session_state(
             &session_id.to_string(),
             TITLE_STATE_KEY,
@@ -1039,6 +1325,24 @@ impl AcpSessionHandler {
         value: SessionConfigOptionValue,
         connection: ConnectionTo<Client>,
     ) -> Result<(), AcpServerError> {
+        let config_options = self.store_config_option(session_id, config_id, value).await?;
+        connection
+            .send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options)),
+            ))
+            .map_err(|e| AcpServerError::Transport(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Validate and persist a configuration option value, returning the full
+    /// option set with the current values reflecting the write.
+    pub(crate) async fn store_config_option(
+        &self,
+        session_id: &SessionId,
+        config_id: &SessionConfigId,
+        value: SessionConfigOptionValue,
+    ) -> Result<Vec<SessionConfigOption>, AcpServerError> {
         self.ensure_running()?;
         let options = self
             .session_controls
@@ -1057,18 +1361,9 @@ impl AcpSessionHandler {
             serde_json::to_value(&value).map_err(|e| AcpServerError::Internal(e.to_string()))?;
         self.write_session_state(&session_id.to_string(), &config_state_key(config_id), encoded)
             .await?;
-        // Report the full option set with current values reflecting the write.
-        let (_, config_options) = self.session_controls_snapshot(session_id).await;
-        connection
-            .send_notification(SessionNotification::new(
-                session_id.clone(),
-                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
-                    config_options.unwrap_or_default(),
-                )),
-            ))
-            .map_err(|e| AcpServerError::Transport(e.to_string()))?;
         info!(session_id = %session_id, config_id = %config_id, "set ACP session config option");
-        Ok(())
+        let (_, config_options) = self.session_controls_snapshot(session_id).await;
+        Ok(config_options.unwrap_or_default())
     }
 
     /// Persist a single session-state key by appending a state-delta event.
@@ -1088,6 +1383,32 @@ impl AcpSessionHandler {
             .append_event(session_id, event)
             .await
             .map_err(|e| AcpServerError::Internal(format!("failed to persist session state: {e}")))
+    }
+
+    /// The commands the agent's [`SessionControls`] declare, if any.
+    #[cfg(feature = "unstable-protocol-v2")]
+    pub(crate) fn declared_commands(
+        &self,
+    ) -> Vec<agent_client_protocol::v1::schema::AvailableCommand> {
+        self.session_controls
+            .as_ref()
+            .map(|controls| controls.available_commands())
+            .unwrap_or_default()
+    }
+
+    /// Whether a session is active on this connection.
+    #[cfg(feature = "unstable-protocol-v2")]
+    pub(crate) async fn is_active(&self, session_id: &SessionId) -> bool {
+        self.sessions.lock().await.contains_key(&session_id.to_string())
+    }
+
+    /// A persisted session's stored events, oldest first.
+    #[cfg(feature = "unstable-protocol-v2")]
+    pub(crate) async fn history(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<adk_core::Event>, AcpServerError> {
+        Ok(self.persisted(&session_id.to_string()).await?.events().all())
     }
 
     /// Counts a prompt as running, for [`drain_sessions`](Self::drain_sessions), until the
@@ -1129,10 +1450,14 @@ impl AcpSessionHandler {
     }
 }
 
+/// Start the session's stdio MCP servers and connect its `acp` ones, whose
+/// tools the client serves over `connection`. Without a connection that reaches the
+/// client's tool servers, an `acp` server is refused.
 async fn start_mcp_servers(
     servers: &[McpServer],
     cwd: &Path,
     cancellation: &RequestCancellation,
+    connection: Option<&ConnectionTo<Client>>,
 ) -> Result<McpSessionResources, AcpServerError> {
     validate_mcp_servers(servers)?;
     let mut resources = McpSessionResources {
@@ -1141,11 +1466,22 @@ async fn start_mcp_servers(
     };
     let mut names = Vec::with_capacity(servers.len());
     for server in servers {
-        let McpServer::Stdio(config) = server else {
-            return Err(AcpServerError::MalformedMessage(
-                "this ACP agent supports the required MCP stdio transport; HTTP and SSE were not advertised"
-                    .into(),
-            ));
+        let config = match server {
+            McpServer::Stdio(config) => config,
+            McpServer::Acp(config) => {
+                let Some(connection) = connection else {
+                    return Err(unsupported_mcp_transport());
+                };
+                resources.cancellations.push(None);
+                resources.toolsets.push(Arc::new(AcpMcpToolset::new(
+                    &config.name,
+                    config.server_id.clone(),
+                    connection.clone(),
+                )));
+                names.push(config.name.as_str());
+                continue;
+            }
+            _ => return Err(unsupported_mcp_transport()),
         };
         if !config.command.is_absolute() {
             return Err(AcpServerError::MalformedMessage(format!(
@@ -1245,6 +1581,14 @@ async fn reject_tool_name_collisions(
     Ok(())
 }
 
+/// The error for an MCP server whose transport this agent does not advertise.
+fn unsupported_mcp_transport() -> AcpServerError {
+    AcpServerError::MalformedMessage(
+        "this ACP agent supports the MCP stdio and acp transports; HTTP and SSE were not advertised"
+            .into(),
+    )
+}
+
 fn validate_mcp_servers(servers: &[McpServer]) -> Result<(), AcpServerError> {
     const MAX_MCP_SERVERS: usize = 16;
     if servers.len() > MAX_MCP_SERVERS {
@@ -1254,11 +1598,29 @@ fn validate_mcp_servers(servers: &[McpServer]) -> Result<(), AcpServerError> {
     }
     let mut names = std::collections::HashSet::new();
     for server in servers {
-        let McpServer::Stdio(config) = server else {
-            return Err(AcpServerError::MalformedMessage(
-                "this ACP agent supports the required MCP stdio transport; HTTP and SSE were not advertised"
-                    .into(),
-            ));
+        let config = match server {
+            McpServer::Stdio(config) => config,
+            McpServer::Acp(config) => {
+                if config.name.trim().is_empty() {
+                    return Err(AcpServerError::MalformedMessage(
+                        "MCP server names cannot be empty".into(),
+                    ));
+                }
+                if config.server_id.0.is_empty() {
+                    return Err(AcpServerError::MalformedMessage(format!(
+                        "MCP server '{}' has an empty serverId",
+                        config.name
+                    )));
+                }
+                if !names.insert(config.name.as_str()) {
+                    return Err(AcpServerError::MalformedMessage(format!(
+                        "duplicate MCP server name: {}",
+                        config.name
+                    )));
+                }
+                continue;
+            }
+            _ => return Err(unsupported_mcp_transport()),
         };
         if config.name.trim().is_empty() {
             return Err(AcpServerError::MalformedMessage(
@@ -1298,6 +1660,50 @@ fn validate_absolute(path: &Path, field: &str) -> Result<(), AcpServerError> {
     }
 }
 
+/// The tokens a prompt turn's model calls used, summed over the events that
+/// report usage, for `PromptResponse.usage`.
+#[derive(Default)]
+pub(crate) struct TurnUsage {
+    reported: bool,
+    input: u64,
+    output: u64,
+    total: u64,
+    thought: Option<u64>,
+    cached_read: Option<u64>,
+    cached_write: Option<u64>,
+}
+
+impl TurnUsage {
+    pub(crate) fn add(&mut self, metadata: &adk_core::UsageMetadata) {
+        fn count(value: i32) -> u64 {
+            u64::try_from(value.max(0)).unwrap_or(0)
+        }
+        fn add_optional(sum: &mut Option<u64>, value: Option<i32>) {
+            if let Some(value) = value {
+                *sum = Some(sum.unwrap_or(0) + count(value));
+            }
+        }
+        self.reported = true;
+        self.input += count(metadata.prompt_token_count);
+        self.output += count(metadata.candidates_token_count);
+        self.total += count(metadata.total_token_count);
+        add_optional(&mut self.thought, metadata.thinking_token_count);
+        add_optional(&mut self.cached_read, metadata.cache_read_input_token_count);
+        add_optional(&mut self.cached_write, metadata.cache_creation_input_token_count);
+    }
+
+    /// The ACP usage, or `None` when no model call reported any: token counts
+    /// are never fabricated.
+    pub(crate) fn into_acp(self) -> Option<Usage> {
+        self.reported.then(|| {
+            Usage::new(self.total.max(self.input + self.output), self.input, self.output)
+                .thought_tokens(self.thought)
+                .cached_read_tokens(self.cached_read)
+                .cached_write_tokens(self.cached_write)
+        })
+    }
+}
+
 fn prompt_content(blocks: &[ContentBlock]) -> Result<Content, AcpServerError> {
     let mut content = Content::new("user");
     for block in blocks {
@@ -1318,7 +1724,7 @@ fn prompt_content(blocks: &[ContentBlock]) -> Result<Content, AcpServerError> {
 
 #[cfg(test)]
 mod tests {
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         AudioContent, EmbeddedResource as AcpEmbeddedResource, EmbeddedResourceResource,
         EnvVariable, ImageContent, McpServerStdio, TextContent,
         TextResourceContents as AcpTextResourceContents,
@@ -1337,6 +1743,32 @@ mod tests {
     /// those content types are accepted by [`prompt_content`].
     ///
     /// **Validates: Requirements 6.1, 6.2, 6.3, 6.4, 13.1, 13.2**
+    #[test]
+    fn turn_usage_sums_the_reported_calls_and_never_fabricates() {
+        assert!(TurnUsage::default().into_acp().is_none(), "no report, no usage");
+
+        let mut usage = TurnUsage::default();
+        usage.add(&adk_core::UsageMetadata {
+            prompt_token_count: 10,
+            candidates_token_count: 4,
+            total_token_count: 14,
+            thinking_token_count: Some(2),
+            ..Default::default()
+        });
+        usage.add(&adk_core::UsageMetadata {
+            prompt_token_count: 20,
+            candidates_token_count: 6,
+            total_token_count: 26,
+            cache_read_input_token_count: Some(9),
+            ..Default::default()
+        });
+        let usage = usage.into_acp().expect("usage");
+        assert_eq!((usage.input_tokens, usage.output_tokens, usage.total_tokens), (30, 10, 40));
+        assert_eq!(usage.thought_tokens, Some(2));
+        assert_eq!(usage.cached_read_tokens, Some(9));
+        assert_eq!(usage.cached_write_tokens, None);
+    }
+
     #[test]
     fn advertised_prompt_capabilities_match_accepted_content_types() {
         let (agent, session_service) = mock_agent_and_session();

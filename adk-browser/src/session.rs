@@ -164,6 +164,18 @@ impl BrowserSession {
         })
     }
 
+    /// A live WebDriver handle, starting the session when needed.
+    pub(crate) async fn driver(&self) -> Result<WebDriver> {
+        self.live_driver().await
+    }
+
+    /// The WebDriver handle of a running session, without starting one or checking it
+    /// responds. Watchers such as [`frames`](Self::frames) use it so that watching never
+    /// starts a browser.
+    pub(crate) async fn running_driver(&self) -> Option<WebDriver> {
+        self.driver.read().await.clone()
+    }
+
     /// Get a snapshot of the current page context (url, title, truncated body text).
     ///
     /// Useful for returning page state after interaction tools.
@@ -989,7 +1001,7 @@ mod tests {
                 serde_json::json!({"download.default_directory":"/tmp/downloads"}),
             );
         let caps = BrowserSession::new(config).build_capabilities().unwrap();
-        let options = &caps["goog:chromeOptions"];
+        let options = caps.get("goog:chromeOptions").expect("chrome options are set");
         assert_eq!(options["binary"], "/opt/chromium");
         assert_eq!(options["prefs"]["download.default_directory"], "/tmp/downloads");
         assert!(!options["args"].as_array().unwrap().iter().any(|arg| arg == "--no-sandbox"));

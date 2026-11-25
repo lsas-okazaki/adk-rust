@@ -4,6 +4,19 @@
 server. It performs no actuation itself: it orders observation, approval, mutation, and
 verification as a deterministic graph, and checks what the external runtime returns.
 
+For Claude's computer use toolset, `ComputerUseToolset` runs each action the model asks for as a
+governed tool call over a `ComputerActuator` you supply; see
+[Governed Computer Use and Browser Use](toolsets.md).
+
+> **Note:** No released `computer-use-mcp` serves the governed tools `ComputerUseMcpRuntime`
+> calls: `preview_action`, `execute_action`, `get_execution_capabilities`,
+> `acquire_control_lease`, `reserve_target`, `release_target_reservation`, `pause_session`,
+> `stop_session` and `emergency_stop`. The server exposes plain tools (`screenshot`, `click`,
+> `run_steps`, ...). To act on a desktop through it, give `ComputerUseToolset` an
+> `McpComputerActuator` ([A desktop through computer-use-mcp](toolsets.md#a-desktop-through-computer-use-mcp)).
+> The reference graph runs against any other `ComputerUseRuntime`, such as the in-process one
+> in `minimal_graph`.
+
 ## Use it
 
 ```toml
@@ -41,8 +54,8 @@ The crate's examples run with `cargo run -p adk-computer-use --example <name>`:
 | Example | Needs |
 |---------|-------|
 | `minimal_graph` | Nothing; an in-process runtime, on any platform |
-| `live_clipboard` | A running `computer-use-mcp` server (macOS, Linux, Windows) |
-| `live_form`, `live_background_finder` | A running `computer-use-mcp` server and macOS tooling; see `examples/macos/README.md` |
+| `live_clipboard` | A server that serves the governed tools (macOS, Linux, Windows); no released `computer-use-mcp` does |
+| `live_form`, `live_background_finder` | The same, and macOS tooling; see `examples/macos/README.md` |
 
 ## Response binding
 
@@ -102,6 +115,37 @@ For checkpoint resume, the graph stores the runtime preview in an append-only st
 Approval and execution require that channel to contain exactly one preview matching the active
 preview. Resume input can add state but cannot replace the checkpointed value: an attempted
 replacement creates a second entry and fails before reservation or mutation.
+
+## Target bounds
+
+`TargetEvidence.bounds` states its coordinate space and device pixel ratio, so a box from a
+screenshot of a high-density display is never read in the wrong units (spec 3.7 V-I14):
+
+| Field | Meaning |
+|-------|---------|
+| `Bounds.space` | `logical_points` (the space a desktop runtime acts in, and the reading of bounds that state none) or `screenshot_pixels` |
+| `Bounds.devicePixelRatio` | Screenshot pixels per logical point; 1 when unstated |
+| `TargetEvidence.devicePixelRatio` | The ratio of the screenshot `screenshotHash` names |
+
+`TargetEvidence::check_screen_binding` refuses evidence whose bounds come from a screenshot
+without the screenshot's ratio, with a different ratio, or with a non-finite or inverted box.
+`Bounds::to_points` and `Bounds::to_pixels` convert between the spaces:
+
+```rust
+use adk_computer_use::{Bounds, CoordinateSpace};
+
+fn main() {
+    // A Save button in a 3024×1964 screenshot of a 1512×982-point display.
+    let pixels = Bounds::pixels(1920.0, 1180.0, 180.0, 80.0, 2.0);
+    let points = pixels.to_points();
+    assert_eq!(points.space, CoordinateSpace::LogicalPoints);
+    assert_eq!((points.x, points.y, points.width, points.height), (960.0, 590.0, 90.0, 40.0));
+    assert!(points.contains(points.center()));
+}
+```
+
+`adk-vision` fills this evidence from a chosen set-of-marks candidate; see
+[Screen Grounding](../vision/screen.md#target-evidence).
 
 ## Reservation cleanup
 

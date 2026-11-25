@@ -1,6 +1,6 @@
 use axum::{
     Extension, Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ impl SessionController {
     }
 
     /// Helper function to convert a session to SessionResponse with actual events and state
-    fn session_to_response(session: &dyn adk_session::Session) -> SessionResponse {
+    pub(crate) fn session_to_response(session: &dyn adk_session::Session) -> SessionResponse {
         // Convert events to JSON values, capping at a reasonable limit to prevent
         // uncontrolled allocation from very large session histories.
         const MAX_EVENTS: usize = 10_000;
@@ -82,7 +82,7 @@ pub struct CreateSessionRequest {
     pub session_id: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionResponse {
     pub id: String,
@@ -203,6 +203,9 @@ where
 /// Request body for creating session (optional, can be empty)
 #[derive(Serialize, Deserialize, Default)]
 pub struct CreateSessionBodyRequest {
+    /// The session id the client chooses, when the path names none.
+    #[serde(default, alias = "sessionId", skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     #[serde(default, deserialize_with = "deserialize_bounded_state")]
     pub state: std::collections::HashMap<String, serde_json::Value>,
     #[serde(default, deserialize_with = "deserialize_bounded_events")]
@@ -228,7 +231,13 @@ pub async fn create_session_from_path(
     body: Option<Json<CreateSessionBodyRequest>>,
 ) -> Result<Json<SessionResponse>, StatusCode> {
     let user_id = authorize_user_id(&request_context, &params.user_id)?;
-    let session_id = params.session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // The path's id, else the one the body chooses (adk-python and adk-go accept both), else
+    // a new one.
+    let session_id = params
+        .session_id
+        .or_else(|| body.as_ref().and_then(|b| b.0.session_id.clone()))
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let session = controller
         .session_service
@@ -296,26 +305,37 @@ pub async fn delete_session_from_path(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// List sessions for a user (adk-go compatible)
+/// Which sessions `GET .../sessions` lists.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListSessionsQuery {
+    /// `true` lists the archived sessions instead of the active ones.
+    #[serde(default)]
+    pub archived: bool,
+}
+
+/// List sessions for a user (adk-go compatible); archived sessions only with `?archived=true`.
 pub async fn list_sessions(
     State(controller): State<SessionController>,
     Extension(request_context): Extension<Option<adk_core::RequestContext>>,
     Path(params): Path<SessionPathParams>,
+    Query(query): Query<ListSessionsQuery>,
 ) -> Result<Json<Vec<SessionResponse>>, StatusCode> {
     let user_id = authorize_user_id(&request_context, &params.user_id)?;
 
     tracing::info!("list_sessions called with app_name: {}, user_id: {}", params.app_name, user_id);
 
-    let sessions = controller
-        .session_service
-        .list(adk_session::ListRequest {
-            app_name: params.app_name.clone(),
-            user_id,
-            limit: None,
-            offset: None,
-        })
-        .await
-        .map_err(|e| error_status("list", &e))?;
+    let request = adk_session::ListRequest {
+        app_name: params.app_name.clone(),
+        user_id,
+        limit: None,
+        offset: None,
+    };
+    let listed = if query.archived {
+        controller.session_service.list_archived(request).await
+    } else {
+        controller.session_service.list_active(request).await
+    };
+    let sessions = listed.map_err(|e| error_status("list", &e))?;
 
     tracing::info!("Found {} sessions", sessions.len());
 

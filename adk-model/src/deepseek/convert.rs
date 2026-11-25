@@ -416,15 +416,9 @@ pub fn final_chunk_parts(
 ///
 /// When `strict` is `true`, each tool definition includes `"strict": true`
 /// for the beta strict tool mode.
-///
-/// Tools are sent sorted by name: a `HashMap`'s order changes between runs, and
-/// a reordered tool list changes the prompt prefix the provider caches.
-pub fn convert_tools(tools: &std::collections::HashMap<String, Value>, strict: bool) -> Vec<Tool> {
-    let mut entries: Vec<_> = tools.iter().collect();
-    entries.sort_by(|a, b| a.0.cmp(b.0));
-    entries
-        .into_iter()
-        .map(|(_, tool)| tool)
+pub fn convert_tools(tools: &adk_core::ToolDeclarations, strict: bool) -> Vec<Tool> {
+    tools
+        .values()
         .filter_map(|tool| {
             let name = tool.get("name")?.as_str()?;
             let description = tool.get("description").and_then(|d| d.as_str()).unwrap_or("");

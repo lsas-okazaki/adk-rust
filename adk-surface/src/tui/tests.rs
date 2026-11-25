@@ -87,6 +87,9 @@ pub(super) fn card(id: &str, tool: &str, args: Value) -> DecisionCard {
         decided: None,
         adds_agent: None,
         detail: None,
+        elicitation: None,
+        media: None,
+        parked: None,
     }
 }
 
@@ -143,6 +146,7 @@ fn a_decision_key_does_nothing_until_the_box_is_armed() {
             edited_args: None,
             reason: None,
             expanded: true,
+            evidence: Vec::new(),
         })]
     );
 }
@@ -162,7 +166,11 @@ fn esc_never_decides_and_switches_to_typing() {
     let effects = app.key(key(KeyCode::Enter), armed);
     assert_eq!(
         effects,
-        vec![Effect::Execute(Command::Send { session_id: SESSION.into(), text: "yes".into() })],
+        vec![Effect::Execute(Command::Send {
+            session_id: SESSION.into(),
+            text: "yes".into(),
+            images: Vec::new()
+        })],
         "typed while a decision is open: sent, and the engine queues it (S-I4)"
     );
 }
@@ -334,6 +342,7 @@ fn the_full_screen_has_the_layout_of_the_concept() {
             mode: None,
             added: false,
             can_change: false,
+            shell: None,
         }]),
         shown,
     );
@@ -343,6 +352,7 @@ fn the_full_screen_has_the_layout_of_the_concept() {
             from: Speaker::Agent,
             author: "Finance".into(),
             text: "The October invoice for [CLIENT] is ready.".into(),
+            images: Vec::new(),
         }],
     );
     app.update(frame(FeedFrame::Entry { entry }), shown);
@@ -488,13 +498,19 @@ proptest! {
             area: None,
             mode: None,
             added: false,
-            can_change: false,
+            can_change: false, shell: None
         }]), shown);
         let entry = thread_entry(1, vec![
-            ThreadItem::Message { from: Speaker::Agent, author: name.clone(), text: message.clone() },
-            ThreadItem::Message { from: Speaker::You, author: "You".into(), text: message.clone() },
+            ThreadItem::Message { from: Speaker::Agent, author: name.clone(), text: message.clone(), images: Vec::new()  },
+            ThreadItem::Message { from: Speaker::You, author: "You".into(), text: message.clone(), images: Vec::new()  },
             ThreadItem::Activity { tool: tool.clone(), text: message.clone(), call_id: Some("c1".into()) },
-            ThreadItem::Result { tool: tool.clone(), call_id: None, ok: false, text: "Failed".into() },
+            ThreadItem::Result {
+                tool: tool.clone(),
+                call_id: None,
+                ok: false,
+                text: "Failed".into(),
+                image: None,
+            },
             ThreadItem::Decision { decision_id: None, tool: tool.clone(), text: "Waiting for you".into() },
         ]);
         app.update(frame(FeedFrame::Entry { entry: entry.clone() }), shown);
@@ -1001,6 +1017,7 @@ fn each_reply_is_drawn_from_its_own_text() {
                 from: Speaker::Agent,
                 author: "Finance".into(),
                 text: text.into(),
+                images: Vec::new(),
             }],
         )
     };
@@ -1162,6 +1179,7 @@ fn an_answered_decision_shows_once_at_its_place() {
                 from: Speaker::You,
                 author: "You".into(),
                 text: text.into(),
+                images: Vec::new(),
             }],
         )
     };
@@ -1172,6 +1190,7 @@ fn an_answered_decision_shows_once_at_its_place() {
                 from: Speaker::Agent,
                 author: "Finance".into(),
                 text: text.into(),
+                images: Vec::new(),
             }],
         )
     };
@@ -1311,6 +1330,7 @@ fn tab_never_carries_an_edit_to_another_thread() {
         mode: None,
         added: false,
         can_change: false,
+        shell: None,
     });
     for answer in ['e', 'n'] {
         let mut app = app_with(vec![invoice()], shown);
@@ -1460,7 +1480,12 @@ fn decision_keys_never_become_text_while_the_box_waits() {
         let said = format!("message {seq}");
         let entry = thread_entry(
             seq,
-            vec![ThreadItem::Message { from: Speaker::You, author: "You".into(), text: said }],
+            vec![ThreadItem::Message {
+                from: Speaker::You,
+                author: "You".into(),
+                text: said,
+                images: Vec::new(),
+            }],
         );
         app.update(frame(FeedFrame::Entry { entry }), shown);
     }
@@ -1515,7 +1540,7 @@ async fn a_queued_message_is_taken_back() {
     let source = LocalSource::builder("adk-rust").sessions(sessions).approvals(approvals);
     let engine = SurfaceEngine::builder(Arc::new(source.build().unwrap())).build();
     let me = Caller::human("ana", SurfaceKind::Terminal, Origin::Keyboard);
-    let send = Command::Send { session_id: SESSION.into(), text: "y".into() };
+    let send = Command::Send { session_id: SESSION.into(), text: "y".into(), images: Vec::new() };
     assert!(matches!(engine.execute(&me, send).await, Ok(CommandOutcome::Queued { .. })));
     assert_eq!(engine.queued(&me, SESSION), ["y"]);
     assert_eq!(engine.unqueue_last(&me, SESSION), Some("y".into()));
@@ -1808,7 +1833,11 @@ async fn leaving_says_what_was_queued_and_not_sent() {
     let policy = ApprovalPolicy::new([ApproverSelector::human("ana")]);
     fake.pending.push(ApprovalRequest::new("apr_email", scope, &call, policy));
     let surface = fake_terminal(std::sync::Arc::new(fake));
-    let send = Command::Send { session_id: SESSION.into(), text: "also cc my accountant".into() };
+    let send = Command::Send {
+        session_id: SESSION.into(),
+        text: "also cc my accountant".into(),
+        images: Vec::new(),
+    };
     let outcome = surface.engine.execute(&surface.caller, send).await.unwrap();
     assert!(matches!(outcome, CommandOutcome::Queued { .. }), "{outcome:?}");
     let mut out = Vec::new();
@@ -1913,6 +1942,7 @@ fn tab_and_the_arrows_complete_a_command() {
         mode: None,
         added: false,
         can_change: false,
+        shell: None,
     });
     app.update(Update::Agents(rows.to_vec()), now);
     // `/today` and `/todos` share "tod"; Tab takes that, then the chosen name.
@@ -2228,6 +2258,7 @@ fn tab_reaches_an_added_agent_without_a_thread() {
         mode: None,
         added,
         can_change: added,
+        shell: None,
     };
     let rows = vec![
         row("adk-rust", Some(SESSION), false),
@@ -2246,12 +2277,17 @@ fn tab_reaches_an_added_agent_without_a_thread() {
             agent: "finance".into(),
             session_id: "new-1".into(),
             text: "hello".into(),
+            images: Vec::new()
         })]
     );
     type_text(&mut app, "again", now);
     assert_eq!(
         app.key(key(KeyCode::Enter), now),
-        vec![Effect::Execute(Command::Send { session_id: "new-1".into(), text: "again".into() })]
+        vec![Effect::Execute(Command::Send {
+            session_id: "new-1".into(),
+            text: "again".into(),
+            images: Vec::new()
+        })]
     );
     // An agent of the kernel's own without a thread is not reached; Tab comes back round.
     app.switch_session(SESSION.into());
@@ -2313,6 +2349,7 @@ fn tab_never_moves_threads_while_a_command_with_arguments_is_typed() {
         mode: None,
         added: false,
         can_change: false,
+        shell: None,
     });
     app.update(Update::Agents(rows.to_vec()), now);
     type_text(&mut app, "/todo", now);
@@ -2505,6 +2542,7 @@ fn added_row(name: &str, area: &str) -> AgentRow {
         mode: None,
         added: true,
         can_change: true,
+        shell: None,
     }
 }
 
@@ -2569,4 +2607,135 @@ fn a_removed_agent_s_thread_is_read_only() {
     );
     assert_eq!(app.composer.text, "one more invoice");
     assert!(notices(&app).contains("Bills was removed"), "{}", notices(&app));
+}
+
+/// A held `vision_describe` call with the identity card's egress image (spec 3.7 §8.2).
+fn image_card() -> DecisionCard {
+    use crate::evidence::{
+        CardMedia, CoverClass, CoveredLine, EvidenceImage, EvidenceRegion, GoesTo,
+    };
+    let digest = "sha256:6b644f480a4058281fbdb2f2e67821a69f702ea65f7c70552289a6add1f31c7c";
+    let region = |class, tag: &str, x0, y0, x1, y1| EvidenceRegion {
+        class,
+        tag: tag.into(),
+        short_tag: tag.into(),
+        x0,
+        y0,
+        x1,
+        y1,
+    };
+    let mut card = card(
+        "dec-7c41e0",
+        "vision_describe",
+        json!({ "image": "id-card.png", "backend": "claude", "question": "What kind of document is this?" }),
+    );
+    card.heading = "Send this image to Claude".into();
+    card.allowed.options = vec![
+        option(Answer::AllowOnce, "Allow once", false),
+        option(Answer::Edit, "Edit", false),
+        option(Answer::Deny, "Deny", false),
+    ];
+    card.media = Some(CardMedia {
+        title: "The exact image that would leave".into(),
+        images: vec![EvidenceImage {
+            index: 0,
+            digest: digest.into(),
+            digest_short: crate::short_digest(digest),
+            mime_type: "image/png".into(),
+            width: 600,
+            height: 380,
+            size_text: "600 × 380 PNG".into(),
+            href: Some("/api/surface/decisions/dec-7c41e0/evidence/0".into()),
+            regions: vec![
+                region(CoverClass::Face, "face · whole person", 6.0, 72.0, 190.0, 304.0),
+                region(CoverClass::PersonalText, "personal text", 264.0, 122.0, 483.0, 149.0),
+            ],
+            covered_all: false,
+            covered_text: "1 face, 1 personal text".into(),
+            caption: None,
+            field: None,
+            why: None,
+            purged: None,
+        }],
+        goes_to: Some(GoesTo {
+            provider: Some("Claude".into()),
+            model: Some("claude-sonnet-5-5".into()),
+            host: "api.anthropic.com".into(),
+        }),
+        what: Some("Document crop".into()),
+        what_note: None,
+        covered: vec![
+            CoveredLine { class: CoverClass::Face, count: 1, text: "1 face".into(), note: None },
+            CoveredLine {
+                class: CoverClass::PersonalText,
+                count: 1,
+                text: "1 personal text".into(),
+                note: None,
+            },
+        ],
+        covered_all: false,
+        covered_all_text: None,
+        cost_text: Some("Up to $0.0070".into()),
+        cost_detail: Some("308 image tokens".into()),
+        cut_from: Some("id-card.png".into()),
+        cut_note: Some("nothing resized".into()),
+        kept_text: Some("Kept as evidence until 18 Dec".into()),
+        source_href: None,
+        notice: None,
+        can_change: true,
+        replaces: None,
+        fixed_line: crate::words::IMAGES_LEAVE_ONLY_COVERED.into(),
+    });
+    card
+}
+
+/// The terminal shows a decision's image as text: the full digest, what was covered, each
+/// region in the image's pixels, where it goes, the cost and a link; `o` opens it, and Allow
+/// once names the digest (spec 3.7 §8.2, board choice A16).
+#[test]
+fn a_decision_with_an_image_shows_its_digest_regions_and_link() {
+    let shown = Instant::now();
+    let mut app = app_with(vec![image_card()], shown);
+    app.home = Some("http://127.0.0.1:8080".into());
+    let mut renderer = Renderer::new(Theme::new(Appearance::Light, true));
+    renderer.home = app.home.clone();
+    let mut terminal = Terminal::new(TestBackend::new(130, 60)).unwrap();
+    terminal
+        .draw(|frame| {
+            renderer.draw(frame, &app, shown + ARM_DELAY * 4);
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let screen: Vec<String> = (0..60)
+        .map(|y| (0..130).map(|x| buffer[(x, y)].symbol().to_string()).collect::<String>())
+        .collect();
+    let text = screen.join("\n");
+    for expected in [
+        "sha256:6b644f480a4058281fbdb2f2e67821a69f702ea65f7c70552289a6add1f31c7c",
+        "600 × 380 PNG · cut from id-card.png · nothing resized",
+        "Claude claude-sonnet-5-5 → api.anthropic.com · document crop",
+        "1 face · 1 personal text",
+        "2, in the image's pixels (x0,y0 → x1,y1)",
+        "face · whole person  covered  6,72 → 190,304",
+        "covered  6,72 → 190,304",
+        "up to $0.0070 · 308 image tokens",
+        "http://127.0.0.1:8080/ui/decisions/dec-7c41e0 (o opens it)",
+        "open image",
+    ] {
+        assert!(text.contains(expected), "{expected:?} is not on screen:\n{text}");
+    }
+
+    let armed = shown + ARM_DELAY * 4;
+    let opened = app.key(key(KeyCode::Char('o')), armed);
+    assert_eq!(opened, vec![Effect::Open("http://127.0.0.1:8080/ui/decisions/dec-7c41e0".into())]);
+    let allowed = app.key(key(KeyCode::Char('y')), armed);
+    let Some(Command::Decide { evidence, .. }) = decide_of(&allowed) else {
+        panic!("y allows once: {allowed:?}")
+    };
+    assert_eq!(
+        evidence,
+        &vec![
+            "sha256:6b644f480a4058281fbdb2f2e67821a69f702ea65f7c70552289a6add1f31c7c".to_string()
+        ]
+    );
 }

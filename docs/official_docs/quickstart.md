@@ -18,6 +18,33 @@ cd quickstart_agent
 This creates a complete Rust project with an OpenAI agent, in-memory sessions,
 the ADK HTTP runtime and its streaming endpoints.
 
+### Before 3.0.0 is published
+
+Until 3.0.0 is on crates.io, `cargo install cargo-adk` installs 2.3.0, and a 3.0 scaffold's
+`adk-rust = "3.0.0"` does not resolve. Install `cargo-adk` from a clone of the repository and
+point the project at the clone:
+
+```bash
+git clone https://github.com/zavora-ai/adk-rust
+cargo install --locked --path adk-rust/cargo-adk
+cargo adk new quickstart_agent --template api --provider openai
+cd quickstart_agent
+```
+
+> **Note:** `cargo install --path` reads the clone's `.cargo/config.toml`, which links with
+> `clang` and the `wild` linker on Linux. On Linux, install both, or delete the clone's
+> `[target.*]` sections for Linux before `cargo install`.
+
+Then add to the end of `quickstart_agent/Cargo.toml`:
+
+```toml
+[patch.crates-io]
+adk-rust = { path = "../adk-rust/adk-rust" }
+```
+
+A template that adds another `adk-*` crate, such as `adk-tool` for `tools`, needs a
+`[patch.crates-io]` line for that crate too. Remove the section once 3.0.0 is published.
+
 ### Other Templates
 
 ```bash
@@ -49,7 +76,7 @@ cargo adk new my_agent --template tools --addon docker --addon telemetry
 | `tools` | Agent with `#[tool]` macro custom tools + schemars schema generation |
 | `rag` | RAG pipeline — Gemini embeddings, in-memory vector store, document ingestion |
 | `api` | Axum REST server, health check, and streaming endpoints |
-| `openai` | OpenAI `gpt-5.6-terra` agent with console |
+| `openai` | OpenAI `gpt-6.1-sol` agent with console |
 | `a2a` | A2A protocol agent with `A2aServer` builder and agent card (alias for `a2a-server`) |
 
 Run `cargo adk templates` for every template, including the workflow agent types and the
@@ -74,6 +101,15 @@ cargo run
 ```
 
 The server binds `127.0.0.1` unless you set `BIND_HOST`, and `PORT` changes the port.
+It logs nothing at the default level; `RUST_LOG=info cargo run` also prints the routes it
+serves:
+
+```text
+INFO quickstart_agent: ADK agent server running on http://127.0.0.1:8080
+INFO quickstart_agent:   GET  /api/health                                — health check
+INFO quickstart_agent:   POST /api/sessions                              — create a session (appName, userId)
+INFO quickstart_agent:   POST /api/run/quickstart_agent/<user_id>/<session_id>     — send a message, SSE response
+```
 
 ## Step 4: Talk to it
 
@@ -97,9 +133,10 @@ curl -N -X POST http://127.0.0.1:8080/api/run/quickstart_agent/user1/SESSION_ID 
 
 You now have one executable that runs the agent, manages sessions and streams
 events. For a page where you talk to your agents, decide what they ask to do and review what
-they did, run [the web home](surfaces/web-home.md): `adk-rust serve` serves it at
-`http://127.0.0.1:8080/ui/`, and a server you build mounts it with `adk-surface`'s `web`
-feature.
+they did, run [the web home](surfaces/web-home.md): install the CLI with
+`cargo install adk-cli` (before 3.0.0 is published, `cargo install --locked --path ../adk-rust/adk-cli`
+from `quickstart_agent`), and `adk-rust serve` serves it at `http://127.0.0.1:8080/ui/`. A server you
+build mounts it with `adk-surface`'s `web` feature.
 
 ### Prefer a terminal-only agent?
 
@@ -132,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-This handles provider detection for compiled providers, session creation, agent building, and execution in a single call. It checks `ANTHROPIC_API_KEY`, then `OPENAI_API_KEY`, then `GOOGLE_API_KEY`, using each provider's default model, and skips providers whose feature is not compiled; with the default features only `GOOGLE_API_KEY` applies.
+This handles provider detection for compiled providers, session creation, agent building, and execution in a single call. It checks `ANTHROPIC_API_KEY`, then `OPENAI_API_KEY`, then `GOOGLE_API_KEY`, using each provider's default model, and skips providers whose feature is not compiled; with the default features only `GOOGLE_API_KEY` applies. With the `gemini-vertex` feature, `GOOGLE_GENAI_USE_ENTERPRISE` or `GOOGLE_GENAI_USE_VERTEXAI` set to `1` or `true` selects Gemini on Vertex AI first, using `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`.
 
 ---
 
@@ -153,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
     let api_key = std::env::var("OPENAI_API_KEY")?;
 
     let model = adk_rust::model::openai::OpenAIClient::new(
-        adk_rust::model::openai::OpenAIConfig::new(&api_key, "gpt-5.6-terra"),
+        adk_rust::model::openai::OpenAIConfig::new(&api_key, "gpt-6.1-sol"),
     )?;
 
     let agent: Arc<dyn Agent> = Arc::new(
@@ -279,14 +316,14 @@ Or scaffold with a provider: `cargo adk new my-agent --provider openai`
 
 ```rust
 let api_key = std::env::var("OPENAI_API_KEY")?;
-let model = OpenAIClient::new(OpenAIConfig::new(api_key, "gpt-5.6-terra"))?;
+let model = OpenAIClient::new(OpenAIConfig::new(api_key, "gpt-6.1-sol"))?;
 ```
 
 ### Anthropic
 
 ```rust
 let api_key = std::env::var("ANTHROPIC_API_KEY")?;
-let model = AnthropicClient::new(AnthropicConfig::new(api_key, "claude-sonnet-5"))?;
+let model = AnthropicClient::new(AnthropicConfig::new(api_key, "claude-sonnet-5-5"))?;
 ```
 
 ### DeepSeek
@@ -315,9 +352,9 @@ let model = OllamaModel::new(OllamaConfig::new("llama3.2"))?;
 
 | Provider | Model Examples | Feature Flag |
 |----------|---------------|--------------|
-| Gemini | `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-pro-preview` | (default) |
-| OpenAI | `gpt-5.6-terra`, `gpt-5.6-sol`, `gpt-5.6-luna` | `openai` |
-| Anthropic | `claude-sonnet-5`, `claude-opus-5`, `claude-fable-5` | `anthropic` |
+| Gemini | `gemini-3.8-flash`, `gemini-4-hydrogen`, `gemini-4-carbon`, `gemini-3.5-flash-lite` | (default) |
+| OpenAI | `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-luna`, `gpt-5.6-terra` | `openai` |
+| Anthropic | `claude-sonnet-5-5`, `claude-fable-5-2`, `claude-opus-5-5`, `claude-haiku-5-5` | `anthropic` |
 | DeepSeek | `deepseek-flash`, `deepseek-v4-pro` | `deepseek` |
 | Groq | `openai/gpt-oss-120b`, `openai/gpt-oss-20b` | `groq` |
 | Ollama | Any pulled model, such as `qwen3.5` or `llama3.2` | `ollama` |

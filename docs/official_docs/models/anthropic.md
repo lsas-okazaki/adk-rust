@@ -17,14 +17,21 @@ The `adk-anthropic` crate is a dedicated Anthropic API client for ADK-Rust. It p
 
 | Model | API ID | `Model` constructor | Catalog role |
 |-------|--------|---------------------|--------------|
-| Claude Sonnet 5 | `claude-sonnet-5` | `Model::claude_sonnet_5()` | Default, balanced |
-| Claude Fable 5.1 | `claude-fable-5-1` | `Model::claude_fable_5_1()` | Flagship |
+| Claude Sonnet 5.5 | `claude-sonnet-5-5` | `Model::claude_sonnet_5_5()` | Default, balanced |
+| Claude Fable 5.2 | `claude-fable-5-2` | `Model::claude_fable_5_2()` | Flagship |
+| Claude Mythos 5.2 | `claude-mythos-5-2` | `Model::claude_mythos_5_2()` | Flagship (verified organizations only) |
 | Claude Opus 5.5 | `claude-opus-5-5` | `Model::claude_opus_5_5()` | Flagship |
-| Claude Sonnet 5.5 | `claude-sonnet-5-5` | `Model::claude_sonnet_5_5()` | Balanced |
 | Claude Haiku 5.5 | `claude-haiku-5-5` | `Model::claude_haiku_5_5()` | Economy |
+| Claude Fable 5.1 | `claude-fable-5-1` | `Model::claude_fable_5_1()` | Flagship |
 | Claude Opus 5 | `claude-opus-5` | `Model::claude_opus_5()` | Flagship |
+| Claude Sonnet 5 | `claude-sonnet-5` | `Model::claude_sonnet_5()` | Balanced |
 | Claude Fable 5 | `claude-fable-5` | `Model::claude_fable_5()` | Flagship |
 | Claude Haiku 4.5 | `claude-haiku-4-5` | `KnownModel::ClaudeHaiku45` | Economy |
+
+Claude Fable 5.2 and Mythos 5.2 cost $8 / $40 per million input and output tokens, with cache
+reads at $0.20; Opus 5.5 $4 / $20; Sonnet 5.5 $2 / $10; Haiku 5.5 $0.10 / $0.50 for prompts up
+to 100,000 tokens. `claude-sonnet-4-5` is deprecated and retires on 2026-11-30, and
+`warn_if_obsolete` logs a warning when a client is built on it.
 
 `KnownModel` also names earlier models, such as `KnownModel::ClaudeOpus47` and
 `KnownModel::ClaudeSonnet46`, and `Model::Custom` takes any other ID.
@@ -45,7 +52,7 @@ use adk_anthropic::{Anthropic, MessageCreateParams, Model};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Anthropic::new(None)?; // reads ANTHROPIC_API_KEY
-    let params = MessageCreateParams::simple("Hello!", Model::claude_sonnet_5());
+    let params = MessageCreateParams::simple("Hello!", Model::claude_sonnet_5_5());
     let response = client.send(params).await?;
     for block in &response.content {
         if let Some(text) = block.as_text() {
@@ -63,7 +70,7 @@ use adk_model::anthropic::{AnthropicClient, AnthropicConfig};
 
 fn build() -> Result<AnthropicClient, Box<dyn std::error::Error>> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")?;
-    Ok(AnthropicClient::new(AnthropicConfig::new(api_key, "claude-sonnet-5"))?)
+    Ok(AnthropicClient::new(AnthropicConfig::new(api_key, "claude-sonnet-5-5"))?)
 }
 ```
 
@@ -83,7 +90,7 @@ use adk_model::anthropic::{AnthropicClient, AnthropicConfig};
 
 fn build(api_key: String) -> Result<AnthropicClient, adk_core::AdkError> {
     AnthropicClient::new(
-        AnthropicConfig::new(api_key, "claude-sonnet-5")
+        AnthropicConfig::new(api_key, "claude-sonnet-5-5")
             .with_base_url("https://gateway.internal/anthropic"),
     )
 }
@@ -153,7 +160,7 @@ fn build(api_key: String) -> Result<(Anthropic, AnthropicClient), Box<dyn std::e
 
     // adk-model: the opt-in and the base URL can come in either order.
     let model = AnthropicClient::new(
-        AnthropicConfig::new(api_key, "claude-sonnet-5")
+        AnthropicConfig::new(api_key, "claude-sonnet-5-5")
             .allow_insecure_http()
             .with_base_url("http://10.60.1.20:8080/api/v1/llm/anthropic"),
     )?;
@@ -200,7 +207,7 @@ fn build(token: Arc<RwLock<String>>) -> Result<AnthropicClient, adk_core::AdkErr
         );
         Ok(())
     });
-    Ok(AnthropicClient::new(AnthropicConfig::new("unused", "claude-sonnet-5"))?
+    Ok(AnthropicClient::new(AnthropicConfig::new("unused", "claude-sonnet-5-5"))?
         .with_request_adapter(adapter))
 }
 ```
@@ -235,6 +242,10 @@ included, as a starting map for `send_with_headers` and `stream_with_headers`.
 | Tool errors | A `tool_result` is sent with `is_error: true` when the agent answered the call as `refused`, `not_run` or `failed` ([tool result status](../tools/function-tools.md#tool-result-status)); a tool's own result, including one with an `error` field, is sent without it |
 | Generation config | `stop_sequences` is sent; `seed`, `frequency_penalty`, `presence_penalty`, and `top_logprobs` fail with `model.unsupported_config` |
 | Claude 5 and Opus 4.7/4.8 sampling | For `claude-opus-5*`, `claude-sonnet-5*`, `claude-haiku-5*`, `claude-fable-5*`, `claude-mythos-5*`, `claude-mythos-preview`, `claude-opus-4-8`, and `claude-opus-4-7`, a request with `temperature`, `top_p`, or `top_k` fails with `model.anthropic.claude5_sampling_unsupported`, and `ThinkingMode::Enabled` with `model.anthropic.claude5_manual_thinking_unsupported`, before anything is sent |
+| Platform model IDs | A platform-prefixed ID such as `anthropic.claude-sonnet-5-5` or `us.anthropic.claude-opus-4-7-v1` follows the sampling and fast-mode rules of the first-party model it names |
+| Refusals | A classifier refusal (`stop_reason: "refusal"`) ends the turn with `FinishReason::Refusal`, `error_code` `"refusal"`, an `error_message` naming the `stop_details` category and explanation, and `provider_metadata.stop_details` as sent; `LlmAgent` reports it as a failed turn, never as an answer |
+| Fast mode | `with_fast_mode(true)` is accepted for `claude-opus-5-5`, `claude-fable-5-2`, `claude-mythos-5-2`, `claude-opus-5`, and `claude-opus-4-8`; other models fail with `model.anthropic.fast_mode_unsupported` before anything is sent |
+| Forced tool choice | Requests never send a forced `tool_choice` (`any` or `tool`), which Claude Fable 5.1 and later, Mythos 5.1 and later, Opus 5.5, and Sonnet 5.5 reject; tools and `output_schema` leave the choice to the model |
 
 ## Key Features
 
@@ -247,7 +258,7 @@ Claude 5 models and Opus 4.7 reject budget-based thinking (`budget_tokens`).
 use adk_anthropic::{EffortLevel, MessageCreateParams, Model, OutputConfig, ThinkingConfig};
 
 fn params() -> MessageCreateParams {
-    let mut params = MessageCreateParams::simple("Solve this...", Model::claude_sonnet_5())
+    let mut params = MessageCreateParams::simple("Solve this...", Model::claude_sonnet_5_5())
         .with_thinking(ThinkingConfig::adaptive());
     params.output_config = Some(OutputConfig::with_effort(EffortLevel::High));
     params
@@ -275,13 +286,36 @@ fn build() -> Result<AnthropicClient, Box<dyn std::error::Error>> {
 }
 ```
 
+### Turning Thinking Off
+
+Claude Fable 5.x, Mythos 5.x, and Opus 5.5 always think; lower the effort instead.
+Claude Sonnet 5.5 rejects `{"type": "disabled"}` and turns thinking off with
+`ThinkingMode::BetweenTools` (`{"type": "between_tools"}`): the model does not think before
+answering, and the short updates it writes between tool calls come back as thinking blocks. The
+API accepts it at effort `high` or below, and takes no `display` with it.
+
+```rust
+use adk_model::anthropic::{AnthropicClient, AnthropicConfig, Effort, ThinkingMode};
+
+fn build() -> Result<AnthropicClient, Box<dyn std::error::Error>> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY")?;
+    Ok(AnthropicClient::new(
+        AnthropicConfig::new(api_key, "claude-sonnet-5-5")
+            .with_thinking_mode(ThinkingMode::BetweenTools)
+            .with_effort(Effort::Low),
+    )?)
+}
+```
+
+`adk-anthropic` sends the same setting with `ThinkingConfig::between_tools()`.
+
 ### Prompt Caching
 
 ```rust
 use adk_anthropic::{CacheControlEphemeral, CacheTtl, MessageCreateParams, Model};
 
 fn params() -> MessageCreateParams {
-    let mut params = MessageCreateParams::simple("Question", Model::claude_sonnet_5())
+    let mut params = MessageCreateParams::simple("Question", Model::claude_sonnet_5_5())
         .with_system("Large system prompt...");
     // A 5-minute entry (the API default) is `CacheControlEphemeral::new()`.
     params.cache_control = Some(CacheControlEphemeral::new().with_ttl(CacheTtl::one_hour()));
@@ -308,9 +342,100 @@ fn build(api_key: String) -> Result<AnthropicClient, adk_core::AdkError> {
 | `CacheTtl::five_minutes()` (default; also `CacheTtl::standard()`) | 1.25× base input | Requests sharing a prefix arrive within five minutes |
 | `CacheTtl::one_hour()` (also `CacheTtl::long()`) | 2× base input | Requests sharing a prefix are more than five minutes apart, such as a conversation waiting on a person |
 
+#### Tools Added Mid-Conversation
+
+The `tools` array opens the cached prefix, so a request whose tools differ from the previous
+request's — an MCP server that lists a new tool, a toolset that offers more after sign-in —
+misses the whole cache and, on models with preserved thinking, invalidates earlier thinking.
+`with_inline_tool_changes(true)` keeps each conversation's `tools` array as first sent and sends a
+tool added, redefined or removed later as a `tool_addition` or `tool_removal` block in a
+`role: "system"` message after the user turn where the change happened (beta
+`inline-tools-2026-09-15`, added by the client).
+
+```rust
+use adk_model::anthropic::{AnthropicClient, AnthropicConfig};
+
+fn build(api_key: String) -> Result<AnthropicClient, adk_core::AdkError> {
+    AnthropicClient::new(
+        AnthropicConfig::new(api_key, "claude-sonnet-5-5").with_inline_tool_changes(true),
+    )
+}
+```
+
+| Request after a tool is added (Claude Haiku 5.5, 5,800-token prefix) | Cache read | Cache written |
+|---|---|---|
+| Tools array changed (default) | 0 | 5,950 |
+| Inline tool change | 5,787 | 300 |
+
+| Rule | Behaviour |
+|------|-----------|
+| Models | Claude API models with mid-conversation tool changes: Fable 5.x, Mythos 5.x, Opus 5.5 / 5 / 4.8, Sonnet 5.5, Haiku 5.5; others send the tools array as it is |
+| Conversation | Told apart by model, system prompt and first block, and remembered in memory for an hour; a conversation the client does not remember starts with its tools as they are |
+| History edits | A change is tied to the exact messages before it; a request whose history no longer starts with them sends its tools as they are |
+| Placement | A change follows a user turn; a change that cannot starts the conversation over |
+| Compaction | A provider-native compaction request carries the changes before the messages it summarizes, so the summary records them, and the conversation that continues from it keeps the same `tools` array; thinking in kept turns that followed a change the summary does not record is left out |
+
 `pricing::estimate_cost` bills the 1-hour share of `usage.cache_creation_input_tokens`,
 reported as `usage.cache_creation_input_tokens_1h`, at the 1-hour rate and the remainder at
 the 5-minute rate.
+
+### Message Threads
+
+With `with_message_threads(true)`, the API keeps each conversation for a short time (beta
+`message-threads-2026-08-12`, added by the client), so a request sends only the messages since
+the previous response. Requests stay small and time to first token steadier as a tool loop grows,
+at the same price.
+
+```rust
+use adk_model::anthropic::{AnthropicClient, AnthropicConfig};
+
+fn build(api_key: String) -> Result<AnthropicClient, adk_core::AdkError> {
+    AnthropicClient::new(
+        AnthropicConfig::new(api_key, "claude-sonnet-5-5").with_message_threads(true),
+    )
+}
+```
+
+| Rule | Behaviour |
+|------|-----------|
+| Source of truth | The agent's session. A request continues its thread only when the conversation it sends starts with exactly what the thread holds — the messages it was sent and the reply as the client renders it from the agent's history — and its `system`, `tools`, thinking, output config, cache control and beta set are unchanged; otherwise it creates a new thread with the whole conversation |
+| Refused thread | A continue or create request the API refuses (an expired thread, one continued elsewhere, a request a thread cannot hold) is sent again without a thread; a conversation whose create request is refused is sent without one from then on |
+| Compaction | A compaction request, and a conversation that carries a compaction block, are sent without a thread: threads cannot hold one |
+| Lifetime | A thread not used for five minutes is replaced by a new one |
+| Data retention | Message threads are not ZDR eligible |
+
+| Ledger audit with Claude Haiku 5.5 (9 requests over two turns) | Messages sent | Body |
+|---|---|---|
+| First request (creates the thread) | 1 | 978 bytes |
+| Later tool-loop requests (continue) | 1 each | about 2,100 bytes each |
+| First request of the second turn (continue) | 1 | 327 bytes; 13,463 bytes without a thread |
+
+### On-Demand Compaction
+
+Claude summarizes a conversation when a request sets `compaction`, and returns one signed
+`compaction` block in place of a reply, with `stop_reason` `"compaction"`. Every later request
+sends the block first in `messages`, exactly as returned, in place of the turns it summarizes.
+The client adds the `compact-2026-09-04` beta header to both
+(`MessageCreateParams::requires_compaction_beta`).
+
+```rust
+use adk_anthropic::{CompactionParam, MessageCreateParams, MessageParam, Model};
+
+fn compaction_request(conversation: Vec<MessageParam>) -> MessageCreateParams {
+    let mut params = MessageCreateParams::new(4_096, conversation, Model::claude_sonnet_5_5());
+    params.compaction = Some(
+        CompactionParam::summarize()
+            .with_instructions("Keep every file name. Do not call tools; reply with the summary only."),
+    );
+    params
+}
+```
+
+Through `adk-model`, `AnthropicClient` reports `Llm::native_compaction` for the models that
+compact on demand on the Claude API, so the runner's auto-compaction has Claude write the summary
+and keeps the signed block in the agent's history; see
+[Provider-Native Compaction](../sessions/context-compaction.md#provider-native-compaction).
+The summarization call's usage comes from `usage.iterations`.
 
 ### Structured Output
 
@@ -325,11 +450,151 @@ fn params() -> MessageCreateParams {
         "required": ["name"],
         "additionalProperties": false
     });
-    let mut params = MessageCreateParams::simple("Extract data", Model::claude_sonnet_5());
+    let mut params = MessageCreateParams::simple("Extract data", Model::claude_sonnet_5_5());
     params.output_config = Some(OutputConfig::new(OutputFormat::json_schema(schema)));
     params
 }
 ```
+
+`AnthropicClient` sends a request's `response_schema` (from `LlmAgentBuilder::output_schema`,
+the `adk-eval` judges, or `adk_core::decide`) as `output_config.format`, beside any
+`output_config.effort`. The schema is closed with `additionalProperties: false` on every
+object, and `minimum`, `maximum`, `minLength`, `maxLength` and the other bounds structured
+outputs reject are dropped, so the caller checks them on the reply. A schema whose object
+leaves `additionalProperties` open, a map type, is not sent. The client never forces a
+`tool_choice`, which Claude Fable 5.1 and later, Mythos 5.1 and later, Opus 5.5 and Sonnet 5.5
+reject.
+
+### Computer Use and Browser Use
+
+Claude's client toolsets declare a fixed set of member tools in one `tools` entry, and the
+application runs every call. `adk-anthropic` has the toolsets, the earlier computer use
+versions, and the `browser_state` result block:
+
+| Entry | `ToolUnionParam` variant | Beta header | Models |
+|-------|--------------------------|-------------|--------|
+| `computer_toolset_20260801` | `ComputerToolset20260801` | none | Fable and Mythos, Opus 4.8 and later, Sonnet 5 and later, Haiku 5.5 |
+| `computer_20251124` | `Computer20251124` | `computer-use-2025-11-24` | Opus 4.5–4.7, Sonnet 4.6 |
+| `computer_20250124` | `Computer20250124` | `computer-use-2025-01-24` | Haiku 4.5, Sonnet 4.5, Sonnet 4, Opus 4.1 |
+| `browser_toolset_20260801` | `BrowserToolset20260801` | none | Fable and Mythos, Opus 4.8 and later, Sonnet 5 and later, Haiku 5.5 |
+
+On the Claude API, Claude Opus 5.5, Sonnet 5.5, Haiku 5.5 and Fable 5.2 reject
+`computer_20251124` with `does not support tool types`. `ComputerToolVersion::for_model` names
+the version a model accepts, and `supports_browser_toolset` says whether it takes the browser
+toolset. The client adds the beta header an earlier version needs.
+
+A member call is a `tool_use` block whose `name` is the member and whose `toolset_name` is
+`computer` or `browser`; several in one turn form a batch that runs in order and stops at the
+first failure. Each result echoes `toolset_name`:
+
+```rust
+use adk_anthropic::{
+    COMPUTER_BATCH_HALT_TEXT, ComputerMember, ComputerToolset20260801, ContentBlock, Message,
+    ToolResultBlock, ToolUnionParam,
+};
+
+fn tools() -> Vec<ToolUnionParam> {
+    // An environment that cannot produce zoom images withholds the member.
+    vec![ToolUnionParam::ComputerToolset20260801(
+        ComputerToolset20260801::new().with_member(ComputerMember::Zoom, false),
+    )]
+}
+
+fn answer(response: &Message) -> Vec<ToolResultBlock> {
+    let mut failed = false;
+    let mut results = Vec::new();
+    for block in &response.content {
+        let ContentBlock::ToolUse(call) = block else { continue };
+        let Some(toolset) = call.toolset_name.as_deref() else { continue };
+        let result = ToolResultBlock::new(call.id.clone()).with_toolset_name(toolset);
+        results.push(if failed {
+            result.with_string_content(COMPUTER_BATCH_HALT_TEXT.into()).with_error(true)
+        } else {
+            match ComputerMember::from_name(&call.name) {
+                // Run the member here; a failure sets `failed`.
+                Some(_) => result.with_string_content("OK".into()),
+                None => {
+                    failed = true;
+                    result.with_string_content(format!("Error: {} is not implemented", call.name))
+                        .with_error(true)
+                }
+            }
+        });
+    }
+    results
+}
+```
+
+Through `adk-model`, `AnthropicClient` puts every computer use entry in the form the model
+accepts: a declared `computer_20251124` becomes the toolset for Claude Sonnet 5.5, and a toolset
+built from member tools becomes `computer_20251124` for Claude Opus 4.7. Member calls reach the
+agent as function calls named `computer.<member>` and `browser.<member>` (`computer.left_click`,
+`browser.navigate`) with the member's input as arguments, whichever version the model used, and
+the history goes back in the declared version's form.
+
+An ADK tool implements a member by naming it in its declaration under
+`x-adk-anthropic-toolset-member`. The client collapses the members of each toolset into one
+entry that offers exactly the members declared:
+
+```json
+{
+  "name": "computer.left_click",
+  "description": "Click at a coordinate",
+  "x-adk-anthropic-toolset-member": {
+    "toolset": "computer",
+    "member": "left_click",
+    "display_width_px": 1280,
+    "display_height_px": 800
+  }
+}
+```
+
+The display size is needed only for a model that takes an earlier computer use version; without
+it that request fails with guidance, as does a browser toolset for a model without one. A member
+tool answers with a string, or with `{"text": ..., "browser_state": {...}}`, and returns a
+screenshot as inline image data; a tab-management result is the `browser_state` alone, and an
+error result drops it.
+
+### Advisor Tool
+
+Claude's advisor tool (`advisor_20260301`, beta) lets the executor model consult a stronger
+Claude model in the middle of a request. Declare it as a built-in tool on an agent whose model
+is an `AnthropicClient`:
+
+```rust
+use std::sync::Arc;
+
+use adk_agent::LlmAgentBuilder;
+use adk_model::anthropic::{AnthropicClient, AnthropicConfig};
+use adk_tool::AnthropicAdvisorTool;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let key = std::env::var("ANTHROPIC_API_KEY")?;
+    let executor = AnthropicClient::new(AnthropicConfig::new(key, "claude-haiku-5-5"))?;
+    let _agent = LlmAgentBuilder::new("worker")
+        .instruction("Consult the advisor before you commit to a plan.")
+        .model(Arc::new(executor))
+        .tool(Arc::new(
+            AnthropicAdvisorTool::new("claude-sonnet-5-5").with_max_uses(2).with_max_tokens(2_048),
+        ))
+        .build()?;
+    Ok(())
+}
+```
+
+| Behaviour | Detail |
+|-----------|--------|
+| Beta header | `advisor-tool-2026-03-01` is sent while the request declares the tool or replays an `advisor_tool_result` block |
+| History | The `server_tool_use` and `advisor_tool_result` blocks are replayed verbatim on later turns |
+| Cost | Each `advisor_message` entry of `usage.iterations` is priced at the advisor model's rates and added to `UsageMetadata::cost`, so the run budget and the spend ledger count it; an unpriced advisor model makes the cost unknown |
+| Bound | `max_cost_micro_usd` adds `max_uses` advisor calls, each reading the whole request and writing `max_tokens`; an advisor without `max_uses` cannot be bounded, so a run under a spend or cost cap refuses the request |
+| Governance | A built-in tool: the run's tool policy decides before the request whether it is sent |
+| Pairing | The advisor must be at least as capable as the executor; current advisor models return their advice encrypted |
+
+The run budget's token count covers the executor's tokens; the advisor's tokens reach the
+budget and the ledger through the cost. To read the advice yourself, or to consult a model of
+another provider, use the provider-neutral `AdvisorTool`
+([Advisor tool](../tools/advisor.md)).
 
 ### Token Pricing
 
@@ -360,7 +625,7 @@ Run with `cargo run -p adk-anthropic --example <name>`:
 | `structured_output` | JSON schema output |
 | `caching` | Multi-turn caching with costs |
 | `context_editing` | Tool and thinking clearing (beta) |
-| `compaction` | Server-side compaction |
+| `compaction` | On-demand compaction: a signed summary in place of a reply, then the conversation continued from it (beta) |
 | `token_counting` | Token counting before sending |
 | `stop_reasons` | Every stop reason |
 | `fast_mode` | Fast mode (beta) |

@@ -282,12 +282,15 @@ fn build(api_key: String) -> Result<OpenAIResponsesClient, adk_core::AdkError> {
 
 | Model | Catalog role |
 |-------|--------------|
-| `gpt-5.6-terra` | Default, balanced |
+| `gpt-6.1-sol` | Default, balanced |
+| `gpt-6-astra` | Flagship |
+| `gpt-6.1-terra` | Balanced |
+| `gpt-6-luna` | Economy |
+| `gpt-5.6-terra` | Balanced |
 | `gpt-5.6-sol` | Flagship |
 | `gpt-5.6-luna` | Economy |
-| `gpt-5.6` | Flagship |
 
-The client sends any other model ID as given, such as `gpt-4.1-nano` or `o4-mini` in
+The client sends any other model ID as given, such as `gpt-4.1-mini` in
 `examples/openai_responses`.
 
 ---
@@ -480,9 +483,14 @@ Errors are mapped to structured `AdkError` with appropriate categories:
 | 404 | `NotFound` | No |
 | 408 | `Timeout` | Yes |
 | 429 | `RateLimited` | Yes |
+| 402, or a `code` or `type` of `insufficient_quota`, `credit_balance_exhausted`, `billing_hard_limit_reached` or a spend limit, at any status | `ResourceExhausted` (`model.openai_responses.quota_exhausted`) | No |
 | 500, 502, 503, 504, 529 | `Unavailable` | Yes |
 | Other 4xx | `InvalidInput` | No |
 | Other | `Internal` | No |
+
+OpenAI answers HTTP 429 both for a rate limit and for an account with no credit; only the body
+tells them apart. A `response.failed` event or WebSocket `error` event with one of those codes is
+`ResourceExhausted` too.
 
 HTTP errors carry the upstream status in `details.upstream_status_code` and an
 identifier-like `x-request-id` in `details.request_id`. A `Retry-After` header, in
@@ -501,6 +509,13 @@ category, line, and column, without quoting the response.
 The generation config fields the API has no place for (`stop_sequences`, `seed`,
 `frequency_penalty`, `presence_penalty`) fail with `model.unsupported_config` before the
 request is sent; see [Generation Config Fields](./providers.md#generation-config-fields).
+
+### Refusals
+
+A completed response whose message carries a `refusal` content part returns the refusal as
+the response's text and finishes with `FinishReason::Refusal`, streamed or not. `LlmAgent`
+emits that event and then ends the run with `model.refusal`; see
+[finish reasons](../events/events.md).
 
 ### Failed and unfinished responses
 
@@ -631,9 +646,6 @@ let model = OpenAIResponsesClient::new(config.clone())?
     .with_websocket_fallback(true);
 ```
 
-The former `OpenAIResponsesConfig::with_transport` option and the `ResponsesTransport` enum
-were never read and are removed.
-
 `examples/gemini_ws_outcomes` runs each WebSocket case against a scripted local server and,
 when `OPENAI_API_KEY` is set, against the live endpoint:
 
@@ -725,24 +737,26 @@ cargo run --manifest-path examples/openai_responses/Cargo.toml
 
 | Scenario | Model |
 |----------|-------|
-| 1. Non-streaming chat | `gpt-4.1-nano` |
-| 2. Streaming chat | `gpt-4.1-nano` |
-| 3. Reasoning with a summary | `o4-mini` |
-| 4. Function tool calling | `gpt-4.1-nano` |
-| 5. Multi-turn conversation | `gpt-4.1-nano` |
-| 6. System instruction | `gpt-4.1-nano` |
-| 7. Temperature and `top_p` | `gpt-4.1-nano` |
+| 1. Non-streaming chat | `gpt-5.6-luna` |
+| 2. Streaming chat | `gpt-5.6-luna` |
+| 3. Reasoning with a summary | `gpt-5.6-terra` |
+| 4. Function tool calling | `gpt-5.6-luna` |
+| 5. Multi-turn conversation | `gpt-5.6-luna` |
+| 6. System instruction | `gpt-5.6-luna` |
+| 7. Temperature and `top_p` | `gpt-4.1-mini` (a non-reasoning model; served until 2027-01-14) |
 
 ### Additional Examples
 
-| Example | Run Command | Feature |
-|---------|-------------|---------|
-| WebSocket transport | `cargo run --manifest-path examples/openai_ws_minimal/Cargo.toml` | Persistent connection |
-| Background mode | `cargo run --manifest-path examples/openai_background/Cargo.toml` | Submit and poll |
-| Conversations API | `cargo run --manifest-path examples/openai_conversations/Cargo.toml` | Server-managed multi-turn |
-| Built-in tools | `cargo run --manifest-path examples/openai_builtin_tools/Cargo.toml` | Image generation, web search |
-| Deep research | `cargo run --manifest-path examples/openai_deep_research/Cargo.toml` | Background research |
-| Open Responses | `cargo run --manifest-path examples/openai_open_responses/Cargo.toml` | Provider-agnostic endpoints |
+These examples live in [adk-playground](https://github.com/zavora-ai/adk-playground):
+
+| Example | Crate | Feature |
+|---------|-------|---------|
+| WebSocket transport | `openai_ws_minimal` | Persistent connection |
+| Background mode | `openai_background` | Submit and poll |
+| Conversations API | `openai_conversations` | Server-managed multi-turn |
+| Built-in tools | `openai_builtin_tools` | Image generation, web search |
+| Deep research | `openai_deep_research` | Background research |
+| Open Responses | `openai_open_responses` | Provider-agnostic endpoints |
 
 ---
 

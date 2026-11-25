@@ -49,6 +49,10 @@ adk-mistralrs = { version = "3.0.0", features = ["metal"] }
 adk-mistralrs = { version = "3.0.0", features = ["cuda"] }
 ```
 
+The umbrella crate re-exports the same API as `adk_rust::mistralrs` behind its `mistralrs`
+feature, so `adk-rust = { version = "3.0.0", features = ["mistralrs"] }` can replace the
+`adk-mistralrs` line when no GPU feature is needed.
+
 ---
 
 ## Step 2: Basic Example
@@ -203,6 +207,9 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+For regions in source pixels, verified weights and the governed vision tools, use the model as
+an `adk-vision` describer: see [Local Describer](../vision/local-describer.md).
+
 ---
 
 ## Step 6: Multi-Model Serving
@@ -271,6 +278,10 @@ Any model ID the mistral.rs 0.8 engine supports can be loaded. The examples on t
 | `microsoft/Phi-3.5-vision-instruct` | Vision and text |
 | `google/gemma-2-2b-it` | Text |
 | `meta-llama/Llama-3.2-3B-Instruct` | Text, base for LoRA adapters |
+
+Every mistral.rs model runs in this process, so its `Llm::data_locality()` is `InProcess`: a
+guardrail that gates what leaves the machine passes its requests through. See
+[Data locality](providers.md#data-locality).
 
 ---
 
